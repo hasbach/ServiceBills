@@ -1069,6 +1069,8 @@ def update_customer(customer_id):
             customer.sector = data['sector']
         if 'discount' in data:
             customer.discount = float(data['discount'])
+        if 'balance' in data:
+            customer.balance = float(data['balance'])
         if 'reseller_id' in data:
             new_reseller_id = data['reseller_id'] if data['reseller_id'] != "" else None
             old_reseller_id = customer.reseller_id
@@ -1208,6 +1210,40 @@ def delete_customer(customer_id):
     except Exception as e:
         db.session.rollback()
         traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/customers/<int:customer_id>/reconcile-balance', methods=['POST'])
+@jwt_required()
+def reconcile_single_customer_balance(customer_id):
+    try:
+        customer = db.session.get(Customer, customer_id)
+        if not customer:
+            return jsonify({'message': 'Customer not found!'}), 404
+        
+        unpaid_total = db.session.query(func.coalesce(func.sum(Payment.amount), 0.0)).filter_by(customer_id=customer.id, paid=False).scalar()
+        customer.balance = -float(unpaid_total)
+        db.session.commit()
+        return jsonify({'message': 'Customer balance reconciled successfully!', 'balance': float(customer.balance)}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/customers/reconcile-all-balances', methods=['POST'])
+@jwt_required()
+def reconcile_all_customers_balances():
+    try:
+        customers = Customer.query.all()
+        count = 0
+        for c in customers:
+            unpaid_total = db.session.query(func.coalesce(func.sum(Payment.amount), 0.0)).filter_by(customer_id=c.id, paid=False).scalar()
+            c.balance = -float(unpaid_total)
+            count += 1
+        db.session.commit()
+        return jsonify({'message': f'Successfully reconciled balances for {count} customers!'}), 200
+    except Exception as e:
+        db.session.rollback()
         return jsonify({'error': str(e)}), 500
 
 
