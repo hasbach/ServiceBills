@@ -361,7 +361,7 @@ class WhatsAppSettings(db.Model):
 class SystemUpdateSettings(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     current_version = db.Column(db.String(50), nullable=False, default='1.4.0')
-    github_repo = db.Column(db.String(200), nullable=False, default='yourusername/delta-net')
+    github_repo = db.Column(db.String(200), nullable=False, default='hasbach/servicesBills')
     auto_update_enabled = db.Column(db.Boolean, nullable=False, default=False)
     auto_update_time = db.Column(db.String(10), nullable=False, default='03:00')
     platform = db.Column(db.String(50), nullable=False, default='pythonanywhere') # 'pythonanywhere', 'linux_vps', 'windows_server'
@@ -2423,7 +2423,7 @@ def check_for_system_updates():
         settings = SystemUpdateSettings()
         db.session.add(settings)
 
-    repo = settings.github_repo or 'yourusername/delta-net'
+    repo = settings.github_repo or 'hasbach/servicesBills'
     settings.last_checked_at = datetime.utcnow()
 
     try:

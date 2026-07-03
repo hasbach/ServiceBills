@@ -158,7 +158,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     // ── System Update state ───────────────────────────────────────────────────
     const [sysUpdate, setSysUpdate] = useState({
         current_version: '1.4.0', latest_available_version: '1.4.0',
-        github_repo: 'yourusername/delta-net', auto_update_enabled: false,
+        github_repo: 'hasbach/servicesBills', auto_update_enabled: false,
         auto_update_time: '03:00', platform: 'pythonanywhere',
         last_checked_at: null, last_updated_at: null, release_notes: ''
     });
