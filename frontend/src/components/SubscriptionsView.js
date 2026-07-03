@@ -59,7 +59,8 @@ import {
     ViewList as ViewListIcon,
     ViewModule as ViewModuleIcon,
     Chat as ChatIcon,
-    Download as DownloadIcon
+    Download as DownloadIcon,
+    Receipt as ReceiptIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 
@@ -198,6 +199,7 @@ const SubscriptionsView = ({
         additional_payment_amount: 0.0,
     });
     const [expandedCustomerId, setExpandedCustomerId] = useState(null);
+    const [paymentsModalCustomer, setPaymentsModalCustomer] = useState(null);
     const [payments, setPayments] = useState([]);
     const [loadingPayments, setLoadingPayments] = useState(false);
 
@@ -238,22 +240,26 @@ const SubscriptionsView = ({
         return colors[planName?.toLowerCase()] || colors.default;
     };
 
-    const fetchCustomerPayments = useCallback(async (customerId) => {
-        if (expandedCustomerId === customerId) {
+    const fetchCustomerPayments = useCallback(async (customerId, customerObj = null) => {
+        if (!customerObj && expandedCustomerId === customerId) {
             setExpandedCustomerId(null);
             setPayments([]);
+            return;
+        }
+        if (customerObj) {
+            setPaymentsModalCustomer(customerObj);
         } else {
             setExpandedCustomerId(customerId);
-            setLoadingPayments(true);
-            try {
-                const response = await apiService.fetchPayments(customerId);
-                setPayments(response.payments || []); // Ensure we are accessing the payments array
-            } catch (error) {
-                console.error("Error fetching payments:", error);
-                setSnackbar({ open: true, message: 'Failed to load payments.', severity: 'error' });
-            } finally {
-                setLoadingPayments(false);
-            }
+        }
+        setLoadingPayments(true);
+        try {
+            const response = await apiService.fetchPayments(customerId);
+            setPayments(response.data?.payments || response.payments || []);
+        } catch (error) {
+            console.error("Error fetching payments:", error);
+            setSnackbar({ open: true, message: 'Failed to load payments.', severity: 'error' });
+        } finally {
+            setLoadingPayments(false);
         }
     }, [expandedCustomerId, apiService, setSnackbar]);
 
@@ -881,6 +887,11 @@ const SubscriptionsView = ({
                                             <TableCell>{new Date(customer.subscription_expiry_date).toLocaleDateString()}</TableCell>
                                             <TableCell onClick={(e) => e.stopPropagation()} sx={{ whiteSpace: 'nowrap' }}>
                                                 {/* Stop propagation so clicking buttons doesn't select the row */}
+                                                <Tooltip title="Payments History">
+                                                    <IconButton size="small" color="secondary" onClick={() => fetchCustomerPayments(customer.id, customer)}>
+                                                        <ReceiptIcon fontSize="small" />
+                                                    </IconButton>
+                                                </Tooltip>
                                                 <Tooltip title="Edit">
                                                     <IconButton size="small" color="info" onClick={() => { setEditingCustomer(customer); setEditDialogOpen(true); }}>
                                                         <EditIcon fontSize="small" />
@@ -960,6 +971,45 @@ const SubscriptionsView = ({
                 <DialogActions>
                     <Button onClick={() => setEditDialogOpen(false)}>Cancel</Button>
                     <Button variant="contained" onClick={handleUpdateCustomer}>Save Changes</Button>
+                </DialogActions>
+            </Dialog>
+
+            <Dialog open={Boolean(paymentsModalCustomer)} onClose={() => { setPaymentsModalCustomer(null); setPayments([]); }} maxWidth="md" fullWidth>
+                <DialogTitle sx={{ fontWeight: 700 }}>Payments History - {paymentsModalCustomer?.name}</DialogTitle>
+                <DialogContent>
+                    {loadingPayments ? (
+                        <Box sx={{ display: 'flex', justifyContent: 'center', my: 4 }}>
+                            <CircularProgress size={32} />
+                        </Box>
+                    ) : (
+                        <TableContainer sx={{ mt: 1 }}>
+                            <Table size="small">
+                                <TableHead>
+                                    <TableRow sx={{ backgroundColor: alpha(theme.palette.primary.main, 0.05) }}>
+                                        <TableCell sx={{ fontWeight: 700 }}>Date</TableCell>
+                                        <TableCell sx={{ fontWeight: 700 }}>Amount</TableCell>
+                                        <TableCell sx={{ fontWeight: 700 }}>Status</TableCell>
+                                        <TableCell sx={{ fontWeight: 700 }}>Actions</TableCell>
+                                    </TableRow>
+                                </TableHead>
+                                <TableBody>
+                                    {payments.length > 0 ? payments.map(p => (
+                                        <TableRow key={p.id}>
+                                            <TableCell>{new Date(p.date).toLocaleDateString()}</TableCell>
+                                            <TableCell sx={{ fontWeight: 600 }}>${p.amount.toFixed(2)}</TableCell>
+                                            <TableCell><Chip label={p.paid ? 'Paid' : 'Unpaid'} size="small" color={p.paid ? 'success' : 'error'} variant="outlined" /></TableCell>
+                                            <TableCell>{!p.paid && <Button size="small" variant="contained" color="success" onClick={() => handleMarkPaid(p.id, p.amount)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Mark Paid</Button>}</TableCell>
+                                        </TableRow>
+                                    )) : (
+                                        <TableRow><TableCell colSpan={4} sx={{ textAlign: 'center', py: 4 }}><Typography variant="body2" color="text.secondary">No payment history found for this customer.</Typography></TableCell></TableRow>
+                                    )}
+                                </TableBody>
+                            </Table>
+                        </TableContainer>
+                    )}
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => { setPaymentsModalCustomer(null); setPayments([]); }}>Close</Button>
                 </DialogActions>
             </Dialog>
         </Box>
