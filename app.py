@@ -2566,26 +2566,26 @@ def send_whatsapp_message(customer, event_type, context=None):
 
     try:
         if not getattr(customer, 'whatsapp_notifications_enabled', True):
-            return  # User disabled notifications
+            return {'success': False, 'status': 'Skipped', 'error': 'Customer has WhatsApp notifications disabled'}  # User disabled notifications
 
         settings = WhatsAppSettings.query.first()
         if not settings or not settings.enabled:
-            return  # WhatsApp notifications are disabled
+            return {'success': False, 'status': 'Skipped', 'error': 'WhatsApp system notifications disabled in settings'}  # WhatsApp notifications are disabled
 
         if settings.mode != 'api':
             # Deep-link mode is manual (button in UI) — nothing to auto-send
-            return
+            return {'success': True, 'status': 'Simulated / Manual', 'details': 'Sent in manual / deep-link mode'}
 
         # Validate that required API credentials are present
         if not settings.access_token or not settings.phone_number_id:
             logging.warning('WhatsApp API mode is enabled but credentials are missing – skipping send.')
-            return
+            return {'success': False, 'status': 'Failed', 'error': 'WhatsApp API credentials missing in settings'}
 
         # Normalise the recipient phone number (digits only, no leading +)
         phone = ''.join(filter(str.isdigit, customer.phone or ''))
         if not phone:
             logging.warning(f'Customer {customer.id} has no valid phone number – skipping WhatsApp send.')
-            return
+            return {'success': False, 'status': 'Failed', 'error': 'Customer has no valid phone number'}
 
         # Pick the correct approved template name
         if event_type == 'payment_paid':
@@ -2608,10 +2608,10 @@ def send_whatsapp_message(customer, event_type, context=None):
             template_name = getattr(settings, f'template_{event_type}', None)
             if not template_name:
                 logging.warning(f'Bulk message missing template_name for {event_type}.')
-                return
+                return {'success': False, 'status': 'Failed', 'error': f'Missing template name for {event_type}'}
         else:
             logging.warning(f'Unknown WhatsApp event_type "{event_type}" – skipping.')
-            return
+            return {'success': False, 'status': 'Failed', 'error': f'Unknown event_type {event_type}'}
 
         api_version = settings.api_version or 'v19.0'
         url = f'https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages'
@@ -2720,27 +2720,41 @@ def send_whatsapp_message(customer, event_type, context=None):
                 ]
             }]
 
+        template_dict = {
+            'name': template_name,
+            'language': {'code': settings.template_language or 'en'},
+        }
+        if components:
+            template_dict['components'] = components
+
         payload = {
             'messaging_product': 'whatsapp',
             'to': phone,
             'type': 'template',
-            'template': {
-                'name': template_name,
-                'language': {'code': settings.template_language or 'en'},
-                'components': components,
-            },
+            'template': template_dict,
         }
 
         response = requests.post(url, json=payload, headers=headers, timeout=10)
         if response.ok:
-            logging.info(f'WhatsApp [{event_type}] sent to customer {customer.id} ({phone}): {response.json()}')
+            res_data = response.json()
+            msg_id = res_data.get('messages', [{}])[0].get('id', 'Accepted')
+            logging.info(f'WhatsApp [{event_type}] sent to customer {customer.id} ({phone}): {res_data}')
+            return {'success': True, 'status': 'Sent / Delivered', 'details': f'Delivered via Meta API (ID: {msg_id})'}
         else:
+            err_json = {}
+            try:
+                err_json = response.json().get('error', {})
+            except:
+                pass
+            err_msg = err_json.get('message') or err_json.get('error_data', {}).get('details') or response.text
             logging.error(f'WhatsApp API error for customer {customer.id}: {response.status_code} {response.text}')
+            return {'success': False, 'status': 'Failed', 'error': f'Meta API Error ({response.status_code}): {err_msg}'}
 
     except Exception as exc:
         # Never let a WhatsApp failure break the main payment flow
         logging.error(f'send_whatsapp_message exception: {exc}')
         traceback.print_exc()
+        return {'success': False, 'status': 'Failed', 'error': f'Exception: {str(exc)}'}
 
 
 @app.route('/api/dashboard', methods=['GET'])
@@ -3151,9 +3165,19 @@ def send_bulk_messages():
 
         settings = WhatsAppSettings.query.first()
         success_count = 0
+        failed_count = 0
+        report_details = []
+
         for phone_raw in custom_phones:
             phone = ''.join(filter(str.isdigit, str(phone_raw or '')))
             if not phone:
+                failed_count += 1
+                report_details.append({
+                    'recipient': str(phone_raw),
+                    'name': 'Unknown / File Upload',
+                    'status': 'Failed',
+                    'details': 'Invalid phone number format (must contain digits)'
+                })
                 continue
             if settings and settings.mode == 'api' and settings.access_token and settings.phone_number_id:
                 try:
@@ -3171,29 +3195,75 @@ def send_bulk_messages():
                     elif data.get('variables', {}).get('message'):
                         components = [{'type': 'body', 'parameters': [{'type': 'text', 'text': str(data['variables']['message'])}]}]
 
+                    template_dict = {
+                        'name': custom_template,
+                        'language': {'code': template_language or 'en'},
+                    }
+                    if components:
+                        template_dict['components'] = components
+
                     payload = {
                         'messaging_product': 'whatsapp',
                         'to': phone,
                         'type': 'template',
-                        'template': {
-                            'name': custom_template,
-                            'language': {'code': template_language or 'en'},
-                            'components': components,
-                        },
+                        'template': template_dict,
                     }
                     response = requests.post(url, json=payload, headers=headers, timeout=10)
                     if response.ok:
                         success_count += 1
-                        logging.info(f'Custom Meta template [{custom_template}] sent to {phone}: {response.json()}')
+                        res_data = response.json()
+                        msg_id = res_data.get('messages', [{}])[0].get('id', 'Accepted')
+                        logging.info(f'Custom Meta template [{custom_template}] sent to {phone}: {res_data}')
+                        report_details.append({
+                            'recipient': f'+{phone}',
+                            'name': 'Custom Contact',
+                            'status': 'Sent / Delivered',
+                            'details': f'Delivered via Meta API (ID: {msg_id})'
+                        })
                     else:
+                        failed_count += 1
+                        err_json = {}
+                        try:
+                            err_json = response.json().get('error', {})
+                        except:
+                            pass
+                        err_msg = err_json.get('message') or err_json.get('error_data', {}).get('details') or response.text
                         logging.error(f'Meta API error sending to {phone}: {response.status_code} {response.text}')
+                        report_details.append({
+                            'recipient': f'+{phone}',
+                            'name': 'Custom Contact',
+                            'status': 'Failed',
+                            'details': f'Meta API Error ({response.status_code}): {err_msg}'
+                        })
                 except Exception as e:
+                    failed_count += 1
                     logging.error(f"Error sending custom template to {phone}: {e}")
+                    report_details.append({
+                        'recipient': f'+{phone}',
+                        'name': 'Custom Contact',
+                        'status': 'Failed',
+                        'details': f'Network / Execution Error: {str(e)}'
+                    })
             else:
                 success_count += 1
                 logging.info(f'Simulated sending custom template [{custom_template}] to {phone}')
+                report_details.append({
+                    'recipient': f'+{phone}',
+                    'name': 'Custom Contact',
+                    'status': 'Simulated / Sent',
+                    'details': 'Sent in simulated/manual mode (no API credentials configured)'
+                })
 
-        return jsonify({'message': f'Successfully dispatched marketing template [{custom_template}] to {success_count} contacts.'}), 200
+        total_targeted = success_count + failed_count
+        return jsonify({
+            'message': f'Dispatched marketing template [{custom_template}] to {total_targeted} contacts ({success_count} sent, {failed_count} failed).',
+            'report': {
+                'total_targeted': total_targeted,
+                'sent_count': success_count,
+                'failed_count': failed_count,
+                'details': report_details
+            }
+        }), 200
 
     event_type = data.get('event_type')
     variables = data.get('variables', {})
@@ -3214,18 +3284,55 @@ def send_bulk_messages():
     customers = query.all()
     
     success_count = 0
+    failed_count = 0
+    report_details = []
+
     for customer in customers:
         try:
             # We pass variables in the context
             context = {
                 **variables
             }
-            send_whatsapp_message(customer, f'bulk_{event_type}', context)
-            success_count += 1
+            res = send_whatsapp_message(customer, f'bulk_{event_type}', context)
+            if isinstance(res, dict):
+                if res.get('success'):
+                    success_count += 1
+                else:
+                    failed_count += 1
+                report_details.append({
+                    'recipient': f"+{customer.phone}" if customer.phone else "N/A",
+                    'name': customer.name or f"Customer #{customer.id}",
+                    'status': res.get('status', 'Sent / Delivered' if res.get('success') else 'Failed'),
+                    'details': res.get('details') or res.get('error') or 'Processed notification'
+                })
+            else:
+                success_count += 1
+                report_details.append({
+                    'recipient': f"+{customer.phone}" if customer.phone else "N/A",
+                    'name': customer.name or f"Customer #{customer.id}",
+                    'status': 'Sent / Delivered',
+                    'details': 'Processed notification'
+                })
         except Exception as e:
+            failed_count += 1
             logging.error(f"Failed to send bulk message to {customer.id}: {e}")
+            report_details.append({
+                'recipient': f"+{customer.phone}" if customer.phone else "N/A",
+                'name': customer.name or f"Customer #{customer.id}",
+                'status': 'Failed',
+                'details': f"Error: {str(e)}"
+            })
 
-    return jsonify({'message': f'Dispatched messages to {success_count} customers.'}), 200
+    total_targeted = len(customers)
+    return jsonify({
+        'message': f'Dispatched notifications to {total_targeted} customers ({success_count} sent, {failed_count} failed).',
+        'report': {
+            'total_targeted': total_targeted,
+            'sent_count': success_count,
+            'failed_count': failed_count,
+            'details': report_details
+        }
+    }), 200
 
 @app.route('/api/reports/revenue', methods=['GET'])
 @jwt_required()

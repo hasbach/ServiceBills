@@ -2,9 +2,14 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
     Box, Typography, Paper, Grid, TextField, Button, MenuItem,
     FormControl, InputLabel, Select, CircularProgress, Alert, Switch, FormControlLabel,
-    Tabs, Tab, Chip, Divider, Stack
+    Tabs, Tab, Chip, Divider, Stack, Dialog, DialogTitle, DialogContent, DialogActions,
+    Table, TableBody, TableCell, TableContainer, TableHead, TableRow, IconButton, Tooltip
 } from '@mui/material';
-import { Send as SendIcon, Sync as SyncIcon, UploadFile as UploadFileIcon, WhatsApp as WhatsAppIcon } from '@mui/icons-material';
+import {
+    Send as SendIcon, Sync as SyncIcon, UploadFile as UploadFileIcon, WhatsApp as WhatsAppIcon,
+    Assessment as AssessmentIcon, CheckCircle as CheckCircleIcon, Error as ErrorIcon,
+    Close as CloseIcon, ContentCopy as ContentCopyIcon
+} from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext';
 
 const MessagingView = () => {
@@ -28,6 +33,7 @@ const MessagingView = () => {
     const [syncing, setSyncing] = useState(false);
     const [customPhonesText, setCustomPhonesText] = useState('');
     const [customVariables, setCustomVariables] = useState('');
+    const [reportDialog, setReportDialog] = useState({ open: false, data: null });
 
     const fetchSectorsData = useCallback(async () => {
         try {
@@ -138,6 +144,9 @@ const MessagingView = () => {
 
             const response = await apiService.sendBulkMessage(payload);
             setSnackbar({ open: true, message: response.data.message || 'Messages dispatched successfully.', severity: 'success' });
+            if (response.data && response.data.report) {
+                setReportDialog({ open: true, data: response.data.report });
+            }
             
             if (activeTab === 0) {
                 setMessage(eventType === 'outage' ? 'an outage occured from the isp , will be repaired soon' : '');
@@ -389,6 +398,141 @@ const MessagingView = () => {
                     </Box>
                 </Box>
             </Paper>
+
+            {/* Delivery Report Modal Dialog */}
+            <Dialog 
+                open={reportDialog.open} 
+                onClose={() => setReportDialog({ open: false, data: null })}
+                maxWidth="md"
+                fullWidth
+                PaperProps={{
+                    sx: { borderRadius: '24px', p: 1, boxShadow: '0 20px 60px rgba(0,0,0,0.15)' }
+                }}
+            >
+                <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', pb: 1 }}>
+                    <Stack direction="row" spacing={1.5} alignItems="center">
+                        <AssessmentIcon sx={{ color: '#1a1f3a', fontSize: 28 }} />
+                        <Typography variant="h6" sx={{ fontWeight: 800, color: '#1a1f3a' }}>
+                            Bulk Dispatch & Delivery Report
+                        </Typography>
+                    </Stack>
+                    <IconButton onClick={() => setReportDialog({ open: false, data: null })} size="small">
+                        <CloseIcon />
+                    </IconButton>
+                </DialogTitle>
+
+                <DialogContent dividers sx={{ borderColor: 'rgba(0,0,0,0.06)', py: 3 }}>
+                    {reportDialog.data && (
+                        <Box>
+                            {/* Summary Cards */}
+                            <Grid container spacing={2} sx={{ mb: 3 }}>
+                                <Grid item xs={12} sm={4}>
+                                    <Paper elevation={0} sx={{ p: 2.5, borderRadius: '16px', bgcolor: '#f8f9fa', border: '1px solid rgba(0,0,0,0.05)', textAlign: 'center' }}>
+                                        <Typography variant="caption" sx={{ color: 'text.secondary', fontWeight: 700, textTransform: 'uppercase' }}>
+                                            Total Targeted
+                                        </Typography>
+                                        <Typography variant="h4" sx={{ fontWeight: 800, color: '#1a1f3a', mt: 0.5 }}>
+                                            {reportDialog.data.total_targeted}
+                                        </Typography>
+                                    </Paper>
+                                </Grid>
+                                <Grid item xs={12} sm={4}>
+                                    <Paper elevation={0} sx={{ p: 2.5, borderRadius: '16px', bgcolor: 'rgba(46, 125, 50, 0.06)', border: '1px solid rgba(46, 125, 50, 0.15)', textAlign: 'center' }}>
+                                        <Stack direction="row" spacing={1} justifyContent="center" alignItems="center">
+                                            <CheckCircleIcon sx={{ color: '#2e7d32', fontSize: 20 }} />
+                                            <Typography variant="caption" sx={{ color: '#2e7d32', fontWeight: 700, textTransform: 'uppercase' }}>
+                                                Delivered / Sent
+                                            </Typography>
+                                        </Stack>
+                                        <Typography variant="h4" sx={{ fontWeight: 800, color: '#2e7d32', mt: 0.5 }}>
+                                            {reportDialog.data.sent_count}
+                                        </Typography>
+                                    </Paper>
+                                </Grid>
+                                <Grid item xs={12} sm={4}>
+                                    <Paper elevation={0} sx={{ p: 2.5, borderRadius: '16px', bgcolor: 'rgba(211, 47, 47, 0.06)', border: '1px solid rgba(211, 47, 47, 0.15)', textAlign: 'center' }}>
+                                        <Stack direction="row" spacing={1} justifyContent="center" alignItems="center">
+                                            <ErrorIcon sx={{ color: '#d32f2f', fontSize: 20 }} />
+                                            <Typography variant="caption" sx={{ color: '#d32f2f', fontWeight: 700, textTransform: 'uppercase' }}>
+                                                Failed / Undelivered
+                                            </Typography>
+                                        </Stack>
+                                        <Typography variant="h4" sx={{ fontWeight: 800, color: '#d32f2f', mt: 0.5 }}>
+                                            {reportDialog.data.failed_count}
+                                        </Typography>
+                                    </Paper>
+                                </Grid>
+                            </Grid>
+
+                            {/* Details Table */}
+                            <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: '#1a1f3a' }}>
+                                Recipient Breakdown
+                            </Typography>
+                            <TableContainer component={Paper} elevation={0} sx={{ border: '1px solid rgba(0,0,0,0.06)', borderRadius: '16px', maxHeight: 350 }}>
+                                <Table stickyHeader size="small">
+                                    <TableHead>
+                                        <TableRow>
+                                            <TableCell sx={{ fontWeight: 700, bgcolor: '#f8f9fa' }}>Recipient</TableCell>
+                                            <TableCell sx={{ fontWeight: 700, bgcolor: '#f8f9fa' }}>Name / Source</TableCell>
+                                            <TableCell sx={{ fontWeight: 700, bgcolor: '#f8f9fa' }}>Status</TableCell>
+                                            <TableCell sx={{ fontWeight: 700, bgcolor: '#f8f9fa' }}>Details / Meta Status</TableCell>
+                                        </TableRow>
+                                    </TableHead>
+                                    <TableBody>
+                                        {reportDialog.data.details && reportDialog.data.details.map((row, index) => (
+                                            <TableRow key={index} hover>
+                                                <TableCell sx={{ fontWeight: 600, fontFamily: 'monospace' }}>{row.recipient}</TableCell>
+                                                <TableCell>{row.name}</TableCell>
+                                                <TableCell>
+                                                    {row.status.includes('Sent') || row.status.includes('Delivered') || row.status.includes('Simulated') ? (
+                                                        <Chip label={row.status} color="success" size="small" sx={{ fontWeight: 700, fontSize: '0.75rem' }} />
+                                                    ) : row.status.includes('Skipped') ? (
+                                                        <Chip label={row.status} color="warning" size="small" sx={{ fontWeight: 700, fontSize: '0.75rem' }} />
+                                                    ) : (
+                                                        <Chip label={row.status} color="error" size="small" sx={{ fontWeight: 700, fontSize: '0.75rem' }} />
+                                                    )}
+                                                </TableCell>
+                                                <TableCell sx={{ color: 'text.secondary', fontSize: '0.8rem' }}>{row.details}</TableCell>
+                                            </TableRow>
+                                        ))}
+                                    </TableBody>
+                                </Table>
+                            </TableContainer>
+                        </Box>
+                    )}
+                </DialogContent>
+
+                <DialogActions sx={{ px: 3, py: 2, justifyContent: 'space-between' }}>
+                    <Box>
+                        {reportDialog.data && reportDialog.data.failed_count > 0 && (
+                            <Button 
+                                size="small" 
+                                variant="outlined" 
+                                color="error" 
+                                startIcon={<ContentCopyIcon />}
+                                onClick={() => {
+                                    const failedNums = reportDialog.data.details
+                                        .filter(d => !d.status.includes('Sent') && !d.status.includes('Delivered') && !d.status.includes('Simulated'))
+                                        .map(d => d.recipient)
+                                        .join('\n');
+                                    navigator.clipboard.writeText(failedNums);
+                                    setSnackbar({ open: true, message: 'Copied failed numbers to clipboard!', severity: 'info' });
+                                }}
+                                sx={{ borderRadius: '8px', fontWeight: 700 }}
+                            >
+                                Copy Failed Numbers
+                            </Button>
+                        )}
+                    </Box>
+                    <Button 
+                        variant="contained" 
+                        onClick={() => setReportDialog({ open: false, data: null })}
+                        sx={{ borderRadius: '10px', fontWeight: 700, px: 3 }}
+                    >
+                        Close Report
+                    </Button>
+                </DialogActions>
+            </Dialog>
         </Box>
     );
 };

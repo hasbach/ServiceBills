@@ -681,19 +681,6 @@ const PaymentsView = () => {
             const paidCustomerPhone = paidCustomer.phone || '';
             const paidCustomerName  = paidPayment.customer_name || '';
 
-            setReceiptData({
-                payment_id: paymentId,
-                customer_name: paidCustomerName,
-                customer_phone: paidCustomerPhone,
-                customer_address: paidCustomer.address,
-                payment_date: new Date().toISOString().split('T')[0],
-                amount_paid_now: response.data.amount_received_in_this_transaction,
-                remaining_on_payment: response.data.remaining_amount,
-                paid_status: response.data.paid ? 'Paid' : 'Partial',
-                customer_new_balance: response.data.customer_new_balance,
-            });
-            setShowReceiptModal(true);
-
             // ── Auto-open WhatsApp deep link (deep-link mode) ──────────────────
             if (waSettings.enabled && waSettings.mode === 'deeplink') {
                 const phone = paidCustomerPhone.replace(/\D/g, '');
