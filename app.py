@@ -2345,10 +2345,38 @@ def save_whatsapp_settings():
                 setattr(settings, f, data[f])
         settings.updated_at = datetime.utcnow()
         db.session.commit()
+        
+        # Automatically subscribe app to WABA webhooks via Graph API
+        if settings.access_token and settings.business_account_id:
+            try:
+                api_ver = settings.api_version or 'v19.0'
+                sub_url = f"https://graph.facebook.com/{api_ver}/{settings.business_account_id}/subscribed_apps"
+                sub_headers = {'Authorization': f"Bearer {settings.access_token}"}
+                requests.post(sub_url, headers=sub_headers, timeout=5)
+            except Exception as ex_sub:
+                logging.warning(f"Could not auto-subscribe app to WABA: {ex_sub}")
+
         return jsonify({'message': 'WhatsApp settings saved!', 'settings': settings.to_dict()}), 200
     except Exception as e:
         db.session.rollback()
         traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
+@jwt_required()
+def subscribe_waba():
+    try:
+        settings = WhatsAppSettings.query.first()
+        if not settings or not settings.access_token or not settings.business_account_id:
+            return jsonify({'error': 'Please configure your WABA ID and Access Token first.'}), 400
+        api_ver = settings.api_version or 'v19.0'
+        url = f"https://graph.facebook.com/{api_ver}/{settings.business_account_id}/subscribed_apps"
+        headers = {'Authorization': f"Bearer {settings.access_token}"}
+        resp = requests.post(url, headers=headers, timeout=10)
+        if resp.ok and resp.json().get('success'):
+            return jsonify({'message': 'Successfully linked Webhook to your Meta Business Account! Live messages will now be received.'}), 200
+        return jsonify({'error': f"Meta API Error: {resp.text}"}), 400
+    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 

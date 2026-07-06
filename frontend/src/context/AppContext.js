@@ -96,6 +96,7 @@ export const apiService = {
     }),
     fetchWhatsAppSettings: () => api.get('/whatsapp-settings'),
     saveWhatsAppSettings: (data) => api.post('/whatsapp-settings', data),
+    subscribeWaba: () => api.post('/whatsapp/subscribe-waba'),
     fetchSystemUpdateStatus: () => api.get('/system-update/status'),
     saveSystemUpdateSettings: (data) => api.post('/system-update/settings', data),
     checkForSystemUpdates: () => api.post('/system-update/check'),

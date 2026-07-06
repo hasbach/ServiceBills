@@ -155,6 +155,21 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
         }
     };
 
+    const [linkingWaba, setLinkingWaba] = useState(false);
+    const handleLinkWaba = async () => {
+        setLinkingWaba(true);
+        try {
+            await apiService.saveWhatsAppSettings(waForm);
+            const res = await apiService.subscribeWaba();
+            setSnackbar({ open: true, message: res?.data?.message || 'Successfully linked Webhook to Meta Account!', severity: 'success' });
+        } catch (err) {
+            const detail = err?.response?.data?.error || err?.message || 'Unknown error';
+            setSnackbar({ open: true, message: `Failed to link: ${detail}`, severity: 'error' });
+        } finally {
+            setLinkingWaba(false);
+        }
+    };
+
     const waField = (key) => ({ value: waForm[key], onChange: (e) => setWaForm(f => ({ ...f, [key]: e.target.value })) });
 
     // ── System Update state ───────────────────────────────────────────────────
@@ -453,9 +468,13 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12}>
-                                            <Alert severity="success" sx={{ borderRadius: '12px', bgcolor: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0' }}>
+                                            <Alert severity="success" sx={{ borderRadius: '12px', bgcolor: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0', mb: 2 }}>
                                                 <strong>Your Webhook URL for Meta Console:</strong> <code>{window.location.origin}/api/whatsapp/webhook</code>
                                             </Alert>
+                                            <Button variant="outlined" color="primary" onClick={handleLinkWaba} disabled={linkingWaba}
+                                                sx={{ borderRadius: '12px', fontWeight: 600, textTransform: 'none' }}>
+                                                {linkingWaba ? 'Linking to Meta Account...' : '🔗 Force Link Webhook to Meta Account'}
+                                            </Button>
                                         </Grid>
                                     </Grid>
 
