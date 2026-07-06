@@ -2561,6 +2561,36 @@ def apply_system_update():
 
 _template_def_cache = {}
 
+def normalize_whatsapp_phone(phone_raw):
+    """
+    Normalizes a phone number to international E.164 format (digits only, no leading zeros).
+    If a local number starting with 0 is provided, attempts to prepend the business's country code.
+    """
+    if not phone_raw:
+        return ''
+    phone = ''.join(filter(str.isdigit, str(phone_raw)))
+    if not phone:
+        return ''
+    
+    if phone.startswith('0'):
+        phone = phone.lstrip('0')
+        try:
+            biz = BusinessSettings.query.first()
+            if biz and biz.mobile:
+                biz_digits = ''.join(filter(str.isdigit, str(biz.mobile)))
+                if biz_digits.startswith('20') and len(biz_digits) == 12:
+                    phone = '20' + phone
+                elif biz_digits.startswith('966') and len(biz_digits) == 12:
+                    phone = '966' + phone
+                elif len(biz_digits) > 8:
+                    cc_len = len(biz_digits) - len(phone)
+                    if 1 <= cc_len <= 4:
+                        phone = biz_digits[:cc_len] + phone
+        except Exception:
+            pass
+            
+    return phone
+
 def get_meta_template_definition(settings, template_name):
     """
     Retrieves template definition from Meta Business Manager (or in-memory cache).
@@ -2636,10 +2666,17 @@ def build_meta_template_payload(settings, template_name, default_language='en', 
                     if isinstance(ex, dict):
                         handles = ex.get('header_handle') or ex.get('header_url') or []
                         if handles and isinstance(handles, list) and len(handles) > 0:
-                            media_url = handles[0]
+                            cand = str(handles[0])
+                            if cand.startswith('http://') or cand.startswith('https://'):
+                                media_url = cand
                 
-                if not media_url:
-                    media_url = "https://images.unsplash.com/photo-1557804506-669a67965ba0?auto=format&fit=crop&w=800&q=80"
+                if not media_url or not (str(media_url).startswith('http://') or str(media_url).startswith('https://')):
+                    if fmt == 'IMAGE':
+                        media_url = "https://images.unsplash.com/photo-1557804506-669a67965ba0?auto=format&fit=crop&w=800&q=80"
+                    elif fmt == 'VIDEO':
+                        media_url = "https://www.w3schools.com/html/mov_bbb.mp4"
+                    else:
+                        media_url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
                 
                 if fmt == 'IMAGE':
                     components.append({'type': 'header', 'parameters': [{'type': 'image', 'image': {'link': str(media_url)}}]})
@@ -2731,7 +2768,7 @@ def send_whatsapp_message(customer, event_type, context=None):
             return {'success': False, 'status': 'Failed', 'error': 'WhatsApp API credentials missing in settings'}
 
         # Normalise the recipient phone number (digits only, no leading +)
-        phone = ''.join(filter(str.isdigit, customer.phone or ''))
+        phone = normalize_whatsapp_phone(customer.phone)
         if not phone:
             logging.warning(f'Customer {customer.id} has no valid phone number – skipping WhatsApp send.')
             return {'success': False, 'status': 'Failed', 'error': 'Customer has no valid phone number'}
@@ -2812,11 +2849,14 @@ def send_whatsapp_message(customer, event_type, context=None):
             elif context and context.get('message'):
                 user_body_params = [context.get('message')]
 
+        user_header_params = context.get('header_url') or context.get('image_url') or context.get('media_url')
+
         template_dict = build_meta_template_payload(
             settings=settings,
             template_name=template_name,
             default_language=settings.template_language or 'en',
-            user_body_params=user_body_params
+            user_body_params=user_body_params,
+            user_header_params=user_header_params
         )
 
         payload = {
@@ -2831,7 +2871,7 @@ def send_whatsapp_message(customer, event_type, context=None):
             res_data = response.json()
             msg_id = res_data.get('messages', [{}])[0].get('id', 'Accepted')
             logging.info(f'WhatsApp [{event_type}] sent to customer {customer.id} ({phone}): {res_data}')
-            return {'success': True, 'status': 'Sent / Delivered', 'details': f'Delivered via Meta API (ID: {msg_id})'}
+            return {'success': True, 'status': 'Sent (Accepted by Meta)', 'details': f'Dispatched to Meta API queue (ID: {msg_id})'}
         else:
             err_json = {}
             try:
@@ -3261,7 +3301,7 @@ def send_bulk_messages():
         report_details = []
 
         for phone_raw in custom_phones:
-            phone = ''.join(filter(str.isdigit, str(phone_raw or '')))
+            phone = normalize_whatsapp_phone(phone_raw)
             if not phone:
                 failed_count += 1
                 report_details.append({
@@ -3285,11 +3325,14 @@ def send_bulk_messages():
                     elif data.get('variables', {}).get('message'):
                         user_body_params = [str(data['variables']['message'])]
 
+                    user_header_params = data.get('header_url', '').strip() or None
+
                     template_dict = build_meta_template_payload(
                         settings=settings,
                         template_name=custom_template,
                         default_language=template_language or settings.template_language or 'en',
-                        user_body_params=user_body_params
+                        user_body_params=user_body_params,
+                        user_header_params=user_header_params
                     )
 
                     payload = {
@@ -3307,8 +3350,8 @@ def send_bulk_messages():
                         report_details.append({
                             'recipient': f'+{phone}',
                             'name': 'Custom Contact',
-                            'status': 'Sent / Delivered',
-                            'details': f'Delivered via Meta API (ID: {msg_id})'
+                            'status': 'Sent (Accepted by Meta)',
+                            'details': f'Dispatched to Meta API queue (ID: {msg_id})'
                         })
                     else:
                         failed_count += 1
@@ -3392,7 +3435,7 @@ def send_bulk_messages():
                 report_details.append({
                     'recipient': f"+{customer.phone}" if customer.phone else "N/A",
                     'name': customer.name or f"Customer #{customer.id}",
-                    'status': res.get('status', 'Sent / Delivered' if res.get('success') else 'Failed'),
+                    'status': res.get('status', 'Sent (Accepted by Meta)' if res.get('success') else 'Failed'),
                     'details': res.get('details') or res.get('error') or 'Processed notification'
                 })
             else:
@@ -3400,7 +3443,7 @@ def send_bulk_messages():
                 report_details.append({
                     'recipient': f"+{customer.phone}" if customer.phone else "N/A",
                     'name': customer.name or f"Customer #{customer.id}",
-                    'status': 'Sent / Delivered',
+                    'status': 'Sent (Accepted by Meta)',
                     'details': 'Processed notification'
                 })
         except Exception as e:

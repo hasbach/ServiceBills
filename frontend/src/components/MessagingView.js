@@ -33,6 +33,7 @@ const MessagingView = () => {
     const [syncing, setSyncing] = useState(false);
     const [customPhonesText, setCustomPhonesText] = useState('');
     const [customVariables, setCustomVariables] = useState('');
+    const [headerUrl, setHeaderUrl] = useState('');
     const [reportDialog, setReportDialog] = useState({ open: false, data: null });
 
     const fetchSectorsData = useCallback(async () => {
@@ -139,7 +140,8 @@ const MessagingView = () => {
                     custom_phones: phoneList,
                     custom_template: selectedTemplate,
                     template_language: selectedTmplObj ? selectedTmplObj.language : 'en',
-                    custom_variables: varsList
+                    custom_variables: varsList,
+                    header_url: headerUrl
                 };
             }
 
@@ -176,6 +178,9 @@ const MessagingView = () => {
     const bodyText = bodyComp?.text || '';
     const matches = bodyText.match(/\{\{\d+\}\}/g);
     const varCount = matches ? new Set(matches).size : 0;
+    const headerComp = selectedTmplObj?.components?.find(c => c.type === 'HEADER' || c.type === 'header');
+    const headerFormat = headerComp?.format?.toUpperCase() || '';
+    const needsMediaHeader = ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(headerFormat);
 
     return (
         <Box>
@@ -351,6 +356,22 @@ const MessagingView = () => {
                                         }
                                     />
                                 </Grid>
+
+                                {needsMediaHeader && (
+                                    <Grid item xs={12}>
+                                        <TextField
+                                            fullWidth
+                                            label={`Header ${headerFormat} URL (Public HTTPS link required)`}
+                                            placeholder={`https://yourdomain.com/sample-${headerFormat.toLowerCase()}.jpg`}
+                                            value={headerUrl}
+                                            onChange={(e) => setHeaderUrl(e.target.value)}
+                                            helperText={`This template has an ${headerFormat} header. Enter a publicly accessible HTTPS URL to your ${headerFormat.toLowerCase()} file.`}
+                                            InputProps={{
+                                                sx: { borderRadius: '12px', bgcolor: '#f8fafc', fontWeight: 600 }
+                                            }}
+                                        />
+                                    </Grid>
+                                )}
 
                                 <Grid item xs={12}>
                                     <Divider sx={{ my: 1 }}>
