@@ -323,6 +323,7 @@ class WhatsAppSettings(db.Model):
     template_subscription_created = db.Column(db.String(200), nullable=True, default='subscription_created')
     template_subscription_renewed = db.Column(db.String(200), nullable=True, default='subscription_renewal')
     template_payment_reminder = db.Column(db.String(200), nullable=True, default='payment_reminder')
+    template_current_balance = db.Column(db.String(200), nullable=True, default='current_balance')
     template_bulk_outage = db.Column(db.String(200), nullable=True, default='outage_alert')
     template_bulk_maintenance = db.Column(db.String(200), nullable=True, default='maintenance_alert')
     template_bulk_feature = db.Column(db.String(200), nullable=True, default='feature_update')
@@ -357,6 +358,7 @@ class WhatsAppSettings(db.Model):
             'template_subscription_created': self.template_subscription_created or 'subscription_created',
             'template_subscription_renewed': self.template_subscription_renewed or 'subscription_renewal',
             'template_payment_reminder': self.template_payment_reminder or 'payment_reminder',
+            'template_current_balance': self.template_current_balance or 'current_balance',
             'template_bulk_outage': self.template_bulk_outage or 'outage_alert',
             'template_bulk_maintenance': self.template_bulk_maintenance or 'maintenance_alert',
             'template_bulk_feature': self.template_bulk_feature or 'feature_update',
@@ -565,6 +567,12 @@ with app.app_context():
 
     try:
         db.session.execute(text("ALTER TABLE whats_app_settings ADD COLUMN template_subscription_created VARCHAR(200) DEFAULT 'subscription_created'"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    try:
+        db.session.execute(text("ALTER TABLE whats_app_settings ADD COLUMN template_current_balance VARCHAR(200) DEFAULT 'current_balance'"))
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -2355,6 +2363,7 @@ def get_whatsapp_settings():
         'template_subscription_created': 'subscription_created',
         'template_subscription_renewed': 'subscription_renewal',
         'template_payment_reminder': 'payment_reminder',
+        'template_current_balance': 'current_balance',
         'template_bulk_outage': 'outage_alert',
         'template_bulk_maintenance': 'maintenance_alert',
         'template_bulk_feature': 'feature_update',
@@ -2378,7 +2387,7 @@ def save_whatsapp_settings():
             db.session.add(settings)
         fields = ['mode','enabled','phone_number_id','business_account_id','app_id',
                   'app_secret','access_token','api_version','template_payment_paid',
-                  'template_subscription_created', 'template_subscription_renewed','template_payment_reminder',
+                  'template_subscription_created', 'template_subscription_renewed','template_payment_reminder', 'template_current_balance',
                   'template_bulk_outage', 'template_bulk_maintenance', 'template_bulk_feature', 'template_bulk_offer',
                   'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message']
         for f in fields:
@@ -2865,6 +2874,8 @@ def send_whatsapp_message(customer, event_type, context=None):
             template_name = settings.template_subscription_renewed or 'subscription_renewal'
         elif event_type == 'payment_reminder':
             template_name = settings.template_payment_reminder or 'payment_reminder'
+        elif event_type == 'current_balance':
+            template_name = getattr(settings, 'template_current_balance', None) or 'current_balance'
         elif event_type == 'reseller_credit_added':
             template_name = 'reseller_credit_added'
         elif event_type == 'reseller_discount_applied':
@@ -2900,7 +2911,7 @@ def send_whatsapp_message(customer, event_type, context=None):
             plan_name = str(context.get('plan_name', customer.subscription_plan.name if customer.subscription_plan else 'N/A'))
             balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
             user_body_params = [customer.name, plan_name, expiry_date, balance_str]
-        elif event_type == 'payment_reminder':
+        elif event_type in ('payment_reminder', 'current_balance'):
             balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
             expiry_date = str(context.get('expiry_date', customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else 'N/A'))
             user_body_params = [customer.name, balance_str, expiry_date]
@@ -3344,16 +3355,21 @@ def trigger_whatsapp_reminder(customer_id):
     if not customer:
         return jsonify({'message': 'Customer not found'}), 404
     
+    data = request.get_json(silent=True) or {}
+    template_type = data.get('template_type', 'payment_reminder')
+    if template_type not in ('payment_reminder', 'current_balance'):
+        template_type = 'payment_reminder'
+        
     context = {
         'balance': customer.balance,
         'expiry_date': customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else 'N/A'
     }
     
     try:
-        send_whatsapp_message(customer, 'payment_reminder', context)
-        return jsonify({'message': 'WhatsApp reminder triggered successfully'}), 200
+        send_whatsapp_message(customer, template_type, context)
+        return jsonify({'message': f'WhatsApp {template_type.replace("_", " ")} triggered successfully'}), 200
     except Exception as e:
-        return jsonify({'message': f'Failed to trigger WhatsApp reminder: {str(e)}'}), 500
+        return jsonify({'message': f'Failed to trigger WhatsApp message: {str(e)}'}), 500
 
 @app.route('/api/messages/bulk_send', methods=['POST'])
 @jwt_required()

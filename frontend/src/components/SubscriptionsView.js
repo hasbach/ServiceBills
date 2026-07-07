@@ -202,6 +202,8 @@ const SubscriptionsView = ({
     const [paymentsModalCustomer, setPaymentsModalCustomer] = useState(null);
     const [payments, setPayments] = useState([]);
     const [loadingPayments, setLoadingPayments] = useState(false);
+    const [waReminderDialog, setWaReminderDialog] = useState({ open: false, customer: null });
+    const [waReminderType, setWaReminderType] = useState('payment_reminder');
 
     const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
     const [editDialogOpen, setEditDialogOpen] = useState(false);
@@ -328,15 +330,26 @@ const SubscriptionsView = ({
         }
     }, [apiService, setSnackbar, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery]);
 
-    const handleSendWAReminder = useCallback(async (customerId) => {
+    const handleSendWAReminder = useCallback((customerOrId) => {
+        const customer = typeof customerOrId === 'object' ? customerOrId : customers.find(c => c.id === customerOrId);
+        if (customer) {
+            setWaReminderDialog({ open: true, customer });
+            setWaReminderType('payment_reminder');
+        }
+    }, [customers]);
+
+    const handleConfirmWAReminder = useCallback(async (templateType) => {
+        if (!waReminderDialog.customer) return;
+        const custId = waReminderDialog.customer.id;
+        setWaReminderDialog({ open: false, customer: null });
         try {
-            await apiService.sendWhatsappReminder(customerId);
-            setSnackbar({ open: true, message: 'WhatsApp reminder triggered!', severity: 'success' });
+            await apiService.sendWhatsappReminder(custId, templateType);
+            setSnackbar({ open: true, message: `WhatsApp ${templateType.replace('_', ' ')} triggered!`, severity: 'success' });
         } catch (error) {
             console.error('Error sending WA reminder:', error);
             setSnackbar({ open: true, message: 'Failed to send WhatsApp reminder', severity: 'error' });
         }
-    }, [apiService, setSnackbar]);
+    }, [waReminderDialog.customer, apiService, setSnackbar]);
 
     // --- NEW: Bulk Action Handlers ---
     const handleExportCSV = async () => {
@@ -1010,6 +1023,111 @@ const SubscriptionsView = ({
                 </DialogContent>
                 <DialogActions>
                     <Button onClick={() => { setPaymentsModalCustomer(null); setPayments([]); }}>Close</Button>
+                </DialogActions>
+            </Dialog>
+
+            {/* WhatsApp Reminder Template Selection Dialog */}
+            <Dialog open={waReminderDialog.open} onClose={() => setWaReminderDialog({ open: false, customer: null })} maxWidth="sm" fullWidth>
+                <DialogTitle sx={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <ChatIcon sx={{ color: '#25D366' }} /> Select WhatsApp Message Template
+                </DialogTitle>
+                <DialogContent>
+                    <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+                        Choose which WhatsApp message template to send to <b>{waReminderDialog.customer?.name}</b>:
+                    </Typography>
+
+                    <Grid container spacing={2}>
+                        <Grid item xs={12}>
+                            <Paper
+                                variant="outlined"
+                                onClick={() => setWaReminderType('payment_reminder')}
+                                sx={{
+                                    p: 2.5,
+                                    borderRadius: '16px',
+                                    cursor: 'pointer',
+                                    border: '2px solid',
+                                    borderColor: waReminderType === 'payment_reminder' ? '#25D366' : alpha(theme.palette.divider, 0.1),
+                                    bgcolor: waReminderType === 'payment_reminder' ? alpha('#25D366', 0.05) : 'transparent',
+                                    transition: 'all 0.2s ease',
+                                    '&:hover': {
+                                        borderColor: '#25D366',
+                                        bgcolor: alpha('#25D366', 0.02)
+                                    }
+                                }}
+                            >
+                                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+                                    <Typography variant="subtitle1" sx={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1 }}>
+                                        💬 Payment Reminder Template
+                                    </Typography>
+                                    <Chip label="payment_reminder" size="small" sx={{ bgcolor: alpha('#25D366', 0.1), color: '#25D366', fontWeight: 600 }} />
+                                </Box>
+                                <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+                                    Standard reminder for pending or due payments.
+                                </Typography>
+                                <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                                    <Chip label="1- Customer Name" size="small" variant="outlined" sx={{ fontSize: '0.75rem' }} />
+                                    <Chip label="2- Balance Due" size="small" variant="outlined" sx={{ fontSize: '0.75rem' }} />
+                                    <Chip label="3- Expiry Date" size="small" variant="outlined" sx={{ fontSize: '0.75rem' }} />
+                                </Box>
+                            </Paper>
+                        </Grid>
+
+                        <Grid item xs={12}>
+                            <Paper
+                                variant="outlined"
+                                onClick={() => setWaReminderType('current_balance')}
+                                sx={{
+                                    p: 2.5,
+                                    borderRadius: '16px',
+                                    cursor: 'pointer',
+                                    border: '2px solid',
+                                    borderColor: waReminderType === 'current_balance' ? '#25D366' : alpha(theme.palette.divider, 0.1),
+                                    bgcolor: waReminderType === 'current_balance' ? alpha('#25D366', 0.05) : 'transparent',
+                                    transition: 'all 0.2s ease',
+                                    '&:hover': {
+                                        borderColor: '#25D366',
+                                        bgcolor: alpha('#25D366', 0.02)
+                                    }
+                                }}
+                            >
+                                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+                                    <Typography variant="subtitle1" sx={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1 }}>
+                                        📊 Current Balance Template
+                                    </Typography>
+                                    <Chip label="current_balance" size="small" sx={{ bgcolor: alpha('#25D366', 0.1), color: '#25D366', fontWeight: 600 }} />
+                                </Box>
+                                <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+                                    Send account status summary with current balance and subscription expiration date.
+                                </Typography>
+                                <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                                    <Chip label="1- Customer Name" size="small" variant="outlined" sx={{ fontSize: '0.75rem' }} />
+                                    <Chip label="2- Current Balance" size="small" variant="outlined" sx={{ fontSize: '0.75rem' }} />
+                                    <Chip label="3- Expiry Date" size="small" variant="outlined" sx={{ fontSize: '0.75rem' }} />
+                                </Box>
+                            </Paper>
+                        </Grid>
+                    </Grid>
+                </DialogContent>
+                <DialogActions sx={{ p: 2.5, pt: 1 }}>
+                    <Button onClick={() => setWaReminderDialog({ open: false, customer: null })} sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
+                        Cancel
+                    </Button>
+                    <Button
+                        variant="contained"
+                        onClick={() => handleConfirmWAReminder(waReminderType)}
+                        startIcon={<ChatIcon />}
+                        sx={{
+                            bgcolor: '#25D366',
+                            color: '#fff',
+                            borderRadius: '10px',
+                            textTransform: 'none',
+                            fontWeight: 700,
+                            px: 3,
+                            '&:hover': { bgcolor: '#1ebe5d' }
+                        }}
+                    >
+                        Send WhatsApp Message
+                    </Button>
                 </DialogActions>
             </Dialog>
         </Box>

@@ -38,6 +38,7 @@ const DEFAULT_WA = {
     template_payment_paid: 'payment_confirmation',
     template_subscription_renewed: 'subscription_renewal',
     template_payment_reminder: 'payment_reminder',
+    template_current_balance: 'current_balance',
     template_bulk_outage: 'outage_alert',
     template_bulk_maintenance: 'maintenance_alert',
     template_bulk_feature: 'feature_update',
@@ -416,19 +417,24 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                         These must exactly match the template names you approved in Meta Business Manager → WhatsApp → Message Templates.
                                     </Alert>
                                     <Grid container spacing={2}>
-                                        <Grid item xs={12} md={4}>
+                                        <Grid item xs={12} md={3}>
                                             <TextField fullWidth label="Payment Received Template" placeholder="payment_confirmation" {...waField('template_payment_paid')}
                                                 helperText="Triggered when a payment is marked as paid"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
-                                        <Grid item xs={12} md={4}>
+                                        <Grid item xs={12} md={3}>
                                             <TextField fullWidth label="Subscription Renewed Template" placeholder="subscription_renewal" {...waField('template_subscription_renewed')}
                                                 helperText="Triggered when subscription is renewed"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
-                                        <Grid item xs={12} md={4}>
+                                        <Grid item xs={12} md={3}>
                                             <TextField fullWidth label="Payment Reminder Template" placeholder="payment_reminder" {...waField('template_payment_reminder')}
                                                 helperText="For future manual or scheduled reminders"
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                        </Grid>
+                                        <Grid item xs={12} md={3}>
+                                            <TextField fullWidth label="Current Balance Template" placeholder="current_balance" {...waField('template_current_balance')}
+                                                helperText="For balance & expiry reminders"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12} md={3}>

@@ -101,7 +101,7 @@ export const apiService = {
     saveSystemUpdateSettings: (data) => api.post('/system-update/settings', data),
     checkForSystemUpdates: () => api.post('/system-update/check'),
     applySystemUpdate: () => api.post('/system-update/apply'),
-    sendWhatsappReminder: (customerId) => api.post(`/customers/${customerId}/send-whatsapp-reminder`),
+    sendWhatsappReminder: (customerId, templateType = 'payment_reminder') => api.post(`/customers/${customerId}/send-whatsapp-reminder`, { template_type: templateType }),
     fetchReceipt: (paymentId) => api.get(`/receipt/${paymentId}`),
     addCustomerPayment: (paymentData) => api.post(`/payments`, paymentData),
     renewSubscription: (customerId) => api.post(`/customers/${customerId}/renew_subscription`),
