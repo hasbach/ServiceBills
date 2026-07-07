@@ -486,13 +486,21 @@ with app.app_context():
 
     try:
         db.session.execute(text("ALTER TABLE support_ticket ADD COLUMN in_progress_at DATETIME"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    try:
         db.session.execute(text("ALTER TABLE support_ticket ADD COLUMN in_progress_by_id INTEGER REFERENCES user(id)"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    try:
         db.session.execute(text("ALTER TABLE support_ticket ADD COLUMN resolved_by_id INTEGER REFERENCES user(id)"))
         db.session.commit()
-        print("Migration: Successfully added support ticket tracking columns.")
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        print(f"Migration support_ticket tracking columns skipped or failed: {e}")
 
     # Migrations for Reseller, Customer, Payment, Expense
     try:
@@ -509,6 +517,11 @@ with app.app_context():
 
     try:
         db.session.execute(text("ALTER TABLE payment ADD COLUMN collected_amount FLOAT DEFAULT 0.0"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    try:
         db.session.execute(text("ALTER TABLE payment ADD COLUMN collected BOOLEAN DEFAULT 0"))
         db.session.commit()
     except Exception:
@@ -516,6 +529,11 @@ with app.app_context():
 
     try:
         db.session.execute(text("ALTER TABLE expense ADD COLUMN supplier_id INTEGER REFERENCES supplier(id)"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    try:
         db.session.execute(text("ALTER TABLE expense ADD COLUMN is_credit BOOLEAN DEFAULT 0"))
         db.session.commit()
     except Exception:
@@ -523,12 +541,26 @@ with app.app_context():
 
     try:
         db.session.execute(text("ALTER TABLE whats_app_settings ADD COLUMN forwarding_mobile VARCHAR(50)"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    try:
         db.session.execute(text("ALTER TABLE whats_app_settings ADD COLUMN webhook_verify_token VARCHAR(100) DEFAULT 'delta_net_whatsapp_secret'"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    try:
         db.session.execute(text("ALTER TABLE whats_app_settings ADD COLUMN auto_reply_enabled BOOLEAN DEFAULT 1"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    try:
         db.session.execute(text("ALTER TABLE whats_app_settings ADD COLUMN auto_reply_message TEXT"))
         db.session.commit()
-        print("Migration: Successfully added forwarding_mobile, webhook_verify_token, and auto_reply fields to whats_app_settings.")
-    except Exception as e:
+    except Exception:
         db.session.rollback()
 
     try:
