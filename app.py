@@ -2656,7 +2656,7 @@ _template_def_cache = {}
 def normalize_whatsapp_phone(phone_raw):
     """
     Normalizes a phone number to international E.164 format (digits only, no leading zeros).
-    If a local number starting with 0 is provided, attempts to prepend the business's country code.
+    If a local number starting with 0 or <= 9 digits is provided, attempts to prepend the business's country code.
     """
     if not phone_raw:
         return ''
@@ -2666,18 +2666,34 @@ def normalize_whatsapp_phone(phone_raw):
     
     if phone.startswith('0'):
         phone = phone.lstrip('0')
+        
+    # If phone is local (<= 9 digits) without country code, infer and prepend country code
+    if len(phone) <= 9 and not (phone.startswith('961') or phone.startswith('20') or phone.startswith('966') or phone.startswith('971')):
         try:
             biz = BusinessSettings.query.first()
             if biz and biz.mobile:
                 biz_digits = ''.join(filter(str.isdigit, str(biz.mobile)))
-                if biz_digits.startswith('20') and len(biz_digits) == 12:
-                    phone = '20' + phone
-                elif biz_digits.startswith('966') and len(biz_digits) == 12:
-                    phone = '966' + phone
+                if biz_digits.startswith('20') and len(biz_digits) >= 12:
+                    return '20' + phone
+                elif biz_digits.startswith('966') and len(biz_digits) >= 12:
+                    return '966' + phone
+                elif biz_digits.startswith('961') and len(biz_digits) >= 10:
+                    return '961' + phone
                 elif len(biz_digits) > 8:
                     cc_len = len(biz_digits) - len(phone)
                     if 1 <= cc_len <= 4:
-                        phone = biz_digits[:cc_len] + phone
+                        return biz_digits[:cc_len] + phone
+            # Fallback: check most common country code in Customer table
+            sample_cust = Customer.query.filter(Customer.phone != None).first()
+            if sample_cust and sample_cust.phone:
+                c_phone = ''.join(filter(str.isdigit, str(sample_cust.phone)))
+                if c_phone.startswith('961') and len(c_phone) >= 10:
+                    return '961' + phone
+                elif c_phone.startswith('20') and len(c_phone) >= 12:
+                    return '20' + phone
+            # Default fallback for Lebanon if <= 8 digits (e.g. 3261036, 70123456, 81246333)
+            if len(phone) in (7, 8):
+                return '961' + phone
         except Exception:
             pass
             
