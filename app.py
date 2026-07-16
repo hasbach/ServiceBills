@@ -824,7 +824,7 @@ def register():
 @jwt_required()
 @admin_required()
 def get_users():
-    users = User.query.all()
+    users = User.query.filter_by(tenant_id=current_tenant_id()).all()
     result = []
     for u in users:
         result.append({
@@ -860,7 +860,7 @@ def create_user():
 @jwt_required()
 @admin_required()
 def update_user(user_id):
-    user = User.query.get_or_404(user_id)
+    user = User.query.filter_by(id=user_id, tenant_id=current_tenant_id()).first_or_404()
     data = request.json
     
     if 'role' in data:
@@ -875,10 +875,10 @@ def update_user(user_id):
 @jwt_required()
 @admin_required()
 def delete_user(user_id):
-    user = User.query.get_or_404(user_id)
-    
+    user = User.query.filter_by(id=user_id, tenant_id=current_tenant_id()).first_or_404()
+
     if user.role == 'admin':
-        admin_count = User.query.filter_by(role='admin').count()
+        admin_count = User.query.filter_by(role='admin', tenant_id=current_tenant_id()).count()
         if admin_count <= 1:
             return jsonify({"msg": "Cannot delete the last admin"}), 400
             
