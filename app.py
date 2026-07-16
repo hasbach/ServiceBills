@@ -4487,7 +4487,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 def serve_manifest():
     with app.app_context():
         settings = BusinessSettings.query.first()
-        name = settings.business_name if settings and settings.business_name else "DeltaNet Management System"
+        name = settings.business_name if settings and settings.business_name else "servicesBills"
         short_name = name
         logo_url = settings.logo_url if settings and settings.logo_url else "logo192.png"
         

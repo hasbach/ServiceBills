@@ -213,7 +213,7 @@ const MessagingView = () => {
                     {activeTab === 0 ? (
                         <>
                             <Alert severity="info" sx={{ mb: 3, borderRadius: '12px' }}>
-                                Send automated notification alerts directly to your existing subscribers registered in Delta Net.
+                                Send automated notification alerts directly to your existing subscribers registered in servicesBills.
                             </Alert>
                             <Grid container spacing={3}>
                                 <Grid item xs={12} md={6}>

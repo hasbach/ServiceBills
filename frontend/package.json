@@ -1,8 +1,8 @@
 {
-  "name": "delta-net",
+  "name": "servicesbills",
   "version": "0.1.0",
   "private": true,
-  "description": "A customer and subscription management application.",
+  "description": "servicesBills — customer & subscription management SaaS.",
   "author": "Bach",
   "main": "public/electron.js",
   "homepage": "./",
@@ -67,8 +67,8 @@
     ]
   },
   "build": {
-    "appId": "com.betams.deltanetmanager",
-    "productName": "DeltaNet Manager",
+    "appId": "net.servicesbills.app",
+    "productName": "servicesBills",
     "directories": {
       "output": "dist",
       "buildResources": "build-resources"
