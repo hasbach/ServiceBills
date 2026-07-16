@@ -596,16 +596,6 @@ with app.app_context():
         db.session.rollback()
         print(f"Migration step 2 (elevate admin) failed: {e}")
 
-@app.route('/api/debug-db', methods=['GET'])
-def debug_db():
-    try:
-        users = User.query.all()
-        user_list = [{"id": u.id, "username": u.username, "role": u.role} for u in users]
-        return jsonify({"status": "success", "users": user_list}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
 def admin_required():
     def wrapper(fn):
         @wraps(fn)
@@ -733,17 +723,6 @@ def register():
     db.session.add(new_user)
     db.session.commit()
     return jsonify({"msg": "User created successfully"}), 201
-
-def admin_required():
-    def wrapper(fn):
-        @wraps(fn)
-        def decorator(*args, **kwargs):
-            claims = get_jwt()
-            if claims.get('role') != 'admin':
-                return jsonify(msg="Admins only!"), 403
-            return fn(*args, **kwargs)
-        return decorator
-    return wrapper
 
 @app.route('/api/users', methods=['GET'])
 @jwt_required()
