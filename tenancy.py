@@ -29,6 +29,20 @@ def new_for_tenant(model, **kwargs):
     return model(**kwargs)
 
 
+def get_tenant_settings(model, **defaults):
+    """Return the current tenant's singleton settings row for `model`, creating it if absent.
+
+    Replaces the old global `Model.query.first()` singleton pattern with a per-tenant one.
+    """
+    from app import db
+    row = tenant_query(model).first()
+    if row is None:
+        row = new_for_tenant(model, **defaults)
+        db.session.add(row)
+        db.session.commit()
+    return row
+
+
 def tenant_required(fn):
     """Decorator: require a valid JWT that carries a tenant_id."""
     @wraps(fn)

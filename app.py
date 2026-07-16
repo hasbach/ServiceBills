@@ -61,6 +61,19 @@ migrate = Migrate(app, db, render_as_batch=True)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
+# Multi-tenancy scoping helpers (Phase 2). tenancy.py imports `db` lazily inside
+# functions, so importing it here does not create a circular import.
+from tenancy import (
+    current_tenant_id, tenant_query, new_for_tenant, get_tenant_settings, tenant_required,
+)
+from werkzeug.exceptions import Unauthorized
+
+
+@app.errorhandler(Unauthorized)
+def _unauthorized(e):
+    return jsonify(msg=getattr(e, "description", "Unauthorized")), 401
+
+
 # Database Models (unchanged)
 class Tenant(db.Model):
     __tablename__ = "tenant"
