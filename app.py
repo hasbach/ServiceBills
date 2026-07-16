@@ -520,6 +520,35 @@ class PaymentReminder(db.Model):
     sent_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
+
+# --- Tenant write scoping (defense in depth) ---------------------------------
+# Every tenant-owned model. New rows of these get tenant_id stamped from the
+# request's JWT tenant automatically at flush time, so a bare `Model(...)` create
+# inside a request is tenant-correct even if the author forgot new_for_tenant().
+# Outside a request (scheduler/webhook) there is no tenant in context, so callers
+# MUST set tenant_id explicitly; an unset tenant_id then fails loudly (NOT NULL).
+TENANT_OWNED_MODELS = (
+    Reseller, ResellerPayment, Customer, SubscriptionPlan, Sector, Supplier,
+    SupplierPayment, ExpenseCategory, Expense, Payment, GeneratedReceipt,
+    AddonPurchase, BusinessSettings, WhatsAppSettings, SystemUpdateSettings,
+    ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
+    CustomerFeedback, PaymentReminder,
+)
+
+from sqlalchemy import event as _sa_event
+
+
+@_sa_event.listens_for(db.session, "before_flush")
+def _stamp_tenant_id(session, flush_context, instances):
+    try:
+        tid = current_tenant_id()
+    except Exception:
+        return  # no tenant in context (public route, scheduler, webhook) -> caller sets it
+    for obj in session.new:
+        if isinstance(obj, TENANT_OWNED_MODELS) and getattr(obj, "tenant_id", None) is None:
+            obj.tenant_id = tid
+
+
 # Create the database
 with app.app_context():
     # Alembic is the schema source of truth (Phase 1+). Set DISABLE_AUTO_CREATE_ALL=1
@@ -696,7 +725,7 @@ def apply_customer_balance_to_unpaid_payments(customer):
     logging.info(f"Reconciling balance for customer {customer.id}. Current balance: {customer.balance}")
 
     # Get all outstanding bills, oldest first
-    unpaid_payments = Payment.query.filter_by(
+    unpaid_payments = tenant_query(Payment).filter_by(
         customer_id=customer.id, 
         paid=False
     ).order_by(Payment.date.asc()).all()
@@ -753,7 +782,7 @@ def has_pending_payment(customer_id, billing_date):
     """
     Check if a pending payment already exists for the customer for the given billing date.
     """
-    existing_payment = Payment.query.filter_by(
+    existing_payment = tenant_query(Payment).filter_by(
         customer_id=customer_id,
         paid=False,
         date=billing_date
@@ -885,23 +914,23 @@ def uploaded_file(filename):
 def generate_missing_payments():
     try:
         # Clean up ONLY exactly $0.0 unpaid payments (do NOT touch negative credit notes or adjustments)
-        zero_payments = Payment.query.filter(Payment.paid == False, Payment.amount == 0.0).all()
+        zero_payments = tenant_query(Payment).filter(Payment.paid == False, Payment.amount == 0.0).all()
         if zero_payments:
             for zp in zero_payments:
                 db.session.delete(zp)
             db.session.commit()
 
         # Get all active customers
-        customers = Customer.query.filter_by(is_subscription_active=True).all()
+        customers = tenant_query(Customer).filter_by(is_subscription_active=True).all()
 
         for customer in customers:
             # Get the subscription plan for the customer
-            subscription_plan = db.session.get(SubscriptionPlan, customer.subscription_plan_id)
+            subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
             if not subscription_plan:
                 continue  # Skip if subscription plan is missing
 
             # Determine the last payment date or use the subscription start date
-            last_payment = Payment.query.filter_by(
+            last_payment = tenant_query(Payment).filter_by(
                 customer_id=customer.id,
                 pre_payment=False
             ).order_by(Payment.date.desc()).first()
@@ -928,7 +957,7 @@ def generate_missing_payments():
 
                 if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date):
                     if customer.reseller_id:
-                        reseller = db.session.get(Reseller, customer.reseller_id)
+                        reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
                         if reseller:
                             reseller.balance += amount_due
                             reseller_payment = ResellerPayment(
@@ -975,7 +1004,7 @@ def generate_missing_payments_with_context():
 def scheduled_auto_update_check():
     with app.app_context():
         try:
-            settings = SystemUpdateSettings.query.first()
+            settings = tenant_query(SystemUpdateSettings).first()
             if settings and settings.auto_update_enabled:
                 logging.info("Scheduler running overnight auto-update check...")
                 # Run apply update routine silently if needed
@@ -1007,7 +1036,7 @@ def get_customers():
         sort_desc = request.args.get('sort_desc', 'true').lower() == 'true'
 
         # Build the query with join to subscription plan
-        query = Customer.query.options(db.joinedload(Customer.subscription_plan))
+        query = tenant_query(Customer).options(db.joinedload(Customer.subscription_plan))
 
         if reseller_id:
             query = query.filter(Customer.reseller_id == reseller_id)
@@ -1077,14 +1106,15 @@ def add_customer():
             if data.get('subscription_start_date')
             else datetime.now(timezone.utc)
         )
-        subscription_plan = db.session.get(SubscriptionPlan, data['subscription_plan_id'])
+        subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=data['subscription_plan_id']).first()
         if not subscription_plan:
             return jsonify({'message': 'Subscription plan not found!'}), 404
-        
+
         discount = float(data.get('discount', 0.0))
 
         # Create new customer first
-        new_customer = Customer(
+        new_customer = new_for_tenant(
+            Customer,
             name=data['name'],
             phone=data['phone'],
             address=data['address'],
@@ -1093,7 +1123,7 @@ def add_customer():
             discount=discount,
             subscription_start_date=subscription_start_date,
             # Expiry date will be set by the payment loop
-            subscription_expiry_date=subscription_start_date, 
+            subscription_expiry_date=subscription_start_date,
             is_subscription_active=True,
             balance=0.0,
             reseller_id=data.get('reseller_id') if data.get('reseller_id') != "" else None
@@ -1114,10 +1144,11 @@ def add_customer():
 
             if amount_due > 0:
                 if new_customer.reseller_id:
-                    reseller = db.session.get(Reseller, new_customer.reseller_id)
+                    reseller = tenant_query(Reseller).filter_by(id=new_customer.reseller_id).first()
                     if reseller:
                         reseller.balance += amount_due
-                        reseller_payment = ResellerPayment(
+                        reseller_payment = new_for_tenant(
+                            ResellerPayment,
                             reseller_id=reseller.id,
                             amount=amount_due,
                             type='credit_added',
@@ -1125,7 +1156,8 @@ def add_customer():
                         )
                         db.session.add(reseller_payment)
                 else:
-                    new_payment = Payment(
+                    new_payment = new_for_tenant(
+                        Payment,
                         customer_id=new_customer.id,
                         amount=amount_due,
                         paid=False,
@@ -1148,7 +1180,8 @@ def add_customer():
         # Handle any immediate additional payment
         addon_amount = float(data.get('additional_payment_amount', 0))
         if addon_amount > 0:
-            addon_payment = Payment(
+            addon_payment = new_for_tenant(
+                Payment,
                 customer_id=new_customer.id,
                 amount=addon_amount,
                 paid=False,
@@ -1194,7 +1227,7 @@ def add_customer():
 @jwt_required()
 def update_customer(customer_id):
     try:
-        customer = db.session.get(Customer, customer_id)
+        customer = tenant_query(Customer).filter_by(id=customer_id).first()
         if not customer:
             return jsonify({'message': 'Customer not found!'}), 404
         
@@ -1224,9 +1257,9 @@ def update_customer(customer_id):
                 
                 # 1. Reverse accumulated debt/credit from OLD reseller (if any)
                 if old_reseller_id:
-                    old_reseller = db.session.get(Reseller, old_reseller_id)
+                    old_reseller = tenant_query(Reseller).filter_by(id=old_reseller_id).first()
                     if old_reseller:
-                        rps = ResellerPayment.query.filter_by(reseller_id=old_reseller_id).filter(
+                        rps = tenant_query(ResellerPayment).filter_by(reseller_id=old_reseller_id).filter(
                             db_or(
                                 ResellerPayment.description.like(f"%customer {original_name}%"),
                                 ResellerPayment.description.like(f"%customer {customer.name}%")
@@ -1253,7 +1286,7 @@ def update_customer(customer_id):
                     # Coming from Independent: net debt is simply their current balance
                     net_debt = -customer.balance
                     customer.balance = 0.0
-                    unpaid_payments = Payment.query.filter_by(customer_id=customer.id, paid=False).all()
+                    unpaid_payments = tenant_query(Payment).filter_by(customer_id=customer.id, paid=False).all()
                     for p in unpaid_payments:
                         p.paid = True
                         p.collected = True
@@ -1261,7 +1294,7 @@ def update_customer(customer_id):
                 
                 # 2. Apply this net debt to the NEW destination
                 if new_reseller_id:
-                    new_reseller = db.session.get(Reseller, new_reseller_id)
+                    new_reseller = tenant_query(Reseller).filter_by(id=new_reseller_id).first()
                     if new_reseller:
                         new_reseller.balance += net_debt
                         if net_debt > 0:
@@ -1288,7 +1321,7 @@ def update_customer(customer_id):
         
         # Handle subscription plan change
         if 'subscription_plan_id' in data and data['subscription_plan_id'] != customer.subscription_plan_id:
-            new_plan = db.session.get(SubscriptionPlan, data['subscription_plan_id'])
+            new_plan = tenant_query(SubscriptionPlan).filter_by(id=data['subscription_plan_id']).first()
             if not new_plan:
                 return jsonify({'message': 'Subscription plan not found!'}), 404
             
@@ -1342,7 +1375,7 @@ def update_customer(customer_id):
 @jwt_required()
 def delete_customer(customer_id):
     try:
-        customer = db.session.get(Customer, customer_id)
+        customer = tenant_query(Customer).filter_by(id=customer_id).first()
         if not customer:
             return jsonify({'message': 'Customer not found!'}), 404
         
@@ -1377,7 +1410,7 @@ def generate_future_payments():
         until_date = datetime.strptime(until_date_str, '%Y-%m-%d').date()
         today = datetime.utcnow().date()
         
-        query = Customer.query.filter_by(is_subscription_active=True)
+        query = tenant_query(Customer).filter_by(is_subscription_active=True)
         if customer_id and customer_id != 'all':
             query = query.filter_by(id=customer_id)
             
@@ -1388,7 +1421,7 @@ def generate_future_payments():
             if customer.reseller_id:
                 continue # Do not auto-generate pending payments for reseller customers
             
-            subscription_plan = db.session.get(SubscriptionPlan, customer.subscription_plan_id)
+            subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
             if not subscription_plan:
                 continue
 
@@ -1400,7 +1433,7 @@ def generate_future_payments():
             billing_day = subscription_start.day
             
             # Find all existing payments for this customer
-            existing_payments = Payment.query.filter_by(customer_id=customer.id).all()
+            existing_payments = tenant_query(Payment).filter_by(customer_id=customer.id).all()
             existing_payment_dates = set()
             for p in existing_payments:
                 if hasattr(p.date, 'date'):
@@ -1491,7 +1524,7 @@ def generate_future_payments():
                 amount_due = max(subscription_plan.price - (customer.discount or 0.0), 0.0)
                 if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date):
                     if customer.reseller_id:
-                        reseller = db.session.get(Reseller, customer.reseller_id)
+                        reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
                         if reseller:
                             reseller.balance += amount_due
                             reseller_payment = ResellerPayment(
@@ -1537,7 +1570,7 @@ def generate_future_payments():
 @app.route('/api/subscription_plans', methods=['GET'])
 @jwt_required()
 def get_subscription_plans():
-    subscription_plans = db.session.query(SubscriptionPlan).all()
+    subscription_plans = tenant_query(SubscriptionPlan).all()
     return jsonify([plan.to_dict() for plan in subscription_plans]) # Use to_dict() for consistency
 
 @app.route('/api/subscription_plans', methods=['POST'])
@@ -1586,7 +1619,7 @@ def add_subscription_plan():
 @jwt_required()
 def update_subscription_plan(plan_id):
     try:
-        plan = db.session.get(SubscriptionPlan, plan_id)
+        plan = tenant_query(SubscriptionPlan).filter_by(id=plan_id).first()
         if not plan:
             return jsonify({'message': 'Subscription plan not found!'}), 404
         
@@ -1607,7 +1640,7 @@ def update_subscription_plan(plan_id):
 @jwt_required()
 def delete_subscription_plan(plan_id):
     try:
-        plan = db.session.get(SubscriptionPlan, plan_id)
+        plan = tenant_query(SubscriptionPlan).filter_by(id=plan_id).first()
         if not plan:
             return jsonify({'message': 'Subscription plan not found!'}), 404
         
@@ -1637,7 +1670,7 @@ def add_payment():
         return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD.'}), 400
 
     # Fetch the customer to ensure it exists
-    customer = db.session.get(Customer, data['customer_id'])
+    customer = tenant_query(Customer).filter_by(id=data['customer_id']).first()
     if not customer:
         return jsonify({'error': 'Customer not found!'}), 404
 
@@ -1702,7 +1735,7 @@ def get_payments():
     collected_by = request.args.get('collected_by', type=int)
     collected_date = request.args.get('collected_date')
 
-    query = Payment.query.join(Customer)
+    query = tenant_query(Payment).join(Customer)
     query = query.options(db.joinedload(Payment.customer))
 
     if customer_id:
@@ -1769,12 +1802,12 @@ def get_payments():
 @jwt_required()
 def delete_payment(payment_id):
     try:
-        payment = db.session.get(Payment, payment_id)
+        payment = tenant_query(Payment).filter_by(id=payment_id).first()
         if not payment:
             return jsonify({'message': 'Payment not found!'}), 404
 
         # Get customer to update their balance
-        customer = db.session.get(Customer, payment.customer_id)
+        customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
         if not customer:
             return jsonify({'message': 'Customer not found for this payment!'}), 404
 
@@ -1853,12 +1886,12 @@ def mark_payment_as_paid(payment_id):
     current_user = User.query.filter_by(username=current_username).first()
     
     data = request.json
-    payment = db.session.get(Payment, payment_id)
+    payment = tenant_query(Payment).filter_by(id=payment_id).first()
 
     if not payment:
         return jsonify({'message': 'Payment not found!'}), 404
 
-    customer = db.session.get(Customer, payment.customer_id)
+    customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
     if not customer:
         db.session.rollback()
         return jsonify({'message': 'Customer not found for this payment!'}), 404
@@ -1988,7 +2021,7 @@ def mark_payment_as_paid(payment_id):
 @app.route('/api/customers/<int:customer_id>/activate_subscription', methods=['PUT'])
 @jwt_required()
 def activate_subscription(customer_id):
-    customer = db.session.get(Customer, customer_id)
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
         return jsonify({'message': 'Customer not found!'}), 404
 
@@ -1997,7 +2030,7 @@ def activate_subscription(customer_id):
         return jsonify({'message': 'Subscription is already active!'}), 400
 
     try:
-        subscription_plan = db.session.get(SubscriptionPlan, customer.subscription_plan_id)
+        subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
         if not subscription_plan:
             return jsonify({'message': 'Subscription plan not found for customer!'}), 404
 
@@ -2022,7 +2055,7 @@ def activate_subscription(customer_id):
 
             if amount_due > 0 and not has_pending_payment(customer.id, new_expiry_date):
                 if customer.reseller_id:
-                    reseller = db.session.get(Reseller, customer.reseller_id)
+                    reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
                     if reseller:
                         reseller.balance += amount_due
                         reseller_payment = ResellerPayment(
@@ -2070,7 +2103,7 @@ def activate_subscription(customer_id):
 @app.route('/api/customers/<int:customer_id>/cancel_subscription', methods=['PUT'])
 @jwt_required()
 def cancel_subscription(customer_id):
-    customer = db.session.get(Customer, customer_id)
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
         return jsonify({'message': 'Customer not found!'}), 404
 
@@ -2104,12 +2137,12 @@ def get_unpaid_receipt(customer_id):
     Generates a combined statement for all of a customer's unpaid payments.
     """
     try:
-        customer = db.session.get(Customer, customer_id)
+        customer = tenant_query(Customer).filter_by(id=customer_id).first()
         if not customer:
             return jsonify({'message': 'Customer not found!'}), 404
 
         # Find all unpaid payments for this customer
-        unpaid_payments = Payment.query.filter_by(
+        unpaid_payments = tenant_query(Payment).filter_by(
             customer_id=customer_id,
             paid=False
         ).order_by(Payment.date.asc()).all()
@@ -2134,7 +2167,7 @@ def get_unpaid_receipt(customer_id):
             total_unpaid_balance += payment.amount
 
         # Fetch business settings
-        business_settings = BusinessSettings.query.first()
+        business_settings = tenant_query(BusinessSettings).first()
         business_info = {
             'business_name': business_settings.business_name if business_settings else "Your Business",
             'business_address': business_settings.address if business_settings else "",
@@ -2165,17 +2198,17 @@ def get_unpaid_receipt(customer_id):
 @app.route('/api/customers/<int:customer_id>/balance', methods=['GET'])
 @jwt_required()
 def get_customer_balance(customer_id):
-    customer = db.session.get(Customer, customer_id)
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
         return jsonify({'message': 'Customer not found!'}), 404
 
     # Recalculate based on current state (though customer.balance should be real-time)
     # Ensure this logic matches how balance is updated on POST/PUT
-    unpaid_payments = Payment.query.filter_by(customer_id=customer_id, paid=False, pre_payment=False).all()
+    unpaid_payments = tenant_query(Payment).filter_by(customer_id=customer_id, paid=False, pre_payment=False).all()
     # A positive unpaid_balance means the customer owes this amount
     calculated_unpaid_balance = sum(p.amount for p in unpaid_payments)
 
-    pre_payments = Payment.query.filter_by(customer_id=customer_id, paid=True, pre_payment=True).all()
+    pre_payments = tenant_query(Payment).filter_by(customer_id=customer_id, paid=True, pre_payment=True).all()
     # A positive pre-payment_balance means the customer has paid in advance
     calculated_pre_payment_balance = sum(p.amount for p in pre_payments)
 
@@ -2193,11 +2226,11 @@ def get_customer_balance(customer_id):
 @app.route('/api/receipt/<int:payment_id>', methods=['GET'])
 @jwt_required()
 def get_receipt(payment_id):
-    payment = db.session.get(Payment, payment_id)
+    payment = tenant_query(Payment).filter_by(id=payment_id).first()
     if not payment:
         return jsonify({'message': 'Payment not found!'}), 404
 
-    customer = db.session.get(Customer, payment.customer_id)
+    customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
     if not customer:
         return jsonify({'message': 'Customer not found for this payment!'}), 404
 
@@ -2205,7 +2238,7 @@ def get_receipt(payment_id):
     # Attempt to find the subscription plan if this isn't a pre-payment and not explicitly an addon
     if not payment.pre_payment:
         # Assuming that regular payments are associated with the customer's current subscription plan
-        subscription_plan = db.session.get(SubscriptionPlan, customer.subscription_plan_id)
+        subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
 
 
     subscription_start_day = customer.subscription_start_date.day
@@ -2245,7 +2278,7 @@ def get_receipt(payment_id):
     }
 
     # Fetch business settings for the receipt
-    business_settings = BusinessSettings.query.first()
+    business_settings = tenant_query(BusinessSettings).first()
     if business_settings:
         receipt_data['business_name'] = business_settings.business_name
         receipt_data['business_address'] = business_settings.address
@@ -2262,7 +2295,7 @@ def get_receipt(payment_id):
 @jwt_required()
 def get_receipts_with_current_balance():
     search_query = request.args.get('search_query', '')
-    query = GeneratedReceipt.query.join(Customer).order_by(GeneratedReceipt.billing_date.desc())
+    query = tenant_query(GeneratedReceipt).join(Customer).order_by(GeneratedReceipt.billing_date.desc())
 
     if search_query:
         query = query.filter(Customer.name.ilike(f'%{search_query}%'))
@@ -2274,7 +2307,7 @@ def get_receipts_with_current_balance():
         receipt_data = json.loads(r.receipt_data)
         
         # Get the current balance for this customer
-        current_customer = db.session.get(Customer, r.customer_id)
+        current_customer = tenant_query(Customer).filter_by(id=r.customer_id).first()
         current_balance = float(current_customer.balance) if current_customer else 0.0
         
         # Update the balance in the receipt data
@@ -2299,7 +2332,7 @@ def get_receipts_with_current_balance():
 @jwt_required()
 def delete_receipt(receipt_id):
     try:
-        receipt = db.session.get(GeneratedReceipt, receipt_id)
+        receipt = tenant_query(GeneratedReceipt).filter_by(id=receipt_id).first()
         if not receipt:
             return jsonify({'message': 'Receipt not found!'}), 404
         
@@ -2382,7 +2415,7 @@ def get_monthly_revenue():
 def save_business_settings():
     try:
         # Fetch existing settings or create new
-        settings = BusinessSettings.query.first()
+        settings = tenant_query(BusinessSettings).first()
         if not settings:
             settings = BusinessSettings(
                 business_name=request.form.get('business_name', "Default Business"),
@@ -2426,7 +2459,7 @@ def save_business_settings():
 @app.route('/api/business-settings', methods=['GET'])
 @jwt_required()
 def get_business_settings():
-    settings = BusinessSettings.query.first()
+    settings = tenant_query(BusinessSettings).first()
     if settings:
         return jsonify({'settings': settings.to_dict()}), 200
     else:
@@ -2445,7 +2478,7 @@ def get_business_settings():
 @app.route('/api/whatsapp-settings', methods=['GET'])
 @jwt_required()
 def get_whatsapp_settings():
-    settings = WhatsAppSettings.query.first()
+    settings = tenant_query(WhatsAppSettings).first()
     if settings:
         return jsonify({'settings': settings.to_dict()}), 200
     # Return safe defaults if not configured yet
@@ -2476,7 +2509,7 @@ def get_whatsapp_settings():
 def save_whatsapp_settings():
     data = request.json
     try:
-        settings = WhatsAppSettings.query.first()
+        settings = tenant_query(WhatsAppSettings).first()
         if not settings:
             settings = WhatsAppSettings()
             db.session.add(settings)
@@ -2511,7 +2544,7 @@ def save_whatsapp_settings():
 @jwt_required()
 def subscribe_waba():
     try:
-        settings = WhatsAppSettings.query.first()
+        settings = tenant_query(WhatsAppSettings).first()
         if not settings or not settings.access_token or not settings.business_account_id:
             return jsonify({'error': 'Please configure your WABA ID and Access Token first.'}), 400
         api_ver = settings.api_version or 'v19.0'
@@ -2529,7 +2562,7 @@ def subscribe_waba():
 @jwt_required()
 def get_meta_templates():
     try:
-        settings = WhatsAppSettings.query.first()
+        settings = tenant_query(WhatsAppSettings).first()
         meta_templates = []
         if settings and settings.access_token and settings.business_account_id:
             try:
@@ -2579,7 +2612,7 @@ def get_meta_templates():
 @app.route('/api/system-update/status', methods=['GET'])
 @jwt_required()
 def get_system_update_status():
-    settings = SystemUpdateSettings.query.first()
+    settings = tenant_query(SystemUpdateSettings).first()
     if not settings:
         settings = SystemUpdateSettings()
         db.session.add(settings)
@@ -2595,7 +2628,7 @@ def save_system_update_settings():
         return jsonify({'message': 'Access Denied'}), 403
 
     data = request.json
-    settings = SystemUpdateSettings.query.first()
+    settings = tenant_query(SystemUpdateSettings).first()
     if not settings:
         settings = SystemUpdateSettings()
         db.session.add(settings)
@@ -2615,7 +2648,7 @@ def save_system_update_settings():
 @app.route('/api/system-update/check', methods=['POST'])
 @jwt_required()
 def check_for_system_updates():
-    settings = SystemUpdateSettings.query.first()
+    settings = tenant_query(SystemUpdateSettings).first()
     if not settings:
         settings = SystemUpdateSettings()
         db.session.add(settings)
@@ -2649,7 +2682,7 @@ def apply_system_update():
     if not user or user.role != 'admin':
         return jsonify({'message': 'Access Denied'}), 403
 
-    settings = SystemUpdateSettings.query.first()
+    settings = tenant_query(SystemUpdateSettings).first()
     if not settings:
         settings = SystemUpdateSettings()
         db.session.add(settings)
@@ -2765,7 +2798,7 @@ def normalize_whatsapp_phone(phone_raw):
     # If phone is local (<= 9 digits) without country code, infer and prepend country code
     if len(phone) <= 9 and not (phone.startswith('961') or phone.startswith('20') or phone.startswith('966') or phone.startswith('971')):
         try:
-            biz = BusinessSettings.query.first()
+            biz = tenant_query(BusinessSettings).first()
             if biz and biz.mobile:
                 biz_digits = ''.join(filter(str.isdigit, str(biz.mobile)))
                 if biz_digits.startswith('20') and len(biz_digits) >= 12:
@@ -2779,7 +2812,7 @@ def normalize_whatsapp_phone(phone_raw):
                     if 1 <= cc_len <= 4:
                         return biz_digits[:cc_len] + phone
             # Fallback: check most common country code in Customer table
-            sample_cust = Customer.query.filter(Customer.phone != None).first()
+            sample_cust = tenant_query(Customer).filter(Customer.phone != None).first()
             if sample_cust and sample_cust.phone:
                 c_phone = ''.join(filter(str.isdigit, str(sample_cust.phone)))
                 if c_phone.startswith('961') and len(c_phone) >= 10:
@@ -2957,7 +2990,7 @@ def send_whatsapp_message(customer, event_type, context=None):
         if not getattr(customer, 'whatsapp_notifications_enabled', True):
             return {'success': False, 'status': 'Skipped', 'error': 'Customer has WhatsApp notifications disabled'}  # User disabled notifications
 
-        settings = WhatsAppSettings.query.first()
+        settings = tenant_query(WhatsAppSettings).first()
         if not settings or not settings.enabled:
             return {'success': False, 'status': 'Skipped', 'error': 'WhatsApp system notifications disabled in settings'}  # WhatsApp notifications are disabled
 
@@ -3097,12 +3130,12 @@ def send_whatsapp_message(customer, event_type, context=None):
 @app.route('/api/dashboard', methods=['GET'])
 @jwt_required()
 def get_dashboard_metrics():
-    total_customers = Customer.query.count()
-    active_customers = Customer.query.filter_by(is_subscription_active=True).count()
-    total_revenue = sum(payment.amount for payment in Payment.query.filter_by(paid=True, pre_payment=False).all()) # Only actual revenue, not pre-payments
-    total_expenses = sum(expense.amount for expense in Expense.query.filter_by(is_credit=False).all()) + sum(sp.amount for sp in SupplierPayment.query.all())
+    total_customers = tenant_query(Customer).count()
+    active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).count()
+    total_revenue = sum(payment.amount for payment in tenant_query(Payment).filter_by(paid=True, pre_payment=False).all()) # Only actual revenue, not pre-payments
+    total_expenses = sum(expense.amount for expense in tenant_query(Expense).filter_by(is_credit=False).all()) + sum(sp.amount for sp in tenant_query(SupplierPayment).all())
     # Outstanding balance should be the sum of negative balances (customers who owe money)
-    outstanding_balance = sum(c.balance for c in Customer.query.filter(Customer.balance < 0).all())
+    outstanding_balance = sum(c.balance for c in tenant_query(Customer).filter(Customer.balance < 0).all())
     subscriptions_breakdown_query = db.session.query(
         SubscriptionPlan.name,
         func.count(Customer.id).label('customer_count')
@@ -3129,7 +3162,7 @@ def get_dashboard_metrics():
 @app.route('/api/service-statuses', methods=['GET']) # ADDED: New endpoint for all statuses
 @jwt_required()
 def get_all_service_statuses():
-    statuses = ServiceStatus.query.join(Customer).order_by(ServiceStatus.last_updated.desc()).all()
+    statuses = tenant_query(ServiceStatus).join(Customer).order_by(ServiceStatus.last_updated.desc()).all()
     return jsonify([{
         'id': s.id,
         'customer_name': s.customer.name, # Added customer name
@@ -3143,7 +3176,7 @@ def get_all_service_statuses():
 @app.route('/api/service-status/<int:customer_id>', methods=['GET'])
 @jwt_required()
 def get_service_status(customer_id):
-    status = ServiceStatus.query.filter_by(customer_id=customer_id).order_by(ServiceStatus.last_updated.desc()).first()
+    status = tenant_query(ServiceStatus).filter_by(customer_id=customer_id).order_by(ServiceStatus.last_updated.desc()).first()
     if not status:
         return jsonify({'message': 'No service status found'}), 404
     return jsonify({
@@ -3171,7 +3204,7 @@ def send_push_notification(payload_dict):
         print("Push notification failed: VAPID keys not configured.")
         return
         
-    subs = PushSubscription.query.all()
+    subs = tenant_query(PushSubscription).all()
     for sub in subs:
         try:
             sub_info = json.loads(sub.subscription_info)
@@ -3204,7 +3237,7 @@ def push_subscribe():
     sub_info_str = json.dumps(data.get('subscription'))
     
     # Check if this exact subscription already exists for this user
-    existing = PushSubscription.query.filter_by(user_id=user.id, subscription_info=sub_info_str).first()
+    existing = tenant_query(PushSubscription).filter_by(user_id=user.id, subscription_info=sub_info_str).first()
     if not existing:
         new_sub = PushSubscription(user_id=user.id, subscription_info=sub_info_str)
         db.session.add(new_sub)
@@ -3261,7 +3294,7 @@ def get_support_tickets():
     status = request.args.get('status')
     priority = request.args.get('priority')
     
-    query = SupportTicket.query.join(Customer).options(db.joinedload(SupportTicket.logs).joinedload(TicketLog.user))
+    query = tenant_query(SupportTicket).join(Customer).options(db.joinedload(SupportTicket.logs).joinedload(TicketLog.user))
     if status:
         query = query.filter_by(status=status)
     if priority:
@@ -3315,7 +3348,7 @@ def create_service_outage():
 @jwt_required()
 def get_service_outages():
     status = request.args.get('status', 'all')
-    query = ServiceOutage.query
+    query = tenant_query(ServiceOutage)
     if status != 'all':
         query = query.filter_by(status=status)
     outages = query.order_by(ServiceOutage.start_time.desc()).all()
@@ -3332,7 +3365,7 @@ def get_service_outages():
 @app.route('/api/support-tickets/<int:ticket_id>', methods=['PUT'])
 @jwt_required()
 def update_support_ticket(ticket_id):
-    ticket = db.session.get(SupportTicket, ticket_id)
+    ticket = tenant_query(SupportTicket).filter_by(id=ticket_id).first()
     if not ticket:
         return jsonify({'message': 'Ticket not found'}), 404
     data = request.json
@@ -3382,7 +3415,7 @@ def update_support_ticket(ticket_id):
 @app.route('/api/support-tickets/<int:ticket_id>', methods=['DELETE'])
 @jwt_required()
 def delete_support_ticket(ticket_id):
-    ticket = db.session.get(SupportTicket, ticket_id)
+    ticket = tenant_query(SupportTicket).filter_by(id=ticket_id).first()
     if not ticket:
         return jsonify({'message': 'Ticket not found'}), 404
     db.session.delete(ticket)
@@ -3392,7 +3425,7 @@ def delete_support_ticket(ticket_id):
 @app.route('/api/service-outages/<int:outage_id>', methods=['PUT'])
 @jwt_required()
 def update_service_outage(outage_id):
-    outage = db.session.get(ServiceOutage, outage_id)
+    outage = tenant_query(ServiceOutage).filter_by(id=outage_id).first()
     if not outage:
         return jsonify({'message': 'Outage not found'}), 404
     data = request.json
@@ -3416,7 +3449,7 @@ def update_service_outage(outage_id):
 @app.route('/api/service-statuses/<int:status_id>', methods=['PUT'])
 @jwt_required()
 def update_service_status_by_id(status_id):
-    status_record = db.session.get(ServiceStatus, status_id)
+    status_record = tenant_query(ServiceStatus).filter_by(id=status_id).first()
     if not status_record:
         return jsonify({'message': 'Status record not found'}), 404
     data = request.json
@@ -3462,7 +3495,7 @@ def create_payment_reminder():
 @app.route('/api/customers/<int:customer_id>/send-whatsapp-reminder', methods=['POST'])
 @jwt_required()
 def trigger_whatsapp_reminder(customer_id):
-    customer = db.session.get(Customer, customer_id)
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
         return jsonify({'message': 'Customer not found'}), 404
     
@@ -3505,7 +3538,7 @@ def send_bulk_messages():
         if not custom_phones:
             return jsonify({'message': 'No valid mobile numbers provided.'}), 400
 
-        settings = WhatsAppSettings.query.first()
+        settings = tenant_query(WhatsAppSettings).first()
         success_count = 0
         failed_count = 0
         report_details = []
@@ -3613,7 +3646,7 @@ def send_bulk_messages():
     exclude_resellers = data.get('exclude_reseller_customers', False)
     target_sector = data.get('sector', '').strip()
 
-    query = Customer.query.filter_by(whatsapp_notifications_enabled=True)
+    query = tenant_query(Customer).filter_by(whatsapp_notifications_enabled=True)
     if exclude_resellers:
         query = query.filter(Customer.reseller_id == None)
     if target_sector and event_type in ['outage', 'maintenance']:
@@ -3679,7 +3712,7 @@ def send_bulk_messages():
 
 @app.route('/api/whatsapp/webhook', methods=['GET', 'POST'])
 def whatsapp_webhook():
-    settings = WhatsAppSettings.query.first()
+    settings = tenant_query(WhatsAppSettings).first()
     verify_token = settings.webhook_verify_token if settings and settings.webhook_verify_token else 'delta_net_whatsapp_secret'
 
     if request.method == 'GET':
@@ -3748,7 +3781,7 @@ def whatsapp_webhook():
                         if contacts and isinstance(contacts, list):
                             cust_name = contacts[0].get('profile', {}).get('name', cust_name)
                         
-                        cust_obj = Customer.query.filter(Customer.phone.like(f"%{sender_phone[-8:]}%")).first()
+                        cust_obj = tenant_query(Customer).filter(Customer.phone.like(f"%{sender_phone[-8:]}%")).first()
                         if cust_obj:
                             cust_name = cust_obj.name or cust_name
 
@@ -3855,7 +3888,7 @@ def whatsapp_webhook():
                                 # Check if we already sent an auto-reply or created a ticket for this customer in the last 15 minutes
                                 recent_tickets_count = 0
                                 if cust_obj:
-                                    recent_tickets_count = SupportTicket.query.filter(
+                                    recent_tickets_count = tenant_query(SupportTicket).filter(
                                         SupportTicket.customer_id == cust_obj.id,
                                         SupportTicket.created_at >= datetime.utcnow() - timedelta(minutes=15)
                                     ).count()
@@ -3898,7 +3931,7 @@ def get_revenue_report():
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     
-    query = Payment.query.filter(Payment.paid == True)
+    query = tenant_query(Payment).filter(Payment.paid == True)
     if start_date:
         query = query.filter(func.coalesce(Payment.paid_at, Payment.date) >= datetime.strptime(start_date, '%Y-%m-%d'))
     if end_date:
@@ -3910,9 +3943,9 @@ def get_revenue_report():
     # Group by subscription plan
     plan_revenue = {}
     for payment in payments:
-        customer = db.session.get(Customer, payment.customer_id) # Use db.session.get
+        customer = tenant_query(Customer).filter_by(id=payment.customer_id).first() # Use db.session.get
         if customer:
-            plan = db.session.get(SubscriptionPlan, customer.subscription_plan_id) # Use db.session.get
+            plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first() # Use db.session.get
             if plan:
                 plan_revenue[plan.name] = plan_revenue.get(plan.name, 0) + payment.amount
     
@@ -3928,7 +3961,7 @@ def get_overdue_payments():
     days_overdue = request.args.get('days', 30, type=int)
     cutoff_date = datetime.utcnow() - timedelta(days=days_overdue)
     
-    overdue_payments = Payment.query.filter(
+    overdue_payments = tenant_query(Payment).filter(
         Payment.paid == False,
         Payment.date <= cutoff_date
     ).all()
@@ -3936,7 +3969,7 @@ def get_overdue_payments():
     return jsonify([{
         'id': p.id,
         'customer_id': p.customer_id,
-        'customer_name': db.session.get(Customer, p.customer_id).name, # Use db.session.get
+        'customer_name': tenant_query(Customer).filter_by(id=p.customer_id).first().name, # Use db.session.get
         'amount': p.amount,
         'date': p.date.strftime('%Y-%m-%d'),
         'days_overdue': (datetime.utcnow() - p.date).days
@@ -3947,11 +3980,11 @@ def get_overdue_payments():
 @jwt_required()
 def renew_subscription(customer_id):
     try:
-        customer = db.session.get(Customer, customer_id)
+        customer = tenant_query(Customer).filter_by(id=customer_id).first()
         if not customer:
             return jsonify({'message': 'Customer not found!'}), 404
 
-        subscription_plan = db.session.get(SubscriptionPlan, customer.subscription_plan_id)
+        subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
         if not subscription_plan:
             return jsonify({'message': 'Subscription plan not found for this customer!'}), 404
         today = datetime.utcnow()
@@ -3981,7 +4014,7 @@ def renew_subscription(customer_id):
 
         if renewal_amount > 0 and not has_pending_payment(customer.id, new_expiry_date):
             if customer.reseller_id:
-                reseller = db.session.get(Reseller, customer.reseller_id)
+                reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
                 if reseller:
                     reseller.balance += renewal_amount
                     reseller_payment = ResellerPayment(
@@ -4050,7 +4083,7 @@ def renew_subscription(customer_id):
 @app.route('/api/sectors', methods=['GET'])
 @jwt_required()
 def get_sectors():
-    sectors = Sector.query.all()
+    sectors = tenant_query(Sector).all()
     return jsonify([s.to_dict() for s in sectors]), 200
 
 @app.route('/api/sectors', methods=['POST'])
@@ -4060,7 +4093,7 @@ def add_sector():
     if not data or 'name' not in data or not data['name'].strip():
         return jsonify({'error': 'Sector name is required.'}), 400
     
-    existing = Sector.query.filter_by(name=data['name'].strip()).first()
+    existing = tenant_query(Sector).filter_by(name=data['name'].strip()).first()
     if existing:
         return jsonify({'error': 'Sector already exists.'}), 400
 
@@ -4072,7 +4105,7 @@ def add_sector():
 @app.route('/api/sectors/<int:id>', methods=['PUT'])
 @jwt_required()
 def edit_sector(id):
-    sector = db.session.get(Sector, id)
+    sector = tenant_query(Sector).filter_by(id=id).first()
     if not sector:
         return jsonify({'error': 'Sector not found.'}), 404
     
@@ -4081,7 +4114,7 @@ def edit_sector(id):
         return jsonify({'error': 'Sector name is required.'}), 400
 
     new_name = data['name'].strip()
-    existing = Sector.query.filter(Sector.name == new_name, Sector.id != id).first()
+    existing = tenant_query(Sector).filter(Sector.name == new_name, Sector.id != id).first()
     if existing:
         return jsonify({'error': 'Another sector with this name already exists.'}), 400
         
@@ -4092,7 +4125,7 @@ def edit_sector(id):
 @app.route('/api/sectors/<int:id>', methods=['DELETE'])
 @jwt_required()
 def delete_sector(id):
-    sector = db.session.get(Sector, id)
+    sector = tenant_query(Sector).filter_by(id=id).first()
     if not sector:
         return jsonify({'error': 'Sector not found.'}), 404
         
@@ -4105,7 +4138,7 @@ def delete_sector(id):
 @app.route('/api/expense_categories', methods=['GET'])
 @jwt_required()
 def get_expense_categories():
-    categories = ExpenseCategory.query.order_by(ExpenseCategory.name).all()
+    categories = tenant_query(ExpenseCategory).order_by(ExpenseCategory.name).all()
     return jsonify([c.to_dict() for c in categories])
 
 @app.route('/api/expense_categories', methods=['POST'])
@@ -4130,7 +4163,7 @@ def add_expense_category():
 @jwt_required()
 def update_expense_category(category_id):
     data = request.json
-    category = db.session.get(ExpenseCategory, category_id)
+    category = tenant_query(ExpenseCategory).filter_by(id=category_id).first()
     if not category:
         return jsonify({'message': 'Category not found!'}), 404
     if 'name' not in data or not data['name'].strip():
@@ -4149,7 +4182,7 @@ def update_expense_category(category_id):
 @app.route('/api/expense_categories/<int:category_id>', methods=['DELETE'])
 @jwt_required()
 def delete_expense_category(category_id):
-    category = db.session.get(ExpenseCategory, category_id)
+    category = tenant_query(ExpenseCategory).filter_by(id=category_id).first()
     if not category:
         return jsonify({'message': 'Category not found!'}), 404
     # Check if any expenses are using this category
@@ -4171,7 +4204,7 @@ def get_expenses():
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     
-    query = Expense.query
+    query = tenant_query(Expense)
     
     # Apply date filters if provided
     if start_date:
@@ -4188,7 +4221,7 @@ def add_expense():
     try:
         data = request.json
         # Find the category by name to get its ID
-        category = ExpenseCategory.query.filter_by(name=data['category']).first()
+        category = tenant_query(ExpenseCategory).filter_by(name=data['category']).first()
         if not category:
             return jsonify({'error': f"Category '{data['category']}' not found."}), 400
         
@@ -4204,7 +4237,7 @@ def add_expense():
         
         # Update supplier balance if it's a credit expense
         if new_expense.is_credit and new_expense.supplier_id:
-            supplier = db.session.get(Supplier, new_expense.supplier_id)
+            supplier = tenant_query(Supplier).filter_by(id=new_expense.supplier_id).first()
             if supplier:
                 supplier.balance += new_expense.amount
 
@@ -4219,12 +4252,12 @@ def add_expense():
 def update_expense(expense_id):
     try:
         data = request.json
-        expense = db.session.get(Expense, expense_id)
+        expense = tenant_query(Expense).filter_by(id=expense_id).first()
         if not expense:
             return jsonify({'message': 'Expense not found!'}), 404
         
         if 'category' in data:
-            category = ExpenseCategory.query.filter_by(name=data['category']).first()
+            category = tenant_query(ExpenseCategory).filter_by(name=data['category']).first()
             if not category:
                 return jsonify({'error': f"Category '{data['category']}' not found."}), 400
             expense.category_id = category.id
@@ -4235,7 +4268,7 @@ def update_expense(expense_id):
         
         # Handle balance changes if supplier or amount or credit status changed
         if expense.is_credit and expense.supplier_id:
-            old_supplier = db.session.get(Supplier, expense.supplier_id)
+            old_supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
             if old_supplier:
                 old_supplier.balance -= expense.amount  # Revert old expense amount
 
@@ -4246,7 +4279,7 @@ def update_expense(expense_id):
         expense.date = datetime.strptime(data.get('date', expense.date.strftime('%Y-%m-%d')), '%Y-%m-%d')
         
         if expense.is_credit and expense.supplier_id:
-            new_supplier = db.session.get(Supplier, expense.supplier_id)
+            new_supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
             if new_supplier:
                 new_supplier.balance += expense.amount  # Apply new expense amount
 
@@ -4260,7 +4293,7 @@ def update_expense(expense_id):
 @jwt_required()
 def delete_expense(expense_id):
     try:
-        expense = db.session.get(Expense, expense_id)
+        expense = tenant_query(Expense).filter_by(id=expense_id).first()
         if not expense:
             return jsonify({'message': 'Expense not found!'}), 404
         
@@ -4279,7 +4312,7 @@ def delete_expense(expense_id):
 @jwt_required()
 def get_generated_receipts():
     search_query = request.args.get('search_query', '')
-    query = GeneratedReceipt.query.join(Customer).order_by(GeneratedReceipt.billing_date.desc())
+    query = tenant_query(GeneratedReceipt).join(Customer).order_by(GeneratedReceipt.billing_date.desc())
 
     if search_query:
         query = query.filter(Customer.name.ilike(f'%{search_query}%'))
@@ -4308,7 +4341,7 @@ def generate_receipts_for_month():
         return jsonify({'error': 'Year and month are required.'}), 400
 
     # Find all unpaid payments for the specified month and year
-    payments_to_process = Payment.query.filter(
+    payments_to_process = tenant_query(Payment).filter(
         extract('year', Payment.date) == year,
         extract('month', Payment.date) == month,
         Payment.paid == False
@@ -4317,12 +4350,12 @@ def generate_receipts_for_month():
     generated_count = 0
     for payment in payments_to_process:
         # Check if a receipt has already been generated for this payment
-        existing_receipt = GeneratedReceipt.query.filter_by(payment_id=payment.id).first()
+        existing_receipt = tenant_query(GeneratedReceipt).filter_by(payment_id=payment.id).first()
         if existing_receipt:
             continue
 
-        customer = db.session.get(Customer, payment.customer_id)
-        plan = db.session.get(SubscriptionPlan, customer.subscription_plan_id)
+        customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
+        plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
 
         # Create a data snapshot for the receipt
         receipt_data_snapshot = {
@@ -4355,7 +4388,7 @@ def log_receipt_print():
     if not receipt_ids:
         return jsonify({'error': 'No receipt IDs provided.'}), 400
 
-    receipts_to_update = GeneratedReceipt.query.filter(GeneratedReceipt.id.in_(receipt_ids)).all()
+    receipts_to_update = tenant_query(GeneratedReceipt).filter(GeneratedReceipt.id.in_(receipt_ids)).all()
 
     for receipt in receipts_to_update:
         receipt.print_count += 1
@@ -4373,13 +4406,13 @@ def get_active_subscriptions_by_plan():
     """
     try:
         # Get all active customers and group them manually
-        active_customers = Customer.query.filter_by(is_subscription_active=True).all()
+        active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).all()
         
         # Dictionary to store plan counts with price info
         plan_counts = {}
         
         for customer in active_customers:
-            plan = db.session.get(SubscriptionPlan, customer.subscription_plan_id)
+            plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
             if plan:
                 # Create a unique key with plan name and price
                 plan_key = f"{plan.name} - ${plan.price}"
@@ -4554,7 +4587,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 @app.route('/manifest.json')
 def serve_manifest():
     with app.app_context():
-        settings = BusinessSettings.query.first()
+        settings = tenant_query(BusinessSettings).first()
         name = settings.business_name if settings and settings.business_name else "servicesBills"
         short_name = name
         logo_url = settings.logo_url if settings and settings.logo_url else "logo192.png"
@@ -4609,18 +4642,18 @@ def serve_manifest():
 @app.route('/api/resellers/<int:reseller_id>/history', methods=['GET'])
 @jwt_required()
 def get_reseller_history(reseller_id):
-    reseller = db.session.get(Reseller, reseller_id)
+    reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
     if not reseller:
         return jsonify({'message': 'Reseller not found'}), 404
 
-    payments = ResellerPayment.query.filter_by(reseller_id=reseller_id).order_by(ResellerPayment.date.desc()).all()
+    payments = tenant_query(ResellerPayment).filter_by(reseller_id=reseller_id).order_by(ResellerPayment.date.desc()).all()
     result = [p.to_dict() for p in payments]
     return jsonify(result), 200
 
 @app.route('/api/resellers', methods=['GET'])
 @jwt_required()
 def get_resellers():
-    resellers = Reseller.query.all()
+    resellers = tenant_query(Reseller).all()
     result = []
     for r in resellers:
         data = r.to_dict()
@@ -4650,7 +4683,7 @@ def create_reseller():
 @jwt_required()
 def update_reseller(reseller_id):
     data = request.json
-    reseller = db.session.get(Reseller, reseller_id)
+    reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     try:
@@ -4669,7 +4702,7 @@ def update_reseller(reseller_id):
 @jwt_required()
 def add_reseller_credit(reseller_id):
     data = request.json
-    reseller = db.session.get(Reseller, reseller_id)
+    reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     
@@ -4710,7 +4743,7 @@ def add_reseller_credit(reseller_id):
 @jwt_required()
 def apply_reseller_discount(reseller_id):
     data = request.json
-    reseller = db.session.get(Reseller, reseller_id)
+    reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     
@@ -4751,7 +4784,7 @@ def apply_reseller_discount(reseller_id):
 @jwt_required()
 def collect_reseller_payment(reseller_id):
     data = request.json
-    reseller = db.session.get(Reseller, reseller_id)
+    reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     
@@ -4799,7 +4832,7 @@ def collect_reseller_payment(reseller_id):
 @app.route('/api/suppliers', methods=['GET'])
 @jwt_required()
 def get_suppliers():
-    suppliers = Supplier.query.order_by(Supplier.name).all()
+    suppliers = tenant_query(Supplier).order_by(Supplier.name).all()
     return jsonify([s.to_dict() for s in suppliers])
 
 @app.route('/api/suppliers', methods=['POST'])
@@ -4824,7 +4857,7 @@ def add_supplier():
 @jwt_required()
 def update_supplier(supplier_id):
     data = request.json
-    supplier = db.session.get(Supplier, supplier_id)
+    supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
     if not supplier:
         return jsonify({'message': 'Supplier not found!'}), 404
 
@@ -4842,15 +4875,15 @@ def update_supplier(supplier_id):
 @jwt_required()
 def delete_supplier(supplier_id):
     try:
-        supplier = db.session.get(Supplier, supplier_id)
+        supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
         if not supplier:
             return jsonify({'message': 'Supplier not found!'}), 404
 
         # Check if supplier has linked expenses or payments
-        if Expense.query.filter_by(supplier_id=supplier.id).first():
+        if tenant_query(Expense).filter_by(supplier_id=supplier.id).first():
             return jsonify({'error': 'Cannot delete supplier with linked expenses.'}), 400
             
-        if SupplierPayment.query.filter_by(supplier_id=supplier.id).first():
+        if tenant_query(SupplierPayment).filter_by(supplier_id=supplier.id).first():
             return jsonify({'error': 'Cannot delete supplier with existing payments.'}), 400
 
         db.session.delete(supplier)
@@ -4863,14 +4896,14 @@ def delete_supplier(supplier_id):
 @app.route('/api/suppliers/<int:supplier_id>/payments', methods=['GET'])
 @jwt_required()
 def get_supplier_payments(supplier_id):
-    payments = SupplierPayment.query.filter_by(supplier_id=supplier_id).order_by(SupplierPayment.payment_date.desc()).all()
+    payments = tenant_query(SupplierPayment).filter_by(supplier_id=supplier_id).order_by(SupplierPayment.payment_date.desc()).all()
     return jsonify([p.to_dict() for p in payments])
 
 @app.route('/api/suppliers/<int:supplier_id>/payments', methods=['POST'])
 @jwt_required()
 def record_supplier_payment(supplier_id):
     data = request.json
-    supplier = db.session.get(Supplier, supplier_id)
+    supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
     if not supplier:
         return jsonify({'message': 'Supplier not found!'}), 404
 
@@ -4903,13 +4936,13 @@ def record_supplier_payment(supplier_id):
 @app.route('/api/suppliers/<int:supplier_id>/history', methods=['GET'])
 @jwt_required()
 def get_supplier_history(supplier_id):
-    supplier = db.session.get(Supplier, supplier_id)
+    supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
     if not supplier:
         return jsonify({'message': 'Supplier not found!'}), 404
 
     history = []
     # 1. Credit Purchases (Expenses)
-    credit_expenses = Expense.query.filter_by(supplier_id=supplier_id, is_credit=True).all()
+    credit_expenses = tenant_query(Expense).filter_by(supplier_id=supplier_id, is_credit=True).all()
     for exp in credit_expenses:
         history.append({
             'id': f"exp_{exp.id}",
@@ -4921,7 +4954,7 @@ def get_supplier_history(supplier_id):
         })
 
     # 2. Payments Made
-    payments = SupplierPayment.query.filter_by(supplier_id=supplier_id).all()
+    payments = tenant_query(SupplierPayment).filter_by(supplier_id=supplier_id).all()
     for p in payments:
         history.append({
             'id': f"pay_{p.id}",
@@ -4943,7 +4976,7 @@ def get_supplier_history(supplier_id):
 @jwt_required()
 def fix_supplier_balance(supplier_id):
     data = request.json
-    supplier = db.session.get(Supplier, supplier_id)
+    supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
     if not supplier:
         return jsonify({'message': 'Supplier not found!'}), 404
 
