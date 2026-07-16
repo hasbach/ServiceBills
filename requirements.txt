@@ -10,3 +10,7 @@ gunicorn
 waitress
 requests
 pywebpush
+pytest
+Flask-Migrate
+psycopg2-binary
+cryptography

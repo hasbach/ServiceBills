@@ -53,9 +53,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Temporary test/scratch scripts
-patch_*.py
-fix_*.py
-test*.py
+# Temporary test/scratch scripts (repo root only; the tests/ package is tracked)
+/patch_*.py
+/fix_*.py
+/test*.py
 extracted_*.json
 app_copy.py
