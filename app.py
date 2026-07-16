@@ -92,6 +92,7 @@ class User(db.Model):
 
 class Reseller(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
     phone = db.Column(db.String(20), nullable=False)
     type = db.Column(db.String(20), nullable=False) # 'type1' or 'type2'
@@ -110,6 +111,7 @@ class Reseller(db.Model):
 
 class ResellerPayment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     reseller_id = db.Column(db.Integer, db.ForeignKey('reseller.id'), nullable=False)
     amount = db.Column(db.Float, nullable=False)
     type = db.Column(db.String(50), nullable=False) # 'credit_added', 'payment_received', 'discount_applied'
@@ -128,6 +130,7 @@ class ResellerPayment(db.Model):
 
 class Customer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
     phone = db.Column(db.String(20), nullable=False)
     address = db.Column(db.String(200), nullable=False)
@@ -156,6 +159,7 @@ class Customer(db.Model):
 
 class SubscriptionPlan(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
     price = db.Column(db.Float, nullable=False)
     billing_cycle = db.Column(db.String(20), nullable=False)
@@ -174,6 +178,7 @@ class SubscriptionPlan(db.Model):
 
 class Sector(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False, unique=True)
 
     def to_dict(self):
@@ -181,6 +186,7 @@ class Sector(db.Model):
 
 class Supplier(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
     phone = db.Column(db.String(20), nullable=True)
     balance = db.Column(db.Float, default=0.0)
@@ -201,6 +207,7 @@ class Supplier(db.Model):
 
 class SupplierPayment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     supplier_id = db.Column(db.Integer, db.ForeignKey('supplier.id'), nullable=False)
     amount = db.Column(db.Float, nullable=False)
     payment_date = db.Column(db.DateTime, default=datetime.utcnow)
@@ -221,6 +228,7 @@ class SupplierPayment(db.Model):
 
 class ExpenseCategory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False, unique=True)
     expenses = db.relationship('Expense', backref='category', lazy=True)
 
@@ -230,6 +238,7 @@ class ExpenseCategory(db.Model):
 
 class Expense(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     category_id =  db.Column(db.Integer, db.ForeignKey('expense_category.id'), nullable=False)
     supplier_id = db.Column(db.Integer, db.ForeignKey('supplier.id'), nullable=True)
     is_credit = db.Column(db.Boolean, default=False)
@@ -253,6 +262,7 @@ class Expense(db.Model):
 
 class Payment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     amount = db.Column(db.Float, nullable=False)
     reason = db.Column(db.String(255), nullable=True)
@@ -273,6 +283,7 @@ class Payment(db.Model):
 
 class GeneratedReceipt(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     payment_id = db.Column(db.Integer, db.ForeignKey('payment.id'), nullable=False, unique=True)
     billing_date = db.Column(db.DateTime, nullable=False)
@@ -285,6 +296,7 @@ class GeneratedReceipt(db.Model):
 
 class AddonPurchase(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     description = db.Column(db.String(200))
     purchase_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
@@ -296,6 +308,7 @@ class AddonPurchase(db.Model):
 
 class BusinessSettings(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     logo_url = db.Column(db.String(500), nullable=True)  # URL or path to the logo image
     business_name = db.Column(db.String(200), nullable=False)
     address = db.Column(db.String(500), nullable=False)
@@ -324,6 +337,7 @@ class BusinessSettings(db.Model):
 
 class WhatsAppSettings(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     # Mode: 'deeplink' (manual button) or 'api' (auto-send via Meta Cloud API)
     mode = db.Column(db.String(20), nullable=False, default='deeplink')
     enabled = db.Column(db.Boolean, nullable=False, default=False)
@@ -392,6 +406,7 @@ class WhatsAppSettings(db.Model):
 
 class SystemUpdateSettings(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     current_version = db.Column(db.String(50), nullable=False, default='1.4.0')
     github_repo = db.Column(db.String(200), nullable=False, default='hasbach/servicesBills')
     auto_update_enabled = db.Column(db.Boolean, nullable=False, default=False)
@@ -418,6 +433,7 @@ class SystemUpdateSettings(db.Model):
 
 class ServiceStatus(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     status = db.Column(db.String(50), nullable=False)  # active, suspended, terminated
     last_updated = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
@@ -425,6 +441,7 @@ class ServiceStatus(db.Model):
 
 class SupportTicket(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=False)
@@ -443,6 +460,7 @@ class SupportTicket(db.Model):
 
 class TicketLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     ticket_id = db.Column(db.Integer, db.ForeignKey('support_ticket.id'), nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     action = db.Column(db.String(50), nullable=False) # e.g. 'created', 'status_changed', 'assigned'
@@ -452,12 +470,14 @@ class TicketLog(db.Model):
 
 class PushSubscription(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     subscription_info = db.Column(db.Text, nullable=False) # JSON
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 class ServiceOutage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=False)
     affected_areas = db.Column(db.String(500), nullable=False)
@@ -468,6 +488,7 @@ class ServiceOutage(db.Model):
 
 class CustomerFeedback(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     rating = db.Column(db.Integer, nullable=False)  # 1-5
     comment = db.Column(db.Text)
@@ -476,6 +497,7 @@ class CustomerFeedback(db.Model):
 
 class PaymentReminder(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     payment_id = db.Column(db.Integer, db.ForeignKey('payment.id'), nullable=False)
     reminder_date = db.Column(db.DateTime, nullable=False)

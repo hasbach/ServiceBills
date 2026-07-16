@@ -1,8 +1,27 @@
 import werkzeug.exceptions
 from flask_jwt_extended import create_access_token, verify_jwt_in_request
+from sqlalchemy.exc import IntegrityError
 
-from app import db, Tenant
+from app import db, Tenant, SubscriptionPlan
 from tenancy import current_tenant_id
+
+
+def test_domain_model_requires_tenant_id(app):
+    plan = SubscriptionPlan(name="P", price=10, billing_cycle="monthly")  # no tenant_id
+    db.session.add(plan)
+    try:
+        db.session.commit()
+        assert False, "expected IntegrityError (tenant_id NOT NULL)"
+    except IntegrityError:
+        db.session.rollback()
+
+    t = Tenant(name="T", slug="t")
+    db.session.add(t)
+    db.session.commit()
+    plan2 = SubscriptionPlan(name="P2", price=10, billing_cycle="monthly", tenant_id=t.id)
+    db.session.add(plan2)
+    db.session.commit()
+    assert plan2.id is not None
 
 
 def test_tenant_model_roundtrip(app):
