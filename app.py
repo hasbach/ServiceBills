@@ -62,6 +62,22 @@ bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
 # Database Models (unchanged)
+class Tenant(db.Model):
+    __tablename__ = "tenant"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    slug = db.Column(db.String(80), unique=True, nullable=False)
+    status = db.Column(db.String(20), nullable=False, default="active")  # active, suspended
+    plan = db.Column(db.String(20), nullable=False, default="free")      # free, pro, ...
+    stripe_customer_id = db.Column(db.String(120), nullable=True)
+    stripe_subscription_id = db.Column(db.String(120), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {"id": self.id, "name": self.name, "slug": self.slug,
+                "status": self.status, "plan": self.plan}
+
+
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
