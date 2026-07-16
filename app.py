@@ -1104,7 +1104,10 @@ def add_customer():
         subscription_start_date = (
             datetime.strptime(data.get('subscription_start_date'), '%Y-%m-%d')
             if data.get('subscription_start_date')
-            else datetime.now(timezone.utc)
+            # Naive UTC to stay consistent with datetime.utcnow() used in the
+            # back-dated payment loop below (and elsewhere in the app). Using an
+            # aware datetime here crashes the loop's naive/aware comparison.
+            else datetime.utcnow()
         )
         subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=data['subscription_plan_id']).first()
         if not subscription_plan:
@@ -1185,7 +1188,7 @@ def add_customer():
                 customer_id=new_customer.id,
                 amount=addon_amount,
                 paid=False,
-                date=datetime.now(timezone.utc),
+                date=datetime.utcnow(),
                 pre_payment=False,
             )
             db.session.add(addon_payment)
