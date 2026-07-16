@@ -49,13 +49,10 @@ if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
         print("Warning: Could not load VAPID keys.", e)
 
 app = Flask(__name__, static_folder='build', static_url_path='/')
-CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-DATABASE_PATH = os.environ.get('DATABASE_PATH', 'database.db')
-
-app.config["JWT_SECRET_KEY"] = "a135b8778fe5dc203c82a9fcb0bcce63a7bd62f4e72cdaf5649569168bb32b04" # Change this!
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=8)  # Extended to 8 hours
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DATABASE_PATH}'
+from config import Config
+app.config.from_object(Config)
+CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
@@ -677,16 +674,16 @@ def apply_customer_balance_to_unpaid_payments(customer):
             amount_paid_from_balance = customer.balance
             remaining_amount_due = amount_due - amount_paid_from_balance
 
-            # Create a new payment record for the remaining amount
-            # This matches the logic in mark_payment_as_paid
-            remaining_payment = Payment(
-                customer_id=customer.id,
-                amount=remaining_amount_due,
-                paid=False,
-                date=payment.date,
-                pre_payment=payment.pre_payment
-            )
-            db.session.add(remaining_payment)
+            # Create a new payment record for the remaining amount if greater than 0
+            if remaining_amount_due > 0:
+                remaining_payment = Payment(
+                    customer_id=customer.id,
+                    amount=remaining_amount_due,
+                    paid=False,
+                    date=payment.date,
+                    pre_payment=payment.pre_payment
+                )
+                db.session.add(remaining_payment)
             
             # Mark original payment as paid
             # (This is the established logic from mark_payment_as_paid)
@@ -840,6 +837,13 @@ def uploaded_file(filename):
         
 def generate_missing_payments():
     try:
+        # Clean up ONLY exactly $0.0 unpaid payments (do NOT touch negative credit notes or adjustments)
+        zero_payments = Payment.query.filter(Payment.paid == False, Payment.amount == 0.0).all()
+        if zero_payments:
+            for zp in zero_payments:
+                db.session.delete(zp)
+            db.session.commit()
+
         # Get all active customers
         customers = Customer.query.filter_by(is_subscription_active=True).all()
 
@@ -871,22 +875,32 @@ def generate_missing_payments():
             while next_billing_date <= datetime.utcnow():
                 # Calculate amount considering discount
                 # Use subscription_plan.price directly as cost is removed
-                amount_due = subscription_plan.price - customer.discount
+                amount_due = subscription_plan.price - (customer.discount or 0.0)
                 if amount_due < 0:
                     amount_due = 0.0
 
-                # Create a new unpaid payment for the missed billing cycle
-                new_payment = Payment(
-                    customer_id=customer.id,
-                    amount=amount_due,
-                    paid=False,
-                    date=next_billing_date,
-                    pre_payment=False
-                )
-                db.session.add(new_payment)
-
-                # Update the customer's balance (decreasing balance for new owed amount)
-                customer.balance -= amount_due
+                if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date):
+                    if customer.reseller_id:
+                        reseller = db.session.get(Reseller, customer.reseller_id)
+                        if reseller:
+                            reseller.balance += amount_due
+                            reseller_payment = ResellerPayment(
+                                reseller_id=reseller.id,
+                                amount=amount_due,
+                                type='credit_added',
+                                description=f'Billing cycle charge for customer {customer.name}'
+                            )
+                            db.session.add(reseller_payment)
+                    else:
+                        new_payment = Payment(
+                            customer_id=customer.id,
+                            amount=amount_due,
+                            paid=False,
+                            date=next_billing_date,
+                            pre_payment=False
+                        )
+                        db.session.add(new_payment)
+                        customer.balance -= amount_due
 
                 # Move to the next billing cycle
                 if subscription_plan.billing_cycle == 'monthly':
@@ -1047,19 +1061,32 @@ def add_customer():
         total_due = 0
 
         while next_billing_date <= datetime.utcnow():
-            amount_due = subscription_plan.price - new_customer.discount
+            amount_due = subscription_plan.price - (new_customer.discount or 0.0)
             if amount_due < 0:
                 amount_due = 0.0
 
-            new_payment = Payment(
-                customer_id=new_customer.id,
-                amount=amount_due,
-                paid=False,
-                date=next_billing_date,
-                pre_payment=False
-            )
-            db.session.add(new_payment)
-            total_due += amount_due
+            if amount_due > 0:
+                if new_customer.reseller_id:
+                    reseller = db.session.get(Reseller, new_customer.reseller_id)
+                    if reseller:
+                        reseller.balance += amount_due
+                        reseller_payment = ResellerPayment(
+                            reseller_id=reseller.id,
+                            amount=amount_due,
+                            type='credit_added',
+                            description=f'Initial charge for customer {new_customer.name}'
+                        )
+                        db.session.add(reseller_payment)
+                else:
+                    new_payment = Payment(
+                        customer_id=new_customer.id,
+                        amount=amount_due,
+                        paid=False,
+                        date=next_billing_date,
+                        pre_payment=False
+                    )
+                    db.session.add(new_payment)
+                    total_due += amount_due
 
             # Move to the next billing cycle
             if subscription_plan.billing_cycle == 'monthly':
@@ -1414,23 +1441,34 @@ def generate_future_payments():
             # 1. The billing date is inside the generation window
             # 2. There is NO unpaid payment already created for the same billing date
             if next_billing_date <= until_date:
-                if not has_pending_payment(customer.id, next_billing_date):
-
-                    amount_due = max(subscription_plan.price - customer.discount, 0.0)
-
-                    new_payment = Payment(
-                        customer_id=customer.id,
-                        amount=amount_due,
-                        paid=False,
-                        date=check_date,
-                        pre_payment=False
-                    )
-                    db.session.add(new_payment)
-                    customer.balance -= amount_due
-                    payments_created_count += 1
+                amount_due = max(subscription_plan.price - (customer.discount or 0.0), 0.0)
+                if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date):
+                    if customer.reseller_id:
+                        reseller = db.session.get(Reseller, customer.reseller_id)
+                        if reseller:
+                            reseller.balance += amount_due
+                            reseller_payment = ResellerPayment(
+                                reseller_id=reseller.id,
+                                amount=amount_due,
+                                type='credit_added',
+                                description=f'Future billing charge for customer {customer.name}'
+                            )
+                            db.session.add(reseller_payment)
+                            payments_created_count += 1
+                    else:
+                        new_payment = Payment(
+                            customer_id=customer.id,
+                            amount=amount_due,
+                            paid=False,
+                            date=check_date,
+                            pre_payment=False
+                        )
+                        db.session.add(new_payment)
+                        customer.balance -= amount_due
+                        payments_created_count += 1
 
                     print(
-                        f"Generated payment for customer {customer.id} "
+                        f"Generated billing item for customer {customer.id} "
                         f"({customer.name}) on {next_billing_date} "
                         f"(amount: ${amount_due})"
                     )
@@ -1863,15 +1901,16 @@ def mark_payment_as_paid(payment_id):
                 payment.paid_at = datetime.utcnow()
                 payment.received_by_id = current_user.id
                 
-                # Create new payment record for remaining balance
-                remaining_payment = Payment(
-                    customer_id=payment.customer_id,
-                    amount=remaining_amount,
-                    paid=False,
-                    date=payment.date,
-                    pre_payment=payment.pre_payment
-                )
-                db.session.add(remaining_payment)
+                # Create new payment record for remaining balance if greater than 0
+                if remaining_amount > 0:
+                    remaining_payment = Payment(
+                        customer_id=payment.customer_id,
+                        amount=remaining_amount,
+                        paid=False,
+                        date=payment.date,
+                        pre_payment=payment.pre_payment
+                    )
+                    db.session.add(remaining_payment)
 
         else: # Full payment
             if not payment.paid:
