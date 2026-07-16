@@ -83,6 +83,8 @@ class User(db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(128), nullable=False)
     role = db.Column(db.String(20), nullable=False, default='user') # Roles: 'user', 'admin'
+    # NULL tenant_id denotes a platform super-admin who operates servicesBills itself.
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=True, index=True)
 
     def set_password(self, password):
         self.password_hash = bcrypt.generate_password_hash(password).decode('utf8')
@@ -753,20 +755,28 @@ def register():
     data = request.json
     username = data.get('username')
     password = data.get('password')
+    business_name = data.get('business_name') or username
     if not username or not password:
         return jsonify({"msg": "Username and password required"}), 400
     if User.query.filter_by(username=username).first():
         return jsonify({"msg": "Username already exists"}), 409
-    
-    new_user = User(username=username)
+
+    # Each registration provisions a new tenant (business); the registrant is its admin.
+    slug = re.sub(r'[^a-z0-9]+', '-', business_name.lower()).strip('-')[:80] or 'tenant'
+    base = slug
+    i = 1
+    while Tenant.query.filter_by(slug=slug).first():
+        i += 1
+        slug = f"{base}-{i}"
+    tenant = Tenant(name=business_name, slug=slug)
+    db.session.add(tenant)
+    db.session.flush()  # assign tenant.id before creating the user
+
+    new_user = User(username=username, role='admin', tenant_id=tenant.id)
     new_user.set_password(password)
-    # Make the first registered user an admin
-    if User.query.count() == 0:
-        new_user.role = 'admin'
-    
     db.session.add(new_user)
     db.session.commit()
-    return jsonify({"msg": "User created successfully"}), 201
+    return jsonify({"msg": "User created successfully", "tenant": tenant.to_dict()}), 201
 
 @app.route('/api/users', methods=['GET'])
 @jwt_required()
@@ -795,10 +805,11 @@ def create_user():
         return jsonify({"msg": "Username and password required"}), 400
     if User.query.filter_by(username=username).first():
         return jsonify({"msg": "Username already exists"}), 409
-        
-    new_user = User(username=username, role=role)
+
+    # New users are created inside the current admin's tenant only.
+    new_user = User(username=username, role=role, tenant_id=get_jwt().get('tenant_id'))
     new_user.set_password(password)
-    
+
     db.session.add(new_user)
     db.session.commit()
     return jsonify({"msg": "User created successfully"}), 201
@@ -848,7 +859,7 @@ def login():
     if user and user.check_password(password):
         access_token = create_access_token(
             identity=username,
-            additional_claims={'role': user.role}
+            additional_claims={'role': user.role, 'tenant_id': user.tenant_id}
         )
         return jsonify(access_token=access_token, user={'username': user.username, 'role': user.role})
     return jsonify({"msg": "Bad username or password"}), 401
