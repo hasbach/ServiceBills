@@ -55,6 +55,9 @@ app.config.from_object(Config)
 CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
 
 db = SQLAlchemy(app)
+from flask_migrate import Migrate
+# render_as_batch=True lets Alembic emit SQLite-safe table rebuilds for ALTERs.
+migrate = Migrate(app, db, render_as_batch=True)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
@@ -466,8 +469,11 @@ class PaymentReminder(db.Model):
 
 # Create the database
 with app.app_context():
-    db.create_all()
-    
+    # Alembic is the schema source of truth (Phase 1+). Set DISABLE_AUTO_CREATE_ALL=1
+    # when generating/stamping migrations so autogenerate can diff against an empty DB.
+    if os.environ.get("DISABLE_AUTO_CREATE_ALL") != "1":
+        db.create_all()
+
     # 1. Automatic Migration: Add 'role' column if it doesn't exist for legacy databases
     try:
         db.session.execute(text("ALTER TABLE user ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'user'"))
