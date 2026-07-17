@@ -893,6 +893,79 @@ def create_superadmin():
     db.session.commit()
     print(f"Super-admin '{u}' created.")
 
+
+# --- Tenant lifecycle ---------------------------------------------------------
+# A suspended tenant is blocked from data routes, but NOT from billing/auth — so
+# it can still log in and pay to reactivate. (Deliberate: blocking at login would
+# lock a delinquent tenant out of the very page that fixes billing.)
+_SUSPEND_EXEMPT_PREFIXES = (
+    "/api/billing", "/api/login", "/api/logout", "/api/stripe/webhook",
+    "/api/verify-email", "/api/forgot-password", "/api/reset-password",
+    "/api/tenant/export", "/api/admin/",
+)
+
+
+@app.before_request
+def _block_suspended_tenants():
+    path = request.path
+    if not path.startswith("/api/") or any(path.startswith(p) for p in _SUSPEND_EXEMPT_PREFIXES):
+        return
+    try:
+        verify_jwt_in_request(optional=True)
+        claims = get_jwt()
+    except Exception:
+        return  # invalid/missing token — let the route's own auth respond
+    tid = (claims or {}).get("tenant_id")
+    if tid is not None:
+        t = db.session.get(Tenant, tid)
+        if t is not None and t.status != "active":
+            return jsonify({"msg": "Subscription inactive. Update billing to continue."}), 402
+
+
+def _row_to_dict(row):
+    out = {}
+    for c in row.__table__.columns:
+        v = getattr(row, c.name)
+        out[c.name] = v.isoformat() if isinstance(v, datetime) else v
+    return out
+
+
+@app.route('/api/tenant/export', methods=['GET'])
+@jwt_required()
+@admin_required()
+def tenant_export():
+    tid = current_tenant_id()
+    export = {"tenant_id": tid}
+    for model in TENANT_OWNED_MODELS:
+        export[model.__tablename__] = [
+            _row_to_dict(r) for r in model.query.filter_by(tenant_id=tid).all()
+        ]
+    return jsonify(export), 200
+
+
+# Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
+_TENANT_DELETE_ORDER = [
+    PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
+    CustomerFeedback, ServiceStatus, Payment, ResellerPayment, SupplierPayment,
+    Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
+    WhatsAppSettings, SystemUpdateSettings, ExpenseCategory, Sector,
+    SubscriptionPlan, Reseller, Supplier,
+]
+
+
+@app.route('/api/admin/tenants/<int:tid>', methods=['DELETE'])
+@superadmin_required
+def admin_delete_tenant(tid):
+    t = db.session.get(Tenant, tid)
+    if not t:
+        return jsonify({"msg": "Tenant not found"}), 404
+    for model in _TENANT_DELETE_ORDER:
+        model.query.filter_by(tenant_id=tid).delete()
+    User.query.filter_by(tenant_id=tid).delete()
+    db.session.delete(t)
+    db.session.commit()
+    return jsonify({"msg": "Tenant deleted"}), 200
+
 @app.route('/api/users', methods=['GET'])
 @jwt_required()
 @admin_required()
