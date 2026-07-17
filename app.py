@@ -3155,6 +3155,8 @@ def create_support_ticket():
     user = User.query.filter_by(username=current_username).first()
     
     data = request.json
+    # Ensure the referenced customer belongs to the caller's tenant (404 otherwise).
+    tenant_query(Customer).filter_by(id=data['customer_id']).first_or_404()
     ticket = SupportTicket(
         customer_id=data['customer_id'],
         title=data['title'],
