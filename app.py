@@ -1845,6 +1845,7 @@ def get_total_sales():
         func.strftime('%Y-%m', func.coalesce(Payment.paid_at, Payment.date)).label('month'),
         func.sum(Payment.amount).label('total_sales')
     ).filter(
+        Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.pre_payment == False
     ).group_by('month').all()
@@ -1861,6 +1862,7 @@ def get_unpaid_payments():
         func.strftime('%Y-%m', Payment.date).label('month'),
         func.sum(Payment.amount).label('unpaid')
     ).filter(
+        Payment.tenant_id == current_tenant_id(),
         Payment.paid == False
     ).group_by('month').all()
 
@@ -1875,6 +1877,8 @@ def get_customer_numbers():
     customer_numbers = db.session.query(
         func.strftime('%Y-%m', Customer.subscription_start_date).label('month'),
         func.count(Customer.id).label('customers')
+    ).filter(
+        Customer.tenant_id == current_tenant_id()
     ).group_by('month').all()
 
     return jsonify([{
@@ -2355,13 +2359,13 @@ def get_expenses_total():
     exp_data = {item.month: item.total_expenses for item in db.session.query(
         func.strftime('%Y-%m', Expense.date).label('month'),
         func.sum(Expense.amount).label('total_expenses')
-    ).filter(Expense.is_credit == False).group_by('month').all()}
+    ).filter(Expense.tenant_id == current_tenant_id(), Expense.is_credit == False).group_by('month').all()}
 
     # Supplier cash payments
     sp_data = {item.month: item.total_sp for item in db.session.query(
         func.strftime('%Y-%m', SupplierPayment.payment_date).label('month'),
         func.sum(SupplierPayment.amount).label('total_sp')
-    ).group_by('month').all()}
+    ).filter(SupplierPayment.tenant_id == current_tenant_id()).group_by('month').all()}
 
     all_months = sorted(set(exp_data.keys()) | set(sp_data.keys()))
 
@@ -2379,6 +2383,7 @@ def get_monthly_revenue():
         func.strftime('%Y-%m', func.coalesce(Payment.paid_at, Payment.date)).label('month'),
         func.sum(Payment.amount).label('total_sales')
     ).filter(
+        Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.pre_payment == False
     ).group_by('month').all()
@@ -2387,13 +2392,13 @@ def get_monthly_revenue():
     expenses_query = db.session.query(
         func.strftime('%Y-%m', Expense.date).label('month'),
         func.sum(Expense.amount).label('total_expenses')
-    ).filter(Expense.is_credit == False).group_by('month').all()
+    ).filter(Expense.tenant_id == current_tenant_id(), Expense.is_credit == False).group_by('month').all()
 
     # Get supplier cash payments
     sp_query = db.session.query(
         func.strftime('%Y-%m', SupplierPayment.payment_date).label('month'),
         func.sum(SupplierPayment.amount).label('total_sp')
-    ).group_by('month').all()
+    ).filter(SupplierPayment.tenant_id == current_tenant_id()).group_by('month').all()
 
     sales_data = {item.month: (item.total_sales or 0.0) for item in sales_query}
     expenses_data = {item.month: (item.total_expenses or 0.0) for item in expenses_query}
@@ -3143,7 +3148,7 @@ def get_dashboard_metrics():
         SubscriptionPlan.name,
         func.count(Customer.id).label('customer_count')
     ).join(Customer, Customer.subscription_plan_id == SubscriptionPlan.id)\
-     .filter(Customer.is_subscription_active == True)\
+     .filter(Customer.tenant_id == current_tenant_id(), Customer.is_subscription_active == True)\
      .group_by(SubscriptionPlan.name)\
      .order_by(SubscriptionPlan.name)\
      .all()
@@ -4466,6 +4471,7 @@ def get_collector_progress():
             func.count(Payment.id).label('total_payments')
         ).join(Payment, Payment.collected_by_id == User.id)\
          .filter(
+             Payment.tenant_id == current_tenant_id(),
              Payment.collected_at >= start_date,
              Payment.collected_at <= end_date
          ).group_by(User.username).all()
@@ -4507,6 +4513,7 @@ def get_financial_report():
             func.strftime('%Y-%m', func.coalesce(Payment.paid_at, Payment.date)).label('month'),
             func.sum(Payment.amount).label('total')
         ).filter(
+            Payment.tenant_id == current_tenant_id(),
             Payment.paid == True,
             func.coalesce(Payment.paid_at, Payment.date) >= start_date,
             func.coalesce(Payment.paid_at, Payment.date) <= end_date
@@ -4517,6 +4524,7 @@ def get_financial_report():
             func.strftime('%Y-%m', Expense.date).label('month'),
             func.sum(Expense.amount).label('total')
         ).filter(
+            Expense.tenant_id == current_tenant_id(),
             Expense.is_credit == False,
             Expense.date >= start_date,
             Expense.date <= end_date
@@ -4527,6 +4535,7 @@ def get_financial_report():
             func.strftime('%Y-%m', SupplierPayment.payment_date).label('month'),
             func.sum(SupplierPayment.amount).label('total')
         ).filter(
+            SupplierPayment.tenant_id == current_tenant_id(),
             SupplierPayment.payment_date >= start_date,
             SupplierPayment.payment_date <= end_date
         ).group_by('month').all()
