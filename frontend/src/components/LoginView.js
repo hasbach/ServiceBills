@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { Box, Typography, TextField, Button, Paper, CircularProgress } from '@mui/material';
 import { InstallMobile as InstallMobileIcon } from '@mui/icons-material';
+import { Link } from 'react-router-dom';
 import { useAppContext } from '../context/AppContext.js';
 
-const LoginView = ({ onSwitchToRegister }) => {
+const LoginView = () => {
     const { login, setSnackbar } = useAppContext();
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
@@ -80,8 +81,11 @@ const LoginView = ({ onSwitchToRegister }) => {
                 <Button type="submit" variant="contained" fullWidth sx={{ mt: 2, py: 1.5 }} disabled={loading}>
                     {loading ? <CircularProgress size={24} /> : 'Login'}
                 </Button>
-                <Button fullWidth sx={{ mt: 2 }} onClick={onSwitchToRegister}>
+                <Button component={Link} to="/register" fullWidth sx={{ mt: 2 }}>
                     Don't have an account? Register
+                </Button>
+                <Button component={Link} to="/forgot-password" fullWidth size="small" sx={{ mt: 1 }}>
+                    Forgot password?
                 </Button>
                 {installPromptEvent && !isIos && (
                     <Button 

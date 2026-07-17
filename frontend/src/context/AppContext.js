@@ -42,7 +42,18 @@ export const apiService = {
     api: api, // Export raw axios instance for generic requests
     login: (credentials) => api.post('/login', credentials),
     register: (credentials) => api.post('/register', credentials),
-    
+    verifyEmail: (token) => api.post('/verify-email', { token }),
+    forgotPassword: (email) => api.post('/forgot-password', { email }),
+    resetPassword: (token, new_password) => api.post('/reset-password', { token, new_password }),
+    // Billing
+    billingCheckout: (plan) => api.post('/billing/checkout', { plan }),
+    billingPortal: () => api.post('/billing/portal'),
+    // Platform super-admin
+    adminTenants: () => api.get('/admin/tenants'),
+    adminSuspendTenant: (id) => api.post(`/admin/tenants/${id}/suspend`),
+    adminReactivateTenant: (id) => api.post(`/admin/tenants/${id}/reactivate`),
+    adminDeleteTenant: (id) => api.delete(`/admin/tenants/${id}`),
+
     // User Management API methods
     fetchUsers: () => api.get('/users'),
     createUser: (data) => api.post('/users', data),

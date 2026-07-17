@@ -5,7 +5,7 @@ import {
     ListItemIcon, ListItemText, Divider, alpha, useTheme, useMediaQuery, Chip,
     ThemeProvider, CssBaseline
 } from '@mui/material';
-import { BrowserRouter } from 'react-router-dom';
+import { BrowserRouter, useLocation } from 'react-router-dom';
 import theme from './theme';
 import {
     Menu as MenuIcon,
@@ -37,6 +37,9 @@ import SubscriptionPlansView from './components/SubscriptionPlansView.js';
 import ReceiptsView from './components/ReceiptsView.js';
 import LoginView from './components/LoginView.js';
 import RegisterView from './components/RegisterView.js';
+import VerifyEmailView from './components/VerifyEmailView.js';
+import ForgotPasswordView from './components/ForgotPasswordView.js';
+import ResetPasswordView from './components/ResetPasswordView.js';
 import ServiceManagementView from './components/ServiceManagementView.js';
 import EnhancedReportsView from './components/EnhancedReportsView.js';
 import MessagingView from './components/MessagingView.js';
@@ -282,7 +285,7 @@ const MainApp = ({
 // This component now decides whether to show the Login/Register screens or the MainApp
 const AppContent = () => {
     const { isAuthenticated, setSnackbar, logout } = useAppContext();
-    const [showRegister, setShowRegister] = useState(false);
+    const location = useLocation();
 
     const [customers, setCustomers] = useState([]);
     const [pagination, setPagination] = useState({ pages: 1, total: 0, current_page: 1 });
@@ -396,10 +399,13 @@ const AppContent = () => {
     }, [isAuthenticated, setSnackbar]);
 
 
+    // Public deep-link screens render regardless of auth (email links land here).
+    if (location.pathname === '/verify') return <VerifyEmailView />;
+    if (location.pathname === '/reset-password') return <ResetPasswordView />;
+    if (location.pathname === '/forgot-password') return <ForgotPasswordView />;
+
     if (!isAuthenticated) {
-        return showRegister
-            ? <RegisterView onSwitchToLogin={() => setShowRegister(false)} />
-            : <LoginView onSwitchToRegister={() => setShowRegister(true)} />;
+        return location.pathname === '/register' ? <RegisterView /> : <LoginView />;
     }
 
     // --- FIX: Show loader while loading is true, even after authentication ---

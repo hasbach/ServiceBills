@@ -1,58 +1,66 @@
 import React, { useState } from 'react';
-import { Box, Typography, TextField, Button, Paper, CircularProgress } from '@mui/material';
+import { Typography, TextField, Button, CircularProgress, Alert } from '@mui/material';
+import { Link } from 'react-router-dom';
 import { useAppContext } from '../context/AppContext.js';
+import AuthShell from './AuthShell.js';
 
-const RegisterView = ({ onSwitchToLogin }) => {
-    const { apiService, setSnackbar } = useAppContext();
-    const [username, setUsername] = useState('');
-    const [password, setPassword] = useState('');
+const RegisterView = () => {
+    const { apiService } = useAppContext();
+    const [form, setForm] = useState({ business_name: '', email: '', username: '', password: '' });
     const [loading, setLoading] = useState(false);
+    const [error, setError] = useState('');
+    const [done, setDone] = useState(false);
+
+    const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
     const handleRegister = async (e) => {
         e.preventDefault();
-        if (!username || !password) {
-            setSnackbar({ open: true, message: 'Please enter username and password.', severity: 'warning' });
-            return;
-        }
+        setError('');
         setLoading(true);
         try {
-            const response = await apiService.register({ username, password });
-            setSnackbar({ open: true, message: response.data.msg, severity: 'success' });
-            onSwitchToLogin(); // Switch to login view after successful registration
-        } catch (error) {
-            setSnackbar({ open: true, message: error.response?.data?.msg || 'Registration failed.', severity: 'error' });
+            await apiService.register(form);
+            setDone(true);
+        } catch (err) {
+            setError(err.response?.data?.msg || 'Registration failed.');
         } finally {
             setLoading(false);
         }
     };
 
+    if (done) {
+        return (
+            <AuthShell>
+                <Typography variant="h6" sx={{ mb: 1 }}>Almost there</Typography>
+                <Typography sx={{ mb: 3 }}>
+                    We've created <strong>{form.business_name || form.username}</strong>. Check
+                    {form.email ? ` ${form.email}` : ' your email'} to verify your address, then log in.
+                </Typography>
+                <Button component={Link} to="/login" variant="contained" fullWidth>Go to login</Button>
+            </AuthShell>
+        );
+    }
+
     return (
-        <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
-            <Paper component="form" onSubmit={handleRegister} sx={{ p: 4, width: '100%', maxWidth: '400px', borderRadius: '16px' }}>
-                <Typography variant="h4" sx={{ mb: 3, textAlign: 'center', fontWeight: 'bold' }}>Register</Typography>
-                <TextField
-                    fullWidth
-                    label="Username"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    margin="normal"
-                />
-                <TextField
-                    fullWidth
-                    label="Password"
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    margin="normal"
-                />
-                <Button type="submit" variant="contained" fullWidth sx={{ mt: 2, py: 1.5 }} disabled={loading}>
-                    {loading ? <CircularProgress size={24} /> : 'Register'}
+        <AuthShell>
+            <Typography variant="h6" sx={{ mb: 2 }}>Create your servicesBills account</Typography>
+            {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+            <form onSubmit={handleRegister}>
+                <TextField fullWidth label="Business name" value={form.business_name}
+                           onChange={set('business_name')} margin="normal" required />
+                <TextField fullWidth type="email" label="Email" value={form.email}
+                           onChange={set('email')} margin="normal" required />
+                <TextField fullWidth label="Username" value={form.username}
+                           onChange={set('username')} margin="normal" required />
+                <TextField fullWidth type="password" label="Password" value={form.password}
+                           onChange={set('password')} margin="normal" required />
+                <Button type="submit" variant="contained" fullWidth sx={{ mt: 2, py: 1.3 }} disabled={loading}>
+                    {loading ? <CircularProgress size={22} /> : 'Create account'}
                 </Button>
-                <Button fullWidth sx={{ mt: 2 }} onClick={onSwitchToLogin}>
-                    Already have an account? Login
-                </Button>
-            </Paper>
-        </Box>
+            </form>
+            <Button component={Link} to="/login" fullWidth sx={{ mt: 2 }}>
+                Already have an account? Log in
+            </Button>
+        </AuthShell>
     );
 };
 
