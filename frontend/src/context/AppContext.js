@@ -4,7 +4,7 @@ import axios from 'axios';
 
 // --- API Service Abstraction ---
 // Use Flask backend URL during development, empty for production builds
-const API_BASE_URL = process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000';
+const API_BASE_URL = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
 const api = axios.create({
     baseURL: `${API_BASE_URL}/api`, // API endpoints are under /api
 });
