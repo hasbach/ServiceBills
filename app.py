@@ -77,6 +77,20 @@ from tenancy import (
 )
 from crypto import EncryptedString
 import storage
+import email_util
+from itsdangerous import URLSafeTimedSerializer, BadData
+
+
+def _make_signed_token(salt, value):
+    return URLSafeTimedSerializer(app.config["JWT_SECRET_KEY"], salt=salt).dumps(value)
+
+
+def _read_signed_token(salt, token, max_age):
+    """Return the payload, or None if the token is invalid/expired."""
+    try:
+        return URLSafeTimedSerializer(app.config["JWT_SECRET_KEY"], salt=salt).loads(token, max_age=max_age)
+    except BadData:
+        return None
 from werkzeug.exceptions import Unauthorized
 
 
@@ -106,9 +120,11 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(128), nullable=False)
-    role = db.Column(db.String(20), nullable=False, default='user') # Roles: 'user', 'admin'
+    role = db.Column(db.String(20), nullable=False, default='user') # Roles: 'user', 'admin', 'superadmin'
     # NULL tenant_id denotes a platform super-admin who operates servicesBills itself.
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=True, index=True)
+    email = db.Column(db.String(200), unique=True, nullable=True)
+    email_verified = db.Column(db.Boolean, nullable=False, default=False)
 
     def set_password(self, password):
         self.password_hash = bcrypt.generate_password_hash(password).decode('utf8')
@@ -685,11 +701,14 @@ def register():
     data = request.json
     username = data.get('username')
     password = data.get('password')
+    email = (data.get('email') or '').strip().lower() or None
     business_name = data.get('business_name') or username
     if not username or not password:
         return jsonify({"msg": "Username and password required"}), 400
     if User.query.filter_by(username=username).first():
         return jsonify({"msg": "Username already exists"}), 409
+    if email and User.query.filter_by(email=email).first():
+        return jsonify({"msg": "Email already in use"}), 409
 
     # Each registration provisions a new tenant (business); the registrant is its admin.
     slug = re.sub(r'[^a-z0-9]+', '-', business_name.lower()).strip('-')[:80] or 'tenant'
@@ -702,11 +721,36 @@ def register():
     db.session.add(tenant)
     db.session.flush()  # assign tenant.id before creating the user
 
-    new_user = User(username=username, role='admin', tenant_id=tenant.id)
+    new_user = User(username=username, role='admin', tenant_id=tenant.id, email=email)
     new_user.set_password(password)
     db.session.add(new_user)
     db.session.commit()
+
+    # Send an email-verification link (best-effort; failure doesn't block signup).
+    if email:
+        try:
+            token = _make_signed_token("email-verify", email)
+            link = f"{Config.APP_BASE_URL}/verify?token={token}"
+            email_util.send(email, "Verify your servicesBills email",
+                            f"Welcome to servicesBills! Verify your email:\n\n{link}\n")
+        except Exception as e:
+            logging.warning(f"Verification email failed for {email}: {e}")
+
     return jsonify({"msg": "User created successfully", "tenant": tenant.to_dict()}), 201
+
+
+@app.route('/api/verify-email', methods=['POST'])
+def verify_email():
+    token = (request.json or {}).get('token')
+    email = _read_signed_token("email-verify", token, max_age=60 * 60 * 24 * 3) if token else None
+    if not email:
+        return jsonify({"msg": "Invalid or expired verification link"}), 400
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({"msg": "Invalid or expired verification link"}), 400
+    user.email_verified = True
+    db.session.commit()
+    return jsonify({"msg": "Email verified"}), 200
 
 @app.route('/api/users', methods=['GET'])
 @jwt_required()
