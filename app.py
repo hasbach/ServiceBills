@@ -906,8 +906,10 @@ def scheduled_auto_update_check():
         except Exception as e:
             logging.error(f"Scheduled auto-update error: {e}")
 
-# Start scheduler only if not already running
-if not scheduler.running:
+# Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
+# in-process scheduler would fire the daily jobs once per worker; run exactly one
+# process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
+if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     scheduler.add_job(func=generate_missing_payments_with_context, trigger="interval", days=1)
     scheduler.add_job(func=scheduled_auto_update_check, trigger="interval", hours=12)
     scheduler.start()
