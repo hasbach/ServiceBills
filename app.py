@@ -3010,7 +3010,9 @@ def send_whatsapp_message(customer, event_type, context=None):
         if not getattr(customer, 'whatsapp_notifications_enabled', True):
             return {'success': False, 'status': 'Skipped', 'error': 'Customer has WhatsApp notifications disabled'}  # User disabled notifications
 
-        settings = tenant_query(WhatsAppSettings).first()
+        # Scope by the customer's own tenant so this works in any context
+        # (request or a future scheduled reminder), not just the request's JWT tenant.
+        settings = WhatsAppSettings.query.filter_by(tenant_id=customer.tenant_id).first()
         if not settings or not settings.enabled:
             return {'success': False, 'status': 'Skipped', 'error': 'WhatsApp system notifications disabled in settings'}  # WhatsApp notifications are disabled
 
