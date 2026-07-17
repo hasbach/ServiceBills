@@ -194,7 +194,9 @@ class SubscriptionPlan(db.Model):
 class Sector(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
-    name = db.Column(db.String(100), nullable=False, unique=True)
+    # Unique per tenant, not globally: different tenants may use the same sector name.
+    name = db.Column(db.String(100), nullable=False)
+    __table_args__ = (db.UniqueConstraint('tenant_id', 'name', name='uq_sector_tenant_name'),)
 
     def to_dict(self):
         return {'id': self.id, 'name': self.name}
@@ -244,7 +246,9 @@ class SupplierPayment(db.Model):
 class ExpenseCategory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
-    name = db.Column(db.String(100), nullable=False, unique=True)
+    # Unique per tenant, not globally.
+    name = db.Column(db.String(100), nullable=False)
+    __table_args__ = (db.UniqueConstraint('tenant_id', 'name', name='uq_expense_category_tenant_name'),)
     expenses = db.relationship('Expense', backref='category', lazy=True)
 
     def to_dict(self):
