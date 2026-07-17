@@ -76,6 +76,7 @@ from tenancy import (
     current_tenant_id, tenant_query, new_for_tenant, get_tenant_settings, tenant_required,
 )
 from crypto import EncryptedString
+import storage
 from werkzeug.exceptions import Unauthorized
 
 
@@ -350,7 +351,7 @@ class BusinessSettings(db.Model):
     def to_dict(self):
         l_url = self.logo_url
         if l_url and not l_url.startswith('/') and not l_url.startswith('http'):
-            l_url = f"/uploads/{l_url}"
+            l_url = storage.url(l_url)
             
         return {
             'id': self.id,
@@ -794,7 +795,7 @@ def login():
     return jsonify({"msg": "Bad username or password"}), 401
 
 
-@app.route('/uploads/<filename>')
+@app.route('/uploads/<path:filename>')
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)        
         
@@ -2075,7 +2076,7 @@ def get_unpaid_receipt(customer_id):
             'business_mobile': business_settings.mobile if business_settings else "",
             'business_email': business_settings.email if business_settings else "",
             'business_website': business_settings.website if business_settings else "",
-            'business_logo_url': f"/uploads/{business_settings.logo_url}" if business_settings and business_settings.logo_url else None
+            'business_logo_url': storage.url(business_settings.logo_url) if business_settings and business_settings.logo_url else None
         }
 
         # Prepare the final receipt data
@@ -2186,7 +2187,7 @@ def get_receipt(payment_id):
         receipt_data['business_mobile'] = business_settings.mobile
         receipt_data['business_email'] = business_settings.email
         receipt_data['business_website'] = business_settings.website
-        receipt_data['business_logo_url'] = f"/uploads/{business_settings.logo_url}" if business_settings.logo_url else None
+        receipt_data['business_logo_url'] = storage.url(business_settings.logo_url) if business_settings.logo_url else None
 
 
     return jsonify(receipt_data)
@@ -2333,10 +2334,7 @@ def save_business_settings():
         if 'logo' in request.files:
             file = request.files['logo']
             if file and allowed_file(file.filename):
-                filename = secure_filename(file.filename)
-                file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                file.save(file_path)
-                logo_url = filename # Store just the filename, route handles prefix
+                logo_url = storage.save(file, current_tenant_id())  # tenant-namespaced key
 
         # Update fields from form data
         settings.business_name = request.form.get('business_name', settings.business_name)
@@ -4507,54 +4505,23 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 @app.route('/manifest.json')
 def serve_manifest():
-    with app.app_context():
-        settings = tenant_query(BusinessSettings).first()
-        name = settings.business_name if settings and settings.business_name else "servicesBills"
-        short_name = name
-        logo_url = settings.logo_url if settings and settings.logo_url else "logo192.png"
-        
-        if logo_url and not logo_url.startswith('/') and not logo_url.startswith('http') and logo_url != "logo192.png":
-            logo_url = '/uploads/' + logo_url
-        elif logo_url == "logo192.png":
-            logo_url = '/' + logo_url
-        
-        icon_type = 'image/png'
-        lower_logo = logo_url.lower()
-        if lower_logo.endswith('.jpg') or lower_logo.endswith('.jpeg'):
-            icon_type = 'image/jpeg'
-        elif lower_logo.endswith('.svg'):
-            icon_type = 'image/svg+xml'
-        elif lower_logo.endswith('.webp'):
-            icon_type = 'image/webp'
-        elif lower_logo.endswith('.gif'):
-            icon_type = 'image/gif'
-
-        manifest = {
-            "short_name": short_name,
-            "name": name,
-            "icons": [
-                {
-                    "src": logo_url,
-                    "sizes": "192x192",
-                    "type": icon_type,
-                    "purpose": "any maskable"
-                },
-                {
-                    "src": logo_url,
-                    "sizes": "512x512",
-                    "type": icon_type,
-                    "purpose": "any maskable"
-                }
-            ],
-            "start_url": ".",
-            "display": "standalone",
-            "theme_color": "#000000",
-            "background_color": "#ffffff"
-        }
-        
-        response = jsonify(manifest)
-        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        return response
+    # Public endpoint (fetched by the browser with no auth) -> cannot be tenant-scoped.
+    # Serve a generic servicesBills PWA manifest; per-tenant branding is applied in-app.
+    manifest = {
+        "short_name": "servicesBills",
+        "name": "servicesBills",
+        "icons": [
+            {"src": "/logo192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/logo512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+        "start_url": ".",
+        "display": "standalone",
+        "theme_color": "#000000",
+        "background_color": "#ffffff",
+    }
+    response = jsonify(manifest)
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    return response
 
 
 # --- Reseller API Endpoints ---
