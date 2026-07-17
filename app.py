@@ -752,6 +752,41 @@ def verify_email():
     db.session.commit()
     return jsonify({"msg": "Email verified"}), 200
 
+
+@app.route('/api/forgot-password', methods=['POST'])
+def forgot_password():
+    email = ((request.json or {}).get('email') or '').strip().lower()
+    # Always 200 (no user enumeration). Only send if the email actually exists.
+    if email:
+        user = User.query.filter_by(email=email).first()
+        if user:
+            try:
+                token = _make_signed_token("password-reset", user.id)
+                link = f"{Config.APP_BASE_URL}/reset-password?token={token}"
+                email_util.send(email, "Reset your servicesBills password",
+                                f"Reset your password (valid 1 hour):\n\n{link}\n")
+            except Exception as e:
+                logging.warning(f"Reset email failed for {email}: {e}")
+    return jsonify({"msg": "If that email exists, a reset link has been sent."}), 200
+
+
+@app.route('/api/reset-password', methods=['POST'])
+def reset_password():
+    data = request.json or {}
+    token = data.get('token')
+    new_password = data.get('new_password')
+    if not new_password:
+        return jsonify({"msg": "New password required"}), 400
+    user_id = _read_signed_token("password-reset", token, max_age=60 * 60) if token else None
+    if not user_id:
+        return jsonify({"msg": "Invalid or expired reset link"}), 400
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"msg": "Invalid or expired reset link"}), 400
+    user.set_password(new_password)
+    db.session.commit()
+    return jsonify({"msg": "Password updated"}), 200
+
 @app.route('/api/users', methods=['GET'])
 @jwt_required()
 @admin_required()
