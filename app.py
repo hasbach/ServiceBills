@@ -3734,14 +3734,16 @@ def send_bulk_messages():
 
 @app.route('/api/whatsapp/webhook', methods=['GET', 'POST'])
 def whatsapp_webhook():
-    settings = tenant_query(WhatsAppSettings).first()
-    verify_token = settings.webhook_verify_token if settings and settings.webhook_verify_token else 'delta_net_whatsapp_secret'
-
+    # Public endpoint (Meta calls it, no JWT). GET verification matches the incoming
+    # token against ANY tenant's configured verify token; POST processing resolves the
+    # owning tenant by the recipient phone_number_id. These are the only legitimate
+    # cross-tenant queries in the app (documented in the Task 2.15 exit-gate allowlist).
     if request.method == 'GET':
         mode = request.args.get('hub.mode')
         token = request.args.get('hub.verify_token')
         challenge = request.args.get('hub.challenge')
-        if mode == 'subscribe' and token == verify_token:
+        token_match = WhatsAppSettings.query.filter_by(webhook_verify_token=token).first() if token else None
+        if mode == 'subscribe' and (token_match or token == 'delta_net_whatsapp_secret'):
             logging.info("WhatsApp Webhook verified successfully by Meta!")
             return challenge, 200
         return 'Verification failed', 403
@@ -3754,7 +3756,15 @@ def whatsapp_webhook():
                     val = change.get('value', {})
                     messages = val.get('messages', [])
                     contacts = val.get('contacts', [])
-                    
+
+                    # Resolve the owning tenant from the recipient business phone number.
+                    incoming_pnid = (val.get('metadata', {}) or {}).get('phone_number_id')
+                    settings = WhatsAppSettings.query.filter_by(phone_number_id=incoming_pnid).first() if incoming_pnid else None
+                    if not settings:
+                        logging.warning(f"WhatsApp webhook: no tenant for phone_number_id={incoming_pnid}; skipping.")
+                        continue
+                    resolved_tenant_id = settings.tenant_id
+
                     for msg in messages:
                         sender_phone = msg.get('from', '')
                         msg_type = msg.get('type', '')
@@ -3803,7 +3813,7 @@ def whatsapp_webhook():
                         if contacts and isinstance(contacts, list):
                             cust_name = contacts[0].get('profile', {}).get('name', cust_name)
                         
-                        cust_obj = tenant_query(Customer).filter(Customer.phone.like(f"%{sender_phone[-8:]}%")).first()
+                        cust_obj = Customer.query.filter_by(tenant_id=resolved_tenant_id).filter(Customer.phone.like(f"%{sender_phone[-8:]}%")).first()
                         if cust_obj:
                             cust_name = cust_obj.name or cust_name
 
@@ -3889,6 +3899,7 @@ def whatsapp_webhook():
                         if cust_obj:
                             try:
                                 ticket = SupportTicket(
+                                    tenant_id=resolved_tenant_id,
                                     customer_id=cust_obj.id,
                                     title=f"WhatsApp Reply from {cust_name} (+{sender_phone})",
                                     description=f"Incoming WhatsApp message:\n\n{msg_text}\n\n[Received via Meta Cloud API Webhook at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC]",
@@ -3910,7 +3921,7 @@ def whatsapp_webhook():
                                 # Check if we already sent an auto-reply or created a ticket for this customer in the last 15 minutes
                                 recent_tickets_count = 0
                                 if cust_obj:
-                                    recent_tickets_count = tenant_query(SupportTicket).filter(
+                                    recent_tickets_count = SupportTicket.query.filter_by(tenant_id=resolved_tenant_id).filter(
                                         SupportTicket.customer_id == cust_obj.id,
                                         SupportTicket.created_at >= datetime.utcnow() - timedelta(minutes=15)
                                     ).count()
