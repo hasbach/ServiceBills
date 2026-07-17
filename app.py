@@ -73,7 +73,7 @@ jwt = JWTManager(app)
 # Multi-tenancy scoping helpers (Phase 2). tenancy.py imports `db` lazily inside
 # functions, so importing it here does not create a circular import.
 from tenancy import (
-    current_tenant_id, tenant_query, new_for_tenant, get_tenant_settings, tenant_required,
+    current_tenant_id, current_tenant, tenant_query, new_for_tenant, get_tenant_settings, tenant_required,
 )
 from crypto import EncryptedString
 import storage
@@ -786,6 +786,59 @@ def reset_password():
     user.set_password(new_password)
     db.session.commit()
     return jsonify({"msg": "Password updated"}), 200
+
+
+# --- Billing (Stripe) ---------------------------------------------------------
+import billing
+import plans
+
+
+@app.route('/api/billing/checkout', methods=['POST'])
+@jwt_required()
+@admin_required()
+def billing_checkout():
+    plan_name = (request.json or {}).get('plan', 'pro')
+    price_id = plans.PLANS.get(plan_name, {}).get('stripe_price')
+    if not price_id:
+        return jsonify({"msg": f"Plan '{plan_name}' is not purchasable"}), 400
+    tenant = current_tenant()
+    try:
+        url = billing.create_checkout_session(tenant, price_id)
+    except Exception as e:
+        logging.error(f"Stripe checkout failed: {e}")
+        return jsonify({"msg": "Could not start checkout"}), 502
+    return jsonify({"url": url}), 200
+
+
+@app.route('/api/billing/portal', methods=['POST'])
+@jwt_required()
+@admin_required()
+def billing_portal():
+    tenant = current_tenant()
+    if not tenant or not tenant.stripe_customer_id:
+        return jsonify({"msg": "No billing account yet"}), 400
+    try:
+        url = billing.create_portal_session(tenant)
+    except Exception as e:
+        logging.error(f"Stripe portal failed: {e}")
+        return jsonify({"msg": "Could not open billing portal"}), 502
+    return jsonify({"url": url}), 200
+
+
+@app.route('/api/stripe/webhook', methods=['POST'])
+def stripe_webhook():
+    # Public: Stripe calls this. Verify signature, then sync tenant state.
+    # (One of two legitimate public endpoints — see exit-gate allowlist.)
+    import stripe as _stripe
+    payload = request.get_data()
+    sig = request.headers.get('Stripe-Signature')
+    try:
+        event = _stripe.Webhook.construct_event(payload, sig, Config.STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        logging.warning(f"Stripe webhook signature verification failed: {e}")
+        return jsonify({"msg": "invalid signature"}), 400
+    billing.handle_event(event)
+    return jsonify({"status": "ok"}), 200
 
 @app.route('/api/users', methods=['GET'])
 @jwt_required()

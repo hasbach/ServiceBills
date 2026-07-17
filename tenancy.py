@@ -18,6 +18,12 @@ def current_tenant_id():
     return tid
 
 
+def current_tenant():
+    """Return the current Tenant row (resolved from the JWT tenant_id)."""
+    from app import Tenant, db
+    return db.session.get(Tenant, current_tenant_id())
+
+
 def tenant_query(model):
     """Return a query for `model` scoped to the current tenant."""
     return model.query.filter_by(tenant_id=current_tenant_id())
