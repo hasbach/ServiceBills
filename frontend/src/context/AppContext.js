@@ -23,13 +23,22 @@ api.interceptors.response.use(
     response => response,
     error => {
         console.error("API Error:", error.response || error.message);
+        const status = error.response?.status;
+        const url = error.config?.url || '';
 
-        // Automatically logout on 401 (token expired)
-        if (error.response?.status === 401) {
-            console.log("Token expired, logging out...");
+        // Auto-logout on 401 (expired token) — but NOT for a failed login attempt,
+        // which legitimately returns 401 and should surface an error, not reload.
+        if (status === 401 && !url.includes('/login')) {
             localStorage.removeItem('token');
             localStorage.removeItem('user');
-            window.location.reload(); // Force reload to show login screen
+            window.location.reload();
+        }
+
+        // Plan limit hit -> prompt to upgrade (skip billing calls themselves).
+        if (status === 402 && !url.includes('/billing')) {
+            window.dispatchEvent(new CustomEvent('sb:upgrade-required', {
+                detail: { message: error.response?.data?.msg || error.response?.data?.message || 'Upgrade required to continue.' }
+            }));
         }
 
         return Promise.reject(error);
@@ -46,6 +55,8 @@ export const apiService = {
     forgotPassword: (email) => api.post('/forgot-password', { email }),
     resetPassword: (token, new_password) => api.post('/reset-password', { token, new_password }),
     // Billing
+    tenantMe: () => api.get('/tenant/me'),
+    listPlans: () => api.get('/plans'),
     billingCheckout: (plan) => api.post('/billing/checkout', { plan }),
     billingPortal: () => api.post('/billing/portal'),
     // Platform super-admin
@@ -188,6 +199,17 @@ export const AppContextProvider = ({ children }) => {
             setIsAuthenticated(false);
         }
     }, [token, user]);
+
+    // Surface plan-limit (402) prompts raised by the axios interceptor.
+    useEffect(() => {
+        const onUpgrade = (e) => setSnackbar({
+            open: true,
+            message: `${e.detail?.message || 'Upgrade required.'} Open Billing & Plan to upgrade.`,
+            severity: 'warning',
+        });
+        window.addEventListener('sb:upgrade-required', onUpgrade);
+        return () => window.removeEventListener('sb:upgrade-required', onUpgrade);
+    }, []);
 
     const login = async (credentials) => {
         const response = await apiService.login(credentials);

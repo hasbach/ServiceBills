@@ -40,6 +40,8 @@ import RegisterView from './components/RegisterView.js';
 import VerifyEmailView from './components/VerifyEmailView.js';
 import ForgotPasswordView from './components/ForgotPasswordView.js';
 import ResetPasswordView from './components/ResetPasswordView.js';
+import BillingView from './components/BillingView.js';
+import SuperAdminView from './components/SuperAdminView.js';
 import ServiceManagementView from './components/ServiceManagementView.js';
 import EnhancedReportsView from './components/EnhancedReportsView.js';
 import MessagingView from './components/MessagingView.js';
@@ -61,6 +63,7 @@ const NAV_ITEMS = [
     { key: 'subscription-plans', label: 'Subscription Plans', icon: <PlansIcon />,           group: 'manage',    allowedRoles: ['admin', 'finance'] },
     { key: 'messaging',          label: 'Messaging',          icon: <MessageIcon />,         group: 'manage',    allowedRoles: ['admin'] },
     { key: 'settings',           label: 'Settings',           icon: <SettingsIcon />,        group: 'manage',    allowedRoles: ['admin'] },
+    { key: 'billing',            label: 'Billing & Plan',     icon: <PaymentIcon />,         group: 'manage',    allowedRoles: ['admin'] },
 ];
 
 const GROUP_LABELS = { main: 'Main', analytics: 'Analytics', manage: 'Management' };
@@ -83,6 +86,7 @@ const MainApp = ({
     const hasRole = (role) => userRoles.includes(role);
 
     const getDefaultView = () => {
+        if (window.location.pathname.startsWith('/billing')) return 'billing';
         const urlParams = new URLSearchParams(window.location.search);
         const viewParam = urlParams.get('view');
         if (viewParam) return viewParam;
@@ -229,6 +233,7 @@ const MainApp = ({
             case 'subscription-plans': return <SubscriptionPlansView subscriptionPlans={subscriptionPlans} refetchSubscriptionPlans={() => { }} setSnackbar={setSnackbar} />;
             case 'messaging': return hasRole('admin') ? <MessagingView /> : <Typography>Access Denied</Typography>;
             case 'settings': return hasRole('admin') ? <SettingsView businessSettings={businessSettings} setBusinessSettings={setBusinessSettings} setSnackbar={setSnackbar} /> : <Typography>Access Denied</Typography>;
+            case 'billing': return hasRole('admin') ? <BillingView /> : <Typography>Access Denied</Typography>;
             default: 
                 if (hasRole('employee') || hasRole('technician')) return <ServiceManagementView />;
                 return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
@@ -284,8 +289,9 @@ const MainApp = ({
 
 // This component now decides whether to show the Login/Register screens or the MainApp
 const AppContent = () => {
-    const { isAuthenticated, setSnackbar, logout } = useAppContext();
+    const { isAuthenticated, setSnackbar, logout, user } = useAppContext();
     const location = useLocation();
+    const isSuperadmin = (user?.role || '') === 'superadmin';
 
     const [customers, setCustomers] = useState([]);
     const [pagination, setPagination] = useState({ pages: 1, total: 0, current_page: 1 });
@@ -357,13 +363,13 @@ const AppContent = () => {
 
     // Auto-fetch when pagination state changes
     useEffect(() => {
-        if (isAuthenticated) {
+        if (isAuthenticated && !isSuperadmin) {
             refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery, customerSortBy, customerResellerId);
         }
-    }, [currentPage, itemsPerPage, debouncedSearchQuery, customerSortBy, customerResellerId, isAuthenticated, refetchCustomers]);
+    }, [currentPage, itemsPerPage, debouncedSearchQuery, customerSortBy, customerResellerId, isAuthenticated, isSuperadmin, refetchCustomers]);
 
     useEffect(() => {
-        if (isAuthenticated) {
+        if (isAuthenticated && !isSuperadmin) {
             const loadInitialData = async () => {
                 setLoading(true);
                 try {
@@ -406,6 +412,11 @@ const AppContent = () => {
 
     if (!isAuthenticated) {
         return location.pathname === '/register' ? <RegisterView /> : <LoginView />;
+    }
+
+    // Platform operators get the cross-tenant admin console, not the tenant app.
+    if (isSuperadmin) {
+        return <SuperAdminView />;
     }
 
     // --- FIX: Show loader while loading is true, even after authentication ---

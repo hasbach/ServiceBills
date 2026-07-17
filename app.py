@@ -826,6 +826,25 @@ def billing_portal():
     return jsonify({"url": url}), 200
 
 
+@app.route('/api/tenant/me', methods=['GET'])
+@jwt_required()
+def tenant_me():
+    t = current_tenant()
+    if not t:
+        return jsonify({"msg": "No tenant"}), 404
+    return jsonify(t.to_dict()), 200
+
+
+@app.route('/api/plans', methods=['GET'])
+@jwt_required()
+def list_plans():
+    # Expose plan names + limits (never the Stripe price/secret) for pricing cards.
+    return jsonify({
+        name: {"max_customers": p["max_customers"], "whatsapp_api": p["whatsapp_api"]}
+        for name, p in plans.PLANS.items()
+    }), 200
+
+
 @app.route('/api/stripe/webhook', methods=['POST'])
 def stripe_webhook():
     # Public: Stripe calls this. Verify signature, then sync tenant state.
@@ -901,7 +920,7 @@ def create_superadmin():
 _SUSPEND_EXEMPT_PREFIXES = (
     "/api/billing", "/api/login", "/api/logout", "/api/stripe/webhook",
     "/api/verify-email", "/api/forgot-password", "/api/reset-password",
-    "/api/tenant/export", "/api/admin/",
+    "/api/tenant/", "/api/plans", "/api/admin/",
 )
 
 
