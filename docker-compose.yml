@@ -1,0 +1,38 @@
+# Local production-like dry-run: Postgres + the servicesBills web image.
+#   docker compose up --build
+# Then open http://localhost:8000 . Migrations run automatically on start.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: servicesbills
+      POSTGRES_PASSWORD: localdevpass
+      POSTGRES_DB: servicesbills
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U servicesbills"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://servicesbills:localdevpass@db:5432/servicesbills
+      FLASK_APP: app.py
+      DISABLE_AUTO_CREATE_ALL: "1"   # Alembic owns the schema
+      RUN_SCHEDULER: "1"             # single container -> run the scheduler here
+    depends_on:
+      db:
+        condition: service_healthy
+    # Build the schema, then serve (1 worker so the in-process scheduler fires once).
+    command: sh -c "flask db upgrade && gunicorn -w 1 -b 0.0.0.0:8000 --timeout 120 app:app"
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:

@@ -7,10 +7,14 @@ class Config:
     JWT_SECRET_KEY = os.environ["JWT_SECRET_KEY"]
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=8)
     # Prefer a full DATABASE_URL (e.g. Postgres in prod); fall back to a local SQLite file.
-    SQLALCHEMY_DATABASE_URI = os.environ.get(
-        "DATABASE_URL",
-        f"sqlite:///{os.environ.get('DATABASE_PATH', 'database.db')}",
-    )
+    # Managed hosts (Render/Railway/Heroku) emit "postgres://" — normalize to the
+    # "postgresql+psycopg2://" form SQLAlchemy 2.x requires.
+    _db_url = os.environ.get("DATABASE_URL", f"sqlite:///{os.environ.get('DATABASE_PATH', 'database.db')}")
+    if _db_url.startswith("postgres://"):
+        _db_url = _db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif _db_url.startswith("postgresql://"):
+        _db_url = _db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    SQLALCHEMY_DATABASE_URI = _db_url
     # Comma-separated allowlist; defaults to the local React dev server.
     CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
 
