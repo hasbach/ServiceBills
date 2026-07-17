@@ -2,8 +2,11 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
     Button, AppBar, Toolbar, Typography, Box, CircularProgress,
     Snackbar, Alert, IconButton, Drawer, List, ListItem, ListItemButton,
-    ListItemIcon, ListItemText, Divider, alpha, useTheme, useMediaQuery, Chip
+    ListItemIcon, ListItemText, Divider, alpha, useTheme, useMediaQuery, Chip,
+    ThemeProvider, CssBaseline
 } from '@mui/material';
+import { BrowserRouter } from 'react-router-dom';
+import theme from './theme';
 import {
     Menu as MenuIcon,
     Close as CloseIcon,
@@ -434,9 +437,14 @@ const AppContent = () => {
 // The final App component wraps everything in the context provider
 function App() {
     return (
-        <AppContextProvider>
-            <AppContentWrapper />
-        </AppContextProvider>
+        <ThemeProvider theme={theme}>
+            <CssBaseline />
+            <BrowserRouter>
+                <AppContextProvider>
+                    <AppContentWrapper />
+                </AppContextProvider>
+            </BrowserRouter>
+        </ThemeProvider>
     );
 }
 
