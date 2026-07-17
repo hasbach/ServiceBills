@@ -42,6 +42,7 @@ import ForgotPasswordView from './components/ForgotPasswordView.js';
 import ResetPasswordView from './components/ResetPasswordView.js';
 import BillingView from './components/BillingView.js';
 import SuperAdminView from './components/SuperAdminView.js';
+import LandingView from './components/LandingView.js';
 import ServiceManagementView from './components/ServiceManagementView.js';
 import EnhancedReportsView from './components/EnhancedReportsView.js';
 import MessagingView from './components/MessagingView.js';
@@ -107,6 +108,13 @@ const MainApp = ({
     const navItems = NAV_ITEMS.filter(item => !item.allowedRoles || item.allowedRoles.some(r => hasRole(r)));
     const currentLabel = navItems.find(n => n.key === currentView)?.label || 'Dashboard';
 
+    // Per-tenant branding: resolve the uploaded logo to an absolute URL (dev API host differs).
+    const _apiBase = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
+    const logoSrc = businessSettings?.logo_url
+        ? (businessSettings.logo_url.startsWith('http') ? businessSettings.logo_url : `${_apiBase}${businessSettings.logo_url}`)
+        : null;
+    const brandName = businessSettings?.business_name || 'servicesBills';
+
     // ── Desktop horizontal nav ────────────────────────────────────────────────
     const DesktopNav = () => (
         <Box sx={{ display: { xs: 'none', md: 'flex' }, gap: 0.5, px: 1, py: 1, flexWrap: 'wrap', justifyContent: 'center', bgcolor: 'background.paper', borderBottom: `1px solid ${alpha(theme.palette.divider, 0.1)}`, boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
@@ -154,7 +162,7 @@ const MainApp = ({
                 <Box sx={{ px: 2.5, py: 2.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
                     <Box>
                         <Typography variant="h6" sx={{ fontWeight: 800, color: 'white', lineHeight: 1.2 }}>
-                            {businessSettings?.business_name || 'Dashboard'}
+                            {brandName}
                         </Typography>
                         <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.5)' }}>
                             {user?.username} · {user?.role}
@@ -241,7 +249,7 @@ const MainApp = ({
     };
 
     return (
-        <Box sx={{ minHeight: '100vh', bgcolor: '#f6f9fc' }}>
+        <Box sx={{ minHeight: '100vh', bgcolor: 'background.default', overflowX: 'hidden' }}>
             {/* ── AppBar ── */}
             <AppBar position="sticky" elevation={0} sx={{ bgcolor: 'white', borderBottom: `1px solid ${alpha(theme.palette.divider, 0.1)}`, color: 'text.primary', zIndex: theme.zIndex.drawer + 1 }}>
                 <Toolbar sx={{ minHeight: { xs: 56, sm: 64 } }}>
@@ -252,10 +260,16 @@ const MainApp = ({
                         </IconButton>
                     )}
 
-                    {/* Logo / Title */}
-                    <Typography variant="h6" sx={{ fontWeight: 800, flexGrow: 1, background: 'linear-gradient(135deg, #667eea, #764ba2)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', fontSize: { xs: '1rem', sm: '1.15rem' } }}>
-                        {businessSettings?.business_name || 'Business Dashboard'}
-                    </Typography>
+                    {/* Per-tenant logo + name (falls back to the servicesBills brand) */}
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexGrow: 1, minWidth: 0 }}>
+                        {logoSrc && (
+                            <Box component="img" src={logoSrc} alt=""
+                                 sx={{ height: 32, width: 32, borderRadius: '8px', objectFit: 'cover' }} />
+                        )}
+                        <Typography variant="h6" noWrap sx={{ fontWeight: 800, color: 'primary.main', fontSize: { xs: '1rem', sm: '1.15rem' } }}>
+                            {brandName}
+                        </Typography>
+                    </Box>
 
                     {/* Current view badge — mobile */}
                     {isMobile && (
@@ -411,7 +425,9 @@ const AppContent = () => {
     if (location.pathname === '/forgot-password') return <ForgotPasswordView />;
 
     if (!isAuthenticated) {
-        return location.pathname === '/register' ? <RegisterView /> : <LoginView />;
+        if (location.pathname === '/register') return <RegisterView />;
+        if (location.pathname === '/login') return <LoginView />;
+        return <LandingView />; // public landing at '/' (and any other path)
     }
 
     // Platform operators get the cross-tenant admin console, not the tenant app.
