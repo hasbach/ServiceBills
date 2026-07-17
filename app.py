@@ -1129,6 +1129,11 @@ from datetime import datetime, timezone
 @jwt_required()
 def add_customer():
     try:
+        # Plan-gating: enforce the tenant's customer limit (None = unlimited).
+        _limit = plans.limits(current_tenant().plan)["max_customers"]
+        if _limit is not None and tenant_query(Customer).count() >= _limit:
+            return jsonify({"message": f"Customer limit ({_limit}) reached for your plan. "
+                                       f"Upgrade to add more."}), 402
         data = request.json
         subscription_start_date = (
             datetime.strptime(data.get('subscription_start_date'), '%Y-%m-%d')
@@ -2543,6 +2548,9 @@ def get_whatsapp_settings():
 def save_whatsapp_settings():
     data = request.json
     try:
+        # Plan-gating: WhatsApp Cloud API (auto-send) mode requires a plan that allows it.
+        if data.get('mode') == 'api' and not plans.limits(current_tenant().plan)["whatsapp_api"]:
+            return jsonify({"msg": "WhatsApp API mode requires an upgraded plan."}), 402
         settings = tenant_query(WhatsAppSettings).first()
         if not settings:
             settings = WhatsAppSettings()
