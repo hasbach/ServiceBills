@@ -23,3 +23,15 @@ class Config:
     STORAGE_PREFIX = os.environ.get("STORAGE_PREFIX", "uploads")
     AWS_REGION = os.environ.get("AWS_REGION")
     S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL")  # Cloudflare R2 / MinIO endpoint
+
+    # --- Phase 4: billing, signup emails, app links ---
+    APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:3000")
+    STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+    STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+    # Email: "console" (dev/CI, records in-memory) or "smtp".
+    MAIL_BACKEND = os.environ.get("MAIL_BACKEND", "console")
+    SMTP_HOST = os.environ.get("SMTP_HOST")
+    SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+    SMTP_USER = os.environ.get("SMTP_USER")
+    SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+    MAIL_FROM = os.environ.get("MAIL_FROM", "noreply@servicesbills.net")
