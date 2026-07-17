@@ -59,3 +59,7 @@ yarn-error.log*
 /test*.py
 extracted_*.json
 app_copy.py
+
+# Compiled frontend (built by Docker/CI, not tracked)
+frontend/build/
+frontend/build.zip
