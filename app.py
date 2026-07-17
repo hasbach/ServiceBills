@@ -54,7 +54,16 @@ from config import Config
 app.config.from_object(Config)
 CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
 
-db = SQLAlchemy(app)
+from sqlalchemy import MetaData
+# Explicit naming convention so Alembic can add/drop constraints by name across
+# engines (needed for the Postgres FK/unique reconciliation in Phase 3).
+_naming_convention = MetaData(naming_convention={
+    "ix": "ix_%(column_0_label)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+})
+db = SQLAlchemy(app, metadata=_naming_convention)
 from flask_migrate import Migrate
 # render_as_batch=True lets Alembic emit SQLite-safe table rebuilds for ALTERs.
 migrate = Migrate(app, db, render_as_batch=True)
