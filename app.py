@@ -73,7 +73,8 @@ jwt = JWTManager(app)
 # Multi-tenancy scoping helpers (Phase 2). tenancy.py imports `db` lazily inside
 # functions, so importing it here does not create a circular import.
 from tenancy import (
-    current_tenant_id, current_tenant, tenant_query, new_for_tenant, get_tenant_settings, tenant_required,
+    current_tenant_id, current_tenant, tenant_query, new_for_tenant, get_tenant_settings,
+    tenant_required, superadmin_required,
 )
 from crypto import EncryptedString
 import storage
@@ -839,6 +840,58 @@ def stripe_webhook():
         return jsonify({"msg": "invalid signature"}), 400
     billing.handle_event(event)
     return jsonify({"status": "ok"}), 200
+
+
+# --- Platform super-admin (cross-tenant; never uses tenant_query) -------------
+@app.route('/api/admin/tenants', methods=['GET'])
+@superadmin_required
+def admin_list_tenants():
+    result = []
+    for t in Tenant.query.order_by(Tenant.created_at.desc()).all():
+        d = t.to_dict()
+        d["customers"] = Customer.query.filter_by(tenant_id=t.id).count()
+        d["users"] = User.query.filter_by(tenant_id=t.id).count()
+        result.append(d)
+    return jsonify(result), 200
+
+
+@app.route('/api/admin/tenants/<int:tid>/suspend', methods=['POST'])
+@superadmin_required
+def admin_suspend_tenant(tid):
+    t = db.session.get(Tenant, tid)
+    if not t:
+        return jsonify({"msg": "Tenant not found"}), 404
+    t.status = "suspended"
+    db.session.commit()
+    return jsonify(t.to_dict()), 200
+
+
+@app.route('/api/admin/tenants/<int:tid>/reactivate', methods=['POST'])
+@superadmin_required
+def admin_reactivate_tenant(tid):
+    t = db.session.get(Tenant, tid)
+    if not t:
+        return jsonify({"msg": "Tenant not found"}), 404
+    t.status = "active"
+    db.session.commit()
+    return jsonify(t.to_dict()), 200
+
+
+@app.cli.command("create-superadmin")
+def create_superadmin():
+    """Create a platform super-admin from SA_USERNAME/SA_PASSWORD/SA_EMAIL env vars."""
+    u = os.environ.get("SA_USERNAME")
+    p = os.environ.get("SA_PASSWORD")
+    if not u or not p:
+        print("Set SA_USERNAME and SA_PASSWORD"); return
+    if User.query.filter_by(username=u).first():
+        print(f"User {u} already exists"); return
+    su = User(username=u, role="superadmin", tenant_id=None,
+              email=os.environ.get("SA_EMAIL"), email_verified=True)
+    su.set_password(p)
+    db.session.add(su)
+    db.session.commit()
+    print(f"Super-admin '{u}' created.")
 
 @app.route('/api/users', methods=['GET'])
 @jwt_required()

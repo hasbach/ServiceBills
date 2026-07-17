@@ -49,6 +49,18 @@ def get_tenant_settings(model, **defaults):
     return row
 
 
+def superadmin_required(fn):
+    """Platform operator only: role 'superadmin' AND no tenant (tenant_id is None)."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        verify_jwt_in_request()
+        claims = get_jwt()
+        if claims.get("role") != "superadmin" or claims.get("tenant_id") is not None:
+            abort(403, description="Super-admin only")
+        return fn(*args, **kwargs)
+    return wrapper
+
+
 def tenant_required(fn):
     """Decorator: require a valid JWT that carries a tenant_id."""
     @wraps(fn)
