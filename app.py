@@ -75,6 +75,7 @@ jwt = JWTManager(app)
 from tenancy import (
     current_tenant_id, tenant_query, new_for_tenant, get_tenant_settings, tenant_required,
 )
+from crypto import EncryptedString
 from werkzeug.exceptions import Unauthorized
 
 
@@ -373,8 +374,8 @@ class WhatsAppSettings(db.Model):
     phone_number_id = db.Column(db.String(100), nullable=True)
     business_account_id = db.Column(db.String(100), nullable=True)
     app_id = db.Column(db.String(100), nullable=True)
-    app_secret = db.Column(db.String(200), nullable=True)
-    access_token = db.Column(db.Text, nullable=True)
+    app_secret = db.Column(EncryptedString, nullable=True)      # encrypted at rest
+    access_token = db.Column(EncryptedString, nullable=True)    # encrypted at rest
     api_version = db.Column(db.String(20), nullable=True, default='v19.0')
     # Message templates (template names registered in Meta Business Manager)
     template_payment_paid = db.Column(db.String(200), nullable=True, default='payment_confirmation')
