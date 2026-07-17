@@ -724,9 +724,11 @@ def apply_customer_balance_to_unpaid_payments(customer):
 
     logging.info(f"Reconciling balance for customer {customer.id}. Current balance: {customer.balance}")
 
-    # Get all outstanding bills, oldest first
-    unpaid_payments = tenant_query(Payment).filter_by(
-        customer_id=customer.id, 
+    # Get all outstanding bills, oldest first. Scope by the customer's own tenant so
+    # this helper is correct whether called from a request or the (context-less) scheduler.
+    unpaid_payments = Payment.query.filter_by(
+        tenant_id=customer.tenant_id,
+        customer_id=customer.id,
         paid=False
     ).order_by(Payment.date.asc()).all()
 
@@ -755,6 +757,7 @@ def apply_customer_balance_to_unpaid_payments(customer):
             # Create a new payment record for the remaining amount if greater than 0
             if remaining_amount_due > 0:
                 remaining_payment = Payment(
+                    tenant_id=customer.tenant_id,
                     customer_id=customer.id,
                     amount=remaining_amount_due,
                     paid=False,
@@ -778,11 +781,13 @@ def apply_customer_balance_to_unpaid_payments(customer):
 
 
 
-def has_pending_payment(customer_id, billing_date):
+def has_pending_payment(customer_id, billing_date, tenant_id):
     """
     Check if a pending payment already exists for the customer for the given billing date.
+    tenant_id is explicit so this works in both request and scheduler contexts.
     """
-    existing_payment = tenant_query(Payment).filter_by(
+    existing_payment = Payment.query.filter_by(
+        tenant_id=tenant_id,
         customer_id=customer_id,
         paid=False,
         date=billing_date
@@ -911,26 +916,29 @@ def login():
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)        
         
-def generate_missing_payments():
+def generate_missing_payments(tenant_id):
+    """Generate missing billing entries for one tenant. Runs outside a request
+    (scheduler), so every query/create is scoped by the explicit tenant_id."""
     try:
         # Clean up ONLY exactly $0.0 unpaid payments (do NOT touch negative credit notes or adjustments)
-        zero_payments = tenant_query(Payment).filter(Payment.paid == False, Payment.amount == 0.0).all()
+        zero_payments = Payment.query.filter_by(tenant_id=tenant_id).filter(Payment.paid == False, Payment.amount == 0.0).all()
         if zero_payments:
             for zp in zero_payments:
                 db.session.delete(zp)
             db.session.commit()
 
         # Get all active customers
-        customers = tenant_query(Customer).filter_by(is_subscription_active=True).all()
+        customers = Customer.query.filter_by(tenant_id=tenant_id, is_subscription_active=True).all()
 
         for customer in customers:
             # Get the subscription plan for the customer
-            subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
+            subscription_plan = SubscriptionPlan.query.filter_by(tenant_id=tenant_id, id=customer.subscription_plan_id).first()
             if not subscription_plan:
                 continue  # Skip if subscription plan is missing
 
             # Determine the last payment date or use the subscription start date
-            last_payment = tenant_query(Payment).filter_by(
+            last_payment = Payment.query.filter_by(
+                tenant_id=tenant_id,
                 customer_id=customer.id,
                 pre_payment=False
             ).order_by(Payment.date.desc()).first()
@@ -955,12 +963,13 @@ def generate_missing_payments():
                 if amount_due < 0:
                     amount_due = 0.0
 
-                if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date):
+                if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date, customer.tenant_id):
                     if customer.reseller_id:
-                        reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
+                        reseller = Reseller.query.filter_by(tenant_id=tenant_id, id=customer.reseller_id).first()
                         if reseller:
                             reseller.balance += amount_due
                             reseller_payment = ResellerPayment(
+                                tenant_id=tenant_id,
                                 reseller_id=reseller.id,
                                 amount=amount_due,
                                 type='credit_added',
@@ -969,6 +978,7 @@ def generate_missing_payments():
                             db.session.add(reseller_payment)
                     else:
                         new_payment = Payment(
+                            tenant_id=tenant_id,
                             customer_id=customer.id,
                             amount=amount_due,
                             paid=False,
@@ -999,15 +1009,17 @@ scheduler = BackgroundScheduler(daemon=True, executors={'default': {'type': 'thr
 
 def generate_missing_payments_with_context():
     with app.app_context():
-        generate_missing_payments()
+        for t in Tenant.query.filter_by(status="active").all():
+            generate_missing_payments(t.id)
 
 def scheduled_auto_update_check():
     with app.app_context():
         try:
-            settings = tenant_query(SystemUpdateSettings).first()
-            if settings and settings.auto_update_enabled:
-                logging.info("Scheduler running overnight auto-update check...")
-                # Run apply update routine silently if needed
+            for t in Tenant.query.filter_by(status="active").all():
+                settings = SystemUpdateSettings.query.filter_by(tenant_id=t.id).first()
+                if settings and settings.auto_update_enabled:
+                    logging.info(f"Scheduler running overnight auto-update check for tenant {t.id}...")
+                    # Run apply update routine silently if needed
         except Exception as e:
             logging.error(f"Scheduled auto-update error: {e}")
 
@@ -1525,7 +1537,7 @@ def generate_future_payments():
             # 2. There is NO unpaid payment already created for the same billing date
             if next_billing_date <= until_date:
                 amount_due = max(subscription_plan.price - (customer.discount or 0.0), 0.0)
-                if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date):
+                if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date, customer.tenant_id):
                     if customer.reseller_id:
                         reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
                         if reseller:
@@ -2060,7 +2072,7 @@ def activate_subscription(customer_id):
             if amount_due < 0:
                 amount_due = 0.0
 
-            if amount_due > 0 and not has_pending_payment(customer.id, new_expiry_date):
+            if amount_due > 0 and not has_pending_payment(customer.id, new_expiry_date, customer.tenant_id):
                 if customer.reseller_id:
                     reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
                     if reseller:
@@ -4020,7 +4032,7 @@ def renew_subscription(customer_id):
         if renewal_amount < 0:
             renewal_amount = 0.0
 
-        if renewal_amount > 0 and not has_pending_payment(customer.id, new_expiry_date):
+        if renewal_amount > 0 and not has_pending_payment(customer.id, new_expiry_date, customer.tenant_id):
             if customer.reseller_id:
                 reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
                 if reseller:
