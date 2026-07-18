@@ -553,6 +553,28 @@ class PaymentReminder(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
+class UpgradeRequest(db.Model):
+    """A tenant's 'contact us to upgrade' request (manual/offline payment path)."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    requested_plan = db.Column(db.String(20), nullable=False, default='pro')
+    contact_name = db.Column(db.String(200))
+    contact_email = db.Column(db.String(200))
+    contact_phone = db.Column(db.String(50))
+    message = db.Column(db.Text)
+    status = db.Column(db.String(20), nullable=False, default='pending')  # pending, handled
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'tenant_id': self.tenant_id, 'requested_plan': self.requested_plan,
+            'contact_name': self.contact_name, 'contact_email': self.contact_email,
+            'contact_phone': self.contact_phone, 'message': self.message,
+            'status': self.status,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+        }
+
+
 # --- Tenant write scoping (defense in depth) ---------------------------------
 # Every tenant-owned model. New rows of these get tenant_id stamped from the
 # request's JWT tenant automatically at flush time, so a bare `Model(...)` create
@@ -564,7 +586,7 @@ TENANT_OWNED_MODELS = (
     SupplierPayment, ExpenseCategory, Expense, Payment, GeneratedReceipt,
     AddonPurchase, BusinessSettings, WhatsAppSettings, SystemUpdateSettings,
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
-    CustomerFeedback, PaymentReminder,
+    CustomerFeedback, PaymentReminder, UpgradeRequest,
 )
 
 from sqlalchemy import event as _sa_event
@@ -845,6 +867,42 @@ def list_plans():
     }), 200
 
 
+@app.route('/api/billing/config', methods=['GET'])
+@jwt_required()
+def billing_config():
+    # Tells the UI which upgrade paths to show. Contact-to-upgrade is always on;
+    # Stripe checkout appears only once keys + a Pro price are configured.
+    stripe_enabled = bool(Config.STRIPE_SECRET_KEY and plans.PLANS.get('pro', {}).get('stripe_price'))
+    return jsonify({"stripe_enabled": stripe_enabled, "contact_enabled": True}), 200
+
+
+@app.route('/api/billing/contact', methods=['POST'])
+@jwt_required()
+@admin_required()
+def billing_contact():
+    # Manual/offline upgrade path: record a request for the operator to action.
+    data = request.json or {}
+    req = new_for_tenant(
+        UpgradeRequest,
+        requested_plan=data.get('plan', 'pro'),
+        contact_name=data.get('name'),
+        contact_email=data.get('email'),
+        contact_phone=data.get('phone'),
+        message=data.get('message'),
+        status='pending',
+    )
+    db.session.add(req)
+    db.session.commit()
+    # Best-effort operator notification (no-op in console mode / if unset).
+    try:
+        email_util.send(Config.MAIL_FROM, "servicesBills: new upgrade request",
+                        f"Tenant {current_tenant_id()} requested {req.requested_plan}. "
+                        f"Contact: {req.contact_name} / {req.contact_email} / {req.contact_phone}\n\n{req.message or ''}")
+    except Exception as e:
+        logging.warning(f"Upgrade-request notification failed: {e}")
+    return jsonify({"msg": "Thanks — we'll contact you shortly to complete the upgrade."}), 201
+
+
 @app.route('/api/stripe/webhook', methods=['POST'])
 def stripe_webhook():
     # Public: Stripe calls this. Verify signature, then sync tenant state.
@@ -894,6 +952,37 @@ def admin_reactivate_tenant(tid):
     t.status = "active"
     db.session.commit()
     return jsonify(t.to_dict()), 200
+
+
+@app.route('/api/admin/tenants/<int:tid>/set-plan', methods=['POST'])
+@superadmin_required
+def admin_set_plan(tid):
+    # Manual upgrade/downgrade (offline payment path, before/without Stripe).
+    plan = (request.json or {}).get('plan')
+    if plan not in plans.PLANS:
+        return jsonify({"msg": f"Unknown plan '{plan}'"}), 400
+    t = db.session.get(Tenant, tid)
+    if not t:
+        return jsonify({"msg": "Tenant not found"}), 404
+    t.plan = plan
+    # Resolve any pending upgrade requests for this tenant.
+    for r in UpgradeRequest.query.filter_by(tenant_id=tid, status='pending').all():
+        r.status = 'handled'
+    db.session.commit()
+    return jsonify(t.to_dict()), 200
+
+
+@app.route('/api/admin/upgrade-requests', methods=['GET'])
+@superadmin_required
+def admin_upgrade_requests():
+    rows = UpgradeRequest.query.filter_by(status='pending').order_by(UpgradeRequest.created_at.desc()).all()
+    out = []
+    for r in rows:
+        d = r.to_dict()
+        t = db.session.get(Tenant, r.tenant_id)
+        d["tenant_name"] = t.name if t else None
+        out.append(d)
+    return jsonify(out), 200
 
 
 @app.cli.command("create-superadmin")
@@ -964,7 +1053,7 @@ def tenant_export():
 
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
-    PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
+    UpgradeRequest, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
     CustomerFeedback, ServiceStatus, Payment, ResellerPayment, SupplierPayment,
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
     WhatsAppSettings, SystemUpdateSettings, ExpenseCategory, Sector,

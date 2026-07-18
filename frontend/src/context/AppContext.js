@@ -57,13 +57,17 @@ export const apiService = {
     // Billing
     tenantMe: () => api.get('/tenant/me'),
     listPlans: () => api.get('/plans'),
+    billingConfig: () => api.get('/billing/config'),
     billingCheckout: (plan) => api.post('/billing/checkout', { plan }),
     billingPortal: () => api.post('/billing/portal'),
+    billingContact: (payload) => api.post('/billing/contact', payload),
     // Platform super-admin
     adminTenants: () => api.get('/admin/tenants'),
     adminSuspendTenant: (id) => api.post(`/admin/tenants/${id}/suspend`),
     adminReactivateTenant: (id) => api.post(`/admin/tenants/${id}/reactivate`),
     adminDeleteTenant: (id) => api.delete(`/admin/tenants/${id}`),
+    adminSetPlan: (id, plan) => api.post(`/admin/tenants/${id}/set-plan`, { plan }),
+    adminUpgradeRequests: () => api.get('/admin/upgrade-requests'),
 
     // User Management API methods
     fetchUsers: () => api.get('/users'),
