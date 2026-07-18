@@ -29,7 +29,9 @@ class Config:
     S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL")  # Cloudflare R2 / MinIO endpoint
 
     # --- Phase 4: billing, signup emails, app links ---
-    APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:3000")
+    # On Render, RENDER_EXTERNAL_URL is injected automatically, so APP_BASE_URL
+    # (used in verification/reset/billing links) resolves with no manual setup.
+    APP_BASE_URL = os.environ.get("APP_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:3000"
     STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
     STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
     # Email: "console" (dev/CI, records in-memory) or "smtp".
