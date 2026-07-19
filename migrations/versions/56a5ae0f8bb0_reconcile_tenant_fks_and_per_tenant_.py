@@ -29,14 +29,18 @@ def upgrade():
     }
     _insp = _sa_inspect(op.get_bind())
 
-    def _has_name_unique(table):
+    def _name_unique(table):
+        """Return the actual name of a single-column unique on `name`, or '' if it
+        exists but is unnamed (SQLite), or None if there is none.
+        On Postgres the real name (e.g. 'expense_category_name_key') must be used to
+        drop it; on SQLite the unnamed constraint is resolved via naming_convention."""
         for u in _insp.get_unique_constraints(table):
             if u.get('column_names') == ['name']:
-                return True
+                return u.get('name') or ''
         for ix in _insp.get_indexes(table):
             if ix.get('unique') and ix.get('column_names') == ['name']:
-                return True
-        return False
+                return ix.get('name') or ''
+        return None
 
     with op.batch_alter_table('addon_purchase', schema=None) as batch_op:
         batch_op.create_foreign_key(batch_op.f('fk_addon_purchase_tenant_id_tenant'), 'tenant', ['tenant_id'], ['id'])
@@ -53,9 +57,10 @@ def upgrade():
     with op.batch_alter_table('expense', schema=None) as batch_op:
         batch_op.create_foreign_key(batch_op.f('fk_expense_tenant_id_tenant'), 'tenant', ['tenant_id'], ['id'])
 
+    _ec_uc = _name_unique('expense_category')
     with op.batch_alter_table('expense_category', schema=None, naming_convention=_naming) as batch_op:
-        if _has_name_unique('expense_category'):
-            batch_op.drop_constraint('uq_expense_category_name', type_='unique')
+        if _ec_uc is not None:
+            batch_op.drop_constraint(_ec_uc or 'uq_expense_category_name', type_='unique')
         batch_op.create_unique_constraint('uq_expense_category_tenant_name', ['tenant_id', 'name'])
         batch_op.create_foreign_key('fk_expense_category_tenant_id_tenant', 'tenant', ['tenant_id'], ['id'])
 
@@ -77,9 +82,10 @@ def upgrade():
     with op.batch_alter_table('reseller_payment', schema=None) as batch_op:
         batch_op.create_foreign_key(batch_op.f('fk_reseller_payment_tenant_id_tenant'), 'tenant', ['tenant_id'], ['id'])
 
+    _sec_uc = _name_unique('sector')
     with op.batch_alter_table('sector', schema=None, naming_convention=_naming) as batch_op:
-        if _has_name_unique('sector'):
-            batch_op.drop_constraint('uq_sector_name', type_='unique')
+        if _sec_uc is not None:
+            batch_op.drop_constraint(_sec_uc or 'uq_sector_name', type_='unique')
         batch_op.create_unique_constraint('uq_sector_tenant_name', ['tenant_id', 'name'])
         batch_op.create_foreign_key('fk_sector_tenant_id_tenant', 'tenant', ['tenant_id'], ['id'])
 

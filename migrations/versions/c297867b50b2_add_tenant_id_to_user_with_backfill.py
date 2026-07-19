@@ -36,7 +36,7 @@ def upgrade():
     ).scalar()
     if default_tenant_id is not None:
         conn.execute(
-            sa.text("UPDATE user SET tenant_id = :tid WHERE tenant_id IS NULL"),
+            sa.text('UPDATE "user" SET tenant_id = :tid WHERE tenant_id IS NULL'),
             {"tid": default_tenant_id},
         )
 
