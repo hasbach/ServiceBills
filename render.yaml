@@ -9,7 +9,7 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free            # $0 — spins down when idle (~30-60s cold start). Bump to "starter" for always-on.
     healthCheckPath: /manifest.json
-    dockerCommand: sh -c "flask db upgrade && gunicorn -w 1 -b 0.0.0.0:$PORT --timeout 120 app:app"
+    # No dockerCommand: the Dockerfile CMD already runs migrations + gunicorn on $PORT.
     envVars:
       - key: DATABASE_URL
         sync: false        # paste your Supabase Session-pooler connection string

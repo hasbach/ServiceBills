@@ -24,9 +24,12 @@ EXPOSE 8000
 # Required env at runtime: JWT_SECRET_KEY, DATABASE_URL (Supabase Postgres),
 # FERNET_KEY, CORS_ORIGINS, and for prod uploads: STORAGE_BACKEND=s3,
 # STORAGE_BUCKET, S3_ENDPOINT_URL (Cloudflare R2), AWS_* creds.
-#
-# SCHEDULER: run exactly ONE process with RUN_SCHEDULER=1 (e.g. a 1-replica
-# service using `gunicorn -w 1`), and run the web tier with RUN_SCHEDULER=0 so
-# the daily jobs don't fire once per worker.
-ENV RUN_SCHEDULER=0
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8000", "--timeout", "120", "app:app"]
+ENV FLASK_APP=app.py
+# Single-runner scheduler by default: with WEB_CONCURRENCY=1 (Render free) the one
+# worker runs the scheduler. If you scale to multiple workers, set RUN_SCHEDULER=0
+# here and run the scheduler in a separate 1-instance service.
+ENV RUN_SCHEDULER=1
+# Startup: apply DB migrations, then serve. Binds Render's $PORT (falls back 8000)
+# and uses WEB_CONCURRENCY workers (Render sets this; falls back 1). This runs
+# regardless of any platform command override, so the schema is always built.
+CMD ["sh", "-c", "flask db upgrade && exec gunicorn -w ${WEB_CONCURRENCY:-1} -b 0.0.0.0:${PORT:-8000} --timeout 120 app:app"]
