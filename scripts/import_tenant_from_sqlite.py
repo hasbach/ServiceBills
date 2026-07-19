@@ -78,13 +78,24 @@ def main():
     for t in domain:
         visit(t)
 
+    # A legacy (single-tenant desktop) source has no tenant_id/tenant table — import
+    # ALL its rows as the new tenant. A migrated source is filtered by SOURCE_TENANT_ID.
+    src_has_tenant = "customer" in smd.tables and "tenant_id" in smd.tables["customer"].c
+    print("Source type:", "migrated (filtering tenant %d)" % src_tid if src_has_tenant
+          else "legacy single-tenant (importing all rows)")
+
+    def src_rows(tname):
+        st = smd.tables[tname]
+        q = select(st)
+        if src_has_tenant and "tenant_id" in st.c:
+            q = q.where(st.c.tenant_id == src_tid)
+        return sc.execute(q)
+
     with src.connect() as sc, dst.begin() as dc:
         # Derive business name + a unique slug; refuse if it already exists.
-        bs_tbl = dmd.tables.get("business_settings")
         biz_name = name_override
-        if not biz_name and bs_tbl is not None and "business_settings" in smd.tables:
-            row = sc.execute(select(smd.tables["business_settings"])
-                             .where(smd.tables["business_settings"].c.tenant_id == src_tid)).first()
+        if not biz_name and "business_settings" in smd.tables:
+            row = next(iter(src_rows("business_settings")), None)
             biz_name = getattr(row, "business_name", None) if row else None
         biz_name = biz_name or "Imported Business"
         base = re.sub(r"[^a-z0-9]+", "-", biz_name.lower()).strip("-")[:70] or "imported"
@@ -103,13 +114,13 @@ def main():
 
         idmap = {}  # {table: {old_id: new_id}}
 
-        def copy_table(tname, where_tid):
-            st, dt = smd.tables[tname], dmd.tables[tname]
+        def copy_table(tname):
+            dt = dmd.tables[tname]
             dcols = set(dt.c.keys())
             bool_cols = {c.name for c in dt.c if isinstance(c.type, Boolean)}
             notnull = {c.name for c in dt.c if not c.nullable}
             m, skipped = {}, 0
-            for row in sc.execute(select(st).where(st.c.tenant_id == where_tid)):
+            for row in src_rows(tname):
                 d = {k: v for k, v in dict(row._mapping).items() if k in dcols}
                 old_id = d.pop("id", None)
                 d["tenant_id"] = new_tid
@@ -138,10 +149,10 @@ def main():
             print(f"  {tname}: {len(m)}" + (f"  (skipped {skipped} orphaned)" if skipped else ""))
 
         # Users first (so payments/tickets can remap collected_by, etc.).
-        st, dt = smd.tables["user"], dmd.tables["user"]
+        dt = dmd.tables["user"]
         dcols = set(dt.c.keys())
         idmap["user"] = {}
-        for row in sc.execute(select(st).where(st.c.tenant_id == src_tid)):
+        for row in src_rows("user"):
             d = {k: v for k, v in dict(row._mapping).items() if k in dcols}
             old_id = d.pop("id", None)
             d["tenant_id"] = new_tid
@@ -153,7 +164,11 @@ def main():
         print(f"  user: {len(idmap['user'])}")
 
         for tname in ordered:
-            copy_table(tname, src_tid)
+            if tname in smd.tables:
+                copy_table(tname)
+            else:
+                idmap[tname] = {}   # table doesn't exist in a legacy source — nothing to import
+                print(f"  {tname}: (not in source, skipped)")
 
     print(f"\nDone. Imported source tenant {src_tid} as new tenant id {new_tid} ('{slug}').")
 
