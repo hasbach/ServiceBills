@@ -1,14 +1,7 @@
-# Render blueprint (starter). Deploys the Dockerfile + a managed Postgres.
+# Render blueprint — free web service, external Postgres (Supabase).
 # Secrets marked sync:false are entered in the Render dashboard (never committed).
-# Starter runs 1 web worker with the scheduler in-process (fires jobs once). To
-# scale, set RUN_SCHEDULER=0 here, raise -w, and add a 1-instance worker service
-# with RUN_SCHEDULER=1 (see DEPLOY.md).
-databases:
-  - name: servicesbills-db
-    databaseName: servicesbills
-    user: servicesbills
-    plan: free
-
+# Free web spins down when idle; the in-process scheduler (RUN_SCHEDULER=1, -w 1)
+# only runs while awake. Set DATABASE_URL to your Supabase SESSION-pooler URL.
 services:
   - type: web
     name: servicesbills-web
@@ -19,7 +12,7 @@ services:
     dockerCommand: sh -c "flask db upgrade && gunicorn -w 1 -b 0.0.0.0:$PORT --timeout 120 app:app"
     envVars:
       - key: DATABASE_URL
-        fromDatabase: { name: servicesbills-db, property: connectionString }
+        sync: false        # paste your Supabase Session-pooler connection string
       - key: JWT_SECRET_KEY
         generateValue: true
       - key: FLASK_APP
