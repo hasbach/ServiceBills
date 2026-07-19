@@ -48,7 +48,10 @@ if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
     except Exception as e:
         print("Warning: Could not load VAPID keys.", e)
 
-app = Flask(__name__, static_folder='build', static_url_path='/')
+# static_url_path is a parked prefix (NOT '/') so Flask's built-in static handler
+# doesn't shadow client-side routes like /login. The serve() catch-all below serves
+# build/ files and falls back to index.html for SPA routes (fixes 404 on refresh).
+app = Flask(__name__, static_folder='build', static_url_path='/_assets')
 
 from config import Config
 app.config.from_object(Config)
@@ -5254,6 +5257,9 @@ def fix_supplier_balance(supplier_id):
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
+    # Unknown API paths must 404 (as JSON), never fall back to the SPA HTML.
+    if path.startswith('api/'):
+        return jsonify(msg="Not found"), 404
     if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
         response = send_from_directory(app.static_folder, path)
         if path in ['service-worker.js', 'manifest.json', 'index.html']:

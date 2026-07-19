@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { Box, Typography, TextField, Button, Paper, CircularProgress } from '@mui/material';
 import { InstallMobile as InstallMobileIcon } from '@mui/icons-material';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useAppContext } from '../context/AppContext.js';
 
 const LoginView = () => {
     const { login, setSnackbar } = useAppContext();
+    const navigate = useNavigate();
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
     const [loading, setLoading] = useState(false);
@@ -51,7 +52,7 @@ const LoginView = () => {
         setLoading(true);
         try {
             await login({ username, password });
-            // The App component will handle redirecting upon successful login
+            navigate('/');   // clean URL after login (so a refresh doesn't land on /login)
         } catch (error) {
             setSnackbar({ open: true, message: error.response?.data?.msg || 'Login failed.', severity: 'error' });
         } finally {
