@@ -27,11 +27,10 @@ services:
         sync: false
       - key: CORS_ORIGINS
         sync: false
-      # Start with local storage + console email so the first deploy needs only
-      # Postgres + FERNET_KEY. Switch STORAGE_BACKEND=s3 and MAIL_BACKEND=smtp
-      # (and fill the vars below) once R2/SMTP are ready.
+      # R2 + SMTP are live: storage writes to Cloudflare R2, email sends via SMTP.
+      # Fill the sync:false vars below in the Render dashboard.
       - key: STORAGE_BACKEND
-        value: local
+        value: s3
       - key: STORAGE_BUCKET
         sync: false
       - key: STORAGE_PREFIX
@@ -51,7 +50,7 @@ services:
       - key: STRIPE_PRICE_PRO
         sync: false
       - key: MAIL_BACKEND
-        value: console
+        value: smtp
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
