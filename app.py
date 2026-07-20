@@ -57,6 +57,10 @@ from config import Config
 app.config.from_object(Config)
 CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
 
+# Served from frontend/public/serviceBillsLogo.png (build/ in prod). Used whenever
+# a tenant hasn't uploaded their own logo via /api/business-settings.
+DEFAULT_LOGO_URL = '/serviceBillsLogo.png'
+
 from sqlalchemy import MetaData
 # Explicit naming convention so Alembic can add/drop constraints by name across
 # engines (needed for the Postgres FK/unique reconciliation in Phase 3).
@@ -372,7 +376,9 @@ class BusinessSettings(db.Model):
         l_url = self.logo_url
         if l_url and not l_url.startswith('/') and not l_url.startswith('http'):
             l_url = storage.url(l_url)
-            
+        if not l_url:
+            l_url = DEFAULT_LOGO_URL
+
         return {
             'id': self.id,
             'logo_url': l_url,
@@ -2452,7 +2458,7 @@ def get_unpaid_receipt(customer_id):
             'business_mobile': business_settings.mobile if business_settings else "",
             'business_email': business_settings.email if business_settings else "",
             'business_website': business_settings.website if business_settings else "",
-            'business_logo_url': storage.url(business_settings.logo_url) if business_settings and business_settings.logo_url else None
+            'business_logo_url': storage.url(business_settings.logo_url) if business_settings and business_settings.logo_url else DEFAULT_LOGO_URL
         }
 
         # Prepare the final receipt data
@@ -2552,7 +2558,7 @@ def get_receipt(payment_id):
         'business_mobile': '', # To be fetched from BusinessSettings
         'business_email': '', # To be fetched from BusinessSettings
         'business_website': '', # To be fetched from BusinessSettings
-        'business_logo_url': '' # To be fetched from BusinessSettings
+        'business_logo_url': DEFAULT_LOGO_URL # To be fetched from BusinessSettings
     }
 
     # Fetch business settings for the receipt
@@ -2563,7 +2569,7 @@ def get_receipt(payment_id):
         receipt_data['business_mobile'] = business_settings.mobile
         receipt_data['business_email'] = business_settings.email
         receipt_data['business_website'] = business_settings.website
-        receipt_data['business_logo_url'] = storage.url(business_settings.logo_url) if business_settings.logo_url else None
+        receipt_data['business_logo_url'] = storage.url(business_settings.logo_url) if business_settings.logo_url else DEFAULT_LOGO_URL
 
 
     return jsonify(receipt_data)
@@ -2742,7 +2748,7 @@ def get_business_settings():
         # Return default settings instead of a 404 error
         return jsonify({
             'settings': {
-                'logo_url': None,
+                'logo_url': DEFAULT_LOGO_URL,
                 'business_name': "Default Business",
                 'address': "",
                 'mobile': "",
@@ -4519,13 +4525,16 @@ def add_expense():
         if not category:
             return jsonify({'error': f"Category '{data['category']}' not found."}), 400
         
+        raw_supplier_id = data.get('supplier_id')
+        supplier_id = int(raw_supplier_id) if raw_supplier_id not in (None, '') else None
+
         new_expense = Expense(
             category_id=category.id,
             amount=float(data['amount']),
             description=data['description'],
             date=datetime.strptime(data['date'], '%Y-%m-%d'),
             is_credit=data.get('is_credit', False),
-            supplier_id=data.get('supplier_id')
+            supplier_id=supplier_id
         )
         db.session.add(new_expense)
         
@@ -4558,8 +4567,9 @@ def update_expense(expense_id):
 
         new_amount = float(data.get('amount', expense.amount))
         new_is_credit = data.get('is_credit', expense.is_credit)
-        new_supplier_id = data.get('supplier_id', expense.supplier_id)
-        
+        raw_supplier_id = data.get('supplier_id', expense.supplier_id)
+        new_supplier_id = int(raw_supplier_id) if raw_supplier_id not in (None, '') else None
+
         # Handle balance changes if supplier or amount or credit status changed
         if expense.is_credit and expense.supplier_id:
             old_supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()

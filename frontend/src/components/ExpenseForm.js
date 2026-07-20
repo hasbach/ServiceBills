@@ -155,7 +155,7 @@ function ExpenseForm({ expense, onSave, onCancel }) {
         control={
             <Switch
                 checked={formData.is_credit}
-                onChange={(e) => setFormData({...formData, is_credit: e.target.checked})}
+                onChange={(e) => setFormData({...formData, is_credit: e.target.checked, supplier_id: e.target.checked ? formData.supplier_id : ''})}
                 color="primary"
             />
         }

@@ -102,7 +102,9 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 website: businessSettings.website || ''
             });
             if (businessSettings.logo_url) {
-                setLogoPreview(`${API_BASE_URL}${businessSettings.logo_url}`);
+                const url = businessSettings.logo_url;
+                // Absolute already (S3/R2 presigned URL) or the frontend's own default asset — don't double-prefix.
+                setLogoPreview(url.startsWith('http') || url === '/serviceBillsLogo.png' ? url : `${API_BASE_URL}${url}`);
             }
         }
     }, [businessSettings]);

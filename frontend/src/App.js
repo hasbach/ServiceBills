@@ -69,6 +69,17 @@ const NAV_ITEMS = [
 
 const GROUP_LABELS = { main: 'Main', analytics: 'Analytics', manage: 'Management' };
 
+// The app-wide default logo (frontend/public/serviceBillsLogo.png) is a static
+// frontend asset, not something the API serves — resolve it relative to this
+// origin even in dev, unlike tenant-uploaded logos which live behind the API.
+const DEFAULT_LOGO_PATH = '/serviceBillsLogo.png';
+const resolveLogoUrl = (logoUrl) => {
+    if (!logoUrl) return null;
+    if (logoUrl.startsWith('http') || logoUrl === DEFAULT_LOGO_PATH) return logoUrl;
+    const apiBase = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
+    return `${apiBase}${logoUrl}`;
+};
+
 // ── Drawer width ─────────────────────────────────────────────────────────────
 const DRAWER_WIDTH = 280;
 
@@ -108,11 +119,8 @@ const MainApp = ({
     const navItems = NAV_ITEMS.filter(item => !item.allowedRoles || item.allowedRoles.some(r => hasRole(r)));
     const currentLabel = navItems.find(n => n.key === currentView)?.label || 'Dashboard';
 
-    // Per-tenant branding: resolve the uploaded logo to an absolute URL (dev API host differs).
-    const _apiBase = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
-    const logoSrc = businessSettings?.logo_url
-        ? (businessSettings.logo_url.startsWith('http') ? businessSettings.logo_url : `${_apiBase}${businessSettings.logo_url}`)
-        : null;
+    // Per-tenant branding: resolve the logo (custom upload or app default) to an absolute URL.
+    const logoSrc = resolveLogoUrl(businessSettings?.logo_url) || DEFAULT_LOGO_PATH;
     const brandName = businessSettings?.business_name || 'servicesBills';
 
     // ── Desktop horizontal nav ────────────────────────────────────────────────
@@ -325,27 +333,23 @@ const AppContent = () => {
             if (businessSettings.business_name) {
                 document.title = businessSettings.business_name;
             }
-            if (businessSettings.logo_url) {
-                const url = businessSettings.logo_url.startsWith('http') 
-                    ? businessSettings.logo_url 
-                    : `${process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000'}${businessSettings.logo_url}`;
-                    
-                let link = document.querySelector("link[rel~='icon']");
-                if (!link) {
-                    link = document.createElement('link');
-                    link.rel = 'icon';
-                    document.head.appendChild(link);
-                }
-                link.href = url;
-                
-                let appleLink = document.querySelector("link[rel='apple-touch-icon']");
-                if (!appleLink) {
-                    appleLink = document.createElement('link');
-                    appleLink.rel = 'apple-touch-icon';
-                    document.head.appendChild(appleLink);
-                }
-                appleLink.href = url;
+            const url = resolveLogoUrl(businessSettings.logo_url) || DEFAULT_LOGO_PATH;
+
+            let link = document.querySelector("link[rel~='icon']");
+            if (!link) {
+                link = document.createElement('link');
+                link.rel = 'icon';
+                document.head.appendChild(link);
             }
+            link.href = url;
+
+            let appleLink = document.querySelector("link[rel='apple-touch-icon']");
+            if (!appleLink) {
+                appleLink = document.createElement('link');
+                appleLink.rel = 'apple-touch-icon';
+                document.head.appendChild(appleLink);
+            }
+            appleLink.href = url;
         }
     }, [businessSettings]);
 

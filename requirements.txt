@@ -16,3 +16,4 @@ psycopg2-binary
 cryptography
 stripe
 itsdangerous
+boto3
