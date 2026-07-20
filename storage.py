@@ -32,8 +32,14 @@ class LocalBackend:
 class S3Backend:
     def __init__(self):
         import boto3
+        from botocore.client import Config as BotoConfig
+        # R2 only supports SigV4; boto3 can default presigned URLs to the legacy
+        # SigV2 query scheme (AWSAccessKeyId=&Signature=&Expires=) for a
+        # non-standard region like "auto", which R2 then rejects (401) or errors
+        # on (503) intermittently. Force SigV4 explicitly.
         self._c = boto3.client("s3", region_name=Config.AWS_REGION,
-                               endpoint_url=Config.S3_ENDPOINT_URL)
+                               endpoint_url=Config.S3_ENDPOINT_URL,
+                               config=BotoConfig(signature_version="s3v4"))
         self._bucket = Config.STORAGE_BUCKET
         self._prefix = Config.STORAGE_PREFIX
 
