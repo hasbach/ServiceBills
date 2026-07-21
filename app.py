@@ -26,7 +26,6 @@ except ImportError:
 from functools import wraps
 import calendar
 from pywebpush import webpush, WebPusher
-from sqlalchemy import or_ as db_or, text
 import logging
 from datetime import timedelta
 
@@ -163,6 +162,9 @@ class ResellerPayment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     reseller_id = db.Column(db.Integer, db.ForeignKey('reseller.id'), nullable=False)
+    # Set for per-customer billing entries (credit_added charges); null for reseller-level
+    # entries not tied to one customer (manual add_credit/apply_discount/collect_payment).
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True, index=True)
     amount = db.Column(db.Float, nullable=False)
     type = db.Column(db.String(50), nullable=False) # 'credit_added', 'payment_received', 'discount_applied'
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
@@ -172,6 +174,7 @@ class ResellerPayment(db.Model):
         return {
             'id': self.id,
             'reseller_id': self.reseller_id,
+            'customer_id': self.customer_id,
             'amount': float(self.amount),
             'type': self.type,
             'date': self.date.strftime('%Y-%m-%d %H:%M:%S'),
@@ -699,6 +702,20 @@ def has_pending_payment(customer_id, billing_date, tenant_id):
     return existing_payment is not None
 
 
+def has_pending_reseller_charge(customer_id, billing_date, tenant_id):
+    """
+    Reseller-linked customers never get a Payment row (the charge goes to the
+    reseller's balance instead), so has_pending_payment() can never see them and
+    is a permanent no-op for this branch. Check the ResellerPayment ledger
+    (scoped to this customer) instead, so a cycle can't be billed twice.
+    """
+    existing_charge = ResellerPayment.query.filter_by(
+        tenant_id=tenant_id,
+        customer_id=customer_id,
+        type='credit_added',
+        date=billing_date
+    ).first()
+    return existing_charge is not None
 
 
 @app.route('/api/register', methods=['POST'])
@@ -1167,14 +1184,25 @@ def generate_missing_payments(tenant_id):
             if not subscription_plan:
                 continue  # Skip if subscription plan is missing
 
-            # Determine the last payment date or use the subscription start date
-            last_payment = Payment.query.filter_by(
-                tenant_id=tenant_id,
-                customer_id=customer.id,
-                pre_payment=False
-            ).order_by(Payment.date.desc()).first()
-
-            last_payment_date = last_payment.date if last_payment else customer.subscription_start_date
+            # Determine the last billed date or use the subscription start date.
+            # Reseller-linked customers never get a Payment row (their charges go
+            # to the reseller's balance instead), so the cursor has to come from
+            # the ResellerPayment ledger for them, or it never advances past
+            # subscription_start_date and every run re-bills every historical cycle.
+            if customer.reseller_id:
+                last_charge = ResellerPayment.query.filter_by(
+                    tenant_id=tenant_id,
+                    customer_id=customer.id,
+                    type='credit_added'
+                ).order_by(ResellerPayment.date.desc()).first()
+                last_payment_date = last_charge.date if last_charge else customer.subscription_start_date
+            else:
+                last_payment = Payment.query.filter_by(
+                    tenant_id=tenant_id,
+                    customer_id=customer.id,
+                    pre_payment=False
+                ).order_by(Payment.date.desc()).first()
+                last_payment_date = last_payment.date if last_payment else customer.subscription_start_date
 
             # Calculate the next billing date based on the billing cycle
             # Use relativedelta for more accurate month/year increments
@@ -1194,7 +1222,11 @@ def generate_missing_payments(tenant_id):
                 if amount_due < 0:
                     amount_due = 0.0
 
-                if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date, customer.tenant_id):
+                already_billed = (
+                    has_pending_reseller_charge(customer.id, next_billing_date, tenant_id) if customer.reseller_id
+                    else has_pending_payment(customer.id, next_billing_date, tenant_id)
+                )
+                if amount_due > 0 and not already_billed:
                     if customer.reseller_id:
                         reseller = Reseller.query.filter_by(tenant_id=tenant_id, id=customer.reseller_id).first()
                         if reseller:
@@ -1202,8 +1234,10 @@ def generate_missing_payments(tenant_id):
                             reseller_payment = ResellerPayment(
                                 tenant_id=tenant_id,
                                 reseller_id=reseller.id,
+                                customer_id=customer.id,
                                 amount=amount_due,
                                 type='credit_added',
+                                date=next_billing_date,
                                 description=f'Billing cycle charge for customer {customer.name}'
                             )
                             db.session.add(reseller_payment)
@@ -1391,8 +1425,10 @@ def add_customer():
                         reseller_payment = new_for_tenant(
                             ResellerPayment,
                             reseller_id=reseller.id,
+                            customer_id=new_customer.id,
                             amount=amount_due,
                             type='credit_added',
+                            date=next_billing_date,
                             description=f'Initial charge for customer {new_customer.name}'
                         )
                         db.session.add(reseller_payment)
@@ -1473,9 +1509,7 @@ def update_customer(customer_id):
             return jsonify({'message': 'Customer not found!'}), 404
         
         data = request.json
-        
-        original_name = customer.name
-        
+
         # Update basic customer information
         if 'name' in data:
             customer.name = data['name']
@@ -1500,27 +1534,28 @@ def update_customer(customer_id):
                 if old_reseller_id:
                     old_reseller = tenant_query(Reseller).filter_by(id=old_reseller_id).first()
                     if old_reseller:
-                        rps = tenant_query(ResellerPayment).filter_by(reseller_id=old_reseller_id).filter(
-                            db_or(
-                                ResellerPayment.description.like(f"%customer {original_name}%"),
-                                ResellerPayment.description.like(f"%customer {customer.name}%")
-                            )
+                        # customer_id match, not description string matching: a prior rename
+                        # (or a name that happens to be a substring of another customer's) could
+                        # never be matched reliably by text search. Rows predating this column
+                        # (customer_id NULL) are not included; audit those historical rows manually.
+                        rps = tenant_query(ResellerPayment).filter_by(
+                            reseller_id=old_reseller_id, customer_id=customer.id
                         ).all()
                         for rp in rps:
                             if rp.type == 'credit_added':
                                 net_debt += rp.amount
                             elif rp.type == 'payment_collected':
                                 net_debt -= rp.amount
-                                
+
                         old_reseller.balance -= net_debt
                         if net_debt > 0:
                             db.session.add(ResellerPayment(
-                                reseller_id=old_reseller.id, amount=net_debt, type='payment_collected',
+                                reseller_id=old_reseller.id, customer_id=customer.id, amount=net_debt, type='payment_collected',
                                 description=f"Reversed accumulated debt for customer {customer.name} (moved)"
                             ))
                         elif net_debt < 0:
                             db.session.add(ResellerPayment(
-                                reseller_id=old_reseller.id, amount=abs(net_debt), type='credit_added',
+                                reseller_id=old_reseller.id, customer_id=customer.id, amount=abs(net_debt), type='credit_added',
                                 description=f"Reversed accumulated credit for customer {customer.name} (moved)"
                             ))
                 else:
@@ -1540,12 +1575,12 @@ def update_customer(customer_id):
                         new_reseller.balance += net_debt
                         if net_debt > 0:
                             db.session.add(ResellerPayment(
-                                reseller_id=new_reseller.id, amount=net_debt, type='credit_added',
+                                reseller_id=new_reseller.id, customer_id=customer.id, amount=net_debt, type='credit_added',
                                 description=f"Assumed debt from customer {customer.name}"
                             ))
                         elif net_debt < 0:
                             db.session.add(ResellerPayment(
-                                reseller_id=new_reseller.id, amount=abs(net_debt), type='payment_collected',
+                                reseller_id=new_reseller.id, customer_id=customer.id, amount=abs(net_debt), type='payment_collected',
                                 description=f"Assumed credit from customer {customer.name}"
                             ))
                 else:
@@ -2298,15 +2333,21 @@ def activate_subscription(customer_id):
             if amount_due < 0:
                 amount_due = 0.0
 
-            if amount_due > 0 and not has_pending_payment(customer.id, new_expiry_date, customer.tenant_id):
+            already_billed = (
+                has_pending_reseller_charge(customer.id, new_expiry_date, customer.tenant_id) if customer.reseller_id
+                else has_pending_payment(customer.id, new_expiry_date, customer.tenant_id)
+            )
+            if amount_due > 0 and not already_billed:
                 if customer.reseller_id:
                     reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
                     if reseller:
                         reseller.balance += amount_due
                         reseller_payment = ResellerPayment(
                             reseller_id=reseller.id,
+                            customer_id=customer.id,
                             amount=amount_due,
                             type='credit_added',
+                            date=new_expiry_date,
                             description=f'Reactivation for customer {customer.name}'
                         )
                         db.session.add(reseller_payment)
@@ -4106,15 +4147,21 @@ def renew_subscription(customer_id):
         if renewal_amount < 0:
             renewal_amount = 0.0
 
-        if renewal_amount > 0 and not has_pending_payment(customer.id, new_expiry_date, customer.tenant_id):
+        already_billed = (
+            has_pending_reseller_charge(customer.id, new_expiry_date, customer.tenant_id) if customer.reseller_id
+            else has_pending_payment(customer.id, new_expiry_date, customer.tenant_id)
+        )
+        if renewal_amount > 0 and not already_billed:
             if customer.reseller_id:
                 reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
                 if reseller:
                     reseller.balance += renewal_amount
                     reseller_payment = ResellerPayment(
                         reseller_id=reseller.id,
+                        customer_id=customer.id,
                         amount=renewal_amount,
                         type='credit_added',
+                        date=new_expiry_date,
                         description=f'Renewal for customer {customer.name}'
                     )
                     db.session.add(reseller_payment)
