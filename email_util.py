@@ -23,7 +23,10 @@ def _send_smtp(to, subject, body):
     msg["To"] = to
     msg["Subject"] = subject
     msg.set_content(body)
-    with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT) as s:
+    # Without a timeout, a blocked/unreachable SMTP port hangs the request until
+    # gunicorn's own worker timeout kills the process (verified live: this took
+    # down the worker handling the request, forcing a restart). Fail fast instead.
+    with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT, timeout=10) as s:
         s.starttls()
         if Config.SMTP_USER:
             s.login(Config.SMTP_USER, Config.SMTP_PASSWORD)
