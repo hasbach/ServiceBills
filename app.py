@@ -460,33 +460,6 @@ class WhatsAppSettings(db.Model):
             'auto_reply_message': self.auto_reply_message or "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\nسيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم",
         }
 
-class SystemUpdateSettings(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
-    current_version = db.Column(db.String(50), nullable=False, default='1.4.0')
-    github_repo = db.Column(db.String(200), nullable=False, default='hasbach/servicesBills')
-    auto_update_enabled = db.Column(db.Boolean, nullable=False, default=False)
-    auto_update_time = db.Column(db.String(10), nullable=False, default='03:00')
-    platform = db.Column(db.String(50), nullable=False, default='pythonanywhere') # 'pythonanywhere', 'linux_vps', 'windows_server'
-    last_checked_at = db.Column(db.DateTime, nullable=True)
-    last_updated_at = db.Column(db.DateTime, nullable=True)
-    latest_available_version = db.Column(db.String(50), nullable=True, default='1.4.0')
-    release_notes = db.Column(db.Text, nullable=True)
-
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'current_version': self.current_version,
-            'github_repo': self.github_repo,
-            'auto_update_enabled': self.auto_update_enabled,
-            'auto_update_time': self.auto_update_time,
-            'platform': self.platform,
-            'last_checked_at': self.last_checked_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_checked_at else None,
-            'last_updated_at': self.last_updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_updated_at else None,
-            'latest_available_version': self.latest_available_version or self.current_version,
-            'release_notes': self.release_notes or 'No new release notes available.'
-        }
-
 class ServiceStatus(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -593,7 +566,7 @@ class UpgradeRequest(db.Model):
 TENANT_OWNED_MODELS = (
     Reseller, ResellerPayment, Customer, SubscriptionPlan, Sector, Supplier,
     SupplierPayment, ExpenseCategory, Expense, Payment, GeneratedReceipt,
-    AddonPurchase, BusinessSettings, WhatsAppSettings, SystemUpdateSettings,
+    AddonPurchase, BusinessSettings, WhatsAppSettings,
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
     CustomerFeedback, PaymentReminder, UpgradeRequest,
 )
@@ -1065,7 +1038,7 @@ _TENANT_DELETE_ORDER = [
     UpgradeRequest, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
     CustomerFeedback, ServiceStatus, Payment, ResellerPayment, SupplierPayment,
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
-    WhatsAppSettings, SystemUpdateSettings, ExpenseCategory, Sector,
+    WhatsAppSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
 ]
 
@@ -1270,23 +1243,11 @@ def generate_missing_payments_with_context():
         for t in Tenant.query.filter_by(status="active").all():
             generate_missing_payments(t.id)
 
-def scheduled_auto_update_check():
-    with app.app_context():
-        try:
-            for t in Tenant.query.filter_by(status="active").all():
-                settings = SystemUpdateSettings.query.filter_by(tenant_id=t.id).first()
-                if settings and settings.auto_update_enabled:
-                    logging.info(f"Scheduler running overnight auto-update check for tenant {t.id}...")
-                    # Run apply update routine silently if needed
-        except Exception as e:
-            logging.error(f"Scheduled auto-update error: {e}")
-
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
 if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     scheduler.add_job(func=generate_missing_payments_with_context, trigger="interval", days=1)
-    scheduler.add_job(func=scheduled_auto_update_check, trigger="interval", hours=12)
     scheduler.start()
  
     
@@ -2894,173 +2855,6 @@ def get_meta_templates():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/system-update/status', methods=['GET'])
-@jwt_required()
-def get_system_update_status():
-    settings = tenant_query(SystemUpdateSettings).first()
-    if not settings:
-        settings = SystemUpdateSettings()
-        db.session.add(settings)
-        db.session.commit()
-    return jsonify({'status': settings.to_dict()}), 200
-
-@app.route('/api/system-update/settings', methods=['POST'])
-@jwt_required()
-def save_system_update_settings():
-    current_username = get_jwt_identity()
-    user = User.query.filter_by(username=current_username).first()
-    if not user or user.role != 'admin':
-        return jsonify({'message': 'Access Denied'}), 403
-
-    data = request.json
-    settings = tenant_query(SystemUpdateSettings).first()
-    if not settings:
-        settings = SystemUpdateSettings()
-        db.session.add(settings)
-
-    if 'github_repo' in data:
-        settings.github_repo = data['github_repo'].strip()
-    if 'auto_update_enabled' in data:
-        settings.auto_update_enabled = bool(data['auto_update_enabled'])
-    if 'auto_update_time' in data:
-        settings.auto_update_time = data['auto_update_time'].strip()
-    if 'platform' in data:
-        settings.platform = data['platform'].strip()
-
-    db.session.commit()
-    return jsonify({'message': 'System update settings saved successfully!', 'status': settings.to_dict()}), 200
-
-@app.route('/api/system-update/check', methods=['POST'])
-@jwt_required()
-def check_for_system_updates():
-    settings = tenant_query(SystemUpdateSettings).first()
-    if not settings:
-        settings = SystemUpdateSettings()
-        db.session.add(settings)
-
-    repo = settings.github_repo or 'hasbach/servicesBills'
-    settings.last_checked_at = datetime.utcnow()
-
-    try:
-        url = f"https://api.github.com/repos/{repo}/releases/latest"
-        resp = requests.get(url, timeout=6)
-        if resp.ok:
-            data = resp.json()
-            tag_name = data.get('tag_name', '').lstrip('v')
-            if tag_name:
-                settings.latest_available_version = tag_name
-                settings.release_notes = data.get('body', 'No release notes provided.')
-        else:
-            if not settings.latest_available_version:
-                settings.latest_available_version = settings.current_version
-    except Exception as e:
-        logging.warning(f"GitHub check update failed: {e}")
-
-    db.session.commit()
-    return jsonify({'message': 'Checked GitHub repository for latest release.', 'status': settings.to_dict()}), 200
-
-@app.route('/api/system-update/apply', methods=['POST'])
-@jwt_required()
-def apply_system_update():
-    current_username = get_jwt_identity()
-    user = User.query.filter_by(username=current_username).first()
-    if not user or user.role != 'admin':
-        return jsonify({'message': 'Access Denied'}), 403
-
-    settings = tenant_query(SystemUpdateSettings).first()
-    if not settings:
-        settings = SystemUpdateSettings()
-        db.session.add(settings)
-
-    repo_dir = os.path.abspath(os.path.dirname(__file__))
-    platform = settings.platform or 'pythonanywhere'
-
-    logs = []
-    # Step 1: Git Pull / Sync
-    try:
-        import subprocess
-        pull_res = subprocess.run(["git", "pull", "origin", "main"], cwd=repo_dir, capture_output=True, text=True, timeout=30)
-        if pull_res.returncode != 0 or "not a git repository" in (pull_res.stderr or "").lower():
-            logs.append("Git repo uninitialized or detached. Self-healing connection...")
-            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True)
-            subprocess.run(["git", "remote", "remove", "origin"], cwd=repo_dir, capture_output=True)
-            subprocess.run(["git", "remote", "add", "origin", "https://github.com/hasbach/servicesBills.git"], cwd=repo_dir, capture_output=True)
-            subprocess.run(["git", "fetch", "origin", "main"], cwd=repo_dir, capture_output=True, timeout=30)
-            reset_res = subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=repo_dir, capture_output=True, text=True)
-            logs.append(f"Git auto-heal & sync: {reset_res.stdout or reset_res.stderr or 'Successfully synced with GitHub'}")
-        else:
-            logs.append(f"Git pull: {pull_res.stdout or pull_res.stderr or 'OK'}")
-    except Exception as e:
-        try:
-            import urllib.request, zipfile, shutil
-            zip_url = "https://github.com/hasbach/servicesBills/archive/refs/heads/main.zip"
-            zip_path = os.path.join(repo_dir, "update_temp.zip")
-            urllib.request.urlretrieve(zip_url, zip_path)
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                extract_dir = os.path.join(repo_dir, "update_extracted")
-                zip_ref.extractall(extract_dir)
-                source_dir = os.path.join(extract_dir, "servicesBills-main")
-                for root, dirs, files in os.walk(source_dir):
-                    rel_path = os.path.relpath(root, source_dir)
-                    if any(ignored in rel_path for ignored in ['instance', 'uploads', '__pycache__', '.git']):
-                        continue
-                    dest_dir = repo_dir if rel_path == '.' else os.path.join(repo_dir, rel_path)
-                    os.makedirs(dest_dir, exist_ok=True)
-                    for file in files:
-                        if file in ['database.db', 'vapid_keys.env', '.env']:
-                            continue
-                        shutil.copy2(os.path.join(root, file), os.path.join(dest_dir, file))
-                shutil.rmtree(extract_dir, ignore_errors=True)
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-            logs.append("Updated code directly from GitHub archive ZIP (zero data loss).")
-        except Exception as zip_e:
-            logs.append(f"Update error: {str(zip_e)}")
-
-    # Step 1.5: Sync frontend/build to root build/ so PythonAnywhere static file settings always get updated
-    try:
-        fb_dir = os.path.join(repo_dir, 'frontend', 'build')
-        rb_dir = os.path.join(repo_dir, 'build')
-        if os.path.exists(fb_dir):
-            import shutil
-            shutil.copytree(fb_dir, rb_dir, dirs_exist_ok=True)
-            logs.append("Frontend UI build synchronized to root build/ directory.")
-    except Exception as sync_e:
-        logs.append(f"Build sync: {str(sync_e)}")
-
-    # Step 2: Database Migration Upgrade
-    try:
-        mig_res = subprocess.run([sys.executable, "-m", "flask", "db", "upgrade"], cwd=repo_dir, capture_output=True, text=True, timeout=30)
-        logs.append(f"Database schema sync: Verified & upgraded tables via Alembic/SQLAlchemy (Zero Data Loss).")
-    except Exception as e:
-        logs.append(f"Database schema sync: All table columns verified intact without data loss.")
-
-    # Step 3: Server Reload / Touch WSGI
-    try:
-        if platform == 'pythonanywhere':
-            wsgi_files = [os.path.join('/var/www', f) for f in os.listdir('/var/www')] if os.path.exists('/var/www') else []
-            reloaded = False
-            for wf in wsgi_files:
-                if wf.endswith('_wsgi.py'):
-                    os.utime(wf, None)
-                    reloaded = True
-            logs.append(f"PythonAnywhere WSGI reload: {'Triggered live reload' if reloaded else 'Simulated WSGI utime touch'}")
-        elif platform == 'linux_vps':
-            logs.append("Linux VPS systemd restart scheduled.")
-        elif platform == 'windows_server':
-            logs.append("Windows Server IIS/Service restart scheduled.")
-    except Exception as e:
-        logs.append(f"Reload step: {str(e)}")
-
-    settings.current_version = settings.latest_available_version or settings.current_version
-    settings.last_updated_at = datetime.utcnow()
-    db.session.commit()
-
-    return jsonify({
-        'message': f'System successfully updated to v{settings.current_version} with zero data loss!',
-        'logs': logs,
-        'status': settings.to_dict()
-    }), 200
 
 
 

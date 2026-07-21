@@ -17,11 +17,6 @@ import {
     Message as MessageIcon,
     People as PeopleIcon,
     LocationOn as LocationOnIcon,
-    SystemUpdateAlt as UpdateIcon,
-    CloudDownload as CloudDownloadIcon,
-    CheckCircle as CheckCircleIcon,
-    Storage as StorageIcon,
-    Refresh as RefreshIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import ExpenseCategoryManager from './ExpenseCategoryManager.js';
@@ -178,72 +173,6 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
 
     const waField = (key) => ({ value: waForm[key], onChange: (e) => setWaForm(f => ({ ...f, [key]: e.target.value })) });
 
-    // ── System Update state ───────────────────────────────────────────────────
-    const [sysUpdate, setSysUpdate] = useState({
-        current_version: '1.4.0', latest_available_version: '1.4.0',
-        github_repo: 'hasbach/servicesBills', auto_update_enabled: false,
-        auto_update_time: '03:00', platform: 'pythonanywhere',
-        last_checked_at: null, last_updated_at: null, release_notes: ''
-    });
-    const [sysLoading, setSysLoading] = useState(false);
-    const [checkingUpdate, setCheckingUpdate] = useState(false);
-    const [applyingUpdate, setApplyingUpdate] = useState(false);
-    const [updateLogs, setUpdateLogs] = useState([]);
-
-    const fetchSysUpdate = useCallback(async () => {
-        try {
-            const res = await apiService.fetchSystemUpdateStatus();
-            if (res?.data?.status) setSysUpdate(res.data.status);
-        } catch (e) {
-            console.error('Failed to fetch system update status', e);
-        }
-    }, [apiService]);
-
-    useEffect(() => { fetchSysUpdate(); }, [fetchSysUpdate]);
-
-    const handleSaveSysSettings = async (e) => {
-        if (e) e.preventDefault();
-        setSysLoading(true);
-        try {
-            const res = await apiService.saveSystemUpdateSettings(sysUpdate);
-            if (res?.data?.status) setSysUpdate(res.data.status);
-            setSnackbar({ open: true, message: 'System update settings saved!', severity: 'success' });
-        } catch (err) {
-            setSnackbar({ open: true, message: 'Failed to save update settings.', severity: 'error' });
-        } finally {
-            setSysLoading(false);
-        }
-    };
-
-    const handleCheckUpdate = async () => {
-        setCheckingUpdate(true);
-        try {
-            const res = await apiService.checkForSystemUpdates();
-            if (res?.data?.status) setSysUpdate(res.data.status);
-            setSnackbar({ open: true, message: res?.data?.message || 'Checked GitHub repo!', severity: 'info' });
-        } catch (err) {
-            setSnackbar({ open: true, message: 'Failed to check GitHub repo.', severity: 'error' });
-        } finally {
-            setCheckingUpdate(false);
-        }
-    };
-
-    const handleApplyUpdate = async () => {
-        if (!window.confirm("Are you sure you want to download and apply the latest update from GitHub now? Database migrations will run safely without data loss.")) return;
-        setApplyingUpdate(true);
-        setUpdateLogs([]);
-        try {
-            const res = await apiService.applySystemUpdate();
-            if (res?.data?.status) setSysUpdate(res.data.status);
-            if (res?.data?.logs) setUpdateLogs(res.data.logs);
-            setSnackbar({ open: true, message: res?.data?.message || 'Update applied successfully!', severity: 'success' });
-        } catch (err) {
-            setSnackbar({ open: true, message: 'Error applying update.', severity: 'error' });
-        } finally {
-            setApplyingUpdate(false);
-        }
-    };
-
     // ── Render ────────────────────────────────────────────────────────────────
     return (
         <Box sx={{ p: { xs: 1.5, sm: 2, md: 3 }, background: 'linear-gradient(135deg, #f6f9fc 0%, #ffffff 100%)', minHeight: '100vh' }}>
@@ -265,7 +194,6 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                     <Tab icon={<MessageIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Expense Categories" />
                     <Tab icon={<PeopleIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="User Management" />
                     <Tab icon={<LocationOnIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Sectors" />
-                    <Tab icon={<UpdateIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Software & System Updates" />
                 </Tabs>
             </Paper>
 
@@ -549,148 +477,6 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 <SectorManager />
             )}
 
-            {/* ── Tab 5: Software & System Updates ── */}
-            {tab === 5 && (
-                <Box>
-                    {/* Status Card */}
-                    <Paper elevation={0} sx={{
-                        p: 3, mb: 3, borderRadius: '20px',
-                        background: sysUpdate.latest_available_version > sysUpdate.current_version 
-                            ? 'linear-gradient(135deg, #1e293b 0%, #0f172a 100%)'
-                            : 'linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%)',
-                        color: 'white', position: 'relative', overflow: 'hidden'
-                    }}>
-                        <Grid container spacing={3} alignItems="center">
-                            <Grid item xs={12} md={7}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 1 }}>
-                                    <Avatar sx={{ bgcolor: alpha('#10b981', 0.2), color: '#10b981', width: 50, height: 50 }}>
-                                        <CloudDownloadIcon sx={{ fontSize: 28 }} />
-                                    </Avatar>
-                                    <Box>
-                                        <Typography variant="h5" sx={{ fontWeight: 700 }}>
-                                            {sysUpdate.latest_available_version > sysUpdate.current_version 
-                                                ? `🚀 Update Available: v${sysUpdate.latest_available_version}`
-                                                : `✅ System is up to date (v${sysUpdate.current_version})`}
-                                        </Typography>
-                                        <Typography variant="body2" sx={{ opacity: 0.8 }}>
-                                            Repository: {sysUpdate.github_repo} | Platform: {sysUpdate.platform.toUpperCase()}
-                                        </Typography>
-                                    </Box>
-                                </Box>
-                                <Typography variant="body2" sx={{ mt: 2, p: 1.5, bgcolor: alpha('#fff', 0.05), borderRadius: '10px', fontFamily: 'monospace' }}>
-                                    Last checked: {sysUpdate.last_checked_at || 'Never'} | Last updated: {sysUpdate.last_updated_at || 'Initial release'}
-                                </Typography>
-                            </Grid>
-                            <Grid item xs={12} md={5} sx={{ display: 'flex', gap: 2, justifyContent: { xs: 'flex-start', md: 'flex-end' }, flexWrap: 'wrap' }}>
-                                <Button
-                                    variant="outlined"
-                                    startIcon={checkingUpdate ? <CircularProgress size={16} color="inherit" /> : <RefreshIcon />}
-                                    onClick={handleCheckUpdate}
-                                    disabled={checkingUpdate}
-                                    sx={{ color: 'white', borderColor: alpha('#fff', 0.3), borderRadius: '12px', textTransform: 'none', fontWeight: 600 }}
-                                >
-                                    Check GitHub
-                                </Button>
-                                <Button
-                                    variant="contained"
-                                    color="success"
-                                    startIcon={applyingUpdate ? <CircularProgress size={16} color="inherit" /> : <UpdateIcon />}
-                                    onClick={handleApplyUpdate}
-                                    disabled={applyingUpdate}
-                                    sx={{ borderRadius: '12px', textTransform: 'none', fontWeight: 700, px: 3, boxShadow: '0 4px 14px rgba(16, 185, 129, 0.4)' }}
-                                >
-                                    {applyingUpdate ? 'Upgrading & Migrating...' : 'Install Update Now'}
-                                </Button>
-                            </Grid>
-                        </Grid>
-                    </Paper>
-
-                    {/* Console Output Logs if any */}
-                    {updateLogs.length > 0 && (
-                        <Paper elevation={0} sx={{ p: 2.5, mb: 3, borderRadius: '16px', bgcolor: '#0f172a', color: '#38bdf8', fontFamily: 'monospace', fontSize: '0.85rem' }}>
-                            <Typography variant="subtitle2" sx={{ color: '#94a3b8', mb: 1, fontWeight: 700 }}>
-                                ⚡ Deployment & Database Migration Log:
-                            </Typography>
-                            {updateLogs.map((log, idx) => (
-                                <Box key={idx} sx={{ py: 0.5, borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                                    &gt; {log}
-                                </Box>
-                            ))}
-                        </Paper>
-                    )}
-
-                    {/* Settings Form */}
-                    <Section icon={<StorageIcon />} title="Deployment & Automatic Update Settings" subtitle="Configure automated overnight syncing with GitHub and safe database schema upgrades">
-                        <form onSubmit={handleSaveSysSettings}>
-                            <Grid container spacing={3}>
-                                <Grid item xs={12} md={6}>
-                                    <TextField
-                                        fullWidth
-                                        label="GitHub Repository (username/repository)"
-                                        value={sysUpdate.github_repo}
-                                        onChange={e => setSysUpdate(s => ({ ...s, github_repo: e.target.value }))}
-                                        helperText="Where deployment servers pull new releases from"
-                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}
-                                    />
-                                </Grid>
-                                <Grid item xs={12} md={6}>
-                                    <TextField
-                                        fullWidth
-                                        select
-                                        SelectProps={{ native: true }}
-                                        label="Server Deployment Platform"
-                                        value={sysUpdate.platform}
-                                        onChange={e => setSysUpdate(s => ({ ...s, platform: e.target.value }))}
-                                        helperText="Determines how the web server reloads after code updates"
-                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}
-                                    >
-                                        <option value="pythonanywhere">PythonAnywhere (Touch WSGI File)</option>
-                                        <option value="linux_vps">Linux VPS / Cloud (Systemd Service Restart)</option>
-                                        <option value="windows_server">Windows Server / IIS Service Restart</option>
-                                    </TextField>
-                                </Grid>
-                                <Grid item xs={12} md={6}>
-                                    <Box sx={{ p: 2, border: `1px solid ${alpha(theme.palette.divider, 0.15)}`, borderRadius: '14px' }}>
-                                        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
-                                            <Box>
-                                                <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>Automatic Overnight Updates</Typography>
-                                                <Typography variant="caption" color="text.secondary">Run scheduled code sync & safe DB upgrade while closed</Typography>
-                                            </Box>
-                                            <Switch
-                                                checked={sysUpdate.auto_update_enabled}
-                                                onChange={e => setSysUpdate(s => ({ ...s, auto_update_enabled: e.target.checked }))}
-                                                color="primary"
-                                            />
-                                        </Box>
-                                    </Box>
-                                </Grid>
-                                <Grid item xs={12} md={6}>
-                                    <TextField
-                                        fullWidth
-                                        label="Overnight Auto-Update Check Time (24h format)"
-                                        value={sysUpdate.auto_update_time}
-                                        onChange={e => setSysUpdate(s => ({ ...s, auto_update_time: e.target.value }))}
-                                        disabled={!sysUpdate.auto_update_enabled}
-                                        helperText="Example: 03:00 for 3:00 AM daily check"
-                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}
-                                    />
-                                </Grid>
-                            </Grid>
-                            <Box sx={{ mt: 3 }}>
-                                <Button
-                                    type="submit"
-                                    variant="contained"
-                                    startIcon={sysLoading ? <CircularProgress size={18} color="inherit" /> : <SaveIcon />}
-                                    disabled={sysLoading}
-                                    sx={{ borderRadius: '12px', textTransform: 'none', fontWeight: 600, px: 4, py: 1.5 }}
-                                >
-                                    {sysLoading ? 'Saving...' : 'Save Update Configuration'}
-                                </Button>
-                            </Box>
-                        </form>
-                    </Section>
-                </Box>
-            )}
         </Box>
     );
 };
