@@ -10,11 +10,23 @@ timeout killed the process, taking the app down for every user, not just the
 request that triggered it). The HTTP API rides over normal HTTPS (443), which
 is never blocked the way raw SMTP ports are.
 """
+import socket
 import logging
 import smtplib
 import requests
 from email.message import EmailMessage
 from config import Config
+
+# Render's containers have an IPv6 interface but no working outbound IPv6 route:
+# any host that publishes an AAAA record (api.sendgrid.com does; Cloudflare R2
+# apparently doesn't, which is why that one worked) fails instantly with
+# "[Errno 101] Network is unreachable" -- confirmed live in production logs --
+# before even attempting IPv4. Force urllib3 (what `requests` uses under the
+# hood) to resolve IPv4 only. This module is imported early in app.py, so it
+# patches process-wide before any other requests-based call runs (WhatsApp's
+# Graph API calls included, which likely hit the same failure).
+import urllib3.util.connection as _urllib3_cn
+_urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 # Test/dev inspection: console backend appends {"to","subject","body"} here.
 SENT = []
