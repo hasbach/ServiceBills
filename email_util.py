@@ -1,10 +1,18 @@
 """Minimal email sending abstraction.
 
 MAIL_BACKEND=console (dev/CI) records messages in SENT and logs them; smtp sends
-via smtplib. Verification/reset flows call send() and don't care which backend runs.
+via smtplib; sendgrid sends via SendGrid's HTTP API. Verification/reset flows
+call send() and don't care which backend runs.
+
+sendgrid is the recommended production backend: Render's free tier blocks
+outbound SMTP (confirmed live -- smtplib hung until gunicorn's own worker
+timeout killed the process, taking the app down for every user, not just the
+request that triggered it). The HTTP API rides over normal HTTPS (443), which
+is never blocked the way raw SMTP ports are.
 """
 import logging
 import smtplib
+import requests
 from email.message import EmailMessage
 from config import Config
 
@@ -33,9 +41,30 @@ def _send_smtp(to, subject, body):
         s.send_message(msg)
 
 
+def _send_sendgrid(to, subject, body):
+    resp = requests.post(
+        "https://api.sendgrid.com/v3/mail/send",
+        headers={
+            "Authorization": f"Bearer {Config.SENDGRID_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "personalizations": [{"to": [{"email": to}]}],
+            "from": {"email": Config.MAIL_FROM},
+            "subject": subject,
+            "content": [{"type": "text/plain", "value": body}],
+        },
+        timeout=10,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"SendGrid send failed ({resp.status_code}): {resp.text}")
+
+
 def send(to, subject, body):
     """Send an email via the configured backend."""
-    if Config.MAIL_BACKEND == "smtp":
+    if Config.MAIL_BACKEND == "sendgrid":
+        _send_sendgrid(to, subject, body)
+    elif Config.MAIL_BACKEND == "smtp":
         _send_smtp(to, subject, body)
     else:
         _send_console(to, subject, body)

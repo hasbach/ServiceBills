@@ -27,8 +27,9 @@ services:
         sync: false
       - key: CORS_ORIGINS
         sync: false
-      # R2 + SMTP are live: storage writes to Cloudflare R2, email sends via SMTP.
-      # Fill the sync:false vars below in the Render dashboard.
+      # R2 + SendGrid are live: storage writes to Cloudflare R2, email sends via
+      # SendGrid's HTTP API (Render blocks outbound SMTP -- confirmed live, direct
+      # SMTP hangs/fails). Fill the sync:false vars below in the Render dashboard.
       - key: STORAGE_BACKEND
         value: s3
       - key: STORAGE_BUCKET
@@ -50,7 +51,9 @@ services:
       - key: STRIPE_PRICE_PRO
         sync: false
       - key: MAIL_BACKEND
-        value: smtp
+        value: sendgrid
+      - key: SENDGRID_API_KEY
+        sync: false
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT

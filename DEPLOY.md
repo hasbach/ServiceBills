@@ -54,7 +54,10 @@ Validates the Postgres migration chain, the full app boot, and the SaaS flows.
    Create a **webhook endpoint** → `https://<your-app>/api/stripe/webhook`, subscribe to
    `checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`
    (copy the `whsec_...` signing secret).
-4. **SMTP** — any provider (SendGrid/Mailgun/SES/etc.): host, port 587, user, password, from-address.
+4. **Email — SendGrid** (recommended; Render blocks outbound SMTP, confirmed live): create a
+   SendGrid account, verify a sender/domain, create an API key (Mail Send scope) →
+   `SENDGRID_API_KEY`. Direct SMTP (`MAIL_BACKEND=smtp`) is still available for hosts that
+   allow it, but won't work on Render's free tier.
 5. **Secrets** — generate:
    ```
    python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"   # FERNET_KEY
@@ -67,7 +70,7 @@ Validates the Postgres migration chain, the full app boot, and the SaaS flows.
    (`render.yaml`). It creates the Postgres DB + the web service.
 2. Fill the `sync:false` env vars in the dashboard: `FERNET_KEY`, `APP_BASE_URL`
    (your Render URL, e.g. `https://servicesbills-web.onrender.com`), `CORS_ORIGINS`
-   (same), `STORAGE_*`/`AWS_*`/`S3_ENDPOINT_URL`, `STRIPE_*`, `SMTP_*`, `MAIL_FROM`.
+   (same), `STORAGE_*`/`AWS_*`/`S3_ENDPOINT_URL`, `STRIPE_*`, `SENDGRID_API_KEY`, `MAIL_FROM`.
 3. First deploy runs `flask db upgrade` automatically (in `dockerCommand`).
 4. **Create the super-admin** — Render **Shell** on the web service:
    ```

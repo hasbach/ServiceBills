@@ -34,10 +34,12 @@ class Config:
     APP_BASE_URL = os.environ.get("APP_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:3000"
     STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
     STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-    # Email: "console" (dev/CI, records in-memory) or "smtp".
+    # Email: "console" (dev/CI, records in-memory), "smtp", or "sendgrid" (recommended
+    # in prod -- rides over HTTPS, unlike raw SMTP ports many hosts block outbound).
     MAIL_BACKEND = os.environ.get("MAIL_BACKEND", "console")
     SMTP_HOST = os.environ.get("SMTP_HOST")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
     SMTP_USER = os.environ.get("SMTP_USER")
     SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+    SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
     MAIL_FROM = os.environ.get("MAIL_FROM", "noreply@servicesbills.net")
