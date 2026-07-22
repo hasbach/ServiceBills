@@ -718,18 +718,6 @@ def has_pending_reseller_charge(customer_id, billing_date, tenant_id):
     return existing_charge is not None
 
 
-@app.route('/api/debug/mail-config', methods=['GET'])
-def debug_mail_config():
-    # TEMPORARY diagnostic route -- no secrets returned, just which backend/host
-    # is actually active on the running instance. Remove after confirming.
-    return jsonify({
-        'mail_backend': Config.MAIL_BACKEND,
-        'smtp_host': Config.SMTP_HOST,
-        'mail_from': Config.MAIL_FROM,
-        'has_sendgrid_key': bool(Config.SENDGRID_API_KEY),
-    }), 200
-
-
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
