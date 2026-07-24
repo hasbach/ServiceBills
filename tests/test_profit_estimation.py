@@ -239,3 +239,67 @@ def test_daily_recompute_covers_quiet_tenants_without_events(app, client):
         assert estimate_b is not None
         assert estimate_b.estimated_income == 0.0
         assert appmod.MonthlyProfitEstimate.query.filter(appmod.MonthlyProfitEstimate.tenant_id.is_(None)).count() == 0
+
+
+def test_financial_report_includes_estimated_profit_and_variance(app, client):
+    from datetime import datetime, timedelta
+
+    a = make_tenant(client, "Biz A", "a_admin")
+
+    with app.app_context():
+        tenant_id = appmod.Tenant.query.filter_by(slug="biz-a").first().id
+
+    r = client.post("/api/subscription_plans", headers=a,
+                     json={"name": "Fiber 50", "price": 25, "billing_cycle": "monthly", "cost": 15})
+    plan_id = r.get_json()["plan"]["id"]
+    client.post("/api/customers", headers=a,
+                json={"name": "Cust", "phone": "1", "address": "a",
+                      "subscription_plan_id": plan_id, "subscription_start_date": "2026-01-01"})
+
+    # Delete the estimate row that add_customer's trigger already created, so
+    # the assertions below can only pass via the endpoint's OWN lazy
+    # current-month backfill, not a row left over from an earlier trigger.
+    with app.app_context():
+        month = appmod.datetime.utcnow().strftime('%Y-%m')
+        appmod.MonthlyProfitEstimate.query.filter_by(tenant_id=tenant_id, month=month).delete()
+        appmod.db.session.commit()
+        assert appmod.MonthlyProfitEstimate.query.filter_by(tenant_id=tenant_id, month=month).first() is None
+
+    start = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+    end = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+    fin = client.get(f"/api/reports/financial?start_date={start}&end_date={end}", headers=a).get_json()
+
+    assert len(fin["monthly_data"]) == 1
+    row = fin["monthly_data"][0]
+    # No real cash income/expenses recorded this month, but the estimate
+    # (25 income - 15 cost = 10 profit) is present via the lazy current-month backfill.
+    assert row["income"] == 0.0
+    assert row["profit"] == 0.0
+    assert row["estimated_profit"] == 10.0
+    assert row["variance"] == -10.0  # real (0) - estimated (10)
+    assert fin["totals"]["estimated_profit"] == 10.0
+    assert fin["totals"]["variance"] == -10.0
+
+
+def test_financial_report_past_month_with_no_estimate_is_null(client):
+    from datetime import datetime, timedelta
+
+    a = make_tenant(client, "Biz A", "a_admin")
+
+    # A far-past range that predates this feature entirely: no MonthlyProfitEstimate
+    # row will ever exist for it, and it is NOT the current month, so there is no
+    # lazy backfill either.
+    start = "2020-01-01T00:00:00Z"
+    end = "2020-01-31T23:59:59Z"
+
+    # Force a real cash data point in that month so it actually appears as a row.
+    client.post("/api/expense_categories", headers=a, json={"name": "Rent"})
+    client.post("/api/expenses", headers=a,
+                json={"category": "Rent", "amount": 50, "description": "Office rent",
+                      "date": "2020-01-15", "is_credit": False})
+
+    fin = client.get(f"/api/reports/financial?start_date={start}&end_date={end}", headers=a).get_json()
+    assert len(fin["monthly_data"]) == 1
+    row = fin["monthly_data"][0]
+    assert row["estimated_profit"] is None
+    assert row["variance"] is None

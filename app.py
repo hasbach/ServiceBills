@@ -4921,10 +4921,30 @@ def get_financial_report():
             SalaryPayment.payment_date <= end_date
         ).group_by('month').all()
 
+        # 5. Logged estimated profit -- lazily backfill the current month if it's
+        # in range and hasn't been computed yet (no event/daily-job tick reached
+        # it yet), so the current month is never blank.
+        current_month = datetime.utcnow().strftime('%Y-%m')
+        start_month = start_date.strftime('%Y-%m')
+        end_month = end_date.strftime('%Y-%m')
+        if start_month <= current_month <= end_month:
+            if not MonthlyProfitEstimate.query.filter_by(
+                tenant_id=current_tenant_id(), month=current_month
+            ).first():
+                recalculate_estimated_profit(current_tenant_id())
+
+        estimate_query = MonthlyProfitEstimate.query.filter(
+            MonthlyProfitEstimate.tenant_id == current_tenant_id(),
+            MonthlyProfitEstimate.month >= start_month,
+            MonthlyProfitEstimate.month <= end_month
+        ).all()
+        estimate_data = {e.month: e.estimated_profit for e in estimate_query}
+
         # Combine results
         months_set = set(
             [row.month for row in income_query] + [row.month for row in expense_query]
             + [row.month for row in sp_query] + [row.month for row in sal_query]
+            + list(estimate_data.keys())
         )
 
         monthly_data_dict = {m: {'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0} for m in months_set}
@@ -4944,14 +4964,24 @@ def get_financial_report():
         monthly_data = []
         total_income = 0.0
         total_expenses = 0.0
+        total_estimated_profit = 0.0
+        total_variance = 0.0
 
         for m in sorted(months_set):
             data = monthly_data_dict[m]
             data['profit'] = data['income'] - data['expenses']
+
+            estimated_profit = estimate_data.get(m)
+            data['estimated_profit'] = estimated_profit
+            data['variance'] = (data['profit'] - estimated_profit) if estimated_profit is not None else None
+
             monthly_data.append(data)
-            
+
             total_income += data['income']
             total_expenses += data['expenses']
+            if estimated_profit is not None:
+                total_estimated_profit += estimated_profit
+                total_variance += data['variance']
 
         total_profit = total_income - total_expenses
 
@@ -4960,7 +4990,9 @@ def get_financial_report():
             'totals': {
                 'income': total_income,
                 'expenses': total_expenses,
-                'profit': total_profit
+                'profit': total_profit,
+                'estimated_profit': total_estimated_profit,
+                'variance': total_variance
             }
         }), 200
 
