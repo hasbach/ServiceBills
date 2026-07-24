@@ -2118,6 +2118,7 @@ def update_subscription_plan(plan_id):
         plan.status = data.get('status', plan.status)
 
         db.session.commit()
+        recalculate_estimated_profit(plan.tenant_id)
         return jsonify({'message': 'Subscription plan updated successfully!', 'plan': plan.to_dict()}), 200
     except Exception as e:
         db.session.rollback()

@@ -168,3 +168,36 @@ def test_customer_lifecycle_triggers_recompute(app, client):
     r7 = client.delete(f"/api/customers/{customer_id}", headers=a)
     assert r7.status_code == 200
     assert _current_estimate().estimated_income == 0.0
+
+
+def test_subscription_plan_cost_field_and_recompute_on_edit(app, client):
+    a = make_tenant(client, "Biz A", "a_admin")
+
+    with app.app_context():
+        tenant_id = appmod.Tenant.query.filter_by(slug="biz-a").first().id
+
+    r = client.post("/api/subscription_plans", headers=a,
+                     json={"name": "Fiber 50", "price": 25, "billing_cycle": "monthly", "cost": 15})
+    assert r.status_code in (200, 201)
+    plan = r.get_json()["plan"]
+    assert plan["cost"] == 15.0
+
+    r2 = client.post("/api/customers", headers=a,
+                      json={"name": "Cust", "phone": "1", "address": "a",
+                            "subscription_plan_id": plan["id"], "subscription_start_date": "2026-01-01"})
+    assert r2.status_code == 201
+
+    with app.app_context():
+        month = appmod.datetime.utcnow().strftime('%Y-%m')
+        estimate = appmod.MonthlyProfitEstimate.query.filter_by(tenant_id=tenant_id, month=month).first()
+        assert estimate is not None
+        assert estimate.estimated_cost == 15.0
+
+    r3 = client.put(f"/api/subscription_plans/{plan['id']}", headers=a, json={"cost": 20})
+    assert r3.status_code == 200
+    assert r3.get_json()["plan"]["cost"] == 20.0
+
+    with app.app_context():
+        month = appmod.datetime.utcnow().strftime('%Y-%m')
+        estimate = appmod.MonthlyProfitEstimate.query.filter_by(tenant_id=tenant_id, month=month).first()
+        assert estimate.estimated_cost == 20.0
