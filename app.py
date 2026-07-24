@@ -5365,6 +5365,60 @@ def record_employee_payment(employee_id):
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
 
+@app.route('/api/employees/<int:employee_id>/history', methods=['GET'])
+@admin_required()
+def get_employee_history(employee_id):
+    employee = tenant_query(Employee).filter_by(id=employee_id).first()
+    if not employee:
+        return jsonify({'message': 'Employee not found!'}), 404
+
+    history = []
+    charge_titles = {'salary': 'Salary Accrued', 'bonus': 'Bonus', 'deduction': 'Deduction'}
+    charges = tenant_query(SalaryCharge).filter_by(employee_id=employee_id).all()
+    for c in charges:
+        title = charge_titles[c.type]
+        history.append({
+            'id': f"chg_{c.id}",
+            'type': c.type,
+            'title': title,
+            'description': c.reason or title,
+            'amount': -float(c.amount) if c.type == 'deduction' else float(c.amount),
+            'date': c.date.strftime('%Y-%m-%d %H:%M:%S')
+        })
+
+    payments = tenant_query(SalaryPayment).filter_by(employee_id=employee_id).all()
+    for p in payments:
+        history.append({
+            'id': f"pay_{p.id}",
+            'type': 'advance' if p.is_advance else 'payment',
+            'title': 'Advance Paid' if p.is_advance else (f"Payment Made ({p.method})" if p.method else "Payment Made"),
+            'description': p.note or ('Salary advance' if p.is_advance else 'Salary payment'),
+            'amount': -float(p.amount),
+            'date': p.payment_date.strftime('%Y-%m-%d %H:%M:%S')
+        })
+
+    history.sort(key=lambda x: x['date'], reverse=True)
+    return jsonify({
+        'employee': employee.to_dict(),
+        'history': history
+    }), 200
+
+
+@app.route('/api/employees/<int:employee_id>/fix-balance', methods=['PUT'])
+@admin_required()
+def fix_employee_balance(employee_id):
+    data = request.json
+    employee = tenant_query(Employee).filter_by(id=employee_id).first()
+    if not employee:
+        return jsonify({'message': 'Employee not found!'}), 404
+
+    if 'balance' not in data:
+        return jsonify({'error': 'New balance is required'}), 400
+
+    employee.balance = float(data['balance'])
+    db.session.commit()
+    return jsonify({'message': 'Employee balance fixed successfully!', 'employee': employee.to_dict()}), 200
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):

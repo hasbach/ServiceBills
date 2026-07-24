@@ -179,3 +179,24 @@ def test_salary_payment_and_advance(client):
 
     r3 = client.post(f"/api/employees/{emp_id}/payments", headers=a, json={"amount": 0})
     assert r3.status_code == 400
+
+
+def test_employee_history_and_fix_balance(client):
+    a = make_tenant(client, "Biz A", "a_admin")
+    r = client.post("/api/employees", headers=a, json={"name": "EmployeeH", "monthly_salary": 1000})
+    emp_id = r.get_json()["id"]
+
+    client.post(f"/api/employees/{emp_id}/charges", headers=a,
+                json={"type": "salary", "amount": 1000, "reason": "July accrual"})
+    client.post(f"/api/employees/{emp_id}/payments", headers=a, json={"amount": 400, "method": "bank"})
+
+    r1 = client.get(f"/api/employees/{emp_id}/history", headers=a)
+    assert r1.status_code == 200
+    body = r1.get_json()
+    assert body["employee"]["balance"] == 600.0
+    types = {h["type"] for h in body["history"]}
+    assert types == {"salary", "payment"}
+
+    r2 = client.put(f"/api/employees/{emp_id}/fix-balance", headers=a, json={"balance": 50})
+    assert r2.status_code == 200
+    assert r2.get_json()["employee"]["balance"] == 50.0
