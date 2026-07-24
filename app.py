@@ -1410,6 +1410,53 @@ def generate_missing_salary_charges(tenant_id):
         print(f"Error generating missing salary charges: {str(e)}")
 
 
+def recalculate_estimated_profit(tenant_id):
+    """Recompute the CURRENT month's estimated profit for one tenant from its
+    currently active customers. Runs both from request handlers (called after
+    their own commit, so a failure here never blocks the primary action) and
+    from the scheduler, so it takes an explicit tenant_id and never calls
+    tenant_query(). Never raises -- mirrors generate_missing_salary_charges's
+    rollback+print pattern."""
+    try:
+        customers = Customer.query.filter_by(tenant_id=tenant_id, is_subscription_active=True).all()
+
+        estimated_income = 0.0
+        estimated_cost = 0.0
+
+        for customer in customers:
+            plan = SubscriptionPlan.query.filter_by(tenant_id=tenant_id, id=customer.subscription_plan_id).first()
+            if not plan:
+                continue
+
+            effective_price = max(0.0, plan.price - (customer.discount or 0.0))
+            effective_cost = customer.cost_override if customer.cost_override is not None else plan.cost
+
+            if plan.billing_cycle == 'monthly':
+                factor = 1.0
+            elif plan.billing_cycle == 'yearly':
+                factor = 1.0 / 12
+            else:
+                continue  # Unrecognized cycle: skip, matches generate_missing_payments
+
+            estimated_income += effective_price * factor
+            estimated_cost += effective_cost * factor
+
+        month = datetime.utcnow().strftime('%Y-%m')
+        estimate = MonthlyProfitEstimate.query.filter_by(tenant_id=tenant_id, month=month).first()
+        if not estimate:
+            estimate = MonthlyProfitEstimate(tenant_id=tenant_id, month=month)
+            db.session.add(estimate)
+
+        estimate.estimated_income = estimated_income
+        estimate.estimated_cost = estimated_cost
+        estimate.estimated_profit = estimated_income - estimated_cost
+
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error recalculating estimated profit: {str(e)}")
+
+
 # Initialize scheduler
 scheduler = BackgroundScheduler(daemon=True, executors={'default': {'type': 'threadpool', 'max_workers': 1}})
 
