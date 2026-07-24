@@ -317,6 +317,83 @@ class Expense(db.Model):
             'date': self.date.strftime('%Y-%m-%d')
         }
 
+# --- Payroll: Employee is a party you owe money to, exactly like Supplier.
+# SalaryCharge is the "what's owed" ledger (salary/bonus/deduction, mirrors
+# Expense.is_credit=True); SalaryPayment is disbursements incl. advances
+# (mirrors SupplierPayment). balance = sum(charges) - sum(payments).
+class Employee(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    name = db.Column(db.String(100), nullable=False)
+    monthly_salary = db.Column(db.Float, nullable=False, default=0.0)
+    hire_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    active = db.Column(db.Boolean, default=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    balance = db.Column(db.Float, default=0.0)
+    notes = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    user = db.relationship('User', foreign_keys=[user_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'monthly_salary': float(self.monthly_salary),
+            'hire_date': self.hire_date.strftime('%Y-%m-%d'),
+            'active': self.active,
+            'user_id': self.user_id,
+            'balance': float(self.balance),
+            'notes': self.notes,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+class SalaryCharge(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=False)
+    type = db.Column(db.String(20), nullable=False)  # 'salary' | 'bonus' | 'deduction'
+    amount = db.Column(db.Float, nullable=False)
+    period = db.Column(db.String(7), nullable=False)  # 'YYYY-MM'
+    date = db.Column(db.DateTime, default=datetime.utcnow)
+    reason = db.Column(db.String(200), nullable=True)
+
+    employee = db.relationship('Employee', backref='charges', lazy=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'employee_id': self.employee_id,
+            'type': self.type,
+            'amount': float(self.amount),
+            'period': self.period,
+            'date': self.date.strftime('%Y-%m-%d %H:%M:%S'),
+            'reason': self.reason
+        }
+
+class SalaryPayment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    payment_date = db.Column(db.DateTime, default=datetime.utcnow)
+    method = db.Column(db.String(50), nullable=True)
+    is_advance = db.Column(db.Boolean, default=False)
+    note = db.Column(db.Text, nullable=True)
+
+    employee = db.relationship('Employee', backref='payments', lazy=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'employee_id': self.employee_id,
+            'amount': float(self.amount),
+            'payment_date': self.payment_date.strftime('%Y-%m-%d %H:%M:%S'),
+            'method': self.method,
+            'is_advance': self.is_advance,
+            'note': self.note
+        }
+
 class Payment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -572,6 +649,7 @@ TENANT_OWNED_MODELS = (
     AddonPurchase, BusinessSettings, WhatsAppSettings,
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
     CustomerFeedback, PaymentReminder, UpgradeRequest,
+    Employee, SalaryCharge, SalaryPayment,
 )
 
 from sqlalchemy import event as _sa_event
