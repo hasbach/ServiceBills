@@ -128,3 +128,28 @@ def test_cannot_delete_employee_with_linked_charges_or_payments(app, client):
     r2 = client.delete(f"/api/employees/{emp_id_2}", headers=a)
     assert r2.status_code == 400
     assert "payments" in r2.get_json()["error"].lower()
+
+
+def test_salary_charge_bonus_and_deduction(client):
+    a = make_tenant(client, "Biz A", "a_admin")
+    r = client.post("/api/employees", headers=a, json={"name": "EmployeeC", "monthly_salary": 1000})
+    emp_id = r.get_json()["id"]
+
+    r1 = client.post(f"/api/employees/{emp_id}/charges", headers=a,
+                      json={"type": "bonus", "amount": 200, "reason": "Holiday bonus"})
+    assert r1.status_code == 201
+    assert r1.get_json()["employee"]["balance"] == 200.0
+
+    r2 = client.post(f"/api/employees/{emp_id}/charges", headers=a,
+                      json={"type": "deduction", "amount": 500, "reason": "Equipment damage"})
+    assert r2.status_code == 201
+    # A deduction may exceed the current balance and push it negative.
+    assert r2.get_json()["employee"]["balance"] == -300.0
+
+    charges = client.get(f"/api/employees/{emp_id}/charges", headers=a).get_json()
+    assert len(charges) == 2
+    assert {c["type"] for c in charges} == {"bonus", "deduction"}
+
+    r3 = client.post(f"/api/employees/{emp_id}/charges", headers=a,
+                      json={"type": "invalid", "amount": 10})
+    assert r3.status_code == 400

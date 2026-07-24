@@ -5276,6 +5276,54 @@ def delete_employee(employee_id):
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/employees/<int:employee_id>/charges', methods=['GET'])
+@admin_required()
+def get_employee_charges(employee_id):
+    charges = tenant_query(SalaryCharge).filter_by(employee_id=employee_id).order_by(SalaryCharge.date.desc()).all()
+    return jsonify([c.to_dict() for c in charges])
+
+@app.route('/api/employees/<int:employee_id>/charges', methods=['POST'])
+@admin_required()
+def add_employee_charge(employee_id):
+    data = request.json
+    employee = tenant_query(Employee).filter_by(id=employee_id).first()
+    if not employee:
+        return jsonify({'message': 'Employee not found!'}), 404
+
+    charge_type = data.get('type')
+    if charge_type not in ('salary', 'bonus', 'deduction'):
+        return jsonify({'error': "type must be 'salary', 'bonus', or 'deduction'"}), 400
+
+    amount = float(data.get('amount', 0))
+    if amount <= 0:
+        return jsonify({'error': 'Amount must be positive'}), 400
+
+    try:
+        charge_date = datetime.strptime(data['date'], '%Y-%m-%d') if data.get('date') else datetime.utcnow()
+        period = data.get('period') or charge_date.strftime('%Y-%m')
+
+        new_charge = SalaryCharge(
+            employee_id=employee.id,
+            type=charge_type,
+            amount=amount,
+            period=period,
+            date=charge_date,
+            reason=data.get('reason', '')
+        )
+        db.session.add(new_charge)
+
+        # Salary/bonus increase what's owed; a deduction reduces it (may go negative).
+        if charge_type == 'deduction':
+            employee.balance -= amount
+        else:
+            employee.balance += amount
+
+        db.session.commit()
+        return jsonify({'charge': new_charge.to_dict(), 'employee': employee.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
