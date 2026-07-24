@@ -194,6 +194,7 @@ class Customer(db.Model):
     is_subscription_active = db.Column(db.Boolean, default=True)
     balance = db.Column(db.Float, default=0.0)
     discount = db.Column(db.Float, default=0.0)
+    cost_override = db.Column(db.Float, nullable=True)
     reseller_id = db.Column(db.Integer, db.ForeignKey('reseller.id'), nullable=True)
     payments = db.relationship('Payment', backref='customer', lazy=True, cascade="all, delete-orphan")
     generated_receipts = db.relationship('GeneratedReceipt', back_populates='customer', cascade="all, delete-orphan")
@@ -215,6 +216,7 @@ class SubscriptionPlan(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
     price = db.Column(db.Float, nullable=False)
+    cost = db.Column(db.Float, nullable=False, default=0.0)
     billing_cycle = db.Column(db.String(20), nullable=False)
     status = db.Column(db.String(50), default='active') # active, inactive
 
@@ -225,6 +227,7 @@ class SubscriptionPlan(db.Model):
             'id': self.id,
             'name': self.name,
             'price': float(self.price),
+            'cost': float(self.cost),
             'billing_cycle': self.billing_cycle,
             'status': self.status
         }
@@ -392,6 +395,30 @@ class SalaryPayment(db.Model):
             'method': self.method,
             'is_advance': self.is_advance,
             'note': self.note
+        }
+
+# --- Estimated vs. real profit: one row per tenant per calendar month.
+# Only ever upserted for the CURRENT month (see recalculate_estimated_profit
+# below) -- once the calendar rolls into a new month nothing targets last
+# month's row again, which is what makes it a frozen historical record.
+class MonthlyProfitEstimate(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    month = db.Column(db.String(7), nullable=False)  # 'YYYY-MM'
+    estimated_income = db.Column(db.Float, nullable=False, default=0.0)
+    estimated_cost = db.Column(db.Float, nullable=False, default=0.0)
+    estimated_profit = db.Column(db.Float, nullable=False, default=0.0)  # denormalized: income - cost
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (db.UniqueConstraint('tenant_id', 'month', name='uq_monthly_profit_estimate_tenant_month'),)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'month': self.month,
+            'estimated_income': float(self.estimated_income),
+            'estimated_cost': float(self.estimated_cost),
+            'estimated_profit': float(self.estimated_profit),
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None
         }
 
 class Payment(db.Model):
@@ -650,6 +677,7 @@ TENANT_OWNED_MODELS = (
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
     CustomerFeedback, PaymentReminder, UpgradeRequest,
     Employee, SalaryCharge, SalaryPayment,
+    MonthlyProfitEstimate,
 )
 
 from sqlalchemy import event as _sa_event
