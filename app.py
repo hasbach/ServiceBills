@@ -1345,8 +1345,43 @@ def generate_missing_payments(tenant_id):
     except Exception as e:
         db.session.rollback()
         print(f"Error generating missing payments: {str(e)}")
-        
-        
+
+
+def generate_missing_salary_charges(tenant_id):
+    """Accrue missing monthly salary charges for one tenant's active employees.
+    Runs outside a request (scheduler), so every query/create is scoped by the
+    explicit tenant_id. Mirrors generate_missing_payments's cadence logic."""
+    try:
+        employees = Employee.query.filter_by(tenant_id=tenant_id, active=True).all()
+
+        for employee in employees:
+            last_charge = SalaryCharge.query.filter_by(
+                tenant_id=tenant_id, employee_id=employee.id, type='salary'
+            ).order_by(SalaryCharge.date.desc()).first()
+            last_date = last_charge.date if last_charge else employee.hire_date
+            next_charge_date = last_date + relativedelta(months=1)
+
+            while next_charge_date <= datetime.utcnow():
+                if employee.monthly_salary > 0:
+                    new_charge = SalaryCharge(
+                        tenant_id=tenant_id,
+                        employee_id=employee.id,
+                        type='salary',
+                        amount=employee.monthly_salary,
+                        period=next_charge_date.strftime('%Y-%m'),
+                        date=next_charge_date,
+                        reason='Monthly salary accrual'
+                    )
+                    db.session.add(new_charge)
+                    employee.balance += employee.monthly_salary
+                next_charge_date += relativedelta(months=1)
+
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error generating missing salary charges: {str(e)}")
+
+
 # Initialize scheduler
 scheduler = BackgroundScheduler(daemon=True, executors={'default': {'type': 'threadpool', 'max_workers': 1}})
 
@@ -1355,11 +1390,17 @@ def generate_missing_payments_with_context():
         for t in Tenant.query.filter_by(status="active").all():
             generate_missing_payments(t.id)
 
+def generate_missing_salary_charges_with_context():
+    with app.app_context():
+        for t in Tenant.query.filter_by(status="active").all():
+            generate_missing_salary_charges(t.id)
+
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
 if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     scheduler.add_job(func=generate_missing_payments_with_context, trigger="interval", days=1)
+    scheduler.add_job(func=generate_missing_salary_charges_with_context, trigger="interval", days=1)
     scheduler.start()
  
     
