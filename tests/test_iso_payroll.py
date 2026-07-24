@@ -48,3 +48,32 @@ def test_employee_model_defaults(app):
         appmod.db.session.commit()
         assert payment.to_dict()["amount"] == 500.0
         assert payment.to_dict()["is_advance"] is False
+
+
+def test_employee_isolation_and_crud(client):
+    a = make_tenant(client, "Biz A", "a_admin")
+    b = make_tenant(client, "Biz B", "b_admin")
+
+    r = client.post("/api/employees", headers=a,
+                     json={"name": "EmployeeA", "monthly_salary": 1000, "hire_date": "2026-01-01"})
+    assert r.status_code == 201
+    emp = r.get_json()
+    assert emp["balance"] == 0.0
+    assert emp["active"] is True
+
+    # Tenant B sees none of tenant A's employees.
+    assert _names(client.get("/api/employees", headers=b)) == set()
+    assert "EmployeeA" in _names(client.get("/api/employees", headers=a))
+
+    r2 = client.put(f"/api/employees/{emp['id']}", headers=a,
+                     json={"monthly_salary": 1200, "active": False})
+    assert r2.status_code == 200
+    assert r2.get_json()["monthly_salary"] == 1200
+    assert r2.get_json()["active"] is False
+
+    # Tenant B cannot reach tenant A's employee.
+    r3 = client.put(f"/api/employees/{emp['id']}", headers=b, json={"monthly_salary": 1})
+    assert r3.status_code == 404
+
+    r4 = client.delete(f"/api/employees/{emp['id']}", headers=a)
+    assert r4.status_code == 200

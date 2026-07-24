@@ -5183,6 +5183,99 @@ def fix_supplier_balance(supplier_id):
     db.session.commit()
     return jsonify({'message': 'Supplier balance fixed successfully!', 'supplier': supplier.to_dict()}), 200
 
+
+# --- NEW: API Endpoints for Employees (Payroll) ---
+
+@app.route('/api/employees', methods=['GET'])
+@admin_required()
+def get_employees():
+    employees = tenant_query(Employee).order_by(Employee.name).all()
+    return jsonify([e.to_dict() for e in employees])
+
+@app.route('/api/employees', methods=['POST'])
+@admin_required()
+def add_employee():
+    data = request.json
+    try:
+        if not data.get('name'):
+            return jsonify({'error': 'Name is required'}), 400
+
+        user_id = None
+        if data.get('user_id') not in (None, ''):
+            user = tenant_query(User).filter_by(id=int(data['user_id'])).first()
+            if not user:
+                return jsonify({'error': 'Linked user not found'}), 400
+            user_id = user.id
+
+        new_employee = Employee(
+            name=data['name'],
+            monthly_salary=float(data.get('monthly_salary', 0) or 0),
+            hire_date=datetime.strptime(data['hire_date'], '%Y-%m-%d') if data.get('hire_date') else datetime.utcnow(),
+            active=data.get('active', True),
+            user_id=user_id,
+            notes=data.get('notes', '')
+        )
+        db.session.add(new_employee)
+        db.session.commit()
+        return jsonify(new_employee.to_dict()), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/employees/<int:employee_id>', methods=['PUT'])
+@admin_required()
+def update_employee(employee_id):
+    data = request.json
+    employee = tenant_query(Employee).filter_by(id=employee_id).first()
+    if not employee:
+        return jsonify({'message': 'Employee not found!'}), 404
+
+    try:
+        if 'user_id' in data:
+            if data['user_id'] in (None, ''):
+                employee.user_id = None
+            else:
+                user = tenant_query(User).filter_by(id=int(data['user_id'])).first()
+                if not user:
+                    return jsonify({'error': 'Linked user not found'}), 400
+                employee.user_id = user.id
+
+        employee.name = data.get('name', employee.name)
+        employee.monthly_salary = float(data.get('monthly_salary', employee.monthly_salary))
+        if data.get('hire_date'):
+            employee.hire_date = datetime.strptime(data['hire_date'], '%Y-%m-%d')
+        employee.active = data.get('active', employee.active)
+        employee.notes = data.get('notes', employee.notes)
+        if 'balance' in data and data['balance'] is not None and data['balance'] != '':
+            employee.balance = float(data['balance'])
+
+        db.session.commit()
+        return jsonify(employee.to_dict()), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/employees/<int:employee_id>', methods=['DELETE'])
+@admin_required()
+def delete_employee(employee_id):
+    try:
+        employee = tenant_query(Employee).filter_by(id=employee_id).first()
+        if not employee:
+            return jsonify({'message': 'Employee not found!'}), 404
+
+        if tenant_query(SalaryCharge).filter_by(employee_id=employee.id).first():
+            return jsonify({'error': 'Cannot delete employee with linked salary charges.'}), 400
+
+        if tenant_query(SalaryPayment).filter_by(employee_id=employee.id).first():
+            return jsonify({'error': 'Cannot delete employee with existing payments.'}), 400
+
+        db.session.delete(employee)
+        db.session.commit()
+        return jsonify({'message': 'Employee deleted successfully!'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
