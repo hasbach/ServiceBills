@@ -5324,6 +5324,47 @@ def add_employee_charge(employee_id):
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
 
+@app.route('/api/employees/<int:employee_id>/payments', methods=['GET'])
+@admin_required()
+def get_employee_payments(employee_id):
+    payments = tenant_query(SalaryPayment).filter_by(employee_id=employee_id).order_by(SalaryPayment.payment_date.desc()).all()
+    return jsonify([p.to_dict() for p in payments])
+
+@app.route('/api/employees/<int:employee_id>/payments', methods=['POST'])
+@admin_required()
+def record_employee_payment(employee_id):
+    data = request.json
+    employee = tenant_query(Employee).filter_by(id=employee_id).first()
+    if not employee:
+        return jsonify({'message': 'Employee not found!'}), 404
+
+    amount = float(data.get('amount', 0))
+    if amount <= 0:
+        return jsonify({'error': 'Amount must be positive'}), 400
+
+    try:
+        # Reduce the balance (an advance can push this negative -- next month's
+        # accrual eats into it automatically).
+        employee.balance -= amount
+
+        new_payment = SalaryPayment(
+            employee_id=employee.id,
+            amount=amount,
+            method=data.get('method', ''),
+            is_advance=bool(data.get('is_advance', False)),
+            note=data.get('note', '')
+        )
+        if data.get('payment_date'):
+            new_payment.payment_date = datetime.strptime(data['payment_date'], '%Y-%m-%d')
+
+        db.session.add(new_payment)
+        db.session.commit()
+
+        return jsonify({'message': 'Payment recorded successfully!', 'employee': employee.to_dict(), 'payment': new_payment.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):

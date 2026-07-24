@@ -153,3 +153,29 @@ def test_salary_charge_bonus_and_deduction(client):
     r3 = client.post(f"/api/employees/{emp_id}/charges", headers=a,
                       json={"type": "invalid", "amount": 10})
     assert r3.status_code == 400
+
+
+def test_salary_payment_and_advance(client):
+    a = make_tenant(client, "Biz A", "a_admin")
+    r = client.post("/api/employees", headers=a, json={"name": "EmployeeP", "monthly_salary": 1000})
+    emp_id = r.get_json()["id"]
+
+    client.post(f"/api/employees/{emp_id}/charges", headers=a, json={"type": "salary", "amount": 1000})
+
+    r1 = client.post(f"/api/employees/{emp_id}/payments", headers=a,
+                      json={"amount": 400, "method": "cash"})
+    assert r1.status_code == 201
+    assert r1.get_json()["employee"]["balance"] == 600.0
+
+    # An advance beyond the current balance is allowed and goes negative.
+    r2 = client.post(f"/api/employees/{emp_id}/payments", headers=a,
+                      json={"amount": 1000, "is_advance": True, "note": "Emergency advance"})
+    assert r2.status_code == 201
+    assert r2.get_json()["employee"]["balance"] == -400.0
+    assert r2.get_json()["payment"]["is_advance"] is True
+
+    payments = client.get(f"/api/employees/{emp_id}/payments", headers=a).get_json()
+    assert len(payments) == 2
+
+    r3 = client.post(f"/api/employees/{emp_id}/payments", headers=a, json={"amount": 0})
+    assert r3.status_code == 400
