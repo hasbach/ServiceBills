@@ -1470,12 +1470,18 @@ def generate_missing_salary_charges_with_context():
         for t in Tenant.query.filter_by(status="active").all():
             generate_missing_salary_charges(t.id)
 
+def recalculate_all_estimated_profits_with_context():
+    with app.app_context():
+        for t in Tenant.query.filter_by(status="active").all():
+            recalculate_estimated_profit(t.id)
+
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
 if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     scheduler.add_job(func=generate_missing_payments_with_context, trigger="interval", days=1)
     scheduler.add_job(func=generate_missing_salary_charges_with_context, trigger="interval", days=1)
+    scheduler.add_job(func=recalculate_all_estimated_profits_with_context, trigger="interval", days=1)
     scheduler.start()
  
     

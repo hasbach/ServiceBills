@@ -201,3 +201,41 @@ def test_subscription_plan_cost_field_and_recompute_on_edit(app, client):
         month = appmod.datetime.utcnow().strftime('%Y-%m')
         estimate = appmod.MonthlyProfitEstimate.query.filter_by(tenant_id=tenant_id, month=month).first()
         assert estimate.estimated_cost == 20.0
+
+
+def test_daily_recompute_covers_quiet_tenants_without_events(app, client):
+    a = make_tenant(client, "Biz A", "a_admin")
+    b = make_tenant(client, "Biz B", "b_admin")
+
+    r = client.post("/api/subscription_plans", headers=a,
+                     json={"name": "Fiber 50", "price": 25, "billing_cycle": "monthly", "cost": 15})
+    plan_id = r.get_json()["plan"]["id"]
+    client.post("/api/customers", headers=a,
+                json={"name": "Cust", "phone": "1", "address": "a",
+                      "subscription_plan_id": plan_id, "subscription_start_date": "2026-01-01"})
+
+    with app.app_context():
+        a_tid = appmod.Tenant.query.filter_by(slug="biz-a").first().id
+        b_tid = appmod.Tenant.query.filter_by(slug="biz-b").first().id
+        month = appmod.datetime.utcnow().strftime('%Y-%m')
+
+        # Wipe out the estimate the add_customer trigger already created, to
+        # prove the daily job -- not the earlier event -- recreates it below.
+        appmod.MonthlyProfitEstimate.query.filter_by(tenant_id=a_tid, month=month).delete()
+        appmod.db.session.commit()
+        assert appmod.MonthlyProfitEstimate.query.filter_by(tenant_id=a_tid, month=month).first() is None
+
+    # Runs with NO request context, exactly like a real scheduler tick.
+    appmod.recalculate_all_estimated_profits_with_context()
+
+    with app.app_context():
+        estimate_a = appmod.MonthlyProfitEstimate.query.filter_by(tenant_id=a_tid, month=month).first()
+        assert estimate_a is not None
+        assert estimate_a.estimated_income == 25.0
+
+        # Tenant B has no customers/plans at all -- the job must not error on
+        # it, and every row must stay under its own tenant.
+        estimate_b = appmod.MonthlyProfitEstimate.query.filter_by(tenant_id=b_tid, month=month).first()
+        assert estimate_b is not None
+        assert estimate_b.estimated_income == 0.0
+        assert appmod.MonthlyProfitEstimate.query.filter(appmod.MonthlyProfitEstimate.tenant_id.is_(None)).count() == 0
