@@ -1541,6 +1541,7 @@ def get_customers():
                 'is_subscription_active': c.is_subscription_active,
                 'balance': float(c.balance) if c.balance else 0.0,
                 'discount': float(c.discount) if c.discount else 0.0,
+                'cost_override': float(c.cost_override) if c.cost_override is not None else None,
                 'reseller_id': c.reseller_id,
                 'subscription_plan': c.subscription_plan.to_dict() if c.subscription_plan else None
             }
@@ -1580,6 +1581,8 @@ def add_customer():
             return jsonify({'message': 'Subscription plan not found!'}), 404
 
         discount = float(data.get('discount', 0.0))
+        raw_cost_override = data.get('cost_override')
+        cost_override = float(raw_cost_override) if raw_cost_override not in (None, '') else None
 
         # Create new customer first
         new_customer = new_for_tenant(
@@ -1590,6 +1593,7 @@ def add_customer():
             sector=data.get('sector'),
             subscription_plan_id=data['subscription_plan_id'],
             discount=discount,
+            cost_override=cost_override,
             subscription_start_date=subscription_start_date,
             # Expiry date will be set by the payment loop
             subscription_expiry_date=subscription_start_date,
@@ -1665,7 +1669,8 @@ def add_customer():
         apply_customer_balance_to_unpaid_payments(new_customer)
 
         db.session.commit()
-        
+        recalculate_estimated_profit(new_customer.tenant_id)
+
         # Send WhatsApp Notification for Subscription Creation
         try:
             send_whatsapp_message(
@@ -1715,6 +1720,8 @@ def update_customer(customer_id):
             customer.sector = data['sector']
         if 'discount' in data:
             customer.discount = float(data['discount'])
+        if 'cost_override' in data:
+            customer.cost_override = float(data['cost_override']) if data['cost_override'] not in (None, '') else None
         if 'balance' in data:
             customer.balance = float(data['balance'])
         if 'reseller_id' in data:
@@ -1817,7 +1824,8 @@ def update_customer(customer_id):
             customer.whatsapp_notifications_enabled = bool(data['whatsapp_notifications_enabled'])
         
         db.session.commit()
-        
+        recalculate_estimated_profit(customer.tenant_id)
+
         return jsonify({
             'message': 'Customer updated successfully!',
             'customer': {
@@ -1827,13 +1835,14 @@ def update_customer(customer_id):
                 'address': customer.address,
                 'subscription_plan_id': customer.subscription_plan_id,
                 'discount': float(customer.discount),
+                'cost_override': float(customer.cost_override) if customer.cost_override is not None else None,
                 'subscription_start_date': customer.subscription_start_date.strftime('%Y-%m-%d'),
                 'subscription_expiry_date': customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else None,
                 'is_subscription_active': customer.is_subscription_active,
                 'balance': float(customer.balance)
             }
         }), 200
-        
+
     except Exception as e:
         db.session.rollback()
         traceback.print_exc()
@@ -1848,11 +1857,13 @@ def delete_customer(customer_id):
         customer = tenant_query(Customer).filter_by(id=customer_id).first()
         if not customer:
             return jsonify({'message': 'Customer not found!'}), 404
-        
+
+        tenant_id = customer.tenant_id
         # The 'cascade' option in the model will handle deleting related records
         db.session.delete(customer)
         db.session.commit()
-        
+        recalculate_estimated_profit(tenant_id)
+
         return jsonify({'message': 'Customer and all related data deleted successfully!'}), 200
     except Exception as e:
         db.session.rollback()
@@ -2060,6 +2071,11 @@ def add_subscription_plan():
         except ValueError:
             return jsonify({'error': "Price must be a valid number."}), 400
 
+        try:
+            cost = float(data.get('cost', 0.0))
+        except ValueError:
+            return jsonify({'error': "Cost must be a valid number."}), 400
+
         if not isinstance(data['name'], str) or not data['name'].strip():
             return jsonify({'error': "Plan name cannot be empty."}), 400
         if data['billing_cycle'] not in ['monthly', 'yearly']:
@@ -2068,6 +2084,7 @@ def add_subscription_plan():
         new_plan = SubscriptionPlan(
             name=data['name'],
             price=price,
+            cost=cost,
             billing_cycle=data['billing_cycle'],
             status=data.get('status', 'active')
         )
@@ -2096,6 +2113,7 @@ def update_subscription_plan(plan_id):
         data = request.json
         plan.name = data.get('name', plan.name)
         plan.price = float(data.get('price', plan.price))
+        plan.cost = float(data.get('cost', plan.cost))
         plan.billing_cycle = data.get('billing_cycle', plan.billing_cycle)
         plan.status = data.get('status', plan.status)
 
@@ -2557,6 +2575,7 @@ def activate_subscription(customer_id):
                     customer.balance -= amount_due
 
         db.session.commit()
+        recalculate_estimated_profit(customer.tenant_id)
 
         # ── Send WhatsApp notification (API mode) ──────────────────────────────
         try:
@@ -2594,8 +2613,9 @@ def cancel_subscription(customer_id):
     try:
         # Mark the subscription as inactive
         customer.is_subscription_active = False
-        
+
         db.session.commit()
+        recalculate_estimated_profit(customer.tenant_id)
 
         expiry_str = customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else None
         return jsonify({
