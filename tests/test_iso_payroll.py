@@ -77,3 +77,54 @@ def test_employee_isolation_and_crud(client):
 
     r4 = client.delete(f"/api/employees/{emp['id']}", headers=a)
     assert r4.status_code == 200
+
+
+def test_cannot_delete_employee_with_linked_charges_or_payments(app, client):
+    a = make_tenant(client, "Biz A", "a_admin")
+
+    # Create first employee to test SalaryCharge guard
+    r = client.post("/api/employees", headers=a,
+                     json={"name": "EmployeeA", "monthly_salary": 1000, "hire_date": "2026-01-01"})
+    assert r.status_code == 201
+    emp_id_1 = r.get_json()["id"]
+
+    # Create second employee to test SalaryPayment guard
+    r = client.post("/api/employees", headers=a,
+                     json={"name": "EmployeeB", "monthly_salary": 1000, "hire_date": "2026-01-01"})
+    assert r.status_code == 201
+    emp_id_2 = r.get_json()["id"]
+
+    # Inside app context, add SalaryCharge to first employee
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(slug="biz-a").first()
+
+        # Add SalaryCharge to emp_id_1
+        charge = appmod.SalaryCharge(
+            tenant_id=tenant.id,
+            employee_id=emp_id_1,
+            type="bonus",
+            amount=100.0,
+            period="2026-01"
+        )
+        appmod.db.session.add(charge)
+        appmod.db.session.commit()
+
+        # Add SalaryPayment to emp_id_2
+        payment = appmod.SalaryPayment(
+            tenant_id=tenant.id,
+            employee_id=emp_id_2,
+            amount=500.0,
+            method="cash"
+        )
+        appmod.db.session.add(payment)
+        appmod.db.session.commit()
+
+    # Test: DELETE with linked SalaryCharge should return 400
+    r1 = client.delete(f"/api/employees/{emp_id_1}", headers=a)
+    assert r1.status_code == 400
+    assert "salary charges" in r1.get_json()["error"].lower()
+
+    # Test: DELETE with linked SalaryPayment should return 400
+    r2 = client.delete(f"/api/employees/{emp_id_2}", headers=a)
+    assert r2.status_code == 400
+    assert "payments" in r2.get_json()["error"].lower()
