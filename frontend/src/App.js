@@ -25,6 +25,7 @@ import {
     ChevronRight as ChevronRightIcon,
     Campaign as MessageIcon,
     Storefront as ResellerIcon,
+    Badge as PayrollIcon,
 } from '@mui/icons-material';
 import { AppContextProvider, useAppContext, apiService } from './context/AppContext.js';
 import DashboardView from './components/DashboardView.js';
@@ -48,6 +49,7 @@ import EnhancedReportsView from './components/EnhancedReportsView.js';
 import MessagingView from './components/MessagingView.js';
 import ResellerManagementView from './components/ResellerManagementView.js';
 import SuppliersView from './components/SuppliersView.js';
+import EmployeesView from './components/EmployeesView.js';
 
 // ── Navigation config ────────────────────────────────────────────────────────
 const NAV_ITEMS = [
@@ -55,6 +57,7 @@ const NAV_ITEMS = [
     { key: 'subscriptions',      label: 'Subscriptions',      icon: <PeopleIcon />,          group: 'main',      allowedRoles: ['admin', 'finance'] },
     { key: 'resellers',          label: 'Resellers',          icon: <ResellerIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
     { key: 'suppliers',          label: 'Suppliers',          icon: <ShoppingCartIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
+    { key: 'employees',          label: 'Payroll',            icon: <PayrollIcon />,             group: 'main',      allowedRoles: ['admin'] },
     { key: 'payments',           label: 'Payments',           icon: <PaymentIcon />,         group: 'main',      allowedRoles: ['admin', 'finance', 'collector'] },
     { key: 'receipts',           label: 'Receipts',           icon: <ReceiptIcon />,         group: 'main',      allowedRoles: ['admin', 'finance'] },
     { key: 'expenses',           label: 'Expenses',           icon: <ExpenseIcon />,         group: 'main',      allowedRoles: ['admin'] },
@@ -239,6 +242,7 @@ const MainApp = ({
             case 'dashboard': return <DashboardView />;
             case 'resellers': return <ResellerManagementView />;
             case 'suppliers': return <SuppliersView />;
+            case 'employees': return <EmployeesView />;
             case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
             case 'payments': return <PaymentsView />;
             case 'receipts': return <ReceiptsView />;
