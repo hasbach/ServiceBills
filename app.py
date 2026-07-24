@@ -2724,11 +2724,17 @@ def get_expenses_total():
         func.sum(SupplierPayment.amount).label('total_sp')
     ).filter(SupplierPayment.tenant_id == current_tenant_id()).group_by('month').all()}
 
-    all_months = sorted(set(exp_data.keys()) | set(sp_data.keys()))
+    # Salary payments (cash paid to employees)
+    sal_data = {item.month: item.total_sal for item in db.session.query(
+        func.strftime('%Y-%m', SalaryPayment.payment_date).label('month'),
+        func.sum(SalaryPayment.amount).label('total_sal')
+    ).filter(SalaryPayment.tenant_id == current_tenant_id()).group_by('month').all()}
+
+    all_months = sorted(set(exp_data.keys()) | set(sp_data.keys()) | set(sal_data.keys()))
 
     return jsonify([{
         'month': m,
-        'value': float(exp_data.get(m, 0.0) or 0.0) + float(sp_data.get(m, 0.0) or 0.0)
+        'value': float(exp_data.get(m, 0.0) or 0.0) + float(sp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0)
     } for m in all_months])
 
 
@@ -2757,17 +2763,24 @@ def get_monthly_revenue():
         func.sum(SupplierPayment.amount).label('total_sp')
     ).filter(SupplierPayment.tenant_id == current_tenant_id()).group_by('month').all()
 
+    # Get salary cash payments
+    sal_query = db.session.query(
+        func.strftime('%Y-%m', SalaryPayment.payment_date).label('month'),
+        func.sum(SalaryPayment.amount).label('total_sal')
+    ).filter(SalaryPayment.tenant_id == current_tenant_id()).group_by('month').all()
+
     sales_data = {item.month: (item.total_sales or 0.0) for item in sales_query}
     expenses_data = {item.month: (item.total_expenses or 0.0) for item in expenses_query}
     sp_data = {item.month: (item.total_sp or 0.0) for item in sp_query}
+    sal_data = {item.month: (item.total_sal or 0.0) for item in sal_query}
 
     # Merge months
-    all_months = sorted(set(sales_data.keys()) | set(expenses_data.keys()) | set(sp_data.keys()))
+    all_months = sorted(set(sales_data.keys()) | set(expenses_data.keys()) | set(sp_data.keys()) | set(sal_data.keys()))
 
     result = []
     for month in all_months:
         sales = float(sales_data.get(month, 0.0) or 0.0)
-        expenses = float(expenses_data.get(month, 0.0) or 0.0) + float(sp_data.get(month, 0.0) or 0.0)
+        expenses = float(expenses_data.get(month, 0.0) or 0.0) + float(sp_data.get(month, 0.0) or 0.0) + float(sal_data.get(month, 0.0) or 0.0)
         result.append({
             'month': month,
             'value': float(sales - expenses)
@@ -3333,7 +3346,7 @@ def get_dashboard_metrics():
     total_customers = tenant_query(Customer).count()
     active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).count()
     total_revenue = sum(payment.amount for payment in tenant_query(Payment).filter_by(paid=True, pre_payment=False).all()) # Only actual revenue, not pre-payments
-    total_expenses = sum(expense.amount for expense in tenant_query(Expense).filter_by(is_credit=False).all()) + sum(sp.amount for sp in tenant_query(SupplierPayment).all())
+    total_expenses = sum(expense.amount for expense in tenant_query(Expense).filter_by(is_credit=False).all()) + sum(sp.amount for sp in tenant_query(SupplierPayment).all()) + sum(sal.amount for sal in tenant_query(SalaryPayment).all())
     # Outstanding balance should be the sum of negative balances (customers who owe money)
     outstanding_balance = sum(c.balance for c in tenant_query(Customer).filter(Customer.balance < 0).all())
     subscriptions_breakdown_query = db.session.query(
@@ -4755,18 +4768,34 @@ def get_financial_report():
             SupplierPayment.payment_date <= end_date
         ).group_by('month').all()
 
+        # 4. Salary cash payments
+        sal_query = db.session.query(
+            func.strftime('%Y-%m', SalaryPayment.payment_date).label('month'),
+            func.sum(SalaryPayment.amount).label('total')
+        ).filter(
+            SalaryPayment.tenant_id == current_tenant_id(),
+            SalaryPayment.payment_date >= start_date,
+            SalaryPayment.payment_date <= end_date
+        ).group_by('month').all()
+
         # Combine results
-        months_set = set([row.month for row in income_query] + [row.month for row in expense_query] + [row.month for row in sp_query])
-        
+        months_set = set(
+            [row.month for row in income_query] + [row.month for row in expense_query]
+            + [row.month for row in sp_query] + [row.month for row in sal_query]
+        )
+
         monthly_data_dict = {m: {'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0} for m in months_set}
 
         for row in income_query:
             monthly_data_dict[row.month]['income'] += float(row.total or 0)
-        
+
         for row in expense_query:
             monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
 
         for row in sp_query:
+            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+
+        for row in sal_query:
             monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
 
         monthly_data = []

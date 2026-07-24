@@ -200,3 +200,27 @@ def test_employee_history_and_fix_balance(client):
     r2 = client.put(f"/api/employees/{emp_id}/fix-balance", headers=a, json={"balance": 50})
     assert r2.status_code == 200
     assert r2.get_json()["employee"]["balance"] == 50.0
+
+
+def test_salary_payments_count_as_expenses_in_reports(client):
+    from datetime import datetime, timedelta
+
+    a = make_tenant(client, "Biz A", "a_admin")
+    r = client.post("/api/employees", headers=a, json={"name": "EmployeeR", "monthly_salary": 1000})
+    emp_id = r.get_json()["id"]
+    client.post(f"/api/employees/{emp_id}/charges", headers=a, json={"type": "salary", "amount": 1000})
+    client.post(f"/api/employees/{emp_id}/payments", headers=a, json={"amount": 700, "method": "cash"})
+
+    dash = client.get("/api/dashboard", headers=a).get_json()
+    assert dash["totalExpenses"] == 700.0
+
+    exp_total = client.get("/api/reports/expenses-total", headers=a).get_json()
+    assert sum(m["value"] for m in exp_total) == 700.0
+
+    rev = client.get("/api/reports/monthly-revenue", headers=a).get_json()
+    assert sum(-m["value"] for m in rev) == 700.0  # value = sales(0) - expenses -> -700
+
+    start = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+    end = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+    fin = client.get(f"/api/reports/financial?start_date={start}&end_date={end}", headers=a).get_json()
+    assert fin["totals"]["expenses"] == 700.0
