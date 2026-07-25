@@ -2329,12 +2329,22 @@ def delete_payment(payment_id):
         return jsonify({'error': str(e)}), 500
 
 
+def month_key(column):
+    """Cross-dialect 'YYYY-MM' grouping key for a DateTime column. SQLite has a
+    native strftime() function; PostgreSQL does not (it uses to_char instead).
+    Every report endpoint groups by month, so this one helper keeps them working
+    on both the SQLite test/dev database and the Postgres production database."""
+    if db.engine.dialect.name == 'postgresql':
+        return func.to_char(column, 'YYYY-MM')
+    return func.strftime('%Y-%m', column)
+
+
 # New Report Routes
 @app.route('/api/reports/total-sales', methods=['GET'])
 @jwt_required()
 def get_total_sales():
     total_sales = db.session.query(
-        func.strftime('%Y-%m', func.coalesce(Payment.paid_at, Payment.date)).label('month'),
+        month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
         func.sum(Payment.amount).label('total_sales')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
@@ -2351,7 +2361,7 @@ def get_total_sales():
 @jwt_required()
 def get_unpaid_payments():
     unpaid_payments = db.session.query(
-        func.strftime('%Y-%m', Payment.date).label('month'),
+        month_key(Payment.date).label('month'),
         func.sum(Payment.amount).label('unpaid')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
@@ -2367,7 +2377,7 @@ def get_unpaid_payments():
 @jwt_required()
 def get_customer_numbers():
     customer_numbers = db.session.query(
-        func.strftime('%Y-%m', Customer.subscription_start_date).label('month'),
+        month_key(Customer.subscription_start_date).label('month'),
         func.count(Customer.id).label('customers')
     ).filter(
         Customer.tenant_id == current_tenant_id()
@@ -2857,19 +2867,19 @@ def delete_receipt(receipt_id):
 def get_expenses_total():
     # Direct cash expenses (exclude credit purchases)
     exp_data = {item.month: item.total_expenses for item in db.session.query(
-        func.strftime('%Y-%m', Expense.date).label('month'),
+        month_key(Expense.date).label('month'),
         func.sum(Expense.amount).label('total_expenses')
     ).filter(Expense.tenant_id == current_tenant_id(), Expense.is_credit == False).group_by('month').all()}
 
     # Supplier cash payments
     sp_data = {item.month: item.total_sp for item in db.session.query(
-        func.strftime('%Y-%m', SupplierPayment.payment_date).label('month'),
+        month_key(SupplierPayment.payment_date).label('month'),
         func.sum(SupplierPayment.amount).label('total_sp')
     ).filter(SupplierPayment.tenant_id == current_tenant_id()).group_by('month').all()}
 
     # Salary payments (cash paid to employees)
     sal_data = {item.month: item.total_sal for item in db.session.query(
-        func.strftime('%Y-%m', SalaryPayment.payment_date).label('month'),
+        month_key(SalaryPayment.payment_date).label('month'),
         func.sum(SalaryPayment.amount).label('total_sal')
     ).filter(SalaryPayment.tenant_id == current_tenant_id()).group_by('month').all()}
 
@@ -2886,7 +2896,7 @@ def get_expenses_total():
 def get_monthly_revenue():
     # Get total sales (paid only)
     sales_query = db.session.query(
-        func.strftime('%Y-%m', func.coalesce(Payment.paid_at, Payment.date)).label('month'),
+        month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
         func.sum(Payment.amount).label('total_sales')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
@@ -2896,19 +2906,19 @@ def get_monthly_revenue():
 
     # Get expenses (exclude credit purchases)
     expenses_query = db.session.query(
-        func.strftime('%Y-%m', Expense.date).label('month'),
+        month_key(Expense.date).label('month'),
         func.sum(Expense.amount).label('total_expenses')
     ).filter(Expense.tenant_id == current_tenant_id(), Expense.is_credit == False).group_by('month').all()
 
     # Get supplier cash payments
     sp_query = db.session.query(
-        func.strftime('%Y-%m', SupplierPayment.payment_date).label('month'),
+        month_key(SupplierPayment.payment_date).label('month'),
         func.sum(SupplierPayment.amount).label('total_sp')
     ).filter(SupplierPayment.tenant_id == current_tenant_id()).group_by('month').all()
 
     # Get salary cash payments
     sal_query = db.session.query(
-        func.strftime('%Y-%m', SalaryPayment.payment_date).label('month'),
+        month_key(SalaryPayment.payment_date).label('month'),
         func.sum(SalaryPayment.amount).label('total_sal')
     ).filter(SalaryPayment.tenant_id == current_tenant_id()).group_by('month').all()
 
@@ -4881,7 +4891,7 @@ def get_financial_report():
 
         # 1. Income: Payments marked as paid. Fall back to date if paid_at is null.
         income_query = db.session.query(
-            func.strftime('%Y-%m', func.coalesce(Payment.paid_at, Payment.date)).label('month'),
+            month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
             func.sum(Payment.amount).label('total')
         ).filter(
             Payment.tenant_id == current_tenant_id(),
@@ -4892,7 +4902,7 @@ def get_financial_report():
 
         # 2. Expenses (direct non-credit)
         expense_query = db.session.query(
-            func.strftime('%Y-%m', Expense.date).label('month'),
+            month_key(Expense.date).label('month'),
             func.sum(Expense.amount).label('total')
         ).filter(
             Expense.tenant_id == current_tenant_id(),
@@ -4903,7 +4913,7 @@ def get_financial_report():
 
         # 3. Supplier cash payments
         sp_query = db.session.query(
-            func.strftime('%Y-%m', SupplierPayment.payment_date).label('month'),
+            month_key(SupplierPayment.payment_date).label('month'),
             func.sum(SupplierPayment.amount).label('total')
         ).filter(
             SupplierPayment.tenant_id == current_tenant_id(),
@@ -4913,7 +4923,7 @@ def get_financial_report():
 
         # 4. Salary cash payments
         sal_query = db.session.query(
-            func.strftime('%Y-%m', SalaryPayment.payment_date).label('month'),
+            month_key(SalaryPayment.payment_date).label('month'),
             func.sum(SalaryPayment.amount).label('total')
         ).filter(
             SalaryPayment.tenant_id == current_tenant_id(),
