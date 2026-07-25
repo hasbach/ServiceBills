@@ -195,6 +195,7 @@ const SubscriptionsView = ({
         subscription_plan_id: '',
         reseller_id: '',
         discount: 0.0,
+        cost_override: '',
         subscription_start_date: new Date().toISOString().split('T')[0],
         additional_payment_amount: 0.0,
     });
@@ -455,6 +456,7 @@ const SubscriptionsView = ({
                 sector: editingCustomer.sector,
                 subscription_plan_id: editingCustomer.subscription_plan_id,
                 discount: editingCustomer.discount,
+                cost_override: editingCustomer.cost_override,
                 balance: editingCustomer.balance !== undefined ? editingCustomer.balance : 0,
                 reseller_id: editingCustomer.reseller_id || ""
             });
@@ -492,7 +494,7 @@ const SubscriptionsView = ({
             await apiService.addCustomer(newCustomer);
             setSnackbar({ open: true, message: 'Customer added successfully!', severity: 'success' });
             setShowAddCustomerForm(false);
-            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', discount: 0.0, subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
+            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
             refetchCustomers(1, itemsPerPage, ''); // Go to first page after adding
         } catch (error) {
             console.error('Error adding customer:', error);
@@ -661,6 +663,7 @@ const SubscriptionsView = ({
                             </TextField>
                         </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount (Fixed Amount)" value={newCustomer.discount} onChange={(e) => setNewCustomer({ ...newCustomer, discount: parseFloat(e.target.value) || 0.0 })} /></Grid>
+                        <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={newCustomer.cost_override} onChange={(e) => setNewCustomer({ ...newCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="date" label="Subscription Start Date" value={newCustomer.subscription_start_date} onChange={(e) => setNewCustomer({ ...newCustomer, subscription_start_date: e.target.value })} InputLabelProps={{ shrink: true }} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Additional Payment Amount" value={newCustomer.additional_payment_amount} onChange={(e) => setNewCustomer({ ...newCustomer, additional_payment_amount: parseFloat(e.target.value) || 0.0 })} helperText="For one-time charges on creation" /></Grid>
                     </Grid>
@@ -978,6 +981,7 @@ const SubscriptionsView = ({
                             </TextField>
                         </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount ($)" value={editingCustomer?.discount || 0} onChange={(e) => setEditingCustomer({ ...editingCustomer, discount: parseFloat(e.target.value) || 0 })} /></Grid>
+                        <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={editingCustomer?.cost_override ?? ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Account Balance ($)" value={editingCustomer?.balance !== undefined ? editingCustomer.balance : 0} helperText="Negative value = Customer owes money. 0 = Paid." onChange={(e) => setEditingCustomer({ ...editingCustomer, balance: parseFloat(e.target.value) || 0 })} /></Grid>
                     </Grid>
                 </DialogContent>

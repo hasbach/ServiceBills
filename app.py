@@ -194,6 +194,7 @@ class Customer(db.Model):
     is_subscription_active = db.Column(db.Boolean, default=True)
     balance = db.Column(db.Float, default=0.0)
     discount = db.Column(db.Float, default=0.0)
+    cost_override = db.Column(db.Float, nullable=True)
     reseller_id = db.Column(db.Integer, db.ForeignKey('reseller.id'), nullable=True)
     payments = db.relationship('Payment', backref='customer', lazy=True, cascade="all, delete-orphan")
     generated_receipts = db.relationship('GeneratedReceipt', back_populates='customer', cascade="all, delete-orphan")
@@ -215,6 +216,7 @@ class SubscriptionPlan(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
     price = db.Column(db.Float, nullable=False)
+    cost = db.Column(db.Float, nullable=False, default=0.0)
     billing_cycle = db.Column(db.String(20), nullable=False)
     status = db.Column(db.String(50), default='active') # active, inactive
 
@@ -225,6 +227,7 @@ class SubscriptionPlan(db.Model):
             'id': self.id,
             'name': self.name,
             'price': float(self.price),
+            'cost': float(self.cost),
             'billing_cycle': self.billing_cycle,
             'status': self.status
         }
@@ -392,6 +395,30 @@ class SalaryPayment(db.Model):
             'method': self.method,
             'is_advance': self.is_advance,
             'note': self.note
+        }
+
+# --- Estimated vs. real profit: one row per tenant per calendar month.
+# Only ever upserted for the CURRENT month (see recalculate_estimated_profit
+# below) -- once the calendar rolls into a new month nothing targets last
+# month's row again, which is what makes it a frozen historical record.
+class MonthlyProfitEstimate(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    month = db.Column(db.String(7), nullable=False)  # 'YYYY-MM'
+    estimated_income = db.Column(db.Float, nullable=False, default=0.0)
+    estimated_cost = db.Column(db.Float, nullable=False, default=0.0)
+    estimated_profit = db.Column(db.Float, nullable=False, default=0.0)  # denormalized: income - cost
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (db.UniqueConstraint('tenant_id', 'month', name='uq_monthly_profit_estimate_tenant_month'),)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'month': self.month,
+            'estimated_income': float(self.estimated_income),
+            'estimated_cost': float(self.estimated_cost),
+            'estimated_profit': float(self.estimated_profit),
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None
         }
 
 class Payment(db.Model):
@@ -650,6 +677,7 @@ TENANT_OWNED_MODELS = (
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
     CustomerFeedback, PaymentReminder, UpgradeRequest,
     Employee, SalaryCharge, SalaryPayment,
+    MonthlyProfitEstimate,
 )
 
 from sqlalchemy import event as _sa_event
@@ -1382,6 +1410,53 @@ def generate_missing_salary_charges(tenant_id):
         print(f"Error generating missing salary charges: {str(e)}")
 
 
+def recalculate_estimated_profit(tenant_id):
+    """Recompute the CURRENT month's estimated profit for one tenant from its
+    currently active customers. Runs both from request handlers (called after
+    their own commit, so a failure here never blocks the primary action) and
+    from the scheduler, so it takes an explicit tenant_id and never calls
+    tenant_query(). Never raises -- mirrors generate_missing_salary_charges's
+    rollback+print pattern."""
+    try:
+        customers = Customer.query.filter_by(tenant_id=tenant_id, is_subscription_active=True).all()
+
+        estimated_income = 0.0
+        estimated_cost = 0.0
+
+        for customer in customers:
+            plan = SubscriptionPlan.query.filter_by(tenant_id=tenant_id, id=customer.subscription_plan_id).first()
+            if not plan:
+                continue
+
+            effective_price = max(0.0, plan.price - (customer.discount or 0.0))
+            effective_cost = customer.cost_override if customer.cost_override is not None else plan.cost
+
+            if plan.billing_cycle == 'monthly':
+                factor = 1.0
+            elif plan.billing_cycle == 'yearly':
+                factor = 1.0 / 12
+            else:
+                continue  # Unrecognized cycle: skip, matches generate_missing_payments
+
+            estimated_income += effective_price * factor
+            estimated_cost += effective_cost * factor
+
+        month = datetime.utcnow().strftime('%Y-%m')
+        estimate = MonthlyProfitEstimate.query.filter_by(tenant_id=tenant_id, month=month).first()
+        if not estimate:
+            estimate = MonthlyProfitEstimate(tenant_id=tenant_id, month=month)
+            db.session.add(estimate)
+
+        estimate.estimated_income = estimated_income
+        estimate.estimated_cost = estimated_cost
+        estimate.estimated_profit = estimated_income - estimated_cost
+
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error recalculating estimated profit: {str(e)}")
+
+
 # Initialize scheduler
 scheduler = BackgroundScheduler(daemon=True, executors={'default': {'type': 'threadpool', 'max_workers': 1}})
 
@@ -1395,12 +1470,18 @@ def generate_missing_salary_charges_with_context():
         for t in Tenant.query.filter_by(status="active").all():
             generate_missing_salary_charges(t.id)
 
+def recalculate_all_estimated_profits_with_context():
+    with app.app_context():
+        for t in Tenant.query.filter_by(status="active").all():
+            recalculate_estimated_profit(t.id)
+
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
 if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     scheduler.add_job(func=generate_missing_payments_with_context, trigger="interval", days=1)
     scheduler.add_job(func=generate_missing_salary_charges_with_context, trigger="interval", days=1)
+    scheduler.add_job(func=recalculate_all_estimated_profits_with_context, trigger="interval", days=1)
     scheduler.start()
  
     
@@ -1466,6 +1547,7 @@ def get_customers():
                 'is_subscription_active': c.is_subscription_active,
                 'balance': float(c.balance) if c.balance else 0.0,
                 'discount': float(c.discount) if c.discount else 0.0,
+                'cost_override': float(c.cost_override) if c.cost_override is not None else None,
                 'reseller_id': c.reseller_id,
                 'subscription_plan': c.subscription_plan.to_dict() if c.subscription_plan else None
             }
@@ -1505,6 +1587,8 @@ def add_customer():
             return jsonify({'message': 'Subscription plan not found!'}), 404
 
         discount = float(data.get('discount', 0.0))
+        raw_cost_override = data.get('cost_override')
+        cost_override = float(raw_cost_override) if raw_cost_override not in (None, '') else None
 
         # Create new customer first
         new_customer = new_for_tenant(
@@ -1515,6 +1599,7 @@ def add_customer():
             sector=data.get('sector'),
             subscription_plan_id=data['subscription_plan_id'],
             discount=discount,
+            cost_override=cost_override,
             subscription_start_date=subscription_start_date,
             # Expiry date will be set by the payment loop
             subscription_expiry_date=subscription_start_date,
@@ -1590,7 +1675,8 @@ def add_customer():
         apply_customer_balance_to_unpaid_payments(new_customer)
 
         db.session.commit()
-        
+        recalculate_estimated_profit(new_customer.tenant_id)
+
         # Send WhatsApp Notification for Subscription Creation
         try:
             send_whatsapp_message(
@@ -1640,6 +1726,8 @@ def update_customer(customer_id):
             customer.sector = data['sector']
         if 'discount' in data:
             customer.discount = float(data['discount'])
+        if 'cost_override' in data:
+            customer.cost_override = float(data['cost_override']) if data['cost_override'] not in (None, '') else None
         if 'balance' in data:
             customer.balance = float(data['balance'])
         if 'reseller_id' in data:
@@ -1742,7 +1830,8 @@ def update_customer(customer_id):
             customer.whatsapp_notifications_enabled = bool(data['whatsapp_notifications_enabled'])
         
         db.session.commit()
-        
+        recalculate_estimated_profit(customer.tenant_id)
+
         return jsonify({
             'message': 'Customer updated successfully!',
             'customer': {
@@ -1752,13 +1841,14 @@ def update_customer(customer_id):
                 'address': customer.address,
                 'subscription_plan_id': customer.subscription_plan_id,
                 'discount': float(customer.discount),
+                'cost_override': float(customer.cost_override) if customer.cost_override is not None else None,
                 'subscription_start_date': customer.subscription_start_date.strftime('%Y-%m-%d'),
                 'subscription_expiry_date': customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else None,
                 'is_subscription_active': customer.is_subscription_active,
                 'balance': float(customer.balance)
             }
         }), 200
-        
+
     except Exception as e:
         db.session.rollback()
         traceback.print_exc()
@@ -1773,11 +1863,13 @@ def delete_customer(customer_id):
         customer = tenant_query(Customer).filter_by(id=customer_id).first()
         if not customer:
             return jsonify({'message': 'Customer not found!'}), 404
-        
+
+        tenant_id = customer.tenant_id
         # The 'cascade' option in the model will handle deleting related records
         db.session.delete(customer)
         db.session.commit()
-        
+        recalculate_estimated_profit(tenant_id)
+
         return jsonify({'message': 'Customer and all related data deleted successfully!'}), 200
     except Exception as e:
         db.session.rollback()
@@ -1985,6 +2077,11 @@ def add_subscription_plan():
         except ValueError:
             return jsonify({'error': "Price must be a valid number."}), 400
 
+        try:
+            cost = float(data.get('cost', 0.0))
+        except ValueError:
+            return jsonify({'error': "Cost must be a valid number."}), 400
+
         if not isinstance(data['name'], str) or not data['name'].strip():
             return jsonify({'error': "Plan name cannot be empty."}), 400
         if data['billing_cycle'] not in ['monthly', 'yearly']:
@@ -1993,6 +2090,7 @@ def add_subscription_plan():
         new_plan = SubscriptionPlan(
             name=data['name'],
             price=price,
+            cost=cost,
             billing_cycle=data['billing_cycle'],
             status=data.get('status', 'active')
         )
@@ -2021,10 +2119,12 @@ def update_subscription_plan(plan_id):
         data = request.json
         plan.name = data.get('name', plan.name)
         plan.price = float(data.get('price', plan.price))
+        plan.cost = float(data.get('cost', plan.cost))
         plan.billing_cycle = data.get('billing_cycle', plan.billing_cycle)
         plan.status = data.get('status', plan.status)
 
         db.session.commit()
+        recalculate_estimated_profit(plan.tenant_id)
         return jsonify({'message': 'Subscription plan updated successfully!', 'plan': plan.to_dict()}), 200
     except Exception as e:
         db.session.rollback()
@@ -2482,6 +2582,7 @@ def activate_subscription(customer_id):
                     customer.balance -= amount_due
 
         db.session.commit()
+        recalculate_estimated_profit(customer.tenant_id)
 
         # ── Send WhatsApp notification (API mode) ──────────────────────────────
         try:
@@ -2519,8 +2620,9 @@ def cancel_subscription(customer_id):
     try:
         # Mark the subscription as inactive
         customer.is_subscription_active = False
-        
+
         db.session.commit()
+        recalculate_estimated_profit(customer.tenant_id)
 
         expiry_str = customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else None
         return jsonify({
@@ -4819,10 +4921,30 @@ def get_financial_report():
             SalaryPayment.payment_date <= end_date
         ).group_by('month').all()
 
+        # 5. Logged estimated profit -- lazily backfill the current month if it's
+        # in range and hasn't been computed yet (no event/daily-job tick reached
+        # it yet), so the current month is never blank.
+        current_month = datetime.utcnow().strftime('%Y-%m')
+        start_month = start_date.strftime('%Y-%m')
+        end_month = end_date.strftime('%Y-%m')
+        if start_month <= current_month <= end_month:
+            if not MonthlyProfitEstimate.query.filter_by(
+                tenant_id=current_tenant_id(), month=current_month
+            ).first():
+                recalculate_estimated_profit(current_tenant_id())
+
+        estimate_query = MonthlyProfitEstimate.query.filter(
+            MonthlyProfitEstimate.tenant_id == current_tenant_id(),
+            MonthlyProfitEstimate.month >= start_month,
+            MonthlyProfitEstimate.month <= end_month
+        ).all()
+        estimate_data = {e.month: e.estimated_profit for e in estimate_query}
+
         # Combine results
         months_set = set(
             [row.month for row in income_query] + [row.month for row in expense_query]
             + [row.month for row in sp_query] + [row.month for row in sal_query]
+            + list(estimate_data.keys())
         )
 
         monthly_data_dict = {m: {'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0} for m in months_set}
@@ -4842,14 +4964,24 @@ def get_financial_report():
         monthly_data = []
         total_income = 0.0
         total_expenses = 0.0
+        total_estimated_profit = 0.0
+        total_variance = 0.0
 
         for m in sorted(months_set):
             data = monthly_data_dict[m]
             data['profit'] = data['income'] - data['expenses']
+
+            estimated_profit = estimate_data.get(m)
+            data['estimated_profit'] = estimated_profit
+            data['variance'] = (data['profit'] - estimated_profit) if estimated_profit is not None else None
+
             monthly_data.append(data)
-            
+
             total_income += data['income']
             total_expenses += data['expenses']
+            if estimated_profit is not None:
+                total_estimated_profit += estimated_profit
+                total_variance += data['variance']
 
         total_profit = total_income - total_expenses
 
@@ -4858,7 +4990,9 @@ def get_financial_report():
             'totals': {
                 'income': total_income,
                 'expenses': total_expenses,
-                'profit': total_profit
+                'profit': total_profit,
+                'estimated_profit': total_estimated_profit,
+                'variance': total_variance
             }
         }), 200
 
