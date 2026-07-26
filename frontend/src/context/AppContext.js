@@ -131,6 +131,18 @@ const rawApiService = {
     fetchSupplierHistory: (id) => api.get(`/suppliers/${id}/history`),
     fixSupplierBalance: (id, data) => api.put(`/suppliers/${id}/fix-balance`, data),
 
+    // Employee / Payroll API methods
+    fetchEmployees: () => api.get('/employees'),
+    addEmployee: (data) => api.post('/employees', data),
+    updateEmployee: (id, data) => api.put(`/employees/${id}`, data),
+    deleteEmployee: (id) => api.delete(`/employees/${id}`),
+    fetchEmployeeCharges: (id) => api.get(`/employees/${id}/charges`),
+    addEmployeeCharge: (id, data) => api.post(`/employees/${id}/charges`, data),
+    fetchEmployeePayments: (id) => api.get(`/employees/${id}/payments`),
+    recordEmployeePayment: (id, data) => api.post(`/employees/${id}/payments`, data),
+    fetchEmployeeHistory: (id) => api.get(`/employees/${id}/history`),
+    fixEmployeeBalance: (id, data) => api.put(`/employees/${id}/fix-balance`, data),
+
 
     fetchCustomers: async (page = 1, perPage = 999, searchQuery = '', sort_by = 'expiry_date', reseller_id = '') => {
         const response = await api.get(`/customers`, { params: { page: page, per_page: perPage, search: searchQuery, sort_by: sort_by, reseller_id: reseller_id } });
