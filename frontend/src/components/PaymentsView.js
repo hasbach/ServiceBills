@@ -396,6 +396,8 @@ const PaymentsView = () => {
     const [currentTab, setCurrentTab] = useState(0);
     const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'list'
     const [selected, setSelected] = useState([]); // selected payment IDs for bulk actions
+    const [bulkActionLoading, setBulkActionLoading] = useState(false);
+    const [markPaidSubmitting, setMarkPaidSubmitting] = useState(false);
     // Mark-as-Paid dialog
     const [markPaidDialog, setMarkPaidDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
     const [markPaidAmount, setMarkPaidAmount] = useState('');
@@ -633,6 +635,7 @@ const PaymentsView = () => {
     };
 
     const handleMarkPaid = async (paymentId, currentOutstandingAmount) => {
+        if (markPaidSubmitting) return; // guard against a double-click firing this twice
         const amountInput = markPaidAmount;
         const paymentAmountInput = amountInput !== '' ? amountInput : null;
         const amountReceived = parseFloat(paymentAmountInput);
@@ -641,6 +644,7 @@ const PaymentsView = () => {
             setSnackbar({ open: true, message: 'Please enter a valid positive amount.', severity: 'warning' });
             return;
         }
+        setMarkPaidSubmitting(true);
         setMarkPaidDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' });
 
         const targetPayment = payments.find(p => p.id === paymentId);
@@ -697,6 +701,8 @@ const PaymentsView = () => {
         } catch (error) {
             console.error("Error marking payment paid:", error);
             setSnackbar({ open: true, message: 'Failed to mark payment as paid. ' + (error.response?.data?.error || error.message), severity: 'error' });
+        } finally {
+            setMarkPaidSubmitting(false);
         }
     };
 
@@ -718,32 +724,50 @@ const PaymentsView = () => {
     };
 
     // --- Bulk delete selected payments ---
+    // Fires ONE bulk request for the whole selection (instead of one HTTP call
+    // per row) and guards against a double-click re-triggering the batch.
     const handleBulkDelete = async () => {
-        if (selected.length === 0) return;
+        if (bulkActionLoading || selected.length === 0) return;
         if (!window.confirm(`Delete ${selected.length} selected payment(s)? This cannot be undone.`)) return;
+        setBulkActionLoading(true);
         try {
-            await Promise.allSettled(selected.map(id => apiService.deletePayment(id)));
-            setSnackbar({ open: true, message: `${selected.length} payment(s) deleted.`, severity: 'success' });
+            const { data } = await apiService.bulkDeletePayments(selected);
+            const failCount = (data.failed || []).length;
+            setSnackbar({
+                open: true,
+                message: `${(data.succeeded || []).length} payment(s) deleted.${failCount ? ` Failed for ${failCount}.` : ''}`,
+                severity: failCount ? 'warning' : 'success'
+            });
             setSelected([]);
             fetchPayments();
             if (filters.customer_id) fetchCustomerBalance(filters.customer_id);
         } catch (error) {
-            setSnackbar({ open: true, message: 'Bulk delete failed: ' + error.message, severity: 'error' });
+            setSnackbar({ open: true, message: 'Bulk delete failed: ' + (error.response?.data?.message || error.message), severity: 'error' });
+        } finally {
+            setBulkActionLoading(false);
         }
     };
 
     // --- Bulk mark selected payments as paid ---
     const handleBulkMarkPaid = async () => {
-        if (selected.length === 0) return;
+        if (bulkActionLoading || selected.length === 0) return;
         if (!window.confirm(`Mark ${selected.length} selected payment(s) as paid?`)) return;
+        setBulkActionLoading(true);
         try {
-            await Promise.allSettled(selected.map(id => apiService.markPaymentAsPaid(id)));
-            setSnackbar({ open: true, message: `${selected.length} payment(s) marked as paid.`, severity: 'success' });
+            const { data } = await apiService.bulkMarkPaymentsPaid(selected);
+            const failCount = (data.failed || []).length;
+            setSnackbar({
+                open: true,
+                message: `${(data.succeeded || []).length} payment(s) marked as paid.${failCount ? ` Failed for ${failCount}.` : ''}`,
+                severity: failCount ? 'warning' : 'success'
+            });
             setSelected([]);
             fetchPayments();
             if (filters.customer_id) fetchCustomerBalance(filters.customer_id);
         } catch (error) {
-            setSnackbar({ open: true, message: 'Bulk mark paid failed: ' + error.message, severity: 'error' });
+            setSnackbar({ open: true, message: 'Bulk mark paid failed: ' + (error.response?.data?.message || error.message), severity: 'error' });
+        } finally {
+            setBulkActionLoading(false);
         }
     };
 
@@ -1104,12 +1128,12 @@ const handlePrint = () => {
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                         <Typography variant="body2" sx={{ fontWeight: 600 }}>{selected.length} selected</Typography>
                         {(userRoles.includes('admin') || userRoles.includes('finance')) && (
-                            <Button size="small" variant="contained" color="success" startIcon={<CheckCircleIcon />} onClick={handleBulkMarkPaid}>Mark Paid</Button>
+                            <Button size="small" variant="contained" color="success" startIcon={bulkActionLoading ? <CircularProgress size={16} color="inherit" /> : <CheckCircleIcon />} onClick={handleBulkMarkPaid} disabled={bulkActionLoading}>Mark Paid</Button>
                         )}
                         {(userRoles.includes('admin') || userRoles.includes('finance')) && (
-                            <Button size="small" variant="contained" color="error" startIcon={<DeleteIcon />} onClick={handleBulkDelete}>Delete Selected</Button>
+                            <Button size="small" variant="contained" color="error" startIcon={bulkActionLoading ? <CircularProgress size={16} color="inherit" /> : <DeleteIcon />} onClick={handleBulkDelete} disabled={bulkActionLoading}>Delete Selected</Button>
                         )}
-                        <Button size="small" variant="outlined" onClick={() => setSelected([])}>Clear</Button>
+                        <Button size="small" variant="outlined" onClick={() => setSelected([])} disabled={bulkActionLoading}>Clear</Button>
                     </Box>
                 )}
             </Box>
@@ -1285,10 +1309,10 @@ const handlePrint = () => {
                         <Toolbar sx={{ bgcolor: alpha(theme.palette.primary.main, 0.08), borderBottom: `1px solid ${alpha(theme.palette.divider, 0.1)}` }}>
                             <Typography sx={{ flex: 1, fontWeight: 600 }}>{selected.length} selected</Typography>
                             {(userRoles.includes('admin') || userRoles.includes('finance')) && (
-                                <Button size="small" variant="contained" color="success" startIcon={<CheckCircleIcon />} onClick={handleBulkMarkPaid} sx={{ mr: 1 }}>Mark Paid</Button>
+                                <Button size="small" variant="contained" color="success" startIcon={bulkActionLoading ? <CircularProgress size={16} color="inherit" /> : <CheckCircleIcon />} onClick={handleBulkMarkPaid} disabled={bulkActionLoading} sx={{ mr: 1 }}>Mark Paid</Button>
                             )}
                             {(userRoles.includes('admin') || userRoles.includes('finance')) && (
-                                <Button size="small" variant="contained" color="error" startIcon={<DeleteIcon />} onClick={handleBulkDelete}>Delete Selected</Button>
+                                <Button size="small" variant="contained" color="error" startIcon={bulkActionLoading ? <CircularProgress size={16} color="inherit" /> : <DeleteIcon />} onClick={handleBulkDelete} disabled={bulkActionLoading}>Delete Selected</Button>
                             )}
                         </Toolbar>
                     )}
@@ -1485,8 +1509,9 @@ const handlePrint = () => {
                     <Button
                         variant="contained"
                         color="success"
-                        startIcon={<CheckCircleIcon />}
+                        startIcon={markPaidSubmitting ? <CircularProgress size={16} color="inherit" /> : <CheckCircleIcon />}
                         onClick={() => handleMarkPaid(markPaidDialog.paymentId, markPaidDialog.outstanding)}
+                        disabled={markPaidSubmitting}
                     >
                         Confirm Payment
                     </Button>

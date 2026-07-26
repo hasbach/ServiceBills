@@ -65,7 +65,7 @@ import {
 import { useAppContext } from '../context/AppContext.js';
 
 // --- NEW: Toolbar for bulk actions ---
-const EnhancedTableToolbar = ({ numSelected, onRenew, onCancel, onDelete }) => {
+const EnhancedTableToolbar = ({ numSelected, onRenew, onCancel, onDelete, disabled }) => {
     const theme = useTheme();
     return (
         <Toolbar
@@ -105,9 +105,10 @@ const EnhancedTableToolbar = ({ numSelected, onRenew, onCancel, onDelete }) => {
                         <Button
                             variant="outlined"
                             color="success"
-                            startIcon={<RefreshIcon />}
+                            startIcon={disabled ? <CircularProgress size={16} /> : <RefreshIcon />}
                             onClick={onRenew}
                             size="small"
+                            disabled={disabled}
                         >
                             Renew
                         </Button>
@@ -116,9 +117,10 @@ const EnhancedTableToolbar = ({ numSelected, onRenew, onCancel, onDelete }) => {
                         <Button
                             variant="outlined"
                             color="warning"
-                            startIcon={<CancelIcon />}
+                            startIcon={disabled ? <CircularProgress size={16} /> : <CancelIcon />}
                             onClick={onCancel}
                             size="small"
+                            disabled={disabled}
                         >
                             Cancel
                         </Button>
@@ -127,9 +129,10 @@ const EnhancedTableToolbar = ({ numSelected, onRenew, onCancel, onDelete }) => {
                         <Button
                             variant="outlined"
                             color="error"
-                            startIcon={<DeleteIcon />}
+                            startIcon={disabled ? <CircularProgress size={16} /> : <DeleteIcon />}
                             onClick={onDelete}
                             size="small"
+                            disabled={disabled}
                         >
                             Delete
                         </Button>
@@ -195,7 +198,6 @@ const SubscriptionsView = ({
         subscription_plan_id: '',
         reseller_id: '',
         discount: 0.0,
-        cost_override: '',
         subscription_start_date: new Date().toISOString().split('T')[0],
         additional_payment_amount: 0.0,
     });
@@ -221,6 +223,7 @@ const SubscriptionsView = ({
         apiService.fetchSectors().then(res => setSectors(res.data)).catch(err => console.error("Failed to load sectors", err));
     }, []);
     const [selected, setSelected] = useState([]); // Array of customer IDs
+    const [bulkActionLoading, setBulkActionLoading] = useState(false);
 
 
     // Sync debouncedSearchQuery from parent's searchQuery (for backward compatibility)
@@ -405,42 +408,48 @@ const SubscriptionsView = ({
         }
     };
 
-    const handleBulkAction = async (actionCallback, actionName, confirmMessage) => {
-        if (window.confirm(confirmMessage)) {
-            const results = await Promise.allSettled(
-                selected.map(id => actionCallback(id))
-            );
+    // Fires ONE bulk request for the whole selection (instead of one HTTP call
+    // per row) and guards against a double-click re-triggering the batch while
+    // it's still in flight.
+    const handleBulkAction = async (bulkApiCall, actionName, confirmMessage) => {
+        if (bulkActionLoading) return;
+        if (!window.confirm(confirmMessage)) return;
 
-            const successCount = results.filter(r => r.status === 'fulfilled').length;
-            const failCount = results.length - successCount;
+        setBulkActionLoading(true);
+        try {
+            const response = await bulkApiCall(selected);
+            const { succeeded = [], failed = [] } = response.data;
 
             setSnackbar({
                 open: true,
-                message: `${actionName} successful for ${successCount} subscriptions. ${failCount > 0 ? `Failed for ${failCount}.` : ''}`,
-                severity: failCount > 0 ? 'warning' : 'success'
+                message: `${actionName} successful for ${succeeded.length} subscription(s). ${failed.length > 0 ? `Failed for ${failed.length}.` : ''}`,
+                severity: failed.length > 0 ? 'warning' : 'success'
             });
 
             setSelected([]); // Clear selection
             refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery); // Refresh data
+        } catch (error) {
+            console.error(`Error performing bulk ${actionName}:`, error);
+            setSnackbar({
+                open: true,
+                message: `Failed to ${actionName.toLowerCase()} selected subscriptions. ${error.response?.data?.message || error.message}`,
+                severity: 'error'
+            });
+        } finally {
+            setBulkActionLoading(false);
         }
     };
 
     const handleBulkRenew = () => {
-        // Note: The renew action doesn't require a confirmation in the single action, so we'll match that.
-        // We'll wrap the apiService call in a function that fits the bulk action handler.
-        const renewAction = (id) => apiService.renewSubscription(id);
-        handleBulkAction(renewAction, 'Renew', `Renew ${selected.length} selected subscriptions? (Reseller customers will have their reseller charged, others will get new pending payments)`);
+        handleBulkAction(apiService.bulkRenewSubscriptions, 'Renew', `Renew ${selected.length} selected subscriptions? (Reseller customers will have their reseller charged, others will get new pending payments)`);
     };
 
     const handleBulkCancel = () => {
-        const cancelAction = (id) => apiService.cancelSubscription(id);
-        handleBulkAction(cancelAction, 'Cancel', `Cancel ${selected.length} selected subscriptions?`);
+        handleBulkAction(apiService.bulkCancelSubscriptions, 'Cancel', `Cancel ${selected.length} selected subscriptions?`);
     };
 
     const handleBulkDelete = () => {
-        // We need a wrapper function to delete without individual confirmation
-        const deleteAction = (id) => apiService.deleteCustomer(id);
-        handleBulkAction(deleteAction, 'Delete', `Are you sure you want to delete ${selected.length} selected customers? This action cannot be undone.`);
+        handleBulkAction(apiService.bulkDeleteCustomers, 'Delete', `Are you sure you want to delete ${selected.length} selected customers? This action cannot be undone.`);
     };
     // --- End of NEW Bulk Action Handlers ---
 
@@ -456,7 +465,6 @@ const SubscriptionsView = ({
                 sector: editingCustomer.sector,
                 subscription_plan_id: editingCustomer.subscription_plan_id,
                 discount: editingCustomer.discount,
-                cost_override: editingCustomer.cost_override,
                 balance: editingCustomer.balance !== undefined ? editingCustomer.balance : 0,
                 reseller_id: editingCustomer.reseller_id || ""
             });
@@ -494,7 +502,7 @@ const SubscriptionsView = ({
             await apiService.addCustomer(newCustomer);
             setSnackbar({ open: true, message: 'Customer added successfully!', severity: 'success' });
             setShowAddCustomerForm(false);
-            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
+            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', discount: 0.0, subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
             refetchCustomers(1, itemsPerPage, ''); // Go to first page after adding
         } catch (error) {
             console.error('Error adding customer:', error);
@@ -663,7 +671,6 @@ const SubscriptionsView = ({
                             </TextField>
                         </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount (Fixed Amount)" value={newCustomer.discount} onChange={(e) => setNewCustomer({ ...newCustomer, discount: parseFloat(e.target.value) || 0.0 })} /></Grid>
-                        <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={newCustomer.cost_override} onChange={(e) => setNewCustomer({ ...newCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="date" label="Subscription Start Date" value={newCustomer.subscription_start_date} onChange={(e) => setNewCustomer({ ...newCustomer, subscription_start_date: e.target.value })} InputLabelProps={{ shrink: true }} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Additional Payment Amount" value={newCustomer.additional_payment_amount} onChange={(e) => setNewCustomer({ ...newCustomer, additional_payment_amount: parseFloat(e.target.value) || 0.0 })} helperText="For one-time charges on creation" /></Grid>
                     </Grid>
@@ -810,6 +817,7 @@ const SubscriptionsView = ({
                         onRenew={handleBulkRenew}
                         onCancel={handleBulkCancel}
                         onDelete={handleBulkDelete}
+                        disabled={bulkActionLoading}
                     />
                     <TableContainer>
                         <Table sx={{ minWidth: 750 }} aria-labelledby="tableTitle">
@@ -981,7 +989,6 @@ const SubscriptionsView = ({
                             </TextField>
                         </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount ($)" value={editingCustomer?.discount || 0} onChange={(e) => setEditingCustomer({ ...editingCustomer, discount: parseFloat(e.target.value) || 0 })} /></Grid>
-                        <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={editingCustomer?.cost_override ?? ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Account Balance ($)" value={editingCustomer?.balance !== undefined ? editingCustomer.balance : 0} helperText="Negative value = Customer owes money. 0 = Paid." onChange={(e) => setEditingCustomer({ ...editingCustomer, balance: parseFloat(e.target.value) || 0 })} /></Grid>
                     </Grid>
                 </DialogContent>

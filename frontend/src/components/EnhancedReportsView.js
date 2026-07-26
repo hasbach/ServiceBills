@@ -139,12 +139,11 @@ const EnhancedReportsView = () => {
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="month" />
               <YAxis />
-              <Tooltip formatter={(value) => (value == null ? '—' : formatCurrency(value))} />
+              <Tooltip formatter={(value) => formatCurrency(value)} />
               <Legend />
               <Bar dataKey="income" name="Income" fill="#4ade80" />
               <Bar dataKey="expenses" fill="#f87171" name="Expenses" />
               <Bar dataKey="profit" fill="#60a5fa" name="Profit" />
-              <Bar dataKey="estimated_profit" fill="#c084fc" name="Estimated Profit" />
             </BarChart>
           </ResponsiveContainer>
           
@@ -161,10 +160,6 @@ const EnhancedReportsView = () => {
                <Typography variant="h6" color="primary.main">Total Profit</Typography>
                <Typography variant="h5" fontWeight="bold">{formatCurrency(reportData.totals.profit)}</Typography>
             </Paper>
-            <Paper elevation={3} sx={{ p: 2, textAlign: 'center', bgcolor: '#faf5ff', flex: 1, mx: 1, minWidth: '200px', mb: 2 }}>
-               <Typography variant="h6" sx={{ color: '#a855f7' }}>Estimated Profit</Typography>
-               <Typography variant="h5" fontWeight="bold">{formatCurrency(reportData.totals.estimated_profit)}</Typography>
-            </Paper>
           </Box>
 
           <Typography variant="h6" gutterBottom sx={{ mt: 2 }}>
@@ -178,8 +173,6 @@ const EnhancedReportsView = () => {
                   <TableCell align="right">Income</TableCell>
                   <TableCell align="right">Expenses</TableCell>
                   <TableCell align="right">Profit</TableCell>
-                  <TableCell align="right">Estimated Profit</TableCell>
-                  <TableCell align="right">Variance</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
@@ -189,10 +182,6 @@ const EnhancedReportsView = () => {
                     <TableCell align="right" sx={{ color: 'success.main' }}>{formatCurrency(row.income)}</TableCell>
                     <TableCell align="right" sx={{ color: 'error.main' }}>{formatCurrency(row.expenses)}</TableCell>
                     <TableCell align="right" sx={{ color: 'primary.main', fontWeight: 'bold' }}>{formatCurrency(row.profit)}</TableCell>
-                    <TableCell align="right" sx={{ color: '#a855f7' }}>{row.estimated_profit == null ? '—' : formatCurrency(row.estimated_profit)}</TableCell>
-                    <TableCell align="right" sx={{ color: row.variance == null ? 'text.secondary' : (row.variance >= 0 ? 'success.main' : 'error.main'), fontWeight: 'bold' }}>
-                      {row.variance == null ? '—' : formatCurrency(row.variance)}
-                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>

@@ -1418,13 +1418,15 @@ def recalculate_estimated_profit(tenant_id):
     tenant_query(). Never raises -- mirrors generate_missing_salary_charges's
     rollback+print pattern."""
     try:
-        customers = Customer.query.filter_by(tenant_id=tenant_id, is_subscription_active=True).all()
+        customers = Customer.query.filter_by(
+            tenant_id=tenant_id, is_subscription_active=True
+        ).options(db.joinedload(Customer.subscription_plan)).all()
 
         estimated_income = 0.0
         estimated_cost = 0.0
 
         for customer in customers:
-            plan = SubscriptionPlan.query.filter_by(tenant_id=tenant_id, id=customer.subscription_plan_id).first()
+            plan = customer.subscription_plan
             if not plan:
                 continue
 
@@ -1856,6 +1858,12 @@ def update_customer(customer_id):
 
 
 
+def _delete_customer_core(customer):
+    """Delete one customer (cascade handles related records). Caller commits
+    and triggers recalculate_estimated_profit."""
+    db.session.delete(customer)
+
+
 @app.route('/api/customers/<int:customer_id>', methods=['DELETE'])
 @jwt_required()
 def delete_customer(customer_id):
@@ -1865,8 +1873,7 @@ def delete_customer(customer_id):
             return jsonify({'message': 'Customer not found!'}), 404
 
         tenant_id = customer.tenant_id
-        # The 'cascade' option in the model will handle deleting related records
-        db.session.delete(customer)
+        _delete_customer_core(customer)
         db.session.commit()
         recalculate_estimated_profit(tenant_id)
 
@@ -1875,6 +1882,38 @@ def delete_customer(customer_id):
         db.session.rollback()
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/customers/bulk_delete', methods=['POST'])
+@jwt_required()
+def bulk_delete_customers():
+    """Delete a batch of customers in a single request instead of one HTTP
+    round trip per row. Recomputes estimated profit once for the whole batch
+    rather than once per customer."""
+    customer_ids = request.json.get('customer_ids', []) if request.json else []
+    if not customer_ids:
+        return jsonify({'message': 'customer_ids is required.'}), 400
+
+    customers = tenant_query(Customer).filter(Customer.id.in_(customer_ids)).all()
+    found_ids = {c.id for c in customers}
+
+    succeeded = []
+    failed = [{'id': cid, 'error': 'Customer not found'} for cid in customer_ids if cid not in found_ids]
+    tenant_id = current_tenant_id()
+
+    for customer in customers:
+        try:
+            _delete_customer_core(customer)
+            db.session.commit()
+            succeeded.append(customer.id)
+        except Exception as e:
+            db.session.rollback()
+            failed.append({'id': customer.id, 'error': str(e)})
+
+    if succeeded:
+        recalculate_estimated_profit(tenant_id)
+
+    return jsonify({'succeeded': succeeded, 'failed': failed}), 200
 
 
 
@@ -2388,6 +2427,19 @@ def get_customer_numbers():
         'value': num.customers
     } for num in customer_numbers])
 
+def _mark_payment_fully_paid(payment, customer, current_user):
+    """Mutate payment+customer to record a full (non-partial) payment. Caller
+    commits. Returns the amount received in this transaction. Shared by the
+    single-item and bulk mark_paid endpoints so the logic lives in one place."""
+    amount_received = payment.amount
+    customer.balance += payment.amount
+    payment.paid = True
+    payment.paid_at = datetime.utcnow()
+    payment.received_by_id = current_user.id
+    # DON'T set amount to 0 - keep original amount
+    return amount_received
+
+
 @app.route('/api/payments/<int:payment_id>/mark_paid', methods=['PUT'])
 @jwt_required()
 def mark_payment_as_paid(payment_id):
@@ -2503,12 +2555,7 @@ def mark_payment_as_paid(payment_id):
 
         else: # Full payment
             if not payment.paid:
-                amount_received_in_this_transaction = payment.amount
-                customer.balance += payment.amount
-                payment.paid = True
-                payment.paid_at = datetime.utcnow()
-                payment.received_by_id = current_user.id
-                # DON'T set amount to 0 - keep original amount
+                amount_received_in_this_transaction = _mark_payment_fully_paid(payment, customer, current_user)
 
         db.session.commit()
 
@@ -2526,7 +2573,85 @@ def mark_payment_as_paid(payment_id):
         return jsonify({'error': str(e)}), 400
 
 
-    
+@app.route('/api/payments/bulk_mark_paid', methods=['POST'])
+@jwt_required()
+def bulk_mark_payments_paid():
+    """Mark a batch of payments as fully paid in a single request instead of
+    one HTTP round trip per row (what the 'select multiple payments' bulk
+    action used to do). Mirrors the full-payment branch of mark_payment_as_paid;
+    doesn't support the collect/partial-payment options since the bulk UI
+    never sends them."""
+    current_username = get_jwt_identity()
+    current_user = User.query.filter_by(username=current_username).first()
+    roles = [r.strip().lower() for r in current_user.role.split(',')]
+    if not ('admin' in roles or 'finance' in roles):
+        return jsonify({'message': 'Unauthorized to mark payments as fully paid. Only finance or admin can do this.'}), 403
+
+    payment_ids = request.json.get('payment_ids', []) if request.json else []
+    if not payment_ids:
+        return jsonify({'message': 'payment_ids is required.'}), 400
+
+    payments = tenant_query(Payment).filter(Payment.id.in_(payment_ids)).options(
+        db.joinedload(Payment.customer)
+    ).all()
+    found_ids = {p.id for p in payments}
+
+    succeeded = []
+    failed = [{'id': pid, 'error': 'Payment not found'} for pid in payment_ids if pid not in found_ids]
+
+    for payment in payments:
+        try:
+            customer = payment.customer
+            if not customer:
+                failed.append({'id': payment.id, 'error': 'Customer not found for this payment'})
+                continue
+            if not payment.paid:
+                _mark_payment_fully_paid(payment, customer, current_user)
+            db.session.commit()
+            succeeded.append(payment.id)
+        except Exception as e:
+            db.session.rollback()
+            failed.append({'id': payment.id, 'error': str(e)})
+
+    return jsonify({'succeeded': succeeded, 'failed': failed}), 200
+
+
+@app.route('/api/payments/bulk_delete', methods=['POST'])
+@jwt_required()
+def bulk_delete_payments():
+    """Delete a batch of payments in a single request (see bulk_mark_payments_paid)."""
+    payment_ids = request.json.get('payment_ids', []) if request.json else []
+    if not payment_ids:
+        return jsonify({'message': 'payment_ids is required.'}), 400
+
+    payments = tenant_query(Payment).filter(Payment.id.in_(payment_ids)).options(
+        db.joinedload(Payment.customer)
+    ).all()
+    found_ids = {p.id for p in payments}
+
+    succeeded = []
+    failed = [{'id': pid, 'error': 'Payment not found'} for pid in payment_ids if pid not in found_ids]
+
+    for payment in payments:
+        try:
+            customer = payment.customer
+            if not customer:
+                failed.append({'id': payment.id, 'error': 'Customer not found for this payment'})
+                continue
+            if payment.paid:
+                customer.balance -= payment.amount
+            else:
+                customer.balance += payment.amount
+            db.session.delete(payment)
+            db.session.commit()
+            succeeded.append(payment.id)
+        except Exception as e:
+            db.session.rollback()
+            failed.append({'id': payment.id, 'error': str(e)})
+
+    return jsonify({'succeeded': succeeded, 'failed': failed}), 200
+
+
 @app.route('/api/customers/<int:customer_id>/activate_subscription', methods=['PUT'])
 @jwt_required()
 def activate_subscription(customer_id):
@@ -2616,6 +2741,12 @@ def activate_subscription(customer_id):
         traceback.print_exc()
         return jsonify({'error': str(e)}), 400
 
+def _cancel_subscription_core(customer):
+    """Mark one customer's subscription inactive. Caller commits and triggers
+    recalculate_estimated_profit."""
+    customer.is_subscription_active = False
+
+
 @app.route('/api/customers/<int:customer_id>/cancel_subscription', methods=['PUT'])
 @jwt_required()
 def cancel_subscription(customer_id):
@@ -2628,8 +2759,7 @@ def cancel_subscription(customer_id):
         return jsonify({'message': 'Subscription is already canceled!'}), 400
 
     try:
-        # Mark the subscription as inactive
-        customer.is_subscription_active = False
+        _cancel_subscription_core(customer)
 
         db.session.commit()
         recalculate_estimated_profit(customer.tenant_id)
@@ -2643,6 +2773,41 @@ def cancel_subscription(customer_id):
         db.session.rollback()
         traceback.print_exc()
         return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/customers/bulk_cancel_subscription', methods=['POST'])
+@jwt_required()
+def bulk_cancel_subscriptions():
+    """Cancel a batch of customer subscriptions in a single request instead of
+    one HTTP round trip per row. Recomputes estimated profit once for the
+    whole batch rather than once per customer."""
+    customer_ids = request.json.get('customer_ids', []) if request.json else []
+    if not customer_ids:
+        return jsonify({'message': 'customer_ids is required.'}), 400
+
+    customers = tenant_query(Customer).filter(Customer.id.in_(customer_ids)).all()
+    found_ids = {c.id for c in customers}
+
+    succeeded = []
+    failed = [{'id': cid, 'error': 'Customer not found'} for cid in customer_ids if cid not in found_ids]
+    tenant_id = current_tenant_id()
+
+    for customer in customers:
+        try:
+            if not customer.is_subscription_active:
+                failed.append({'id': customer.id, 'error': 'Subscription is already canceled'})
+                continue
+            _cancel_subscription_core(customer)
+            db.session.commit()
+            succeeded.append(customer.id)
+        except Exception as e:
+            db.session.rollback()
+            failed.append({'id': customer.id, 'error': str(e)})
+
+    if succeeded:
+        recalculate_estimated_profit(tenant_id)
+
+    return jsonify({'succeeded': succeeded, 'failed': failed}), 200
 
 
 
@@ -2812,20 +2977,21 @@ def get_receipt(payment_id):
 @jwt_required()
 def get_receipts_with_current_balance():
     search_query = request.args.get('search_query', '')
-    query = tenant_query(GeneratedReceipt).join(Customer).order_by(GeneratedReceipt.billing_date.desc())
+    query = tenant_query(GeneratedReceipt).join(Customer).options(
+        db.contains_eager(GeneratedReceipt.customer)
+    ).order_by(GeneratedReceipt.billing_date.desc())
 
     if search_query:
         query = query.filter(Customer.name.ilike(f'%{search_query}%'))
 
     receipts = query.all()
-    
+
     result = []
     for r in receipts:
         receipt_data = json.loads(r.receipt_data)
-        
+
         # Get the current balance for this customer
-        current_customer = tenant_query(Customer).filter_by(id=r.customer_id).first()
-        current_balance = float(current_customer.balance) if current_customer else 0.0
+        current_balance = float(r.customer.balance) if r.customer else 0.0
         
         # Update the balance in the receipt data
         receipt_data['customer_current_balance'] = current_balance
@@ -4310,23 +4476,24 @@ def get_revenue_report():
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     
-    query = tenant_query(Payment).filter(Payment.paid == True)
+    query = tenant_query(Payment).filter(Payment.paid == True).options(
+        db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
+    )
     if start_date:
         query = query.filter(func.coalesce(Payment.paid_at, Payment.date) >= datetime.strptime(start_date, '%Y-%m-%d'))
     if end_date:
         query = query.filter(func.coalesce(Payment.paid_at, Payment.date) <= datetime.strptime(end_date, '%Y-%m-%d'))
-    
+
     payments = query.all()
     total_revenue = sum(p.amount for p in payments)
-    
+
     # Group by subscription plan
     plan_revenue = {}
     for payment in payments:
-        customer = tenant_query(Customer).filter_by(id=payment.customer_id).first() # Use db.session.get
-        if customer:
-            plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first() # Use db.session.get
-            if plan:
-                plan_revenue[plan.name] = plan_revenue.get(plan.name, 0) + payment.amount
+        customer = payment.customer
+        if customer and customer.subscription_plan:
+            plan = customer.subscription_plan
+            plan_revenue[plan.name] = plan_revenue.get(plan.name, 0) + payment.amount
     
     return jsonify({
         'total_revenue': total_revenue,
@@ -4343,16 +4510,127 @@ def get_overdue_payments():
     overdue_payments = tenant_query(Payment).filter(
         Payment.paid == False,
         Payment.date <= cutoff_date
-    ).all()
-    
+    ).options(db.joinedload(Payment.customer)).all()
+
     return jsonify([{
         'id': p.id,
         'customer_id': p.customer_id,
-        'customer_name': tenant_query(Customer).filter_by(id=p.customer_id).first().name, # Use db.session.get
+        'customer_name': p.customer.name,
         'amount': p.amount,
         'date': p.date.strftime('%Y-%m-%d'),
         'days_overdue': (datetime.utcnow() - p.date).days
     } for p in overdue_payments])
+
+
+class _ActionError(Exception):
+    """Raised by shared per-item action helpers to carry an HTTP status code
+    alongside the message, so the single-item route can preserve its exact
+    original response while the bulk route just records the message."""
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _renew_subscription_core(customer):
+    """Renew one customer's subscription: extend expiry, bill (reseller credit
+    or new pending payment), and notify. Raises _ActionError for a missing
+    plan or unrecognized billing cycle. Caller commits are handled inside
+    (mirrors the original function's commit points) since WhatsApp sends must
+    happen after the billing commit."""
+    subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
+    if not subscription_plan:
+        raise _ActionError('Subscription plan not found for this customer!', 404)
+    today = datetime.utcnow()
+    current_expiry_date = customer.subscription_expiry_date
+    renewal_basis_date = current_expiry_date if current_expiry_date and current_expiry_date > today else today
+
+    if subscription_plan.billing_cycle == 'monthly':
+        if current_expiry_date:
+            day = current_expiry_date.day
+            next_month = renewal_basis_date + relativedelta(months=1)
+            last_day_of_next_month = calendar.monthrange(next_month.year, next_month.month)[1]
+            day = min(day, last_day_of_next_month)
+            new_expiry_date = next_month.replace(day=day)
+        else:
+            new_expiry_date = renewal_basis_date + relativedelta(months=1)
+    elif subscription_plan.billing_cycle == 'yearly':
+        new_expiry_date = renewal_basis_date + relativedelta(years=1)
+    else:
+        raise _ActionError('Unrecognized billing cycle for subscription plan.', 400)
+
+    customer.subscription_expiry_date = new_expiry_date
+    customer.is_subscription_active = True
+
+    renewal_amount = subscription_plan.price - customer.discount
+    if renewal_amount < 0:
+        renewal_amount = 0.0
+
+    already_billed = (
+        has_pending_reseller_charge(customer.id, new_expiry_date, customer.tenant_id) if customer.reseller_id
+        else has_pending_payment(customer.id, new_expiry_date, customer.tenant_id)
+    )
+    if renewal_amount > 0 and not already_billed:
+        if customer.reseller_id:
+            reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
+            if reseller:
+                reseller.balance += renewal_amount
+                reseller_payment = ResellerPayment(
+                    reseller_id=reseller.id,
+                    customer_id=customer.id,
+                    amount=renewal_amount,
+                    type='credit_added',
+                    date=new_expiry_date,
+                    description=f'Renewal for customer {customer.name}'
+                )
+                db.session.add(reseller_payment)
+                db.session.commit()
+
+                try:
+                    class FakeCustomer:
+                        phone = reseller.phone
+                        whatsapp_notifications_enabled = True
+                        id = reseller.id
+                        name = reseller.name
+
+                    send_whatsapp_message(
+                        FakeCustomer(),
+                        event_type='reseller_customer_renewed',
+                        context={'amount': renewal_amount, 'balance': reseller.balance, 'customer_name': customer.name}
+                    )
+                except Exception as wa_error:
+                    logging.error(f"Failed to send WA message on renew to reseller: {wa_error}")
+        else:
+            new_payment = Payment(
+                customer_id=customer.id,
+                amount=renewal_amount,
+                paid=False,
+                date=current_expiry_date,
+                pre_payment=False
+            )
+            db.session.add(new_payment)
+
+            customer.balance -= renewal_amount
+            db.session.commit()
+
+            try:
+                send_whatsapp_message(
+                    customer,
+                    event_type='subscription_renewed',
+                    context={'expiry_date': new_expiry_date.strftime('%Y-%m-%d')}
+                )
+            except Exception as wa_error:
+                logging.error(f"Failed to send WA message on renew: {wa_error}")
+    else:
+        db.session.commit()
+
+    return {
+        'message': 'Subscription renewed successfully!',
+        'customer_id': customer.id,
+        'new_expiry_date': new_expiry_date.strftime('%Y-%m-%d'),
+        'renewal_payment_amount': float(renewal_amount),
+        'customer_new_balance': float(customer.balance),
+        'reseller_billed': True if customer.reseller_id else False
+    }
 
 
 @app.route('/api/customers/<int:customer_id>/renew_subscription', methods=['POST'])
@@ -4363,105 +4641,45 @@ def renew_subscription(customer_id):
         if not customer:
             return jsonify({'message': 'Customer not found!'}), 404
 
-        subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
-        if not subscription_plan:
-            return jsonify({'message': 'Subscription plan not found for this customer!'}), 404
-        today = datetime.utcnow()
-        current_expiry_date = customer.subscription_expiry_date
-        renewal_basis_date = current_expiry_date if current_expiry_date and current_expiry_date > today else today
-
-        if subscription_plan.billing_cycle == 'monthly':
-            if current_expiry_date:
-                day = current_expiry_date.day
-                next_month = renewal_basis_date + relativedelta(months=1)
-                last_day_of_next_month = calendar.monthrange(next_month.year, next_month.month)[1]
-                day = min(day, last_day_of_next_month)
-                new_expiry_date = next_month.replace(day=day)
-            else:
-                new_expiry_date = renewal_basis_date + relativedelta(months=1)
-        elif subscription_plan.billing_cycle == 'yearly':
-            new_expiry_date = renewal_basis_date + relativedelta(years=1)
-        else:
-            return jsonify({'message': 'Unrecognized billing cycle for subscription plan.'}), 400
-
-        customer.subscription_expiry_date = new_expiry_date
-        customer.is_subscription_active = True
-
-        renewal_amount = subscription_plan.price - customer.discount
-        if renewal_amount < 0:
-            renewal_amount = 0.0
-
-        already_billed = (
-            has_pending_reseller_charge(customer.id, new_expiry_date, customer.tenant_id) if customer.reseller_id
-            else has_pending_payment(customer.id, new_expiry_date, customer.tenant_id)
-        )
-        if renewal_amount > 0 and not already_billed:
-            if customer.reseller_id:
-                reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
-                if reseller:
-                    reseller.balance += renewal_amount
-                    reseller_payment = ResellerPayment(
-                        reseller_id=reseller.id,
-                        customer_id=customer.id,
-                        amount=renewal_amount,
-                        type='credit_added',
-                        date=new_expiry_date,
-                        description=f'Renewal for customer {customer.name}'
-                    )
-                    db.session.add(reseller_payment)
-                    db.session.commit()
-                    
-                    try:
-                        class FakeCustomer:
-                            phone = reseller.phone
-                            whatsapp_notifications_enabled = True
-                            id = reseller.id
-                            name = reseller.name
-                            
-                        send_whatsapp_message(
-                            FakeCustomer(),
-                            event_type='reseller_customer_renewed',
-                            context={'amount': renewal_amount, 'balance': reseller.balance, 'customer_name': customer.name}
-                        )
-                    except Exception as wa_error:
-                        logging.error(f"Failed to send WA message on renew to reseller: {wa_error}")
-            else:
-                new_payment = Payment(
-                    customer_id=customer.id,
-                    amount=renewal_amount,
-                    paid=False,
-                    date=current_expiry_date,
-                    pre_payment=False
-                )
-                db.session.add(new_payment)
-                
-                customer.balance -= renewal_amount
-                db.session.commit()
-
-                try:
-                    send_whatsapp_message(
-                        customer,
-                        event_type='subscription_renewed',
-                        context={'expiry_date': new_expiry_date.strftime('%Y-%m-%d')}
-                    )
-                except Exception as wa_error:
-                    logging.error(f"Failed to send WA message on renew: {wa_error}")
-        else:
-            db.session.commit()
-
-        return jsonify({
-            'message': 'Subscription renewed successfully!',
-            'customer_id': customer.id,
-            'new_expiry_date': new_expiry_date.strftime('%Y-%m-%d'),
-            'renewal_payment_amount': float(renewal_amount),
-            'customer_new_balance': float(customer.balance),
-            'reseller_billed': True if customer.reseller_id else False
-        }), 200
-
+        result = _renew_subscription_core(customer)
+        return jsonify(result), 200
+    except _ActionError as e:
+        db.session.rollback()
+        return jsonify({'message': str(e)}), e.status_code
     except Exception as e:
         db.session.rollback()
         traceback.print_exc()
         return jsonify({'error': f"Error renewing subscription: {str(e)}"}), 500
+
+
+@app.route('/api/customers/bulk_renew_subscription', methods=['POST'])
+@jwt_required()
+def bulk_renew_subscriptions():
+    """Renew a batch of customer subscriptions in a single request instead of
+    one HTTP round trip per row."""
+    customer_ids = request.json.get('customer_ids', []) if request.json else []
+    if not customer_ids:
+        return jsonify({'message': 'customer_ids is required.'}), 400
+
+    customers = tenant_query(Customer).filter(Customer.id.in_(customer_ids)).all()
+    found_ids = {c.id for c in customers}
+
+    succeeded = []
+    failed = [{'id': cid, 'error': 'Customer not found'} for cid in customer_ids if cid not in found_ids]
+
+    for customer in customers:
+        try:
+            result = _renew_subscription_core(customer)
+            succeeded.append(result)
+        except _ActionError as e:
+            db.session.rollback()
+            failed.append({'id': customer.id, 'error': str(e)})
+        except Exception as e:
+            db.session.rollback()
+            traceback.print_exc()
+            failed.append({'id': customer.id, 'error': str(e)})
+
+    return jsonify({'succeeded': succeeded, 'failed': failed}), 200
 
 # --- SECTOR ENDPOINTS ---
 
@@ -4734,17 +4952,25 @@ def generate_receipts_for_month():
         extract('year', Payment.date) == year,
         extract('month', Payment.date) == month,
         Payment.paid == False
+    ).options(
+        db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
     ).all()
+
+    # Fetch all already-generated payment_ids for this batch in one query
+    # instead of checking existence per payment.
+    already_generated_ids = {
+        pid for (pid,) in tenant_query(GeneratedReceipt).filter(
+            GeneratedReceipt.payment_id.in_([p.id for p in payments_to_process])
+        ).with_entities(GeneratedReceipt.payment_id).all()
+    }
 
     generated_count = 0
     for payment in payments_to_process:
-        # Check if a receipt has already been generated for this payment
-        existing_receipt = tenant_query(GeneratedReceipt).filter_by(payment_id=payment.id).first()
-        if existing_receipt:
+        if payment.id in already_generated_ids:
             continue
 
-        customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
-        plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
+        customer = payment.customer
+        plan = customer.subscription_plan
 
         # Create a data snapshot for the receipt
         receipt_data_snapshot = {
@@ -4795,13 +5021,15 @@ def get_active_subscriptions_by_plan():
     """
     try:
         # Get all active customers and group them manually
-        active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).all()
-        
+        active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).options(
+            db.joinedload(Customer.subscription_plan)
+        ).all()
+
         # Dictionary to store plan counts with price info
         plan_counts = {}
-        
+
         for customer in active_customers:
-            plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
+            plan = customer.subscription_plan
             if plan:
                 # Create a unique key with plan name and price
                 plan_key = f"{plan.name} - ${plan.price}"

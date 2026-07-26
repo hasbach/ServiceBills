@@ -46,8 +46,44 @@ api.interceptors.response.use(
 );
 
 
+// --- Prevent a double-click (or any re-entrant call) from firing the same
+// mutating request twice. Every apiService method is wrapped below so that if
+// it's called again with identical arguments while the first call is still
+// in flight, the caller gets back the SAME promise instead of a second HTTP
+// request -- e.g. clicking "Mark Paid" twice quickly only ever hits the API
+// once. This is a network-layer safety net that covers every button in the
+// app without each component needing its own guard; UI-level disabling
+// (better visual feedback) is layered on top for specific hot-path buttons.
+function hasNonSerializableArg(args) {
+    return args.some(a =>
+        (typeof FormData !== 'undefined' && a instanceof FormData) ||
+        (typeof File !== 'undefined' && a instanceof File) ||
+        (typeof Blob !== 'undefined' && a instanceof Blob)
+    );
+}
+
+function dedupeInFlight(fn) {
+    const inFlight = new Map();
+    return (...args) => {
+        // Can't safely build a cache key for these (e.g. multipart uploads) --
+        // just call through rather than risk an incorrect match.
+        if (hasNonSerializableArg(args)) {
+            return fn(...args);
+        }
+        const key = JSON.stringify(args);
+        if (inFlight.has(key)) {
+            return inFlight.get(key);
+        }
+        const promise = Promise.resolve(fn(...args)).finally(() => {
+            inFlight.delete(key);
+        });
+        inFlight.set(key, promise);
+        return promise;
+    };
+}
+
 // Define API functions
-export const apiService = {
+const rawApiService = {
     api: api, // Export raw axios instance for generic requests
     login: (credentials) => api.post('/login', credentials),
     register: (credentials) => api.post('/register', credentials),
@@ -95,18 +131,6 @@ export const apiService = {
     fetchSupplierHistory: (id) => api.get(`/suppliers/${id}/history`),
     fixSupplierBalance: (id, data) => api.put(`/suppliers/${id}/fix-balance`, data),
 
-    // Employee / Payroll API methods
-    fetchEmployees: () => api.get('/employees'),
-    addEmployee: (data) => api.post('/employees', data),
-    updateEmployee: (id, data) => api.put(`/employees/${id}`, data),
-    deleteEmployee: (id) => api.delete(`/employees/${id}`),
-    fetchEmployeeCharges: (id) => api.get(`/employees/${id}/charges`),
-    addEmployeeCharge: (id, data) => api.post(`/employees/${id}/charges`, data),
-    fetchEmployeePayments: (id) => api.get(`/employees/${id}/payments`),
-    recordEmployeePayment: (id, data) => api.post(`/employees/${id}/payments`, data),
-    fetchEmployeeHistory: (id) => api.get(`/employees/${id}/history`),
-    fixEmployeeBalance: (id, data) => api.put(`/employees/${id}/fix-balance`, data),
-
 
     fetchCustomers: async (page = 1, perPage = 999, searchQuery = '', sort_by = 'expiry_date', reseller_id = '') => {
         const response = await api.get(`/customers`, { params: { page: page, per_page: perPage, search: searchQuery, sort_by: sort_by, reseller_id: reseller_id } });
@@ -128,6 +152,12 @@ export const apiService = {
     cancelSubscription: (customerId) => api.put(`/customers/${customerId}/cancel_subscription`),
     activateSubscription: (customerId) => api.put(`/customers/${customerId}/activate_subscription`),
     deleteCustomer: (customerId) => api.delete(`/customers/${customerId}`),
+    // Bulk actions: one HTTP request for a whole selection instead of one per row.
+    bulkMarkPaymentsPaid: (paymentIds) => api.post('/payments/bulk_mark_paid', { payment_ids: paymentIds }),
+    bulkDeletePayments: (paymentIds) => api.post('/payments/bulk_delete', { payment_ids: paymentIds }),
+    bulkRenewSubscriptions: (customerIds) => api.post('/customers/bulk_renew_subscription', { customer_ids: customerIds }),
+    bulkCancelSubscriptions: (customerIds) => api.post('/customers/bulk_cancel_subscription', { customer_ids: customerIds }),
+    bulkDeleteCustomers: (customerIds) => api.post('/customers/bulk_delete', { customer_ids: customerIds }),
     fetchBusinessSettings: () => api.get('/business-settings'),
     saveBusinessSettings: (formData) => api.post('/business-settings', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
@@ -190,6 +220,12 @@ export const apiService = {
     sendBulkMessage: (payload) => api.post('/messages/bulk_send', payload),
     fetchMetaTemplates: () => api.get('/whatsapp/templates'),
 };
+
+export const apiService = Object.fromEntries(
+    Object.entries(rawApiService).map(([name, value]) =>
+        [name, typeof value === 'function' ? dedupeInFlight(value) : value]
+    )
+);
 
 // --- Context for shared state ---
 export const AppContext = createContext();

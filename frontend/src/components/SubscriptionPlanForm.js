@@ -7,7 +7,6 @@ function SubscriptionPlanForm({ plan, onSave, onCancel }) {
   const [formData, setFormData] = useState({
     name: '',
     price: '',
-    cost: '',
     billing_cycle: 'monthly', // Default value
     status: 'active'
   });
@@ -18,7 +17,6 @@ function SubscriptionPlanForm({ plan, onSave, onCancel }) {
       setFormData({
         name: plan.name || '',
         price: plan.price || '',
-        cost: plan.cost || '',
         billing_cycle: plan.billing_cycle || 'monthly',
         status: plan.status || 'active'
       });
@@ -26,7 +24,6 @@ function SubscriptionPlanForm({ plan, onSave, onCancel }) {
       setFormData({ // Reset for new plan
         name: '',
         price: '',
-        cost: '',
         billing_cycle: 'monthly',
         status: 'active'
       });
@@ -40,13 +37,13 @@ function SubscriptionPlanForm({ plan, onSave, onCancel }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (loading) return; // guard against a double-click firing before the disabled state re-renders
     setLoading(true); // Start loading
     try {
       const dataToSend = {
         ...formData,
-        // Ensure price/cost are always valid numbers, default to 0.0 if empty/NaN
+        // Ensure price is always a valid number, default to 0.0 if empty/NaN
         price: parseFloat(formData.price) || 0.0,
-        cost: parseFloat(formData.cost) || 0.0,
       };
 
       if (plan) {
@@ -98,19 +95,7 @@ function SubscriptionPlanForm({ plan, onSave, onCancel }) {
           startAdornment: <InputAdornment position="start">$</InputAdornment>,
         }}
       />
-      <TextField
-        label="Cost"
-        name="cost"
-        type="number"
-        value={formData.cost}
-        onChange={handleChange}
-        fullWidth
-        margin="normal"
-        helperText="What this plan actually costs you to deliver (used for the estimated profit report)"
-        InputProps={{
-          startAdornment: <InputAdornment position="start">$</InputAdornment>,
-        }}
-      />
+      {/* Removed Cost TextField */}
       <FormControl fullWidth margin="normal" required>
         <InputLabel>Billing Cycle</InputLabel>
         <Select
