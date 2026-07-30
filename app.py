@@ -4271,10 +4271,16 @@ def whatsapp_webhook():
 
                     # Resolve the owning tenant from the recipient business phone number.
                     incoming_pnid = (val.get('metadata', {}) or {}).get('phone_number_id')
-                    settings = WhatsAppSettings.query.filter_by(phone_number_id=incoming_pnid).first() if incoming_pnid else None
+                    matches = WhatsAppSettings.query.filter_by(phone_number_id=incoming_pnid).all() if incoming_pnid else []
+                    settings = matches[0] if matches else None
                     if not settings:
                         logging.warning(f"WhatsApp webhook: no tenant for phone_number_id={incoming_pnid}; skipping.")
                         continue
+                    if len(matches) > 1:
+                        logging.warning(f"WhatsApp webhook: {len(matches)} settings rows share phone_number_id={incoming_pnid} "
+                                         f"(tenant_ids={[m.tenant_id for m in matches]}); using settings.id={settings.id} tenant_id={settings.tenant_id}.")
+                    logging.info(f"WhatsApp webhook: resolved settings.id={settings.id} tenant_id={settings.tenant_id} "
+                                 f"forwarding_mobile={settings.forwarding_mobile!r} for phone_number_id={incoming_pnid}")
                     resolved_tenant_id = settings.tenant_id
 
                     for msg in messages:
