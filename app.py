@@ -4373,19 +4373,29 @@ def whatsapp_webhook():
                                             }
                                         }
                                         res_tmpl = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
-                                        if not res_tmpl.ok:
+                                        if res_tmpl.ok:
+                                            logging.info(f"Forwarded customer reply via template '{tmpl_name}' (3-param) to +{fwd_phone}.")
+                                        else:
+                                            logging.warning(f"Template '{tmpl_name}' (3-param) forward failed: {res_tmpl.status_code} {res_tmpl.text}")
                                             # Second attempt: Try 2 parameters (1- Name & Mobile, 2- Message)
                                             payload_tmpl['template']['components'] = [{'type': 'body', 'parameters': [
                                                 {'type': 'text', 'text': f"{sender_info}"},
                                                 {'type': 'text', 'text': f"{msg_text[:120]}"}
                                             ]}]
                                             res_tmpl2 = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
-                                            if not res_tmpl2.ok:
+                                            if res_tmpl2.ok:
+                                                logging.info(f"Forwarded customer reply via template '{tmpl_name}' (2-param) to +{fwd_phone}.")
+                                            else:
+                                                logging.warning(f"Template '{tmpl_name}' (2-param) forward failed: {res_tmpl2.status_code} {res_tmpl2.text}")
                                                 # Third attempt: Try 1 parameter format
                                                 payload_tmpl['template']['components'] = [{'type': 'body', 'parameters': [
                                                     {'type': 'text', 'text': f"Reply from {sender_info}: {msg_text[:60]}"}
                                                 ]}]
-                                                requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
+                                                res_tmpl3 = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
+                                                if res_tmpl3.ok:
+                                                    logging.info(f"Forwarded customer reply via template '{tmpl_name}' (1-param) to +{fwd_phone}.")
+                                                else:
+                                                    logging.warning(f"Template '{tmpl_name}' (1-param) forward failed: {res_tmpl3.status_code} {res_tmpl3.text}. All fallback attempts exhausted -- customer reply was NOT forwarded.")
                                     except Exception as ex_tmpl:
                                         logging.error(f"Fallback template forwarding failed: {ex_tmpl}")
                                 else:

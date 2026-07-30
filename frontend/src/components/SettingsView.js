@@ -148,7 +148,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
             await apiService.saveWhatsAppSettings(waForm);
             setSnackbar({ open: true, message: 'WhatsApp settings saved!', severity: 'success' });
         } catch (err) {
-            const detail = err?.response?.data?.error || err?.message || 'Unknown error';
+            const detail = err?.response?.data?.error || err?.response?.data?.msg || err?.message || 'Unknown error';
             console.error('WhatsApp save error:', err?.response || err);
             setSnackbar({ open: true, message: `Failed to save: ${detail}`, severity: 'error' });
         } finally {
@@ -164,7 +164,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
             const res = await apiService.subscribeWaba();
             setSnackbar({ open: true, message: res?.data?.message || 'Successfully linked Webhook to Meta Account!', severity: 'success' });
         } catch (err) {
-            const detail = err?.response?.data?.error || err?.message || 'Unknown error';
+            const detail = err?.response?.data?.error || err?.response?.data?.msg || err?.message || 'Unknown error';
             setSnackbar({ open: true, message: `Failed to link: ${detail}`, severity: 'error' });
         } finally {
             setLinkingWaba(false);
