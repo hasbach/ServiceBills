@@ -4361,65 +4361,59 @@ def whatsapp_webhook():
                                     'Authorization': f'Bearer {settings.access_token}',
                                     'Content-Type': 'application/json',
                                 }
-                                fwd_text = f"🔔 *New Customer Reply*\n*From:* {cust_name} (+{sender_phone})\n*Message:* {msg_text}"
-                                payload_fwd = {
-                                    'messaging_product': 'whatsapp',
-                                    'to': fwd_phone,
-                                    'type': 'text',
-                                    'text': {'body': fwd_text}
-                                }
-                                res_fwd = requests.post(url, json=payload_fwd, headers=headers, timeout=10)
-                                if not res_fwd.ok:
-                                    logging.warning(f"Could not forward text reply to {fwd_phone} (may need 24h session open or template): {res_fwd.text}")
-                                    # Fallback: Try sending using an approved template if 24h window is closed
-                                    try:
-                                        sender_info = f"{cust_name} (+{sender_phone})" if (cust_name and cust_name != "Unknown Customer") else f"+{sender_phone}"
-                                        name_param = cust_name if (cust_name and cust_name != "Unknown Customer") else "Customer"
-                                        
-                                        # First attempt: Try 3 parameters (1- Name, 2- Mobile Number, 3- Message)
-                                        tmpl_name = settings.template_forward_alert or 'customer_reply_alert'
-                                        payload_tmpl = {
-                                            'messaging_product': 'whatsapp',
-                                            'to': fwd_phone,
-                                            'type': 'template',
-                                            'template': {
-                                                'name': tmpl_name,
-                                                'language': {'code': settings.template_language or 'en'},
-                                                'components': [{'type': 'body', 'parameters': [
-                                                    {'type': 'text', 'text': f"{name_param}"},
-                                                    {'type': 'text', 'text': f"+{sender_phone}"},
-                                                    {'type': 'text', 'text': f"{msg_text[:120]}"}
-                                                ]}]
-                                            }
-                                        }
-                                        res_tmpl = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
-                                        if res_tmpl.ok:
-                                            logging.info(f"Forwarded customer reply via template '{tmpl_name}' (3-param) to +{fwd_phone}.")
-                                        else:
-                                            logging.warning(f"Template '{tmpl_name}' (3-param) forward failed: {res_tmpl.status_code} {res_tmpl.text}")
-                                            # Second attempt: Try 2 parameters (1- Name & Mobile, 2- Message)
-                                            payload_tmpl['template']['components'] = [{'type': 'body', 'parameters': [
-                                                {'type': 'text', 'text': f"{sender_info}"},
+                                # forwarding_mobile is an internal alert recipient, not a live customer
+                                # conversation -- it essentially never has an open 24h session. WhatsApp's
+                                # Graph API returns 200/"accepted" for a plain-text send even when it is
+                                # certain to fail delivery (error 131047, reported later via an async
+                                # status webhook), so a plain-text-first attempt can never reliably detect
+                                # failure here and silently never falls back. Send via the approved
+                                # template directly instead, which works regardless of session state.
+                                try:
+                                    sender_info = f"{cust_name} (+{sender_phone})" if (cust_name and cust_name != "Unknown Customer") else f"+{sender_phone}"
+                                    name_param = cust_name if (cust_name and cust_name != "Unknown Customer") else "Customer"
+
+                                    # First attempt: Try 3 parameters (1- Name, 2- Mobile Number, 3- Message)
+                                    tmpl_name = settings.template_forward_alert or 'customer_reply_alert'
+                                    payload_tmpl = {
+                                        'messaging_product': 'whatsapp',
+                                        'to': fwd_phone,
+                                        'type': 'template',
+                                        'template': {
+                                            'name': tmpl_name,
+                                            'language': {'code': settings.template_language or 'en'},
+                                            'components': [{'type': 'body', 'parameters': [
+                                                {'type': 'text', 'text': f"{name_param}"},
+                                                {'type': 'text', 'text': f"+{sender_phone}"},
                                                 {'type': 'text', 'text': f"{msg_text[:120]}"}
                                             ]}]
-                                            res_tmpl2 = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
-                                            if res_tmpl2.ok:
-                                                logging.info(f"Forwarded customer reply via template '{tmpl_name}' (2-param) to +{fwd_phone}.")
+                                        }
+                                    }
+                                    res_tmpl = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
+                                    if res_tmpl.ok:
+                                        logging.info(f"Forwarded customer reply via template '{tmpl_name}' (3-param) to +{fwd_phone}.")
+                                    else:
+                                        logging.warning(f"Template '{tmpl_name}' (3-param) forward failed: {res_tmpl.status_code} {res_tmpl.text}")
+                                        # Second attempt: Try 2 parameters (1- Name & Mobile, 2- Message)
+                                        payload_tmpl['template']['components'] = [{'type': 'body', 'parameters': [
+                                            {'type': 'text', 'text': f"{sender_info}"},
+                                            {'type': 'text', 'text': f"{msg_text[:120]}"}
+                                        ]}]
+                                        res_tmpl2 = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
+                                        if res_tmpl2.ok:
+                                            logging.info(f"Forwarded customer reply via template '{tmpl_name}' (2-param) to +{fwd_phone}.")
+                                        else:
+                                            logging.warning(f"Template '{tmpl_name}' (2-param) forward failed: {res_tmpl2.status_code} {res_tmpl2.text}")
+                                            # Third attempt: Try 1 parameter format
+                                            payload_tmpl['template']['components'] = [{'type': 'body', 'parameters': [
+                                                {'type': 'text', 'text': f"Reply from {sender_info}: {msg_text[:60]}"}
+                                            ]}]
+                                            res_tmpl3 = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
+                                            if res_tmpl3.ok:
+                                                logging.info(f"Forwarded customer reply via template '{tmpl_name}' (1-param) to +{fwd_phone}.")
                                             else:
-                                                logging.warning(f"Template '{tmpl_name}' (2-param) forward failed: {res_tmpl2.status_code} {res_tmpl2.text}")
-                                                # Third attempt: Try 1 parameter format
-                                                payload_tmpl['template']['components'] = [{'type': 'body', 'parameters': [
-                                                    {'type': 'text', 'text': f"Reply from {sender_info}: {msg_text[:60]}"}
-                                                ]}]
-                                                res_tmpl3 = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
-                                                if res_tmpl3.ok:
-                                                    logging.info(f"Forwarded customer reply via template '{tmpl_name}' (1-param) to +{fwd_phone}.")
-                                                else:
-                                                    logging.warning(f"Template '{tmpl_name}' (1-param) forward failed: {res_tmpl3.status_code} {res_tmpl3.text}. All fallback attempts exhausted -- customer reply was NOT forwarded.")
-                                    except Exception as ex_tmpl:
-                                        logging.error(f"Fallback template forwarding failed: {ex_tmpl}")
-                                else:
-                                    logging.info(f"Successfully forwarded customer reply text to business mobile (+{fwd_phone})!")
+                                                logging.warning(f"Template '{tmpl_name}' (1-param) forward failed: {res_tmpl3.status_code} {res_tmpl3.text}. All fallback attempts exhausted -- customer reply was NOT forwarded.")
+                                except Exception as ex_tmpl:
+                                    logging.error(f"Template forwarding failed: {ex_tmpl}")
 
                                 # If there is an audio/voice note or media payload, forward the actual media file immediately!
                                 if media_payload:
