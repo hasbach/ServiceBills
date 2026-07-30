@@ -4334,6 +4334,8 @@ def whatsapp_webhook():
                         # 1. Forward message to business mobile if configured
                         if settings and settings.forwarding_mobile and settings.access_token and settings.phone_number_id:
                             fwd_phone = normalize_whatsapp_phone(settings.forwarding_mobile)
+                            if fwd_phone and fwd_phone == sender_phone:
+                                logging.info(f"Skipping forward: sender (+{sender_phone}) is the forwarding_mobile number itself.")
                             if fwd_phone and fwd_phone != sender_phone:
                                 api_version = settings.api_version or 'v19.0'
                                 url = f'https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages'
