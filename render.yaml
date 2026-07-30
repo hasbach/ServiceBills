@@ -64,3 +64,10 @@ services:
         sync: false
       - key: MAIL_FROM
         sync: false
+      # Web Push (Service Management "Enable Notifications" button). Copy the pair
+      # already generated in the local, gitignored vapid_keys.env, or generate a
+      # fresh one with `vapid --gen` (py-vapid CLI) or webpush.org's key generator.
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false

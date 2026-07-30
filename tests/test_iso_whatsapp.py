@@ -34,3 +34,14 @@ def test_whatsapp_settings_resolved_per_customer_tenant(app, client):
     assert res_a["success"] is True          # A enabled (deep-link) -> simulated/manual
     assert res_b["success"] is False         # B disabled -> skipped
     assert "disabled" in res_b["error"].lower()
+
+
+def test_whatsapp_settings_save_persists_template_forward_alert(client):
+    a = make_tenant(client, "Biz A", "a_admin2")
+
+    client.post("/api/whatsapp-settings", headers=a,
+                json={"enabled": True, "mode": "deeplink",
+                      "template_forward_alert": "custom_reply_template"})
+
+    r = client.get("/api/whatsapp-settings", headers=a)
+    assert r.get_json()["settings"]["template_forward_alert"] == "custom_reply_template"

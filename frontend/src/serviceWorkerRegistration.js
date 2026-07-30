@@ -27,20 +27,16 @@ export function unregister() {
 }
 
 export async function subscribeUserToPush(vapidPublicKey) {
-  if (!('serviceWorker' in navigator)) return null;
-  if (!('PushManager' in window)) return null;
+  if (!('serviceWorker' in navigator)) throw new Error('Service workers are not supported in this browser.');
+  if (!('PushManager' in window)) throw new Error('Push notifications are not supported in this browser.');
+  if (!vapidPublicKey) throw new Error('Push notifications are not configured on the server (missing VAPID public key).');
 
-  try {
-    const registration = await navigator.serviceWorker.ready;
-    const subscription = await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(vapidPublicKey)
-    });
-    return subscription;
-  } catch (e) {
-    console.error('Failed to subscribe the user: ', e);
-    return null;
-  }
+  const registration = await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: urlBase64ToUint8Array(vapidPublicKey)
+  });
+  return subscription;
 }
 
 function urlBase64ToUint8Array(base64String) {

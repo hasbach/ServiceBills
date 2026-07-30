@@ -3213,7 +3213,7 @@ def save_whatsapp_settings():
         fields = ['mode','enabled','phone_number_id','business_account_id','app_id',
                   'app_secret','access_token','api_version','template_payment_paid',
                   'template_subscription_created', 'template_subscription_renewed','template_payment_reminder', 'template_current_balance',
-                  'template_bulk_outage', 'template_bulk_maintenance', 'template_bulk_feature', 'template_bulk_offer',
+                  'template_forward_alert', 'template_bulk_outage', 'template_bulk_maintenance', 'template_bulk_feature', 'template_bulk_offer',
                   'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message']
         for f in fields:
             if f in data:
@@ -4357,7 +4357,7 @@ def whatsapp_webhook():
                                         name_param = cust_name if (cust_name and cust_name != "Unknown Customer") else "Customer"
                                         
                                         # First attempt: Try 3 parameters (1- Name, 2- Mobile Number, 3- Message)
-                                        tmpl_name = getattr(settings, 'template_forward_alert', None) or settings.template_bulk_outage or 'customer_reply_alert'
+                                        tmpl_name = settings.template_forward_alert or 'customer_reply_alert'
                                         payload_tmpl = {
                                             'messaging_product': 'whatsapp',
                                             'to': fwd_phone,

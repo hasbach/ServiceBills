@@ -124,14 +124,13 @@ const ServiceManagementView = () => {
       const res = await apiService.api.get('/vapid-public-key');
       const { public_key } = res.data;
       const sub = await serviceWorkerRegistration.subscribeUserToPush(public_key);
-      if (sub) {
-        await apiService.api.post('/push-subscribe', { subscription: sub });
-        setPushSubscribed(true);
-        alert('Push notifications enabled!');
-      }
+      await apiService.api.post('/push-subscribe', { subscription: sub });
+      setPushSubscribed(true);
+      alert('Push notifications enabled!');
     } catch (e) {
       console.error('Failed to subscribe:', e);
-      alert('Could not enable push notifications.');
+      const reason = e?.response?.data?.msg || e?.message || 'Unknown error';
+      alert(`Could not enable push notifications: ${reason}`);
     }
   };
 
