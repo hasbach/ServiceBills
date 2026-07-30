@@ -4283,6 +4283,18 @@ def whatsapp_webhook():
                                  f"forwarding_mobile={settings.forwarding_mobile!r} for phone_number_id={incoming_pnid}")
                     resolved_tenant_id = settings.tenant_id
 
+                    # Delivery/read/failure receipts for messages WE sent (e.g. the forwarded
+                    # alert to forwarding_mobile). Meta reports these separately from inbound
+                    # "messages" -- log them so a silent delivery failure is diagnosable.
+                    for st in val.get('statuses', []):
+                        st_status = st.get('status')
+                        st_recipient = st.get('recipient_id')
+                        if st_status == 'failed':
+                            errors = st.get('errors', [])
+                            logging.warning(f"WhatsApp message to {st_recipient} FAILED: {errors}")
+                        else:
+                            logging.info(f"WhatsApp message status update: to={st_recipient} status={st_status}")
+
                     for msg in messages:
                         sender_phone = msg.get('from', '')
                         msg_type = msg.get('type', '')
