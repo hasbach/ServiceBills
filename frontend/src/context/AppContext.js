@@ -235,7 +235,10 @@ const rawApiService = {
 
 export const apiService = Object.fromEntries(
     Object.entries(rawApiService).map(([name, value]) =>
-        [name, typeof value === 'function' ? dedupeInFlight(value) : value]
+        // `api` is the raw axios instance -- itself a callable function with
+        // .get/.post/etc. attached. Wrapping it in dedupeInFlight would replace
+        // it with a plain function missing those methods, so leave it as-is.
+        [name, (name !== 'api' && typeof value === 'function') ? dedupeInFlight(value) : value]
     )
 );
 
