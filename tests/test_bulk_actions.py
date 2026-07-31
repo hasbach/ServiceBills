@@ -111,6 +111,42 @@ def test_bulk_cancel_and_renew_subscriptions(client):
     assert all(c["is_subscription_active"] for c in listed_a if c["id"] in (c1, c2))
 
 
+def test_bulk_delete_support_tickets(client):
+    a = make_tenant(client, "Biz A", "a_admin")
+    b = make_tenant(client, "Biz B", "b_admin")
+
+    plan_a = _make_plan(client, a)
+    c1 = _make_customer(client, a, plan_a, name="C1")
+
+    plan_b = _make_plan(client, b)
+    c_other = _make_customer(client, b, plan_b, name="Other")
+
+    def _make_ticket(hdr, customer_id, title):
+        r = client.post("/api/support-tickets", headers=hdr,
+                        json={"customer_id": customer_id, "title": title,
+                              "description": "d", "priority": "medium"})
+        assert r.status_code in (200, 201), r.get_data(as_text=True)
+        return r.get_json()["id"]
+
+    t1 = _make_ticket(a, c1, "T1")
+    t2 = _make_ticket(a, c1, "T2")
+    t_other = _make_ticket(b, c_other, "Other")
+
+    r = client.post("/api/support-tickets/bulk_delete", headers=a,
+                    json={"ticket_ids": [t1, t2, t_other]})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert set(body["succeeded"]) == {t1, t2}
+    assert {f["id"] for f in body["failed"]} == {t_other}
+
+    listed_a = client.get("/api/support-tickets", headers=a).get_json()["tickets"]
+    assert listed_a == []
+
+    # Tenant B's ticket survives.
+    listed_b = client.get("/api/support-tickets", headers=b).get_json()["tickets"]
+    assert len(listed_b) == 1
+
+
 def test_bulk_delete_customers(client):
     a = make_tenant(client, "Biz A", "a_admin")
     b = make_tenant(client, "Biz B", "b_admin")

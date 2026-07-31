@@ -224,6 +224,7 @@ const rawApiService = {
     createSupportTicket: (data) => api.post('/support-tickets', data),
     updateSupportTicket: (ticketId, data) => api.put(`/support-tickets/${ticketId}`, data),
     deleteSupportTicket: (ticketId) => api.delete(`/support-tickets/${ticketId}`),
+    bulkDeleteSupportTickets: (ticketIds) => api.post('/support-tickets/bulk_delete', { ticket_ids: ticketIds }),
     createServiceOutage: (data) => api.post('/service-outages', data),
     updateServiceOutage: (outageId, data) => api.put(`/service-outages/${outageId}`, data),
     updateServiceStatusById: (statusId, data) => api.put(`/service-statuses/${statusId}`, data),

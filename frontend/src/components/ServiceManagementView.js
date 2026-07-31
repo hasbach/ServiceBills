@@ -4,7 +4,7 @@ import {
   TableContainer, TableHead, TableRow, Button, Dialog, DialogTitle,
   DialogContent, DialogActions, TextField, Select, MenuItem, FormControl,
   InputLabel, Grid, Chip, IconButton, Tooltip, alpha, useTheme,
-  Divider, CircularProgress, Fade, Autocomplete
+  Divider, CircularProgress, Fade, Autocomplete, Checkbox
 } from '@mui/material';
 import {
   Add as AddIcon, Refresh as RefreshIcon, Edit as EditIcon,
@@ -83,6 +83,9 @@ const ServiceManagementView = () => {
   // Filters
   const [ticketFilter, setTicketFilter] = useState('');
   const [outageFilter, setOutageFilter] = useState('all');
+
+  // Ticket multi-select (bulk delete)
+  const [selectedTicketIds, setSelectedTicketIds] = useState([]);
 
   // ── Fetch ──────────────────────────────────────────────────────────────────
   const fetchAll = useCallback(async () => {
@@ -167,6 +170,23 @@ const ServiceManagementView = () => {
     setLogsDialog({ open: true, logs: ticket.logs || [], ticketTitle: ticket.title });
   };
 
+  // ── Ticket multi-select ────────────────────────────────────────────────────
+  const toggleTicketSelected = (id) => {
+    setSelectedTicketIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
+  const toggleSelectAllTickets = (ids, allSelected) => {
+    setSelectedTicketIds(allSelected ? [] : ids);
+  };
+  const handleBulkDeleteTickets = async () => {
+    if (selectedTicketIds.length === 0) return;
+    if (!window.confirm(`Delete ${selectedTicketIds.length} selected ticket(s)? This cannot be undone.`)) return;
+    try {
+      await apiService.bulkDeleteSupportTickets(selectedTicketIds);
+      setSelectedTicketIds([]);
+      fetchAll();
+    } catch (e) { console.error(e); }
+  };
+
   // ── Outage handlers ────────────────────────────────────────────────────────
   const openCreateOutage = () => {
     setOutageForm({ title: '', description: '', affected_areas: '' });
@@ -208,6 +228,8 @@ const ServiceManagementView = () => {
   // ── Filtered data ──────────────────────────────────────────────────────────
   const filteredTickets = tickets.filter(t => !ticketFilter || t.status === ticketFilter);
   const filteredOutages = outages.filter(o => outageFilter === 'all' || o.status === outageFilter);
+  const filteredTicketIds = filteredTickets.map(t => t.id);
+  const allTicketsSelected = filteredTicketIds.length > 0 && filteredTicketIds.every(id => selectedTicketIds.includes(id));
 
   const sectionPaper = {
     p: 3, borderRadius: '20px',
@@ -325,6 +347,12 @@ const ServiceManagementView = () => {
                 sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
                 New Ticket
               </Button>
+              {selectedTicketIds.length > 0 && (
+                <Button startIcon={<DeleteIcon />} color="error" variant="contained" size="small" onClick={handleBulkDeleteTickets}
+                  sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
+                  Delete Selected ({selectedTicketIds.length})
+                </Button>
+              )}
             </Box>
           }
         />
@@ -335,6 +363,14 @@ const ServiceManagementView = () => {
             <Table size="small">
               <TableHead>
                 <TableRow sx={{ bgcolor: alpha(theme.palette.error.main, 0.04) }}>
+                  <TableCell padding="checkbox">
+                    <Checkbox
+                      size="small"
+                      checked={allTicketsSelected}
+                      indeterminate={selectedTicketIds.length > 0 && !allTicketsSelected}
+                      onChange={() => toggleSelectAllTickets(filteredTicketIds, allTicketsSelected)}
+                    />
+                  </TableCell>
                   <TableCell sx={{ fontWeight: 700 }}>#</TableCell>
                   <TableCell sx={{ fontWeight: 700 }}>Customer</TableCell>
                   <TableCell sx={{ fontWeight: 700 }}>Title</TableCell>
@@ -346,7 +382,14 @@ const ServiceManagementView = () => {
               </TableHead>
               <TableBody>
                 {filteredTickets.map(t => (
-                  <TableRow key={t.id} hover>
+                  <TableRow key={t.id} hover selected={selectedTicketIds.includes(t.id)}>
+                    <TableCell padding="checkbox">
+                      <Checkbox
+                        size="small"
+                        checked={selectedTicketIds.includes(t.id)}
+                        onChange={() => toggleTicketSelected(t.id)}
+                      />
+                    </TableCell>
                     <TableCell sx={{ color: 'text.secondary' }}>#{t.id}</TableCell>
                     <TableCell sx={{ fontWeight: 600 }}>{t.customer_name || `ID:${t.customer_id}`}</TableCell>
                     <TableCell sx={{ maxWidth: 200 }}>

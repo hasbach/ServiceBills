@@ -3956,6 +3956,31 @@ def delete_support_ticket(ticket_id):
     db.session.commit()
     return jsonify({'message': 'Ticket deleted successfully'})
 
+@app.route('/api/support-tickets/bulk_delete', methods=['POST'])
+@jwt_required()
+def bulk_delete_support_tickets():
+    """Delete a batch of support tickets in a single request (see bulk_delete_customers)."""
+    ticket_ids = request.json.get('ticket_ids', []) if request.json else []
+    if not ticket_ids:
+        return jsonify({'message': 'ticket_ids is required.'}), 400
+
+    tickets = tenant_query(SupportTicket).filter(SupportTicket.id.in_(ticket_ids)).all()
+    found_ids = {t.id for t in tickets}
+
+    succeeded = []
+    failed = [{'id': tid, 'error': 'Ticket not found'} for tid in ticket_ids if tid not in found_ids]
+
+    for ticket in tickets:
+        try:
+            db.session.delete(ticket)
+            db.session.commit()
+            succeeded.append(ticket.id)
+        except Exception as e:
+            db.session.rollback()
+            failed.append({'id': ticket.id, 'error': str(e)})
+
+    return jsonify({'succeeded': succeeded, 'failed': failed}), 200
+
 @app.route('/api/service-outages/<int:outage_id>', methods=['PUT'])
 @jwt_required()
 def update_service_outage(outage_id):
