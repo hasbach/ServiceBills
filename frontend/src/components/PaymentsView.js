@@ -259,7 +259,7 @@ const PrintableReceipt = React.forwardRef(({ receiptData }, ref) => {
 const PaymentCardItem = React.memo(({
     payment,
     getStatusColor, getPaymentTypeColor,
-    openMarkPaidDialog, handlePrepareReceipt, handleDeletePayment,
+    openMarkPaidDialog, openMarkGratisDialog, handlePrepareReceipt, handleDeletePayment,
     buildWhatsAppLink, waSettings, userRoles,
 }) => {
     const isCollector = userRoles.includes('collector') || userRoles.includes('admin') || userRoles.includes('finance');
@@ -321,6 +321,10 @@ const PaymentCardItem = React.memo(({
                         <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 1 }}>
                             <Chip label={payment.paid ? 'Paid' : (payment.collected ? (payment.collected_amount ? `Collected ($${payment.collected_amount.toFixed(2)})` : 'Collected') : 'Unpaid')} size="small"
                                 sx={{ backgroundColor: alpha(getStatusColor(payment.paid), 0.1), color: getStatusColor(payment.paid), fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(getStatusColor(payment.paid), 0.2)}` }} />
+                            {payment.is_gratis && (
+                                <Chip label="GRATIS" size="small" title={payment.gratis_note || ''}
+                                    sx={{ backgroundColor: alpha(theme.palette.info.main, 0.1), color: theme.palette.info.main, fontWeight: 700, fontSize: '0.75rem', border: `1px solid ${alpha(theme.palette.info.main, 0.2)}` }} />
+                            )}
                             {payment.pre_payment && (
                                 <Chip label="Pre-Payment" size="small"
                                     sx={{ backgroundColor: alpha(theme.palette.secondary.main, 0.1), color: theme.palette.secondary.main, fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(theme.palette.secondary.main, 0.2)}` }} />
@@ -349,6 +353,11 @@ const PaymentCardItem = React.memo(({
                                 {((!payment.collected && isCollector) || (payment.collected && isAdminOrFinance)) && (
                                     <Button size="small" variant="outlined" startIcon={<CheckCircleIcon />} onClick={() => openMarkPaidDialog(payment)} sx={{ borderColor: alpha('#10B981', 0.3), color: '#10B981', '&:hover': { borderColor: '#10B981', backgroundColor: alpha('#10B981', 0.05) } }}>
                                         {payment.collected ? 'Confirm Receipt' : 'Collect'}
+                                    </Button>
+                                )}
+                                {isAdminOrFinance && (
+                                    <Button size="small" variant="outlined" startIcon={<CardGiftcardIcon />} onClick={() => openMarkGratisDialog(payment)} sx={{ borderColor: alpha(theme.palette.info.main, 0.3), color: theme.palette.info.main, '&:hover': { borderColor: theme.palette.info.main, backgroundColor: alpha(theme.palette.info.main, 0.05) } }}>
+                                        Mark Gratis
                                     </Button>
                                 )}
                                 {isAdminOrFinance && (
@@ -1000,6 +1009,7 @@ const handlePrint = () => {
         getStatusColor,
         getPaymentTypeColor,
         openMarkPaidDialog,
+        openMarkGratisDialog,
         handlePrepareReceipt,
         handleDeletePayment,
         buildWhatsAppLink,
