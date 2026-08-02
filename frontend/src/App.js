@@ -3,7 +3,7 @@ import {
     Button, AppBar, Toolbar, Typography, Box, CircularProgress,
     Snackbar, Alert, IconButton, Drawer, List, ListItem, ListItemButton,
     ListItemIcon, ListItemText, Divider, alpha, useTheme, useMediaQuery, Chip,
-    ThemeProvider, CssBaseline
+    ThemeProvider, CssBaseline, Fab, Zoom, useScrollTrigger
 } from '@mui/material';
 import { BrowserRouter, useLocation } from 'react-router-dom';
 import theme from './theme';
@@ -26,6 +26,7 @@ import {
     Campaign as MessageIcon,
     Storefront as ResellerIcon,
     Badge as PayrollIcon,
+    KeyboardArrowUp as KeyboardArrowUpIcon,
 } from '@mui/icons-material';
 import { AppContextProvider, useAppContext, apiService } from './context/AppContext.js';
 import DashboardView from './components/DashboardView.js';
@@ -99,6 +100,12 @@ const MainApp = ({
     const isMobile = useMediaQuery(theme.breakpoints.down('md'));
     const userRoles = (user?.role || '').split(',').map(r => r.trim());
     const hasRole = (role) => userRoles.includes(role);
+
+    // Floating "back to top" button (mobile only) -- the AppBar/hamburger is
+    // sticky, but on long pages scrolling back up to it can still take a
+    // while, so surface a shortcut once the user has scrolled past a screen.
+    const scrollTrigger = useScrollTrigger({ target: window, disableHysteresis: true, threshold: 300 });
+    const scrollToTop = () => window.scrollTo({ top: 0, behavior: 'smooth' });
 
     const getDefaultView = () => {
         if (window.location.pathname.startsWith('/billing')) return 'billing';
@@ -307,6 +314,21 @@ const MainApp = ({
             <Box sx={{ px: { xs: 1, sm: 2, md: 3 }, py: { xs: 1.5, sm: 2, md: 3 } }}>
                 {renderView()}
             </Box>
+
+            {/* ── Back to Top (mobile) ── */}
+            {isMobile && (
+                <Zoom in={scrollTrigger}>
+                    <Fab
+                        size="small"
+                        color="primary"
+                        aria-label="Scroll back to top"
+                        onClick={scrollToTop}
+                        sx={{ position: 'fixed', bottom: 24, right: 16, zIndex: theme.zIndex.tooltip }}
+                    >
+                        <KeyboardArrowUpIcon />
+                    </Fab>
+                </Zoom>
+            )}
         </Box>
     );
 };
