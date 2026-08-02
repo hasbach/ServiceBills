@@ -2329,11 +2329,24 @@ def get_payments():
             'is_gratis': p.is_gratis,
             'gratis_note': p.gratis_note,
             'customer_name': p.customer.name,
-            'customer_address': p.customer.address
+            'customer_address': p.customer.address,
+            'customer_phone': p.customer.phone
              } for p in pagination.items],
         'total': pagination.total,
         'pages': pagination.pages,
         'current_page': page})
+
+
+def _detach_payment_dependents(payment):
+    """Clear rows that FK-reference this payment but aren't cascade-deleted with
+    it, so the delete doesn't hit a ForeignKeyViolation on Postgres (SQLite
+    doesn't enforce FKs by default, so this only ever bit in production).
+    GeneratedReceipt is a 1:1 snapshot of the payment -- delete it too, it's
+    meaningless without its source. AddonPurchase.payment_id is nullable and
+    represents a real purchase record independent of this payment -- unlink
+    rather than delete it."""
+    GeneratedReceipt.query.filter_by(payment_id=payment.id).delete()
+    AddonPurchase.query.filter_by(payment_id=payment.id).update({'payment_id': None})
 
 
 @app.route('/api/payments/<int:payment_id>', methods=['DELETE'])
@@ -2356,6 +2369,8 @@ def delete_payment(payment_id):
         else:
             # If the payment was unpaid, removing it means increasing the customer's balance (less owed)
             customer.balance += payment.amount
+
+        _detach_payment_dependents(payment)
 
         # Delete the payment
         db.session.delete(payment)
@@ -2679,6 +2694,7 @@ def bulk_delete_payments():
                 customer.balance -= payment.amount
             else:
                 customer.balance += payment.amount
+            _detach_payment_dependents(payment)
             db.session.delete(payment)
             db.session.commit()
             succeeded.append(payment.id)

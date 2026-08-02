@@ -55,7 +55,8 @@ import {
     ViewModule as ViewModuleIcon,
     WhatsApp as WhatsAppIcon,
     LocationOn as LocationIcon,
-    CardGiftcard as CardGiftcardIcon
+    CardGiftcard as CardGiftcardIcon,
+    Phone as PhoneIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 
@@ -298,6 +299,12 @@ const PaymentCardItem = React.memo(({
                                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.5 }}>
                                         <LocationIcon sx={{ fontSize: 14, color: 'text.secondary' }} />
                                         <Typography variant="caption" color="text.secondary">{payment.customer_address}</Typography>
+                                    </Box>
+                                )}
+                                {payment.customer_phone && (
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.5 }}>
+                                        <PhoneIcon sx={{ fontSize: 14, color: 'text.secondary' }} />
+                                        <Typography variant="caption" color="text.secondary">{payment.customer_phone}</Typography>
                                     </Box>
                                 )}
                                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
@@ -1399,6 +1406,9 @@ const handlePrint = () => {
                                                         <Typography variant="body2" sx={{ fontWeight: 600 }}>{payment.customer_name || '—'}</Typography>
                                                         {payment.customer_address && (
                                                             <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{payment.customer_address}</Typography>
+                                                        )}
+                                                        {payment.customer_phone && (
+                                                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{payment.customer_phone}</Typography>
                                                         )}
                                                     </Box>
                                                 </Box>
