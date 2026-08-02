@@ -161,6 +161,7 @@ const rawApiService = {
     fetchPayments: (customerId, status, startDate, endDate, searchQuery, collectedBy, collectedDate, sort_by = 'billed_date', sort_desc = 'true') => api.get(`/payments`, { params: { customer_id: customerId, status: status, start_date: startDate, end_date: endDate, search_query: searchQuery, collected_by: collectedBy, collected_date: collectedDate, sort_by: sort_by, sort_desc: sort_desc } }),
     deletePayment: (paymentId) => api.delete(`/payments/${paymentId}`),
     markPaymentAsPaid: (paymentId, data = {}) => api.put(`/payments/${paymentId}/mark_paid`, data),
+    markPaymentGratis: (paymentId, note) => api.put(`/payments/${paymentId}/mark_gratis`, { note }),
     cancelSubscription: (customerId) => api.put(`/customers/${customerId}/cancel_subscription`),
     activateSubscription: (customerId) => api.put(`/customers/${customerId}/activate_subscription`),
     deleteCustomer: (customerId) => api.delete(`/customers/${customerId}`),

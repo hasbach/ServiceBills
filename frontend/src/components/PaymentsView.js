@@ -54,7 +54,8 @@ import {
     ViewList as ViewListIcon,
     ViewModule as ViewModuleIcon,
     WhatsApp as WhatsAppIcon,
-    LocationOn as LocationIcon
+    LocationOn as LocationIcon,
+    CardGiftcard as CardGiftcardIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 
@@ -401,6 +402,10 @@ const PaymentsView = () => {
     // Mark-as-Paid dialog
     const [markPaidDialog, setMarkPaidDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
     const [markPaidAmount, setMarkPaidAmount] = useState('');
+    // Mark-as-Gratis dialog
+    const [markGratisDialog, setMarkGratisDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
+    const [markGratisNote, setMarkGratisNote] = useState('');
+    const [markGratisSubmitting, setMarkGratisSubmitting] = useState(false);
     const [waSettings, setWaSettings] = useState({ enabled: false, mode: 'deeplink', deeplink_msg_payment: 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!' });
 
     // Fetch WhatsApp settings once
@@ -703,6 +708,32 @@ const PaymentsView = () => {
             setSnackbar({ open: true, message: 'Failed to mark payment as paid. ' + (error.response?.data?.error || error.message), severity: 'error' });
         } finally {
             setMarkPaidSubmitting(false);
+        }
+    };
+
+    // --- Open the mark-as-gratis dialog ---
+    const openMarkGratisDialog = (payment) => {
+        setMarkGratisDialog({ open: true, paymentId: payment.id, outstanding: payment.amount, customerName: payment.customer_name });
+        setMarkGratisNote('');
+    };
+
+    const handleMarkGratis = async () => {
+        if (markGratisSubmitting) return;
+        const { paymentId } = markGratisDialog;
+        setMarkGratisSubmitting(true);
+        setMarkGratisDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' });
+        try {
+            const response = await apiService.markPaymentGratis(paymentId, markGratisNote);
+            setSnackbar({ open: true, message: response.data.message, severity: 'success' });
+            fetchPayments();
+            if (filters.customer_id) {
+                fetchCustomerBalance(filters.customer_id);
+            }
+        } catch (error) {
+            console.error("Error marking payment gratis:", error);
+            setSnackbar({ open: true, message: 'Failed to mark payment gratis. ' + (error.response?.data?.message || error.message), severity: 'error' });
+        } finally {
+            setMarkGratisSubmitting(false);
         }
     };
 
@@ -1370,9 +1401,16 @@ const handlePrint = () => {
                                                 </Typography>
                                             </TableCell>
                                             <TableCell>
-                                                <Chip label={payment.paid ? 'Paid' : 'Unpaid'} size="small"
-                                                    sx={{ bgcolor: alpha(getStatusColor(payment.paid), 0.1), color: getStatusColor(payment.paid), fontWeight: 600, border: `1px solid ${alpha(getStatusColor(payment.paid), 0.25)}` }}
-                                                />
+                                                <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                                                    <Chip label={payment.paid ? 'Paid' : 'Unpaid'} size="small"
+                                                        sx={{ bgcolor: alpha(getStatusColor(payment.paid), 0.1), color: getStatusColor(payment.paid), fontWeight: 600, border: `1px solid ${alpha(getStatusColor(payment.paid), 0.25)}` }}
+                                                    />
+                                                    {payment.is_gratis && (
+                                                        <Chip label="GRATIS" size="small" title={payment.gratis_note || ''}
+                                                            sx={{ bgcolor: alpha(theme.palette.info.main, 0.1), color: theme.palette.info.main, fontWeight: 700, border: `1px solid ${alpha(theme.palette.info.main, 0.25)}` }}
+                                                        />
+                                                    )}
+                                                </Box>
                                             </TableCell>
                                             <TableCell>
                                                 {payment.pre_payment ? (
@@ -1384,6 +1422,13 @@ const handlePrint = () => {
                                                     <Tooltip title={payment.collected ? "Confirm Receipt" : "Collect"}>
                                                         <IconButton size="small" color="success" onClick={() => openMarkPaidDialog(payment)}>
                                                             <CheckCircleIcon fontSize="small" />
+                                                        </IconButton>
+                                                    </Tooltip>
+                                                )}
+                                                {!payment.paid && (userRoles.includes('admin') || userRoles.includes('finance')) && (
+                                                    <Tooltip title="Mark Gratis (Free)">
+                                                        <IconButton size="small" color="info" onClick={() => openMarkGratisDialog(payment)}>
+                                                            <CardGiftcardIcon fontSize="small" />
                                                         </IconButton>
                                                     </Tooltip>
                                                 )}
@@ -1514,6 +1559,37 @@ const handlePrint = () => {
                         disabled={markPaidSubmitting}
                     >
                         Confirm Payment
+                    </Button>
+                </DialogActions>
+            </Dialog>
+
+            <Dialog open={markGratisDialog.open} onClose={() => setMarkGratisDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' })} maxWidth="xs" fullWidth>
+                <DialogTitle sx={{ fontWeight: 700 }}>Mark Payment Gratis</DialogTitle>
+                <DialogContent>
+                    <Typography variant="body2" sx={{ mb: 2, color: 'text.secondary' }}>
+                        Customer: <strong>{markGratisDialog.customerName}</strong><br />
+                        Original amount: <strong>${(markGratisDialog.outstanding || 0).toFixed(2)}</strong><br />
+                        This waives the payment — no charge will be recorded and the customer's balance will not change.
+                    </Typography>
+                    <TextField
+                        fullWidth
+                        autoFocus
+                        label="Reason (optional)"
+                        value={markGratisNote}
+                        onChange={(e) => setMarkGratisNote(e.target.value)}
+                        placeholder="e.g. loyalty reward, outage compensation"
+                    />
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setMarkGratisDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' })}>Cancel</Button>
+                    <Button
+                        variant="contained"
+                        color="info"
+                        startIcon={markGratisSubmitting ? <CircularProgress size={16} color="inherit" /> : <CardGiftcardIcon />}
+                        onClick={handleMarkGratis}
+                        disabled={markGratisSubmitting}
+                    >
+                        Confirm Gratis
                     </Button>
                 </DialogActions>
             </Dialog>
