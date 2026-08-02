@@ -1439,6 +1439,9 @@ const handlePrint = () => {
                                             </TableCell>
                                             <TableCell sx={{ whiteSpace: 'nowrap' }}>
                                                 {!payment.paid && (
+                                                    (!payment.collected && (userRoles.includes('collector') || userRoles.includes('admin') || userRoles.includes('finance'))) ||
+                                                    (payment.collected && (userRoles.includes('admin') || userRoles.includes('finance')))
+                                                ) && (
                                                     <Tooltip title={payment.collected ? "Confirm Receipt" : "Collect"}>
                                                         <IconButton size="small" color="success" onClick={() => openMarkPaidDialog(payment)}>
                                                             <CheckCircleIcon fontSize="small" />
