@@ -436,6 +436,8 @@ class Payment(db.Model):
     received_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     pre_payment = db.Column(db.Boolean, default=False)
+    is_gratis = db.Column(db.Boolean, nullable=False, default=False)
+    gratis_note = db.Column(db.Text, nullable=True)
     addon_purchases = db.relationship('AddonPurchase', backref='payment', lazy=True)
     
     collected_by = db.relationship('User', foreign_keys=[collected_by_id])
@@ -2324,6 +2326,8 @@ def get_payments():
             'received_by': p.received_by.username if p.received_by else None,
             'pre_payment': p.pre_payment,
             'reason': p.reason,
+            'is_gratis': p.is_gratis,
+            'gratis_note': p.gratis_note,
             'customer_name': p.customer.name,
             'customer_address': p.customer.address
              } for p in pagination.items],
@@ -2571,6 +2575,38 @@ def mark_payment_as_paid(payment_id):
         db.session.rollback()
         traceback.print_exc()
         return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/payments/<int:payment_id>/mark_gratis', methods=['PUT'])
+@jwt_required()
+def mark_payment_gratis(payment_id):
+    current_username = get_jwt_identity()
+    current_user = User.query.filter_by(username=current_username).first()
+
+    payment = tenant_query(Payment).filter_by(id=payment_id).first()
+    if not payment:
+        return jsonify({'message': 'Payment not found!'}), 404
+
+    roles = [r.strip().lower() for r in current_user.role.split(',')]
+    if 'admin' not in roles and 'finance' not in roles:
+        return jsonify({'message': 'Unauthorized. Only finance or admin can mark a payment gratis.'}), 403
+
+    if payment.paid:
+        return jsonify({'message': 'Payment is already settled and cannot be marked gratis.'}), 400
+
+    data = request.json or {}
+    payment.paid = True
+    payment.paid_at = datetime.utcnow()
+    payment.is_gratis = True
+    payment.gratis_note = data.get('note') or None
+    payment.received_by_id = current_user.id
+    db.session.commit()
+
+    return jsonify({
+        'message': 'Payment marked gratis — no charge recorded.',
+        'paid': payment.paid,
+        'is_gratis': payment.is_gratis
+    })
 
 
 @app.route('/api/payments/bulk_mark_paid', methods=['POST'])
