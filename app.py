@@ -2392,6 +2392,7 @@ def get_total_sales():
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
+        Payment.is_gratis == False,
         Payment.pre_payment == False
     ).group_by('month').all()
 
@@ -3103,6 +3104,7 @@ def get_monthly_revenue():
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
+        Payment.is_gratis == False,
         Payment.pre_payment == False
     ).group_by('month').all()
 
@@ -4561,7 +4563,7 @@ def get_revenue_report():
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     
-    query = tenant_query(Payment).filter(Payment.paid == True).options(
+    query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False).options(
         db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
     )
     if start_date:
@@ -5209,6 +5211,7 @@ def get_financial_report():
         ).filter(
             Payment.tenant_id == current_tenant_id(),
             Payment.paid == True,
+            Payment.is_gratis == False,
             func.coalesce(Payment.paid_at, Payment.date) >= start_date,
             func.coalesce(Payment.paid_at, Payment.date) <= end_date
         ).group_by('month').all()
