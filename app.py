@@ -438,10 +438,14 @@ class Payment(db.Model):
     pre_payment = db.Column(db.Boolean, default=False)
     is_gratis = db.Column(db.Boolean, nullable=False, default=False)
     gratis_note = db.Column(db.Text, nullable=True)
+    reverted_at = db.Column(db.DateTime, nullable=True)
+    reverted_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    revert_reason = db.Column(db.Text, nullable=True)
     addon_purchases = db.relationship('AddonPurchase', backref='payment', lazy=True)
-    
+
     collected_by = db.relationship('User', foreign_keys=[collected_by_id])
     received_by = db.relationship('User', foreign_keys=[received_by_id])
+    reverted_by = db.relationship('User', foreign_keys=[reverted_by_id])
 
 
 class GeneratedReceipt(db.Model):
@@ -1294,16 +1298,34 @@ def generate_missing_payments(tenant_id):
 
             # Determine the last billed date or use the subscription start date.
             # Reseller-linked customers never get a Payment row (their charges go
-            # to the reseller's balance instead), so the cursor has to come from
-            # the ResellerPayment ledger for them, or it never advances past
-            # subscription_start_date and every run re-bills every historical cycle.
+            # to the reseller's balance instead). The cursor used to come from the
+            # ResellerPayment ledger, but ledger rows created before customer_id was
+            # added to that table (see bb63f05) have customer_id=NULL and are
+            # invisible to a customer-scoped query -- for any customer whose
+            # history predates that fix, the cursor fell back to
+            # subscription_start_date and re-billed (and re-credited the reseller
+            # for) every historical cycle again on every run.
+            # customer.subscription_expiry_date doesn't have this problem: it's
+            # unconditionally kept in lockstep with every reseller charge below
+            # (and in renew/activate/create), so it's always "billed through"
+            # regardless of what the ledger looks like, and is what those other
+            # three call sites already use instead of the ledger.
             if customer.reseller_id:
-                last_charge = ResellerPayment.query.filter_by(
-                    tenant_id=tenant_id,
-                    customer_id=customer.id,
-                    type='credit_added'
-                ).order_by(ResellerPayment.date.desc()).first()
-                last_payment_date = last_charge.date if last_charge else customer.subscription_start_date
+                # subscription_expiry_date is tracked as the NEXT not-yet-billed
+                # cycle date (it's set to next_billing_date *after* it's advanced
+                # by one cycle, further down in this same loop) -- i.e. it's one
+                # cycle ahead of "last billed date". Step it back by one cycle so
+                # the "+1 cycle" below reconstructs the same next_billing_date
+                # instead of skipping a cycle.
+                if customer.subscription_expiry_date:
+                    if subscription_plan.billing_cycle == 'monthly':
+                        last_payment_date = customer.subscription_expiry_date - relativedelta(months=1)
+                    elif subscription_plan.billing_cycle == 'yearly':
+                        last_payment_date = customer.subscription_expiry_date - relativedelta(years=1)
+                    else:
+                        last_payment_date = customer.subscription_expiry_date
+                else:
+                    last_payment_date = customer.subscription_start_date
             else:
                 last_payment = Payment.query.filter_by(
                     tenant_id=tenant_id,
@@ -2050,30 +2072,20 @@ def generate_future_payments():
             # 2. There is NO unpaid payment already created for the same billing date
             if next_billing_date <= until_date:
                 amount_due = max(subscription_plan.price - (customer.discount or 0.0), 0.0)
+                # customer.reseller_id customers already `continue`d out of this loop
+                # above -- reseller billing is handled exclusively by the daily
+                # scheduler (generate_missing_payments), never by this manual button.
                 if amount_due > 0 and not has_pending_payment(customer.id, next_billing_date, customer.tenant_id):
-                    if customer.reseller_id:
-                        reseller = tenant_query(Reseller).filter_by(id=customer.reseller_id).first()
-                        if reseller:
-                            reseller.balance += amount_due
-                            reseller_payment = ResellerPayment(
-                                reseller_id=reseller.id,
-                                amount=amount_due,
-                                type='credit_added',
-                                description=f'Future billing charge for customer {customer.name}'
-                            )
-                            db.session.add(reseller_payment)
-                            payments_created_count += 1
-                    else:
-                        new_payment = Payment(
-                            customer_id=customer.id,
-                            amount=amount_due,
-                            paid=False,
-                            date=check_date,
-                            pre_payment=False
-                        )
-                        db.session.add(new_payment)
-                        customer.balance -= amount_due
-                        payments_created_count += 1
+                    new_payment = Payment(
+                        customer_id=customer.id,
+                        amount=amount_due,
+                        paid=False,
+                        date=check_date,
+                        pre_payment=False
+                    )
+                    db.session.add(new_payment)
+                    customer.balance -= amount_due
+                    payments_created_count += 1
 
                     print(
                         f"Generated billing item for customer {customer.id} "
@@ -2267,6 +2279,8 @@ def get_payments():
     status = request.args.get('status')
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
+    paid_date_start = request.args.get('paid_date_start')
+    paid_date_end = request.args.get('paid_date_end')
     search_query = request.args.get('search_query')
     collected_by = request.args.get('collected_by', type=int)
     collected_date = request.args.get('collected_date')
@@ -2282,6 +2296,10 @@ def get_payments():
         query = query.filter(Payment.date >= datetime.strptime(start_date, '%Y-%m-%d'))
     if end_date:
         query = query.filter(Payment.date <= datetime.strptime(end_date, '%Y-%m-%d'))
+    if paid_date_start:
+        query = query.filter(Payment.paid_at >= datetime.strptime(paid_date_start, '%Y-%m-%d'))
+    if paid_date_end:
+        query = query.filter(Payment.paid_at <= datetime.strptime(paid_date_end, '%Y-%m-%d').replace(hour=23, minute=59, second=59))
     if collected_by:
         query = query.filter(Payment.collected_by_id == collected_by)
     if collected_date:
@@ -2308,6 +2326,7 @@ def get_payments():
     # Eager load relationships for the new fields
     query = query.options(db.joinedload(Payment.collected_by))
     query = query.options(db.joinedload(Payment.received_by))
+    query = query.options(db.joinedload(Payment.reverted_by))
     
     #payments = query.all()
     pagination = query.paginate(page=page, per_page=per_page, error_out=False)
@@ -2328,6 +2347,9 @@ def get_payments():
             'reason': p.reason,
             'is_gratis': p.is_gratis,
             'gratis_note': p.gratis_note,
+            'reverted_at': p.reverted_at.strftime('%Y-%m-%d %H:%M:%S') if p.reverted_at else None,
+            'reverted_by': p.reverted_by.username if p.reverted_by else None,
+            'revert_reason': p.revert_reason,
             'customer_name': p.customer.name,
             'customer_address': p.customer.address,
             'customer_phone': p.customer.phone
@@ -2623,6 +2645,68 @@ def mark_payment_gratis(payment_id):
         'paid': payment.paid,
         'is_gratis': payment.is_gratis
     })
+
+
+@app.route('/api/payments/<int:payment_id>/revert', methods=['PUT'])
+@jwt_required()
+def revert_payment(payment_id):
+    """Undo a payment that was mistakenly marked paid (or gratis). Puts it back
+    to pending: clears paid/collected state, re-adds the amount to the
+    customer's balance if it had been credited, and records who/why for audit."""
+    current_username = get_jwt_identity()
+    current_user = User.query.filter_by(username=current_username).first()
+
+    roles = [r.strip().lower() for r in current_user.role.split(',')]
+    if 'admin' not in roles and 'finance' not in roles:
+        return jsonify({'message': 'Unauthorized. Only finance or admin can revert a payment.'}), 403
+
+    payment = tenant_query(Payment).filter_by(id=payment_id).first()
+    if not payment:
+        return jsonify({'message': 'Payment not found!'}), 404
+
+    if not payment.paid:
+        return jsonify({'message': 'Payment is not marked as paid.'}), 400
+
+    data = request.json or {}
+    reason = (data.get('reason') or '').strip()
+    if not reason:
+        return jsonify({'message': 'A reason is required to revert a payment.'}), 400
+
+    customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
+    if not customer:
+        return jsonify({'message': 'Customer not found for this payment!'}), 404
+
+    try:
+        # Gratis payments never added to the balance, so only reverse it for
+        # a normally-paid payment.
+        if not payment.is_gratis:
+            customer.balance -= payment.amount
+
+        payment.paid = False
+        payment.paid_at = None
+        payment.received_by_id = None
+        payment.collected = False
+        payment.collected_at = None
+        payment.collected_by_id = None
+        payment.collected_amount = None
+        payment.is_gratis = False
+        payment.gratis_note = None
+        payment.reverted_at = datetime.utcnow()
+        payment.reverted_by_id = current_user.id
+        payment.revert_reason = reason
+
+        db.session.commit()
+
+        return jsonify({
+            'message': 'Payment reverted to pending.',
+            'paid': payment.paid,
+            'collected': payment.collected,
+            'customer_new_balance': float(customer.balance)
+        })
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/payments/bulk_mark_paid', methods=['POST'])
@@ -4576,33 +4660,43 @@ def whatsapp_webhook():
 @app.route('/api/reports/revenue', methods=['GET'])
 @jwt_required()
 def get_revenue_report():
-    start_date = request.args.get('start_date')
-    end_date = request.args.get('end_date')
-    
-    query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False).options(
-        db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
-    )
-    if start_date:
-        query = query.filter(func.coalesce(Payment.paid_at, Payment.date) >= datetime.strptime(start_date, '%Y-%m-%d'))
-    if end_date:
-        query = query.filter(func.coalesce(Payment.paid_at, Payment.date) <= datetime.strptime(end_date, '%Y-%m-%d'))
+    try:
+        start_date_str = request.args.get('start_date')
+        end_date_str = request.args.get('end_date')
 
-    payments = query.all()
-    total_revenue = sum(p.amount for p in payments)
+        # Frontend sends full ISO-8601 datetimes (toISOString()), not plain
+        # 'YYYY-MM-DD' -- parse the same way get_financial_report does.
+        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if start_date_str else None
+        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if end_date_str else None
 
-    # Group by subscription plan
-    plan_revenue = {}
-    for payment in payments:
-        customer = payment.customer
-        if customer and customer.subscription_plan:
-            plan = customer.subscription_plan
-            plan_revenue[plan.name] = plan_revenue.get(plan.name, 0) + payment.amount
-    
-    return jsonify({
-        'total_revenue': total_revenue,
-        'plan_revenue': plan_revenue,
-        'payment_count': len(payments)
-    })
+        # Revenue = when the payment was actually paid, not when it was billed/due.
+        query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False).options(
+            db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
+        )
+        if start_date:
+            query = query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
+        if end_date:
+            query = query.filter(func.coalesce(Payment.paid_at, Payment.date) <= end_date)
+
+        payments = query.all()
+        total_revenue = sum(p.amount for p in payments)
+
+        # Group by subscription plan
+        plan_revenue = {}
+        for payment in payments:
+            customer = payment.customer
+            if customer and customer.subscription_plan:
+                plan = customer.subscription_plan
+                plan_revenue[plan.name] = plan_revenue.get(plan.name, 0) + payment.amount
+
+        return jsonify({
+            'total_revenue': total_revenue,
+            'plan_revenue': plan_revenue,
+            'payment_count': len(payments)
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 400
 
 @app.route('/api/reports/overdue', methods=['GET'])
 @jwt_required()

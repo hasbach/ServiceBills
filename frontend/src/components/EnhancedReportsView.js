@@ -19,6 +19,7 @@ import {
   MenuItem,
   FormControl,
   InputLabel,
+  Alert,
 } from '@mui/material';
 import { DatePicker } from '@mui/x-date-pickers/DatePicker';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
@@ -47,6 +48,7 @@ const EnhancedReportsView = () => {
   const [endDate, setEndDate] = useState(new Date());
   const [reportType, setReportType] = useState('financial');
   const [reportData, setReportData] = useState(null);
+  const [reportError, setReportError] = useState(null);
   const [overduePayments, setOverduePayments] = useState([]);
   const [customerMetrics, setCustomerMetrics] = useState(null);
 
@@ -57,8 +59,9 @@ const EnhancedReportsView = () => {
   }, [startDate, endDate, reportType]);
 
   const fetchReportData = async () => {
+    setReportData(null);
+    setReportError(null);
     try {
-      setReportData(null);
       if (reportType === 'financial') {
         const res = await apiService.fetchFinancialReport(startDate.toISOString(), endDate.toISOString());
         setReportData(res.data);
@@ -71,9 +74,13 @@ const EnhancedReportsView = () => {
          headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.error || data?.message || `Failed to load report (HTTP ${response.status})`);
+      }
       setReportData(data);
     } catch (error) {
       console.error('Error fetching report data:', error);
+      setReportError(error.message || 'Failed to load report data.');
     }
   };
 
@@ -106,7 +113,7 @@ const EnhancedReportsView = () => {
   const renderRevenueChart = () => {
     if (!reportData) return null;
 
-    const chartData = Object.entries(reportData.plan_revenue).map(([plan, amount]) => ({
+    const chartData = Object.entries(reportData.plan_revenue || {}).map(([plan, amount]) => ({
       name: plan,
       amount: amount,
     }));
@@ -361,6 +368,13 @@ const EnhancedReportsView = () => {
             </Grid>
           </Paper>
         </Grid>
+
+        {/* Report Error */}
+        {reportError && (
+          <Grid item xs={12}>
+            <Alert severity="error">{reportError}</Alert>
+          </Grid>
+        )}
 
         {/* Customer Metrics */}
         <Grid item xs={12}>

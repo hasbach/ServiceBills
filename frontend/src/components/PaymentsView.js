@@ -56,7 +56,8 @@ import {
     WhatsApp as WhatsAppIcon,
     LocationOn as LocationIcon,
     CardGiftcard as CardGiftcardIcon,
-    Phone as PhoneIcon
+    Phone as PhoneIcon,
+    Undo as UndoIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 
@@ -260,7 +261,7 @@ const PrintableReceipt = React.forwardRef(({ receiptData }, ref) => {
 const PaymentCardItem = React.memo(({
     payment,
     getStatusColor, getPaymentTypeColor,
-    openMarkPaidDialog, openMarkGratisDialog, handlePrepareReceipt, handleDeletePayment,
+    openMarkPaidDialog, openMarkGratisDialog, openRevertDialog, handlePrepareReceipt, handleDeletePayment,
     buildWhatsAppLink, waSettings, userRoles,
 }) => {
     const isCollector = userRoles.includes('collector') || userRoles.includes('admin') || userRoles.includes('finance');
@@ -389,6 +390,11 @@ const PaymentCardItem = React.memo(({
                                 </Button>
                             ) : null;
                         })()}
+                        {payment.paid && isAdminOrFinance && (
+                            <Button size="small" variant="outlined" startIcon={<UndoIcon />} onClick={() => openRevertDialog(payment)} sx={{ borderColor: alpha('#F59E0B', 0.3), color: '#F59E0B', '&:hover': { borderColor: '#F59E0B', backgroundColor: alpha('#F59E0B', 0.05) } }}>
+                                Revert
+                            </Button>
+                        )}
                         {isAdminOrFinance && (
                             <Button size="small" variant="outlined" startIcon={<DeleteIcon />} onClick={() => handleDeletePayment && handleDeletePayment(payment.id)} sx={{ borderColor: alpha('#EF4444', 0.3), color: '#EF4444', '&:hover': { borderColor: '#EF4444', backgroundColor: alpha('#EF4444', 0.05) } }}>
                                 Delete
@@ -422,6 +428,10 @@ const PaymentsView = () => {
     const [markGratisDialog, setMarkGratisDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
     const [markGratisNote, setMarkGratisNote] = useState('');
     const [markGratisSubmitting, setMarkGratisSubmitting] = useState(false);
+    // Revert-payment dialog
+    const [revertDialog, setRevertDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
+    const [revertReason, setRevertReason] = useState('');
+    const [revertSubmitting, setRevertSubmitting] = useState(false);
     const [waSettings, setWaSettings] = useState({ enabled: false, mode: 'deeplink', deeplink_msg_payment: 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!' });
 
     // Fetch WhatsApp settings once
@@ -446,6 +456,8 @@ const PaymentsView = () => {
         status: 'unpaid',
         start_date: '',
         end_date: '',
+        paid_date_start: '',
+        paid_date_end: '',
         search_query: '',
         collected_by: '',
         collected_date: '',
@@ -533,7 +545,9 @@ const PaymentsView = () => {
                 params.collected_by,
                 params.collected_date,
                 params.sort_by,
-                params.sort_desc
+                params.sort_desc,
+                params.paid_date_start,
+                params.paid_date_end
             );
             setPayments(response.data.payments || []); // FIX: Access the 'payments' key from the response
         } catch (error) {
@@ -750,6 +764,36 @@ const PaymentsView = () => {
             setSnackbar({ open: true, message: 'Failed to mark payment gratis. ' + (error.response?.data?.message || error.message), severity: 'error' });
         } finally {
             setMarkGratisSubmitting(false);
+        }
+    };
+
+    // --- Open the revert-payment dialog ---
+    const openRevertDialog = (payment) => {
+        setRevertDialog({ open: true, paymentId: payment.id, outstanding: payment.amount, customerName: payment.customer_name });
+        setRevertReason('');
+    };
+
+    const handleRevertPayment = async () => {
+        if (revertSubmitting) return;
+        const { paymentId } = revertDialog;
+        if (!revertReason.trim()) {
+            setSnackbar({ open: true, message: 'Please enter a reason for reverting this payment.', severity: 'error' });
+            return;
+        }
+        setRevertSubmitting(true);
+        try {
+            const response = await apiService.revertPayment(paymentId, revertReason.trim());
+            setSnackbar({ open: true, message: response.data.message, severity: 'success' });
+            setRevertDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' });
+            fetchPayments();
+            if (filters.customer_id) {
+                fetchCustomerBalance(filters.customer_id);
+            }
+        } catch (error) {
+            console.error("Error reverting payment:", error);
+            setSnackbar({ open: true, message: 'Failed to revert payment. ' + (error.response?.data?.message || error.message), severity: 'error' });
+        } finally {
+            setRevertSubmitting(false);
         }
     };
 
@@ -1017,6 +1061,7 @@ const handlePrint = () => {
         getPaymentTypeColor,
         openMarkPaidDialog,
         openMarkGratisDialog,
+        openRevertDialog,
         handlePrepareReceipt,
         handleDeletePayment,
         buildWhatsAppLink,
@@ -1238,7 +1283,7 @@ const handlePrint = () => {
                         <TextField
                             fullWidth
                             type="date"
-                            label="Start Date"
+                            label="Billed Start Date"
                             name="start_date"
                             value={filters.start_date}
                             onChange={handleFilterChange}
@@ -1250,9 +1295,33 @@ const handlePrint = () => {
                         <TextField
                             fullWidth
                             type="date"
-                            label="End Date"
+                            label="Billed End Date"
                             name="end_date"
                             value={filters.end_date}
+                            onChange={handleFilterChange}
+                            InputLabelProps={{ shrink: true }}
+                            size="small"
+                        />
+                    </Grid>
+                    <Grid item xs={12} sm={6} md={3}>
+                        <TextField
+                            fullWidth
+                            type="date"
+                            label="Paid Start Date"
+                            name="paid_date_start"
+                            value={filters.paid_date_start}
+                            onChange={handleFilterChange}
+                            InputLabelProps={{ shrink: true }}
+                            size="small"
+                        />
+                    </Grid>
+                    <Grid item xs={12} sm={6} md={3}>
+                        <TextField
+                            fullWidth
+                            type="date"
+                            label="Paid End Date"
+                            name="paid_date_end"
+                            value={filters.paid_date_end}
                             onChange={handleFilterChange}
                             InputLabelProps={{ shrink: true }}
                             size="small"
@@ -1472,6 +1541,13 @@ const handlePrint = () => {
                                                         </Tooltip>
                                                     ) : null;
                                                 })()}
+                                                {payment.paid && (userRoles.includes('admin') || userRoles.includes('finance')) && (
+                                                    <Tooltip title="Revert to Pending">
+                                                        <IconButton size="small" sx={{ color: '#F59E0B' }} onClick={() => openRevertDialog(payment)}>
+                                                            <UndoIcon fontSize="small" />
+                                                        </IconButton>
+                                                    </Tooltip>
+                                                )}
                                                 {(userRoles.includes('admin') || userRoles.includes('finance')) && (
                                                     <Tooltip title="Delete">
                                                         <IconButton size="small" color="error" onClick={() => handleDeletePayment(payment.id)}>
@@ -1613,6 +1689,40 @@ const handlePrint = () => {
                         disabled={markGratisSubmitting}
                     >
                         Confirm Gratis
+                    </Button>
+                </DialogActions>
+            </Dialog>
+
+            <Dialog open={revertDialog.open} onClose={() => !revertSubmitting && setRevertDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' })} maxWidth="xs" fullWidth>
+                <DialogTitle sx={{ fontWeight: 700 }}>Revert Payment to Pending</DialogTitle>
+                <DialogContent>
+                    <Typography variant="body2" sx={{ mb: 2, color: 'text.secondary' }}>
+                        Customer: <strong>{revertDialog.customerName}</strong><br />
+                        Amount: <strong>${(revertDialog.outstanding || 0).toFixed(2)}</strong><br />
+                        This undoes the payment: it goes back to pending, the amount is re-added to the customer's balance (if it wasn't gratis), and any collection record is cleared.
+                    </Typography>
+                    <TextField
+                        fullWidth
+                        autoFocus
+                        required
+                        label="Reason for reverting"
+                        value={revertReason}
+                        onChange={(e) => setRevertReason(e.target.value)}
+                        placeholder="e.g. marked paid by mistake"
+                        multiline
+                        minRows={2}
+                    />
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setRevertDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' })} disabled={revertSubmitting}>Cancel</Button>
+                    <Button
+                        variant="contained"
+                        sx={{ bgcolor: '#F59E0B', '&:hover': { bgcolor: '#D97706' } }}
+                        startIcon={revertSubmitting ? <CircularProgress size={16} color="inherit" /> : <UndoIcon />}
+                        onClick={handleRevertPayment}
+                        disabled={revertSubmitting || !revertReason.trim()}
+                    >
+                        Confirm Revert
                     </Button>
                 </DialogActions>
             </Dialog>
