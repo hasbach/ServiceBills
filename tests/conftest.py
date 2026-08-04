@@ -1,6 +1,12 @@
 import os
 os.environ["DATABASE_PATH"] = ":memory:"
 os.environ["JWT_SECRET_KEY"] = "test-secret-not-for-prod"
+# The daily scheduler jobs now fire immediately on startup (see app.py), which
+# during tests means "immediately at import time, before any table exists" --
+# harmless (APScheduler just logs the error) but noisy, and tests shouldn't be
+# depending on or racing a background scheduler thread against a per-test
+# in-memory DB anyway.
+os.environ["RUN_SCHEDULER"] = "0"
 import pytest
 from app import app as flask_app, db
 

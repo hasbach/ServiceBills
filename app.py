@@ -1504,10 +1504,27 @@ def recalculate_all_estimated_profits_with_context():
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
+#
+# next_run_time=datetime.now() below is required, not cosmetic: APScheduler's
+# IntervalTrigger with no explicit start_date defaults it to now + the interval
+# (verified: days=1 -> first fire is ~24h after the job is added), not "now".
+# On this app's actual host (Render free tier, spins down when idle -- see
+# render.yaml) a process rarely stays up for a full 24h between restarts, so
+# every restart re-registered these jobs with a fresh "fire in 24h" clock that
+# real traffic almost never survives long enough to reach -- the daily
+# catch-up (missing payments, salary accrual, profit estimates) could go
+# effectively forever without ever actually running. Firing immediately on
+# every startup makes each wake-up do its own catch-up, which is what a
+# spin-down-prone deployment actually needs.
+# Must be datetime.now() (naive LOCAL time), not datetime.utcnow(): APScheduler
+# interprets a naive next_run_time in the scheduler's local timezone, so a
+# naive UTC value is read as "that many hours in the past" on any host whose
+# local tz isn't UTC -- verified this makes the job log a "missed" warning and
+# push its first real fire a full day out instead of firing immediately.
 if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
-    scheduler.add_job(func=generate_missing_payments_with_context, trigger="interval", days=1)
-    scheduler.add_job(func=generate_missing_salary_charges_with_context, trigger="interval", days=1)
-    scheduler.add_job(func=recalculate_all_estimated_profits_with_context, trigger="interval", days=1)
+    scheduler.add_job(func=generate_missing_payments_with_context, trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=generate_missing_salary_charges_with_context, trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=recalculate_all_estimated_profits_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.start()
  
     
