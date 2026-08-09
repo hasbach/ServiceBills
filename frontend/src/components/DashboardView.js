@@ -79,6 +79,18 @@ const DashboardView = () => {
                 />
             </Grid>
 
+            {/* Expenses by type -- payroll and supplier cash payments were previously
+                only visible buried in their own tabs, invisible next to manual expenses. */}
+            <Divider sx={{ my: 4 }} />
+            <Typography variant="h6" sx={{ mb: 2, color: 'text.secondary' }}>
+                Expenses by Type
+            </Typography>
+            <Grid container spacing={3}>
+                <MetricCard title="Manual Expenses" value={metrics.manualExpenses} format={(v) => `$${v.toFixed(2)}`} />
+                <MetricCard title="Supplier Payments" value={metrics.supplierExpenses} format={(v) => `$${v.toFixed(2)}`} />
+                <MetricCard title="Payroll" value={metrics.payrollExpenses} format={(v) => `$${v.toFixed(2)}`} />
+            </Grid>
+
             {/* --- ADDED: New section for the subscription breakdown --- */}
             {metrics.subscriptionsBreakdown && metrics.subscriptionsBreakdown.length > 0 && (
                 <>

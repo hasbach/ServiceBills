@@ -58,7 +58,9 @@ def test_revert_restores_balance_and_pending_state(app, client):
     assert reverted["reverted_by"] == "a_revert1"
 
 
-def test_revert_gratis_payment_does_not_touch_balance(app, client):
+def test_revert_gratis_payment_reverses_the_balance_credit(app, client):
+    """Marking gratis credits the balance (forgives the debt); reverting it must
+    debit that back out, putting the charge's amount owed back in place."""
     a = make_tenant(client, "Biz A", "a_revert2")
     plan = _make_plan(client, a, price=60)
     cust_id = _make_customer(client, a, plan)
@@ -74,7 +76,7 @@ def test_revert_gratis_payment_does_not_touch_balance(app, client):
     assert r.status_code == 200, r.get_data(as_text=True)
 
     balance_after = client.get(f"/api/customers/{cust_id}/balance", headers=a).get_json()["stored_balance"]
-    assert balance_after == balance_before  # gratis never credited the balance
+    assert balance_after == balance_before - 60  # gratis credit undone -- owed again
 
     payments = client.get("/api/payments", headers=a,
                           query_string={"customer_id": cust_id}).get_json()["payments"]

@@ -34,7 +34,8 @@ import {
     Refresh as RefreshIcon,
     ExpandMore as ExpandMoreIcon,
     ExpandLess as ExpandLessIcon,
-    FolderOpen as FolderOpenIcon
+    FolderOpen as FolderOpenIcon,
+    Lock as LockIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import ExpenseForm from './ExpenseForm.js';
@@ -173,30 +174,38 @@ const CategorySection = ({ category, expenses, totalForCategory, grandTotal, onE
                                         ${parseFloat(expense.amount).toFixed(2)}
                                     </TableCell>
                                     <TableCell align="center" sx={{ whiteSpace: 'nowrap' }}>
-                                        <Tooltip title="Edit">
-                                            <IconButton
-                                                size="small"
-                                                onClick={() => onEdit(expense)}
-                                                sx={{
-                                                    color: theme.palette.primary.main,
-                                                    '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.1) }
-                                                }}
-                                            >
-                                                <EditIcon fontSize="small" />
-                                            </IconButton>
-                                        </Tooltip>
-                                        <Tooltip title="Delete">
-                                            <IconButton
-                                                size="small"
-                                                onClick={() => onDelete(expense.id)}
-                                                sx={{
-                                                    color: theme.palette.error.main,
-                                                    '&:hover': { bgcolor: alpha(theme.palette.error.main, 0.1) }
-                                                }}
-                                            >
-                                                <DeleteIcon fontSize="small" />
-                                            </IconButton>
-                                        </Tooltip>
+                                        {expense.source && expense.source !== 'manual' ? (
+                                            <Tooltip title="Tracked automatically from Payroll/Suppliers — not editable here">
+                                                <LockIcon fontSize="small" sx={{ color: 'text.disabled' }} />
+                                            </Tooltip>
+                                        ) : (
+                                            <>
+                                                <Tooltip title="Edit">
+                                                    <IconButton
+                                                        size="small"
+                                                        onClick={() => onEdit(expense)}
+                                                        sx={{
+                                                            color: theme.palette.primary.main,
+                                                            '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.1) }
+                                                        }}
+                                                    >
+                                                        <EditIcon fontSize="small" />
+                                                    </IconButton>
+                                                </Tooltip>
+                                                <Tooltip title="Delete">
+                                                    <IconButton
+                                                        size="small"
+                                                        onClick={() => onDelete(expense.id)}
+                                                        sx={{
+                                                            color: theme.palette.error.main,
+                                                            '&:hover': { bgcolor: alpha(theme.palette.error.main, 0.1) }
+                                                        }}
+                                                    >
+                                                        <DeleteIcon fontSize="small" />
+                                                    </IconButton>
+                                                </Tooltip>
+                                            </>
+                                        )}
                                     </TableCell>
                                 </TableRow>
                             ))}

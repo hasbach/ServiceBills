@@ -2649,18 +2649,28 @@ def mark_payment_gratis(payment_id):
     if payment.paid:
         return jsonify({'message': 'Payment is already settled and cannot be marked gratis.'}), 400
 
+    customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
+    if not customer:
+        return jsonify({'message': 'Customer not found for this payment!'}), 404
+
     data = request.json or {}
     payment.paid = True
     payment.paid_at = datetime.utcnow()
     payment.is_gratis = True
     payment.gratis_note = data.get('note') or None
     payment.received_by_id = current_user.id
+    # The unpaid charge already debited the balance when it was created (that's
+    # what makes it show as owed) -- waiving it forgives that debt the same way
+    # collecting cash would, even though no money changes hands. Not doing this
+    # left the balance permanently overstating what's actually still owed.
+    customer.balance += payment.amount
     db.session.commit()
 
     return jsonify({
         'message': 'Payment marked gratis — no charge recorded.',
         'paid': payment.paid,
-        'is_gratis': payment.is_gratis
+        'is_gratis': payment.is_gratis,
+        'customer_new_balance': float(customer.balance)
     })
 
 
@@ -2694,10 +2704,10 @@ def revert_payment(payment_id):
         return jsonify({'message': 'Customer not found for this payment!'}), 404
 
     try:
-        # Gratis payments never added to the balance, so only reverse it for
-        # a normally-paid payment.
-        if not payment.is_gratis:
-            customer.balance -= payment.amount
+        # Settling a payment -- paid or gratis -- always credits the balance
+        # (collecting cash and forgiving the debt both clear what was owed);
+        # reverting always debits it back, regardless of which one it was.
+        customer.balance -= payment.amount
 
         payment.paid = False
         payment.paid_at = None
@@ -3207,7 +3217,12 @@ def get_expenses_total():
 
     return jsonify([{
         'month': m,
-        'value': float(exp_data.get(m, 0.0) or 0.0) + float(sp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0)
+        'value': float(exp_data.get(m, 0.0) or 0.0) + float(sp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0),
+        # Breakdown of the same total by source -- computed above either way,
+        # previously discarded once summed into `value`.
+        'manual': float(exp_data.get(m, 0.0) or 0.0),
+        'supplier': float(sp_data.get(m, 0.0) or 0.0),
+        'payroll': float(sal_data.get(m, 0.0) or 0.0)
     } for m in all_months])
 
 
@@ -3820,7 +3835,10 @@ def get_dashboard_metrics():
     total_customers = tenant_query(Customer).count()
     active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).count()
     total_revenue = sum(payment.amount for payment in tenant_query(Payment).filter_by(paid=True, pre_payment=False).all()) # Only actual revenue, not pre-payments
-    total_expenses = sum(expense.amount for expense in tenant_query(Expense).filter_by(is_credit=False).all()) + sum(sp.amount for sp in tenant_query(SupplierPayment).all()) + sum(sal.amount for sal in tenant_query(SalaryPayment).all())
+    manual_expenses = sum(expense.amount for expense in tenant_query(Expense).filter_by(is_credit=False).all())
+    supplier_expenses = sum(sp.amount for sp in tenant_query(SupplierPayment).all())
+    payroll_expenses = sum(sal.amount for sal in tenant_query(SalaryPayment).all())
+    total_expenses = manual_expenses + supplier_expenses + payroll_expenses
     # Outstanding balance should be the sum of negative balances (customers who owe money)
     outstanding_balance = sum(c.balance for c in tenant_query(Customer).filter(Customer.balance < 0).all())
     subscriptions_breakdown_query = db.session.query(
@@ -3841,6 +3859,9 @@ def get_dashboard_metrics():
         'activeCustomers': active_customers,
         'totalRevenue': float(total_revenue),
         'totalExpenses': float(total_expenses),
+        'manualExpenses': float(manual_expenses),
+        'supplierExpenses': float(supplier_expenses),
+        'payrollExpenses': float(payroll_expenses),
         'outstandingBalance': float(outstanding_balance),
         'subscriptionsBreakdown': subscriptions_breakdown
     })
@@ -5020,17 +5041,64 @@ def delete_expense_category(category_id):
 def get_expenses():
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
-    
+
     query = tenant_query(Expense)
-    
+
     # Apply date filters if provided
     if start_date:
         query = query.filter(Expense.date >= start_date)
     if end_date:
         query = query.filter(Expense.date <= end_date)
-    
+
     expenses = query.order_by(Expense.date.desc()).all()
-    return jsonify([e.to_dict() for e in expenses])
+    result = [dict(e.to_dict(), source='manual') for e in expenses]
+
+    # Supplier and payroll cash payments never become Expense rows (they're
+    # tracked in their own ledgers -- see SupplierPayment/SalaryPayment), which
+    # made them invisible here even though they're real money out the door.
+    # Folded in as read-only entries under a synthetic category so this page
+    # is a complete picture of cash outflows, not just manually-logged ones.
+    sp_query = tenant_query(SupplierPayment)
+    if start_date:
+        sp_query = sp_query.filter(SupplierPayment.payment_date >= start_date)
+    if end_date:
+        sp_query = sp_query.filter(SupplierPayment.payment_date <= end_date)
+    for sp in sp_query.order_by(SupplierPayment.payment_date.desc()).all():
+        supplier_name = sp.supplier.name if sp.supplier else 'Unknown supplier'
+        result.append({
+            'id': f'supplier_payment-{sp.id}',
+            'category': 'Supplier Payments',
+            'supplier_name': supplier_name,
+            'supplier_id': sp.supplier_id,
+            'is_credit': False,
+            'amount': float(sp.amount),
+            'description': sp.reference_note or f'Payment to {supplier_name}',
+            'date': sp.payment_date.strftime('%Y-%m-%d'),
+            'source': 'supplier_payment'
+        })
+
+    sal_query = tenant_query(SalaryPayment)
+    if start_date:
+        sal_query = sal_query.filter(SalaryPayment.payment_date >= start_date)
+    if end_date:
+        sal_query = sal_query.filter(SalaryPayment.payment_date <= end_date)
+    for sal in sal_query.order_by(SalaryPayment.payment_date.desc()).all():
+        employee_name = sal.employee.name if sal.employee else 'Unknown employee'
+        label = 'Advance' if sal.is_advance else 'Salary'
+        result.append({
+            'id': f'salary_payment-{sal.id}',
+            'category': 'Payroll',
+            'supplier_name': None,
+            'supplier_id': None,
+            'is_credit': False,
+            'amount': float(sal.amount),
+            'description': sal.note or f'{label} paid to {employee_name}',
+            'date': sal.payment_date.strftime('%Y-%m-%d'),
+            'source': 'payroll'
+        })
+
+    result.sort(key=lambda r: r['date'], reverse=True)
+    return jsonify(result)
 
 @app.route('/api/expenses', methods=['POST'])
 @jwt_required()
@@ -5400,23 +5468,34 @@ def get_financial_report():
             + list(estimate_data.keys())
         )
 
-        monthly_data_dict = {m: {'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0} for m in months_set}
+        monthly_data_dict = {m: {
+            'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0,
+            # Same total as `expenses`, split by source -- previously computed
+            # here and immediately discarded once summed together.
+            'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0
+        } for m in months_set}
 
         for row in income_query:
             monthly_data_dict[row.month]['income'] += float(row.total or 0)
 
         for row in expense_query:
             monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+            monthly_data_dict[row.month]['expenses_manual'] += float(row.total or 0)
 
         for row in sp_query:
             monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+            monthly_data_dict[row.month]['expenses_supplier'] += float(row.total or 0)
 
         for row in sal_query:
             monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+            monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
 
         monthly_data = []
         total_income = 0.0
         total_expenses = 0.0
+        total_expenses_manual = 0.0
+        total_expenses_supplier = 0.0
+        total_expenses_payroll = 0.0
         total_estimated_profit = 0.0
         total_variance = 0.0
 
@@ -5432,6 +5511,9 @@ def get_financial_report():
 
             total_income += data['income']
             total_expenses += data['expenses']
+            total_expenses_manual += data['expenses_manual']
+            total_expenses_supplier += data['expenses_supplier']
+            total_expenses_payroll += data['expenses_payroll']
             if estimated_profit is not None:
                 total_estimated_profit += estimated_profit
                 total_variance += data['variance']
@@ -5443,6 +5525,9 @@ def get_financial_report():
             'totals': {
                 'income': total_income,
                 'expenses': total_expenses,
+                'expenses_manual': total_expenses_manual,
+                'expenses_supplier': total_expenses_supplier,
+                'expenses_payroll': total_expenses_payroll,
                 'profit': total_profit,
                 'estimated_profit': total_estimated_profit,
                 'variance': total_variance

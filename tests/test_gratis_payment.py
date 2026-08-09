@@ -30,11 +30,17 @@ def _add_collector(client, admin_hdr, username):
     return {"Authorization": f"Bearer {r.get_json()['access_token']}"}
 
 
-def test_mark_gratis_settles_payment_without_touching_balance(app, client):
+def test_mark_gratis_forgives_the_debt_by_crediting_balance(app, client):
+    """The unpaid charge already debited the balance when it was created (that's
+    what makes it show as owed); waiving it must credit that back, the same as
+    collecting cash would, or the balance permanently overstates what's owed."""
     a = make_tenant(client, "Biz A", "a_admin")
     plan = _make_plan(client, a)
     cust_id = _make_customer(client, a, plan)
     payment_id = _unpaid_payment_id(client, a, cust_id)
+    payments_before = client.get("/api/payments", headers=a,
+                          query_string={"customer_id": cust_id}).get_json()["payments"]
+    amount = next(p for p in payments_before if p["id"] == payment_id)["amount"]
 
     balance_before = client.get(f"/api/customers/{cust_id}/balance", headers=a).get_json()["stored_balance"]
 
@@ -44,9 +50,10 @@ def test_mark_gratis_settles_payment_without_touching_balance(app, client):
     body = r.get_json()
     assert body["paid"] is True
     assert body["is_gratis"] is True
+    assert body["customer_new_balance"] == balance_before + amount
 
     balance_after = client.get(f"/api/customers/{cust_id}/balance", headers=a).get_json()["stored_balance"]
-    assert balance_after == balance_before  # untouched -- no money collected
+    assert balance_after == balance_before + amount  # debt forgiven -- no longer owed
 
     payments = client.get("/api/payments", headers=a,
                           query_string={"customer_id": cust_id}).get_json()["payments"]
