@@ -28,15 +28,21 @@ def test_sector_and_category_isolation_and_name_reuse(client):
     b = make_tenant(client, "Biz B", "b_admin")
 
     # Both tenants can use the SAME name now that uniqueness is per-tenant.
+    # "Marketing" (not one of the seeded defaults -- Rent/Payroll/Electricity,
+    # see seed_default_expense_categories) so this only exercises name reuse,
+    # not a collision with what every new tenant already has.
     for hdr in (a, b):
         assert client.post("/api/sectors", headers=hdr, json={"name": "North"}).status_code == 201
-        assert client.post("/api/expense_categories", headers=hdr, json={"name": "Rent"}).status_code == 201
+        assert client.post("/api/expense_categories", headers=hdr, json={"name": "Marketing"}).status_code == 201
 
-    # Each tenant sees only its own single row.
+    # Each tenant sees only its own single sector row.
     assert _names(client.get("/api/sectors", headers=a)) == {"North"}
     assert _names(client.get("/api/sectors", headers=b)) == {"North"}
-    assert _names(client.get("/api/expense_categories", headers=a)) == {"Rent"}
-    assert _names(client.get("/api/expense_categories", headers=b)) == {"Rent"}
+    # Each tenant sees its own custom category plus its own seeded defaults --
+    # not each other's.
+    default_categories = {"Rent", "Payroll", "Electricity"}
+    assert _names(client.get("/api/expense_categories", headers=a)) == default_categories | {"Marketing"}
+    assert _names(client.get("/api/expense_categories", headers=b)) == default_categories | {"Marketing"}
 
 
 def test_payments_isolation(client):

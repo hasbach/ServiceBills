@@ -1,7 +1,10 @@
 from tests.conftest import make_tenant
 
 
-def _make_category(client, hdr, name="Rent"):
+def _make_category(client, hdr, name="Office Supplies"):
+    # Rent/Payroll/Electricity are now auto-seeded per tenant (see
+    # seed_default_expense_categories) -- use a name that isn't one of those,
+    # so this helper's own creation doesn't collide with what already exists.
     r = client.post("/api/expense_categories", headers=hdr, json={"name": name})
     assert r.status_code == 201, r.get_data(as_text=True)
     return r.get_json()["name"]
@@ -58,9 +61,13 @@ def test_expenses_list_includes_supplier_and_payroll_payments(app, client):
     assert r.status_code == 200, r.get_data(as_text=True)
     rows = r.get_json()
 
-    manual = next(x for x in rows if x["source"] == "manual")
+    manual_rows = [x for x in rows if x["source"] == "manual"]
     supplier_row = next(x for x in rows if x["source"] == "supplier_payment")
-    payroll_row = next(x for x in rows if x["source"] == "payroll")
+    # Payroll payments are now real Expense rows (see record_employee_payment) --
+    # they come back with source='manual' like any other real expense, just
+    # tagged with employee_id and the Payroll category.
+    payroll_row = next(x for x in manual_rows if x["employee_id"] is not None)
+    manual = next(x for x in manual_rows if x["employee_id"] is None)
 
     assert manual["category"] == category
     assert manual["amount"] == 100
@@ -72,12 +79,14 @@ def test_expenses_list_includes_supplier_and_payroll_payments(app, client):
 
     assert payroll_row["category"] == "Payroll"
     assert payroll_row["amount"] == 500
+    assert payroll_row["employee_name"] == "Jane Doe"
     assert "Jane Doe" in payroll_row["description"]
 
-    # Synthetic rows can't collide with a real integer Expense id and must
-    # never be routable to the edit/delete-by-id Expense endpoints.
+    # Payroll is a real Expense row -- a real integer id, editable/deletable
+    # like any other expense. Only the supplier-payment merge is synthetic
+    # and read-only.
+    assert isinstance(payroll_row["id"], int)
     assert isinstance(supplier_row["id"], str) and supplier_row["id"].startswith("supplier_payment-")
-    assert isinstance(payroll_row["id"], str) and payroll_row["id"].startswith("salary_payment-")
 
 
 def test_expenses_list_respects_date_range_for_all_sources(app, client):
@@ -94,9 +103,9 @@ def test_expenses_list_respects_date_range_for_all_sources(app, client):
     r = client.get("/api/expenses", headers=a,
                    query_string={"start_date": "2026-06-01", "end_date": "2026-12-31"})
     rows = r.get_json()
-    assert not any(x["source"] == "manual" for x in rows)
+    assert not any(x["employee_id"] is None and x["source"] == "manual" for x in rows)  # the out-of-range Office Supplies row
     assert not any(x["source"] == "supplier_payment" for x in rows)
-    assert any(x["source"] == "payroll" for x in rows)
+    assert any(x["employee_id"] is not None for x in rows)  # the in-range payroll payment
 
 
 def test_expenses_total_breakdown_sums_to_value(app, client):

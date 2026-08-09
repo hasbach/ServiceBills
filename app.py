@@ -296,17 +296,47 @@ class ExpenseCategory(db.Model):
         return {'id': self.id, 'name': self.name}
 
 
+# Seeded for every new tenant (register()) and backfilled onto existing ones
+# (migration f9c1a2e4b8d0) so every business starts with the categories most
+# businesses need; the owner can still add as many custom ones as they like.
+DEFAULT_EXPENSE_CATEGORIES = ['Rent', 'Payroll', 'Electricity']
+
+
+def seed_default_expense_categories(tenant_id):
+    existing = {c.name for c in ExpenseCategory.query.filter_by(tenant_id=tenant_id).all()}
+    for name in DEFAULT_EXPENSE_CATEGORIES:
+        if name not in existing:
+            db.session.add(ExpenseCategory(tenant_id=tenant_id, name=name))
+
+
+def get_or_create_payroll_category(tenant_id):
+    """The Payroll category should always exist (seeded at signup / backfilled by
+    migration) -- this is a defensive fallback for the rare case it's missing
+    (e.g. deleted), so recording a payroll payment never hard-fails on it."""
+    category = ExpenseCategory.query.filter_by(tenant_id=tenant_id, name='Payroll').first()
+    if not category:
+        category = ExpenseCategory(tenant_id=tenant_id, name='Payroll')
+        db.session.add(category)
+        db.session.flush()
+    return category
+
+
 class Expense(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     category_id =  db.Column(db.Integer, db.ForeignKey('expense_category.id'), nullable=False)
     supplier_id = db.Column(db.Integer, db.ForeignKey('supplier.id'), nullable=True)
+    # Set when this expense IS a payroll payment (see record_employee_payment /
+    # add_expense) -- what actually identifies a payroll expense for reporting
+    # purposes, independent of whatever the category happens to be named.
+    employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=True)
     is_credit = db.Column(db.Boolean, default=False)
     amount = db.Column(db.Float, nullable=False)
     description = db.Column(db.String(200), nullable=False)
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    
+
     supplier = db.relationship('Supplier', backref='expenses', lazy=True)
+    employee = db.relationship('Employee', backref='expense_payments', lazy=True)
 
     def to_dict(self):
         return {
@@ -314,6 +344,8 @@ class Expense(db.Model):
             'category': self.category.name,
             'supplier_name': self.supplier.name if self.supplier else None,
             'supplier_id': self.supplier_id,
+            'employee_name': self.employee.name if self.employee else None,
+            'employee_id': self.employee_id,
             'is_credit': self.is_credit,
             'amount': float(self.amount),
             'description': self.description,
@@ -854,6 +886,7 @@ def register():
     tenant = Tenant(name=business_name, slug=slug)
     db.session.add(tenant)
     db.session.flush()  # assign tenant.id before creating the user
+    seed_default_expense_categories(tenant.id)
 
     new_user = User(username=username, role='admin', tenant_id=tenant.id, email=email)
     new_user.set_password(password)
@@ -3195,11 +3228,20 @@ def delete_receipt(receipt_id):
 @app.route('/api/reports/expenses-total', methods=['GET'])
 @jwt_required()
 def get_expenses_total():
-    # Direct cash expenses (exclude credit purchases)
+    # Direct cash expenses (exclude credit purchases). A payroll payment is
+    # identified by employee_id being set -- not by category name -- so this
+    # still works correctly even if the Payroll category gets renamed.
     exp_data = {item.month: item.total_expenses for item in db.session.query(
         month_key(Expense.date).label('month'),
         func.sum(Expense.amount).label('total_expenses')
-    ).filter(Expense.tenant_id == current_tenant_id(), Expense.is_credit == False).group_by('month').all()}
+    ).filter(Expense.tenant_id == current_tenant_id(), Expense.is_credit == False,
+              Expense.employee_id.is_(None)).group_by('month').all()}
+
+    payroll_exp_data = {item.month: item.total for item in db.session.query(
+        month_key(Expense.date).label('month'),
+        func.sum(Expense.amount).label('total')
+    ).filter(Expense.tenant_id == current_tenant_id(), Expense.is_credit == False,
+              Expense.employee_id.isnot(None)).group_by('month').all()}
 
     # Supplier cash payments
     sp_data = {item.month: item.total_sp for item in db.session.query(
@@ -3207,22 +3249,24 @@ def get_expenses_total():
         func.sum(SupplierPayment.amount).label('total_sp')
     ).filter(SupplierPayment.tenant_id == current_tenant_id()).group_by('month').all()}
 
-    # Salary payments (cash paid to employees)
+    # Legacy salary payments predating the move to Expense-based payroll (see
+    # record_employee_payment) -- still counted so historical totals don't drop.
     sal_data = {item.month: item.total_sal for item in db.session.query(
         month_key(SalaryPayment.payment_date).label('month'),
         func.sum(SalaryPayment.amount).label('total_sal')
     ).filter(SalaryPayment.tenant_id == current_tenant_id()).group_by('month').all()}
 
-    all_months = sorted(set(exp_data.keys()) | set(sp_data.keys()) | set(sal_data.keys()))
+    all_months = sorted(set(exp_data.keys()) | set(payroll_exp_data.keys()) | set(sp_data.keys()) | set(sal_data.keys()))
 
     return jsonify([{
         'month': m,
-        'value': float(exp_data.get(m, 0.0) or 0.0) + float(sp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0),
+        'value': float(exp_data.get(m, 0.0) or 0.0) + float(payroll_exp_data.get(m, 0.0) or 0.0)
+                 + float(sp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0),
         # Breakdown of the same total by source -- computed above either way,
         # previously discarded once summed into `value`.
         'manual': float(exp_data.get(m, 0.0) or 0.0),
         'supplier': float(sp_data.get(m, 0.0) or 0.0),
-        'payroll': float(sal_data.get(m, 0.0) or 0.0)
+        'payroll': float(payroll_exp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0)
     } for m in all_months])
 
 
@@ -3832,12 +3876,47 @@ def send_whatsapp_message(customer, event_type, context=None):
 @app.route('/api/dashboard', methods=['GET'])
 @jwt_required()
 def get_dashboard_metrics():
+    # start_date/end_date are optional -- when given, they scope the money-flow
+    # figures (revenue, expenses) to that period. Customer counts and
+    # outstanding balance are current-state snapshots, not flows over a range,
+    # so they're intentionally always "as of now" regardless of this filter.
+    start_date_str = request.args.get('start_date')
+    end_date_str = request.args.get('end_date')
+    start_date = datetime.strptime(start_date_str, '%Y-%m-%d') if start_date_str else None
+    end_date = (datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+                if end_date_str else None)
+
     total_customers = tenant_query(Customer).count()
     active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).count()
-    total_revenue = sum(payment.amount for payment in tenant_query(Payment).filter_by(paid=True, pre_payment=False).all()) # Only actual revenue, not pre-payments
-    manual_expenses = sum(expense.amount for expense in tenant_query(Expense).filter_by(is_credit=False).all())
-    supplier_expenses = sum(sp.amount for sp in tenant_query(SupplierPayment).all())
-    payroll_expenses = sum(sal.amount for sal in tenant_query(SalaryPayment).all())
+
+    revenue_query = tenant_query(Payment).filter_by(paid=True, pre_payment=False)  # Only actual revenue, not pre-payments
+    if start_date:
+        revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
+    if end_date:
+        revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) <= end_date)
+    total_revenue = sum(payment.amount for payment in revenue_query.all())
+
+    # employee_id set = a payroll payment, regardless of what the category is named.
+    manual_query = tenant_query(Expense).filter_by(is_credit=False).filter(Expense.employee_id.is_(None))
+    payroll_exp_query = tenant_query(Expense).filter_by(is_credit=False).filter(Expense.employee_id.isnot(None))
+    supplier_query = tenant_query(SupplierPayment)
+    # Legacy salary payments predating Expense-based payroll -- still counted.
+    legacy_payroll_query = tenant_query(SalaryPayment)
+    if start_date:
+        manual_query = manual_query.filter(Expense.date >= start_date)
+        payroll_exp_query = payroll_exp_query.filter(Expense.date >= start_date)
+        supplier_query = supplier_query.filter(SupplierPayment.payment_date >= start_date)
+        legacy_payroll_query = legacy_payroll_query.filter(SalaryPayment.payment_date >= start_date)
+    if end_date:
+        manual_query = manual_query.filter(Expense.date <= end_date)
+        payroll_exp_query = payroll_exp_query.filter(Expense.date <= end_date)
+        supplier_query = supplier_query.filter(SupplierPayment.payment_date <= end_date)
+        legacy_payroll_query = legacy_payroll_query.filter(SalaryPayment.payment_date <= end_date)
+
+    manual_expenses = sum(expense.amount for expense in manual_query.all())
+    supplier_expenses = sum(sp.amount for sp in supplier_query.all())
+    payroll_expenses = (sum(exp.amount for exp in payroll_exp_query.all())
+                         + sum(sal.amount for sal in legacy_payroll_query.all()))
     total_expenses = manual_expenses + supplier_expenses + payroll_expenses
     # Outstanding balance should be the sum of negative balances (customers who owe money)
     outstanding_balance = sum(c.balance for c in tenant_query(Customer).filter(Customer.balance < 0).all())
@@ -5053,11 +5132,11 @@ def get_expenses():
     expenses = query.order_by(Expense.date.desc()).all()
     result = [dict(e.to_dict(), source='manual') for e in expenses]
 
-    # Supplier and payroll cash payments never become Expense rows (they're
-    # tracked in their own ledgers -- see SupplierPayment/SalaryPayment), which
-    # made them invisible here even though they're real money out the door.
-    # Folded in as read-only entries under a synthetic category so this page
-    # is a complete picture of cash outflows, not just manually-logged ones.
+    # Supplier cash payments never become Expense rows (tracked in their own
+    # SupplierPayment ledger), which made them invisible here even though
+    # they're real money out the door. Folded in as read-only entries under a
+    # synthetic category so this page is a complete picture of cash outflows,
+    # not just manually-logged ones.
     sp_query = tenant_query(SupplierPayment)
     if start_date:
         sp_query = sp_query.filter(SupplierPayment.payment_date >= start_date)
@@ -5077,6 +5156,10 @@ def get_expenses():
             'source': 'supplier_payment'
         })
 
+    # Legacy payroll payments recorded before payments moved to the Expense
+    # table (see record_employee_payment) -- kept read-only so historical data
+    # doesn't vanish from this page. New payroll payments arrive as ordinary
+    # (editable) rows in the `expenses` query above, category "Payroll".
     sal_query = tenant_query(SalaryPayment)
     if start_date:
         sal_query = sal_query.filter(SalaryPayment.payment_date >= start_date)
@@ -5090,11 +5173,13 @@ def get_expenses():
             'category': 'Payroll',
             'supplier_name': None,
             'supplier_id': None,
+            'employee_name': employee_name,
+            'employee_id': sal.employee_id,
             'is_credit': False,
             'amount': float(sal.amount),
             'description': sal.note or f'{label} paid to {employee_name}',
             'date': sal.payment_date.strftime('%Y-%m-%d'),
-            'source': 'payroll'
+            'source': 'payroll_legacy'
         })
 
     result.sort(key=lambda r: r['date'], reverse=True)
@@ -5109,25 +5194,46 @@ def add_expense():
         category = tenant_query(ExpenseCategory).filter_by(name=data['category']).first()
         if not category:
             return jsonify({'error': f"Category '{data['category']}' not found."}), 400
-        
+
         raw_supplier_id = data.get('supplier_id')
         supplier_id = int(raw_supplier_id) if raw_supplier_id not in (None, '') else None
 
+        raw_employee_id = data.get('employee_id')
+        employee_id = int(raw_employee_id) if raw_employee_id not in (None, '') else None
+        employee = None
+        if employee_id:
+            employee = tenant_query(Employee).filter_by(id=employee_id).first()
+            if not employee:
+                return jsonify({'error': 'Employee not found.'}), 400
+
+        amount = float(data['amount'])
+        description = data.get('description') or ''
+        if employee and not description:
+            description = f'Salary paid to {employee.name}'
+
         new_expense = Expense(
             category_id=category.id,
-            amount=float(data['amount']),
-            description=data['description'],
+            amount=amount,
+            description=description,
             date=datetime.strptime(data['date'], '%Y-%m-%d'),
-            is_credit=data.get('is_credit', False),
-            supplier_id=supplier_id
+            # A payroll expense is a real cash payment, never a credit purchase.
+            is_credit=data.get('is_credit', False) if not employee else False,
+            supplier_id=supplier_id if not employee else None,
+            employee_id=employee_id
         )
         db.session.add(new_expense)
-        
+
         # Update supplier balance if it's a credit expense
         if new_expense.is_credit and new_expense.supplier_id:
             supplier = tenant_query(Supplier).filter_by(id=new_expense.supplier_id).first()
             if supplier:
                 supplier.balance += new_expense.amount
+
+        # A payroll expense IS the payment: reduce what's owed to the employee,
+        # same effect as (and now the same code path as) the Payroll page's own
+        # "Pay Salary / Advance" action -- one source of truth either way.
+        if employee:
+            employee.balance -= amount
 
         db.session.commit()
         return jsonify(new_expense.to_dict()), 201
@@ -5154,23 +5260,41 @@ def update_expense(expense_id):
         new_is_credit = data.get('is_credit', expense.is_credit)
         raw_supplier_id = data.get('supplier_id', expense.supplier_id)
         new_supplier_id = int(raw_supplier_id) if raw_supplier_id not in (None, '') else None
+        raw_employee_id = data.get('employee_id', expense.employee_id)
+        new_employee_id = int(raw_employee_id) if raw_employee_id not in (None, '') else None
+        if new_employee_id and not tenant_query(Employee).filter_by(id=new_employee_id).first():
+            return jsonify({'error': 'Employee not found.'}), 400
+        # Payroll and credit-purchase-from-supplier are mutually exclusive.
+        if new_employee_id:
+            new_is_credit = False
+            new_supplier_id = None
 
-        # Handle balance changes if supplier or amount or credit status changed
+        # Revert whatever balance effect this expense previously had.
         if expense.is_credit and expense.supplier_id:
             old_supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
             if old_supplier:
                 old_supplier.balance -= expense.amount  # Revert old expense amount
+        if expense.employee_id:
+            old_employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
+            if old_employee:
+                old_employee.balance += expense.amount  # Undo the earlier deduction
 
         expense.amount = new_amount
         expense.is_credit = new_is_credit
         expense.supplier_id = new_supplier_id if new_is_credit else None
+        expense.employee_id = new_employee_id
         expense.description = data.get('description', expense.description)
         expense.date = datetime.strptime(data.get('date', expense.date.strftime('%Y-%m-%d')), '%Y-%m-%d')
-        
+
+        # Re-apply the balance effect for the (possibly changed) new state.
         if expense.is_credit and expense.supplier_id:
             new_supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
             if new_supplier:
                 new_supplier.balance += expense.amount  # Apply new expense amount
+        if expense.employee_id:
+            new_employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
+            if new_employee:
+                new_employee.balance -= expense.amount
 
         db.session.commit()
         return jsonify(expense.to_dict()), 200
@@ -5185,7 +5309,12 @@ def delete_expense(expense_id):
         expense = tenant_query(Expense).filter_by(id=expense_id).first()
         if not expense:
             return jsonify({'message': 'Expense not found!'}), 404
-        
+
+        if expense.employee_id:
+            employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
+            if employee:
+                employee.balance += expense.amount  # Undo the earlier deduction
+
         db.session.delete(expense)
         db.session.commit()
         return jsonify({'message': 'Expense deleted successfully!'}), 200
@@ -5411,13 +5540,28 @@ def get_financial_report():
             func.coalesce(Payment.paid_at, Payment.date) <= end_date
         ).group_by('month').all()
 
-        # 2. Expenses (direct non-credit)
+        # 2. Expenses (direct non-credit, not a payroll payment). employee_id
+        # being set is what identifies a payroll expense -- not the category
+        # name -- so this keeps working even if "Payroll" gets renamed.
         expense_query = db.session.query(
             month_key(Expense.date).label('month'),
             func.sum(Expense.amount).label('total')
         ).filter(
             Expense.tenant_id == current_tenant_id(),
             Expense.is_credit == False,
+            Expense.employee_id.is_(None),
+            Expense.date >= start_date,
+            Expense.date <= end_date
+        ).group_by('month').all()
+
+        # 2b. Payroll payments recorded as Expense rows (see record_employee_payment)
+        payroll_expense_query = db.session.query(
+            month_key(Expense.date).label('month'),
+            func.sum(Expense.amount).label('total')
+        ).filter(
+            Expense.tenant_id == current_tenant_id(),
+            Expense.is_credit == False,
+            Expense.employee_id.isnot(None),
             Expense.date >= start_date,
             Expense.date <= end_date
         ).group_by('month').all()
@@ -5432,7 +5576,8 @@ def get_financial_report():
             SupplierPayment.payment_date <= end_date
         ).group_by('month').all()
 
-        # 4. Salary cash payments
+        # 4. Legacy salary payments predating Expense-based payroll -- still
+        # counted so historical months don't lose their payroll expense.
         sal_query = db.session.query(
             month_key(SalaryPayment.payment_date).label('month'),
             func.sum(SalaryPayment.amount).label('total')
@@ -5464,6 +5609,7 @@ def get_financial_report():
         # Combine results
         months_set = set(
             [row.month for row in income_query] + [row.month for row in expense_query]
+            + [row.month for row in payroll_expense_query]
             + [row.month for row in sp_query] + [row.month for row in sal_query]
             + list(estimate_data.keys())
         )
@@ -5485,6 +5631,10 @@ def get_financial_report():
         for row in sp_query:
             monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
             monthly_data_dict[row.month]['expenses_supplier'] += float(row.total or 0)
+
+        for row in payroll_expense_query:
+            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+            monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
 
         for row in sal_query:
             monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
@@ -6069,8 +6219,15 @@ def add_employee_charge(employee_id):
 @app.route('/api/employees/<int:employee_id>/payments', methods=['GET'])
 @admin_required()
 def get_employee_payments(employee_id):
-    payments = tenant_query(SalaryPayment).filter_by(employee_id=employee_id).order_by(SalaryPayment.payment_date.desc()).all()
-    return jsonify([p.to_dict() for p in payments])
+    # Payments made from here on are Expense rows (see record_employee_payment);
+    # legacy SalaryPayment rows predate that and are merged in for continuity.
+    payments = tenant_query(Expense).filter_by(employee_id=employee_id).order_by(Expense.date.desc()).all()
+    legacy = tenant_query(SalaryPayment).filter_by(employee_id=employee_id).order_by(SalaryPayment.payment_date.desc()).all()
+    combined = [p.to_dict() for p in payments] + [p.to_dict() for p in legacy]
+    # Expense.to_dict() keys its date 'date'; SalaryPayment.to_dict() keys it
+    # 'payment_date' -- normalize just for sorting the merged list.
+    combined.sort(key=lambda p: p.get('date') or p.get('payment_date'), reverse=True)
+    return jsonify(combined)
 
 @app.route('/api/employees/<int:employee_id>/payments', methods=['POST'])
 @admin_required()
@@ -6085,24 +6242,40 @@ def record_employee_payment(employee_id):
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
+        is_advance = bool(data.get('is_advance', False))
+        method = data.get('method', '')
+        note = data.get('note', '')
+        default_description = f"{'Advance' if is_advance else 'Salary'} paid to {employee.name}"
+        if method:
+            default_description += f' via {method}'
+
+        payroll_category = get_or_create_payroll_category(current_tenant_id())
+
+        payment_date = (datetime.strptime(data['payment_date'], '%Y-%m-%d')
+                         if data.get('payment_date') else datetime.utcnow())
+
+        # Recorded as a real Expense (not a separate SalaryPayment row) so a
+        # payment made from here and one made from the Expenses page's "Add
+        # Expense" form (category Payroll) are the exact same kind of record --
+        # one source of truth, so reports never have to guess where to look.
+        new_expense = new_for_tenant(
+            Expense,
+            category_id=payroll_category.id,
+            employee_id=employee.id,
+            amount=amount,
+            description=note or default_description,
+            date=payment_date,
+            is_credit=False
+        )
+        db.session.add(new_expense)
+
         # Reduce the balance (an advance can push this negative -- next month's
         # accrual eats into it automatically).
         employee.balance -= amount
 
-        new_payment = SalaryPayment(
-            employee_id=employee.id,
-            amount=amount,
-            method=data.get('method', ''),
-            is_advance=bool(data.get('is_advance', False)),
-            note=data.get('note', '')
-        )
-        if data.get('payment_date'):
-            new_payment.payment_date = datetime.strptime(data['payment_date'], '%Y-%m-%d')
-
-        db.session.add(new_payment)
         db.session.commit()
 
-        return jsonify({'message': 'Payment recorded successfully!', 'employee': employee.to_dict(), 'payment': new_payment.to_dict()}), 201
+        return jsonify({'message': 'Payment recorded successfully!', 'employee': employee.to_dict(), 'payment': new_expense.to_dict()}), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
@@ -6128,8 +6301,22 @@ def get_employee_history(employee_id):
             'date': c.date.strftime('%Y-%m-%d %H:%M:%S')
         })
 
-    payments = tenant_query(SalaryPayment).filter_by(employee_id=employee_id).all()
+    # Payments made from here on are real Expense rows (see record_employee_payment
+    # / add_expense) -- one source of truth shared with the Expenses page.
+    payments = tenant_query(Expense).filter_by(employee_id=employee_id).all()
     for p in payments:
+        history.append({
+            'id': f"exp_{p.id}",
+            'type': 'payment',
+            'title': 'Payment Made',
+            'description': p.description,
+            'amount': -float(p.amount),
+            'date': p.date.strftime('%Y-%m-%d %H:%M:%S')
+        })
+
+    # Payments made before this became Expense-based still have to show up.
+    legacy_payments = tenant_query(SalaryPayment).filter_by(employee_id=employee_id).all()
+    for p in legacy_payments:
         history.append({
             'id': f"pay_{p.id}",
             'type': 'advance' if p.is_advance else 'payment',

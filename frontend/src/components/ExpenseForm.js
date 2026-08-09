@@ -6,23 +6,30 @@ function ExpenseForm({ expense, onSave, onCancel }) {
     const { apiService, setSnackbar } = useAppContext();
     const [categories, setCategories] = useState([]);
     const [suppliers, setSuppliers] = useState([]);
+    const [employees, setEmployees] = useState([]);
   const [formData, setFormData] = useState({
     category: '',
     amount: '',
     description: '',
     date: new Date().toISOString().split('T')[0],
     is_credit: false,
-    supplier_id: ''
+    supplier_id: '',
+    employee_id: ''
   });
   const [loading, setLoading] = useState(false);
 
+  const isPayroll = formData.category === 'Payroll';
 
     useEffect(() => {
         const fetchCategories = async () => {
             try {
                 const response = await apiService.fetchExpenseCategories();
-                const supRes = await apiService.fetchSuppliers();
+                const [supRes, empRes] = await Promise.all([
+                    apiService.fetchSuppliers(),
+                    apiService.fetchEmployees()
+                ]);
                 setSuppliers(supRes.data);
+                setEmployees(empRes.data || []);
                 setCategories(response.data);
             } catch (error) {
                 setSnackbar({ open: true, message: 'Could not load expense categories.', severity: 'error' });
@@ -39,7 +46,8 @@ function ExpenseForm({ expense, onSave, onCancel }) {
         description: expense.description || '',
         date: expense.date || new Date().toISOString().split('T')[0],
         is_credit: expense.is_credit || false,
-        supplier_id: expense.supplier_id || ''
+        supplier_id: expense.supplier_id || '',
+        employee_id: expense.employee_id || ''
       });
     } else {
       setFormData({ // Reset for new expense
@@ -48,7 +56,8 @@ function ExpenseForm({ expense, onSave, onCancel }) {
         description: '',
         date: new Date().toISOString().split('T')[0],
         is_credit: false,
-        supplier_id: ''
+        supplier_id: '',
+        employee_id: ''
       });
     }
   }, [expense]);
@@ -56,6 +65,20 @@ function ExpenseForm({ expense, onSave, onCancel }) {
   const handleChange = (e) => {
     const { name, value } = e.target;
     setFormData(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handleCategoryChange = (e) => {
+    const category = e.target.value;
+    // Payroll and credit-purchase-from-a-supplier are mutually exclusive on a
+    // single expense row, so switching into/out of Payroll clears whichever
+    // of the two doesn't apply.
+    setFormData(prev => ({
+      ...prev,
+      category,
+      employee_id: category === 'Payroll' ? prev.employee_id : '',
+      is_credit: category === 'Payroll' ? false : prev.is_credit,
+      supplier_id: category === 'Payroll' ? '' : prev.supplier_id
+    }));
   };
 
   const handleSubmit = async (e) => {
@@ -99,7 +122,7 @@ function ExpenseForm({ expense, onSave, onCancel }) {
               <Select
                   name="category"
                   value={formData.category}
-                  onChange={handleChange}
+                  onChange={handleCategoryChange}
                   label="Category"
               >
                   <MenuItem value="" disabled><em>Select a category</em></MenuItem>
@@ -108,6 +131,24 @@ function ExpenseForm({ expense, onSave, onCancel }) {
                   ))}
               </Select>
           </FormControl>
+
+      {isPayroll && (
+        <FormControl fullWidth margin="normal" required size="small">
+            <InputLabel>Employee</InputLabel>
+            <Select
+                value={formData.employee_id}
+                label="Employee"
+                name="employee_id"
+                onChange={handleChange}
+            >
+                <MenuItem value=""><em>Select an Employee</em></MenuItem>
+                {employees.map((emp) => (
+                    <MenuItem key={emp.id} value={emp.id}>{emp.name}</MenuItem>
+                ))}
+            </Select>
+        </FormControl>
+      )}
+
       <TextField
         label="Amount"
         name="amount"
@@ -143,6 +184,7 @@ function ExpenseForm({ expense, onSave, onCancel }) {
         name="description"
         value={formData.description}
         onChange={handleChange}
+        placeholder={isPayroll ? 'Optional — auto-filled with the payment details if left blank' : undefined}
         fullWidth
         margin="normal"
         multiline
@@ -151,7 +193,7 @@ function ExpenseForm({ expense, onSave, onCancel }) {
         size="small"
         className="rounded-md"
       />
-      <FormControlLabel
+      {!isPayroll && <FormControlLabel
         control={
             <Switch
                 checked={formData.is_credit}
@@ -161,7 +203,7 @@ function ExpenseForm({ expense, onSave, onCancel }) {
         }
         label="Purchase on Credit?"
         sx={{ mt: 1, display: 'block' }}
-      />
+      />}
 
       {formData.is_credit && (
         <FormControl fullWidth margin="normal" required size="small">

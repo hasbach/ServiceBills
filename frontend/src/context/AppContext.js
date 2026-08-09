@@ -206,7 +206,10 @@ const rawApiService = {
     updateSector: (sectorId, sectorData) => api.put(`/sectors/${sectorId}`, sectorData),
     deleteSector: (sectorId) => api.delete(`/sectors/${sectorId}`),
 
-    fetchDashboardMetrics: () => api.get('/dashboard'),
+    fetchDashboardMetrics: (startDate, endDate) => api.get('/dashboard', { params: {
+        ...(startDate ? { start_date: startDate } : {}),
+        ...(endDate ? { end_date: endDate } : {})
+    } }),
 
     // Reports
     fetchMonthlyRevenue: () => api.get('/reports/monthly-revenue'),

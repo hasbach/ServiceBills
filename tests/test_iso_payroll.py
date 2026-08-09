@@ -172,7 +172,9 @@ def test_salary_payment_and_advance(client):
                       json={"amount": 1000, "is_advance": True, "note": "Emergency advance"})
     assert r2.status_code == 201
     assert r2.get_json()["employee"]["balance"] == -400.0
-    assert r2.get_json()["payment"]["is_advance"] is True
+    # Payments are now Expense rows (see record_employee_payment) -- there's no
+    # dedicated is_advance column, the distinction is carried in the note/description.
+    assert r2.get_json()["payment"]["description"] == "Emergency advance"
 
     payments = client.get(f"/api/employees/{emp_id}/payments", headers=a).get_json()
     assert len(payments) == 2
