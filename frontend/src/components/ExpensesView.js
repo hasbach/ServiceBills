@@ -157,20 +157,27 @@ const CategorySection = ({ category, expenses, totalForCategory, grandTotal, onE
                                         {new Date(expense.date).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}
                                     </TableCell>
                                     <TableCell sx={{ fontSize: '0.87rem', color: 'text.primary', maxWidth: 320 }}>
-                                        <Typography
-                                            variant="body2"
-                                            sx={{
-                                                overflow: 'hidden',
-                                                textOverflow: 'ellipsis',
-                                                whiteSpace: 'nowrap',
-                                                maxWidth: 300
-                                            }}
-                                            title={expense.description}
-                                        >
-                                            {expense.description || <em style={{ color: '#9CA3AF' }}>No description</em>}
-                                        </Typography>
+                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                            <Typography
+                                                variant="body2"
+                                                sx={{
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap',
+                                                    maxWidth: 300
+                                                }}
+                                                title={expense.description}
+                                            >
+                                                {expense.description || <em style={{ color: '#9CA3AF' }}>No description</em>}
+                                            </Typography>
+                                            {expense.is_credit && (
+                                                <Tooltip title="Bought on credit -- not yet paid, so it isn't counted in the totals below until you record the payment from the Supplier page">
+                                                    <Chip label="On Credit" size="small" sx={{ height: 20, fontSize: '0.68rem', fontWeight: 600 }} />
+                                                </Tooltip>
+                                            )}
+                                        </Box>
                                     </TableCell>
-                                    <TableCell align="right" sx={{ fontWeight: 700, color, whiteSpace: 'nowrap' }}>
+                                    <TableCell align="right" sx={{ fontWeight: 700, color: expense.is_credit ? 'text.disabled' : color, whiteSpace: 'nowrap' }}>
                                         ${parseFloat(expense.amount).toFixed(2)}
                                     </TableCell>
                                     <TableCell align="center" sx={{ whiteSpace: 'nowrap' }}>
@@ -281,7 +288,11 @@ const ExpensesView = () => {
         }
     };
 
-    // Group expenses by category
+    // Group expenses by category. Credit purchases (is_credit) aren't cash out
+    // the door yet -- the supplier hasn't been paid -- so they're excluded from
+    // every dollar total here, same as the backend's financial reports already
+    // exclude them. They still appear in the row list (marked "On Credit"),
+    // just not counted until the actual SupplierPayment happens.
     const grouped = useMemo(() => {
         const map = {};
         (expenses || []).forEach(exp => {
@@ -294,12 +305,15 @@ const ExpensesView = () => {
             .map(([cat, items]) => ({
                 category: cat,
                 expenses: items.sort((a, b) => new Date(b.date) - new Date(a.date)),
-                total: items.reduce((s, e) => s + parseFloat(e.amount), 0)
+                total: items.reduce((s, e) => s + (e.is_credit ? 0 : parseFloat(e.amount)), 0)
             }))
             .sort((a, b) => b.total - a.total);
     }, [expenses]);
 
-    const totalExpenses = useMemo(() => expenses.reduce((s, e) => s + parseFloat(e.amount), 0), [expenses]);
+    const totalExpenses = useMemo(
+        () => expenses.reduce((s, e) => s + (e.is_credit ? 0 : parseFloat(e.amount)), 0),
+        [expenses]
+    );
 
     // Shared date-field style (white-on-gradient header)
     const dateFieldSx = {
@@ -433,6 +447,11 @@ const ExpensesView = () => {
                                 ${totalExpenses.toFixed(2)}
                             </Typography>
                         </Box>
+                        {expenses.some(e => e.is_credit) && (
+                            <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 0.5 }}>
+                                Rows marked "On Credit" aren't counted above until paid — record the payment from the Supplier page.
+                            </Typography>
+                        )}
                     </Paper>
                 </Box>
             ) : (
