@@ -682,6 +682,13 @@ class WhatsAppSettings(db.Model):
     auto_reply_enabled = db.Column(db.Boolean, default=True)
     auto_reply_message = db.Column(db.Text, nullable=True,
         default="your message will be redirected to customer services team, they will respond in minutes, thank you.\n\nسيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم")
+    # Daily keep-alive so forwarding_mobile has an open 24h WhatsApp session for the
+    # raw text/media forward above to actually deliver -- see send_daily_whatsapp_keepalive
+    # and docs/superpowers/specs/2026-08-12-whatsapp-forwarding-keepalive.md. The reply that
+    # actually opens the session comes from an auto-reply configured on forwarding_mobile's
+    # own device, outside this app -- this template send is only the prompt for that.
+    template_forward_keepalive = db.Column(db.String(200), nullable=True, default='daily_checkin')
+    last_forwarding_keepalive_sent_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -713,6 +720,8 @@ class WhatsAppSettings(db.Model):
             'webhook_verify_token': self.webhook_verify_token or 'delta_net_whatsapp_secret',
             'auto_reply_enabled': True if self.auto_reply_enabled is None else self.auto_reply_enabled,
             'auto_reply_message': self.auto_reply_message or "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\nسيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم",
+            'template_forward_keepalive': self.template_forward_keepalive or 'daily_checkin',
+            'last_forwarding_keepalive_sent_at': self.last_forwarding_keepalive_sent_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_forwarding_keepalive_sent_at else None,
         }
 
 class ServiceStatus(db.Model):
@@ -1645,6 +1654,73 @@ def recalculate_all_estimated_profits_with_context():
         for t in Tenant.query.filter_by(status="active").all():
             recalculate_estimated_profit(t.id)
 
+def send_daily_whatsapp_keepalive(tenant_id):
+    """Send a Meta-approved template to forwarding_mobile once a day. WhatsApp
+    only opens a 24h customer-service session when the *user* messages the
+    business, never the reverse, so this send by itself does not open
+    anything -- it's the prompt for an auto-reply configured on
+    forwarding_mobile's own device (outside this app) to reply back, which is
+    what actually opens the session the raw text/media forward in the webhook
+    handler depends on. See
+    docs/superpowers/specs/2026-08-12-whatsapp-forwarding-keepalive.md."""
+    settings = WhatsAppSettings.query.filter_by(tenant_id=tenant_id).first()
+    if not settings or settings.mode != 'api' or not settings.enabled:
+        return
+    if not (settings.forwarding_mobile and settings.access_token and settings.phone_number_id):
+        return
+    # Already sent today? This host spins down and the scheduler re-fires
+    # immediately on every restart (see the interval-trigger comment below) --
+    # without this check a restart-heavy day would blast the template repeatedly.
+    if (settings.last_forwarding_keepalive_sent_at
+            and settings.last_forwarding_keepalive_sent_at.date() == datetime.utcnow().date()):
+        return
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages'
+        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+        tmpl_name = settings.template_forward_keepalive or 'daily_checkin'
+        to_phone = normalize_whatsapp_phone(settings.forwarding_mobile)
+
+        def send_with_params(params):
+            payload = {
+                'messaging_product': 'whatsapp',
+                'to': to_phone,
+                'type': 'template',
+                'template': {'name': tmpl_name, 'language': {'code': settings.template_language or 'en'}}
+            }
+            if params:
+                payload['template']['components'] = [
+                    {'type': 'body', 'parameters': [{'type': 'text', 'text': p} for p in params]}
+                ]
+            return requests.post(url, json=payload, headers=headers, timeout=10)
+
+        # The approved template's exact placeholder count isn't known ahead of
+        # time -- this often reuses an existing alert template (e.g.
+        # customer_reply_alert) rather than a dedicated one. Try progressively
+        # fewer body parameters, same fallback shape already proven for the
+        # per-message forward before commit 72d6316, just with generic values
+        # since this ping isn't tied to any one customer.
+        res = None
+        for params in (["Daily Check-in", "System", "daily ping"], ["System", "daily ping"], ["daily ping"], None):
+            res = send_with_params(params)
+            if res.ok:
+                break
+            logging.warning(f"Keep-alive template '{tmpl_name}' failed with params={params}: {res.status_code} {res.text}")
+
+        if res.ok:
+            settings.last_forwarding_keepalive_sent_at = datetime.utcnow()
+            db.session.commit()
+            logging.info(f"Sent daily WhatsApp keep-alive template '{tmpl_name}' to forwarding_mobile for tenant {tenant_id}.")
+        else:
+            logging.warning(f"Daily WhatsApp keep-alive template '{tmpl_name}' failed for tenant {tenant_id} after all parameter-count fallbacks exhausted.")
+    except Exception as e:
+        logging.error(f"Error sending daily WhatsApp keep-alive for tenant {tenant_id}: {e}")
+
+def send_daily_whatsapp_keepalive_with_context():
+    with app.app_context():
+        for t in Tenant.query.filter_by(status="active").all():
+            send_daily_whatsapp_keepalive(t.id)
+
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
@@ -1669,6 +1745,7 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     scheduler.add_job(func=generate_missing_payments_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.add_job(func=generate_missing_salary_charges_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.add_job(func=recalculate_all_estimated_profits_with_context, trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=send_daily_whatsapp_keepalive_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.start()
  
     
@@ -3651,7 +3728,9 @@ def get_whatsapp_settings():
         'deeplink_msg_renewal': 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
         'forwarding_mobile': '', 'webhook_verify_token': 'delta_net_whatsapp_secret',
         'auto_reply_enabled': True,
-        'auto_reply_message': "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\nسيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم"
+        'auto_reply_message': "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\nسيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم",
+        'template_forward_keepalive': 'daily_checkin',
+        'last_forwarding_keepalive_sent_at': None,
     }}), 200
 
 @app.route('/api/whatsapp-settings', methods=['POST'])
@@ -3670,7 +3749,8 @@ def save_whatsapp_settings():
                   'app_secret','access_token','api_version','template_payment_paid',
                   'template_subscription_created', 'template_subscription_renewed','template_payment_reminder', 'template_current_balance',
                   'template_forward_alert', 'template_bulk_outage', 'template_bulk_maintenance', 'template_bulk_feature', 'template_bulk_offer',
-                  'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message']
+                  'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message',
+                  'template_forward_keepalive']
         for f in fields:
             if f in data:
                 setattr(settings, f, data[f])
@@ -4883,59 +4963,31 @@ def whatsapp_webhook():
                                     'Authorization': f'Bearer {settings.access_token}',
                                     'Content-Type': 'application/json',
                                 }
-                                # forwarding_mobile is an internal alert recipient, not a live customer
-                                # conversation -- it essentially never has an open 24h session. WhatsApp's
-                                # Graph API returns 200/"accepted" for a plain-text send even when it is
-                                # certain to fail delivery (error 131047, reported later via an async
-                                # status webhook), so a plain-text-first attempt can never reliably detect
-                                # failure here and silently never falls back. Send via the approved
-                                # template directly instead, which works regardless of session state.
+                                # forwarding_mobile only has an open 24h session because of the daily
+                                # keep-alive template + your own auto-reply configured on that number
+                                # (see send_daily_whatsapp_keepalive below, and
+                                # docs/superpowers/specs/2026-08-12-whatsapp-forwarding-keepalive.md).
+                                # A plain text send here relies on that session staying open -- if it
+                                # ever lapses, this fails the same silent way plain-text-to-
+                                # forwarding_mobile always has (Graph API returns 200 even though
+                                # delivery fails async, error 131047; see commit 72d6316, which replaced
+                                # this with a template-only alert for exactly that reason). Deliberately
+                                # no template fallback this time -- see the spec for why.
                                 try:
                                     sender_info = f"{cust_name} (+{sender_phone})" if (cust_name and cust_name != "Unknown Customer") else f"+{sender_phone}"
-                                    name_param = cust_name if (cust_name and cust_name != "Unknown Customer") else "Customer"
-
-                                    # First attempt: Try 3 parameters (1- Name, 2- Mobile Number, 3- Message)
-                                    tmpl_name = settings.template_forward_alert or 'customer_reply_alert'
-                                    payload_tmpl = {
+                                    payload_text = {
                                         'messaging_product': 'whatsapp',
                                         'to': fwd_phone,
-                                        'type': 'template',
-                                        'template': {
-                                            'name': tmpl_name,
-                                            'language': {'code': settings.template_language or 'en'},
-                                            'components': [{'type': 'body', 'parameters': [
-                                                {'type': 'text', 'text': f"{name_param}"},
-                                                {'type': 'text', 'text': f"+{sender_phone}"},
-                                                {'type': 'text', 'text': f"{msg_text[:120]}"}
-                                            ]}]
-                                        }
+                                        'type': 'text',
+                                        'text': {'body': f"{sender_info}: {msg_text}"}
                                     }
-                                    res_tmpl = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
-                                    if res_tmpl.ok:
-                                        logging.info(f"Forwarded customer reply via template '{tmpl_name}' (3-param) to +{fwd_phone}.")
+                                    res_text = requests.post(url, json=payload_text, headers=headers, timeout=10)
+                                    if res_text.ok:
+                                        logging.info(f"Forwarded customer reply text to +{fwd_phone}.")
                                     else:
-                                        logging.warning(f"Template '{tmpl_name}' (3-param) forward failed: {res_tmpl.status_code} {res_tmpl.text}")
-                                        # Second attempt: Try 2 parameters (1- Name & Mobile, 2- Message)
-                                        payload_tmpl['template']['components'] = [{'type': 'body', 'parameters': [
-                                            {'type': 'text', 'text': f"{sender_info}"},
-                                            {'type': 'text', 'text': f"{msg_text[:120]}"}
-                                        ]}]
-                                        res_tmpl2 = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
-                                        if res_tmpl2.ok:
-                                            logging.info(f"Forwarded customer reply via template '{tmpl_name}' (2-param) to +{fwd_phone}.")
-                                        else:
-                                            logging.warning(f"Template '{tmpl_name}' (2-param) forward failed: {res_tmpl2.status_code} {res_tmpl2.text}")
-                                            # Third attempt: Try 1 parameter format
-                                            payload_tmpl['template']['components'] = [{'type': 'body', 'parameters': [
-                                                {'type': 'text', 'text': f"Reply from {sender_info}: {msg_text[:60]}"}
-                                            ]}]
-                                            res_tmpl3 = requests.post(url, json=payload_tmpl, headers=headers, timeout=10)
-                                            if res_tmpl3.ok:
-                                                logging.info(f"Forwarded customer reply via template '{tmpl_name}' (1-param) to +{fwd_phone}.")
-                                            else:
-                                                logging.warning(f"Template '{tmpl_name}' (1-param) forward failed: {res_tmpl3.status_code} {res_tmpl3.text}. All fallback attempts exhausted -- customer reply was NOT forwarded.")
-                                except Exception as ex_tmpl:
-                                    logging.error(f"Template forwarding failed: {ex_tmpl}")
+                                        logging.warning(f"Could not forward customer reply text to +{fwd_phone}: {res_text.status_code} {res_text.text}")
+                                except Exception as ex_text:
+                                    logging.error(f"Error forwarding customer reply text: {ex_text}")
 
                                 # If there is an audio/voice note or media payload, forward the actual media file immediately!
                                 if media_payload:
@@ -4973,8 +5025,16 @@ def whatsapp_webhook():
                                 db.session.rollback()
                                 logging.error(f"Failed to create support ticket for WhatsApp reply: {ex_t}")
 
-                        # 3. Send automated acknowledgment reply back to the customer
-                        if settings and settings.access_token and settings.phone_number_id and getattr(settings, 'auto_reply_enabled', True):
+                        # 3. Send automated acknowledgment reply back to the customer. Skipped for
+                        # forwarding_mobile itself -- its replies exist only to keep the forwarding
+                        # session open (see send_daily_whatsapp_keepalive), not to request support,
+                        # so an automated reply back to it would just be unnecessary noise.
+                        is_forwarding_mobile_reply = bool(
+                            settings and settings.forwarding_mobile and
+                            normalize_whatsapp_phone(settings.forwarding_mobile) == sender_phone
+                        )
+                        if (settings and settings.access_token and settings.phone_number_id
+                                and getattr(settings, 'auto_reply_enabled', True) and not is_forwarding_mobile_reply):
                             try:
                                 # Check if we already sent an auto-reply or created a ticket for this customer in the last 15 minutes
                                 recent_tickets_count = 0

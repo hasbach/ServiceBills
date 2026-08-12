@@ -17,6 +17,8 @@ import {
     Message as MessageIcon,
     People as PeopleIcon,
     LocationOn as LocationOnIcon,
+    Edit as EditIcon,
+    Lock as LockIcon,
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import ExpenseCategoryManager from './ExpenseCategoryManager.js';
@@ -39,6 +41,8 @@ const DEFAULT_WA = {
     template_bulk_maintenance: 'maintenance_alert',
     template_bulk_feature: 'feature_update',
     template_bulk_offer: 'special_offer',
+    template_forward_keepalive: 'daily_checkin',
+    last_forwarding_keepalive_sent_at: null,
     template_language: 'en',
     forwarding_mobile: '',
     webhook_verify_token: 'delta_net_whatsapp_secret',
@@ -51,7 +55,7 @@ const DEFAULT_WA = {
 };
 
 // ── Section wrapper ──────────────────────────────────────────────────────────
-const Section = ({ icon, title, subtitle, color, children }) => {
+const Section = ({ icon, title, subtitle, color, action, children }) => {
     const theme = useTheme();
     return (
         <Paper elevation={0} sx={{
@@ -59,14 +63,17 @@ const Section = ({ icon, title, subtitle, color, children }) => {
             background: 'linear-gradient(135deg, #ffffff 0%, #f8fafc 100%)',
             border: `1px solid ${alpha(color || theme.palette.primary.main, 0.12)}`
         }}>
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 3 }}>
-                <Box sx={{ width: 44, height: 44, borderRadius: '14px', bgcolor: alpha(color || theme.palette.primary.main, 0.1), display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    {React.cloneElement(icon, { sx: { color: color || theme.palette.primary.main, fontSize: 22 } })}
+            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1.5, mb: 3, flexWrap: 'wrap' }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                    <Box sx={{ width: 44, height: 44, borderRadius: '14px', bgcolor: alpha(color || theme.palette.primary.main, 0.1), display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        {React.cloneElement(icon, { sx: { color: color || theme.palette.primary.main, fontSize: 22 } })}
+                    </Box>
+                    <Box>
+                        <Typography variant="h6" sx={{ fontWeight: 700, lineHeight: 1.2 }}>{title}</Typography>
+                        {subtitle && <Typography variant="caption" color="text.secondary">{subtitle}</Typography>}
+                    </Box>
                 </Box>
-                <Box>
-                    <Typography variant="h6" sx={{ fontWeight: 700, lineHeight: 1.2 }}>{title}</Typography>
-                    {subtitle && <Typography variant="caption" color="text.secondary">{subtitle}</Typography>}
-                </Box>
+                {action}
             </Box>
             {children}
         </Paper>
@@ -128,6 +135,10 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     const [waFetching, setWaFetching] = useState(true);
     const [showSecret, setShowSecret] = useState(false);
     const [showToken, setShowToken] = useState(false);
+    // Locked by default so a stray keystroke/paste can't corrupt a long
+    // token/ID that's just sitting in the field being viewed -- must click
+    // Edit to unlock, and it re-locks after every save.
+    const [waCredsEditing, setWaCredsEditing] = useState(false);
 
     const fetchWASettings = useCallback(async () => {
         setWaFetching(true);
@@ -148,6 +159,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
         try {
             await apiService.saveWhatsAppSettings(waForm);
             setSnackbar({ open: true, message: 'WhatsApp settings saved!', severity: 'success' });
+            setWaCredsEditing(false);
         } catch (err) {
             const detail = err?.response?.data?.error || err?.response?.data?.msg || err?.message || 'Unknown error';
             console.error('WhatsApp save error:', err?.response || err);
@@ -309,35 +321,51 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                             {/* Meta API Settings */}
                             <Collapse in={waForm.mode === 'api'}>
                                 <Section icon={<ApiIcon />} title="Meta Cloud API Credentials"
-                                    subtitle="Get these from your Meta for Developers dashboard (developers.facebook.com)" color={theme.palette.primary.main}>
+                                    subtitle="Get these from your Meta for Developers dashboard (developers.facebook.com)" color={theme.palette.primary.main}
+                                    action={
+                                        <Button
+                                            size="small"
+                                            variant={waCredsEditing ? 'contained' : 'outlined'}
+                                            color={waCredsEditing ? 'warning' : 'primary'}
+                                            startIcon={waCredsEditing ? <LockIcon /> : <EditIcon />}
+                                            onClick={() => setWaCredsEditing(e => !e)}
+                                            sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}
+                                        >
+                                            {waCredsEditing ? 'Lock' : 'Edit'}
+                                        </Button>
+                                    }>
                                     <Alert severity="warning" sx={{ mb: 3, borderRadius: '12px' }}>
                                         ⚠️ This section stores your API credentials. Keep these secret — never share them. You must have a verified Meta Business account and approved message templates.
+                                        {!waCredsEditing && ' Fields are locked — click Edit above to change them.'}
                                     </Alert>
                                     <Grid container spacing={2}>
                                         <Grid item xs={12} md={6}>
                                             <TextField fullWidth label="App ID" placeholder="e.g. 123456789012345" {...waField('app_id')}
+                                                disabled={!waCredsEditing}
                                                 helperText="From your Meta App Dashboard → App ID"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12} md={6}>
                                             <TextField fullWidth label="App Secret" type={showSecret ? 'text' : 'password'} placeholder="Your app secret"
-                                                {...waField('app_secret')} helperText="Settings → Basic → App Secret"
+                                                {...waField('app_secret')} disabled={!waCredsEditing} helperText="Settings → Basic → App Secret"
                                                 InputProps={{ endAdornment: <InputAdornment position="end"><IconButton size="small" onClick={() => setShowSecret(s => !s)}>{showSecret ? <VisibilityOffIcon /> : <VisibilityIcon />}</IconButton></InputAdornment> }}
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12} md={6}>
                                             <TextField fullWidth label="Phone Number ID" placeholder="e.g. 103843228738291" {...waField('phone_number_id')}
+                                                disabled={!waCredsEditing}
                                                 helperText="WhatsApp → API Setup → Phone Number ID"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12} md={6}>
                                             <TextField fullWidth label="Business Account ID (WABA ID)" placeholder="e.g. 102290129000001" {...waField('business_account_id')}
+                                                disabled={!waCredsEditing}
                                                 helperText="WhatsApp → API Setup → WhatsApp Business Account ID"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12}>
                                             <TextField fullWidth label="Permanent Access Token" type={showToken ? 'text' : 'password'} placeholder="EAA..." multiline={showToken} rows={showToken ? 3 : 1}
-                                                {...waField('access_token')} helperText="System User token from Business Settings → System Users → Generate Token"
+                                                {...waField('access_token')} disabled={!waCredsEditing} helperText="System User token from Business Settings → System Users → Generate Token"
                                                 InputProps={{ endAdornment: <InputAdornment position="end"><IconButton size="small" onClick={() => setShowToken(s => !s)}>{showToken ? <VisibilityOffIcon /> : <VisibilityIcon />}</IconButton></InputAdornment> }}
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
@@ -380,8 +408,8 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Forwarding Alert Template" placeholder="customer_reply_alert" {...waField('template_forward_alert')}
-                                                helperText="Fallback alert sent to you outside 24h window"
+                                            <TextField fullWidth label="Forwarding Alert Template (unused)" placeholder="customer_reply_alert" {...waField('template_forward_alert')}
+                                                helperText="Not sent by the current forwarding flow (see Daily Keep-Alive Template below) — kept only in case you revert to template-only alerts"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
@@ -407,18 +435,30 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                         📩 Webhook & Incoming Reply Forwarding
                                     </Typography>
                                     <Alert severity="info" sx={{ mb: 2, borderRadius: '12px' }}>
-                                        When customers reply to your messages, Meta sends their replies to your webhook. Configure your business mobile number below to receive instant forwarded alerts on your phone!
+                                        When customers reply to your messages, Meta sends their replies to your webhook, which forwards the actual text/audio/video/image to your mobile number below — not just a template alert. This only works while your forwarding number has an open 24-hour WhatsApp session, which the Daily Keep-Alive Template below exists to maintain: it prompts your forwarding number once a day, and that number's own auto-reply (configured on that device, e.g. in WhatsApp Business App — not here) replies back, which is what actually opens the session.
                                     </Alert>
                                     <Grid container spacing={2}>
                                         <Grid item xs={12} md={6}>
                                             <TextField fullWidth label="Forwarding Mobile Number (Business/Personal)" placeholder="e.g. 201012345678 or 010..." {...waField('forwarding_mobile')}
-                                                helperText="Incoming customer replies will be forwarded to this WhatsApp number instantly"
+                                                helperText="Incoming customer replies (text, audio, video, images) are forwarded here directly — requires an open 24h session, see Daily Keep-Alive Template"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12} md={6}>
                                             <TextField fullWidth label="Webhook Verify Token" placeholder="delta_net_whatsapp_secret" {...waField('webhook_verify_token')}
                                                 helperText="Use this exact secret token in Meta Developer Console when configuring your Webhook"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                        </Grid>
+                                        <Grid item xs={12} md={6}>
+                                            <TextField fullWidth label="Daily Keep-Alive Template" placeholder="daily_checkin" {...waField('template_forward_keepalive')}
+                                                helperText="Sent to the forwarding number once a day to prompt its own auto-reply and keep the 24h session open"
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                        </Grid>
+                                        <Grid item xs={12} md={6} sx={{ display: 'flex', alignItems: 'center' }}>
+                                            <Typography variant="body2" color="text.secondary">
+                                                {waForm.last_forwarding_keepalive_sent_at
+                                                    ? `Last keep-alive sent: ${waForm.last_forwarding_keepalive_sent_at}`
+                                                    : 'Keep-alive not sent yet — runs automatically once a day.'}
+                                            </Typography>
                                         </Grid>
                                         <Grid item xs={12}>
                                             <Alert severity="success" sx={{ borderRadius: '12px', bgcolor: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0', mb: 2 }}>
