@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
     Box, Typography, Paper, Button, TextField, CircularProgress,
     Avatar, Grid, Divider, Switch, alpha, useTheme, FormControlLabel,
-    Alert, Collapse, InputAdornment, IconButton,
+    Alert, Collapse, InputAdornment, IconButton, MenuItem,
     ToggleButton, ToggleButtonGroup, Tab, Tabs
 } from '@mui/material';
 import {
@@ -81,7 +81,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
 
     // ── Business form state ───────────────────────────────────────────────────
     const [bizForm, setBizForm] = useState({
-        business_name: '', address: '', mobile: '', email: '', website: ''
+        business_name: '', address: '', mobile: '', email: '', website: '', network_mode: 'none'
     });
     const [logoFile, setLogoFile] = useState(null);
     const [logoPreview, setLogoPreview] = useState(null);
@@ -94,7 +94,8 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 address: businessSettings.address || '',
                 mobile: businessSettings.mobile || '',
                 email: businessSettings.email || '',
-                website: businessSettings.website || ''
+                website: businessSettings.website || '',
+                network_mode: businessSettings.network_mode || 'none'
             });
             if (businessSettings.logo_url) {
                 const url = businessSettings.logo_url;
@@ -223,6 +224,16 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                             </Grid>
                             <Grid item xs={12} md={6}>
                                 <TextField fullWidth label="Website" value={bizForm.website} onChange={e => setBizForm(f => ({ ...f, website: e.target.value }))} sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                            </Grid>
+                            <Grid item xs={12}>
+                                <TextField fullWidth select label="Network Integration" value={bizForm.network_mode}
+                                    onChange={e => setBizForm(f => ({ ...f, network_mode: e.target.value }))}
+                                    helperText="How your network actually works — controls which sections (Upstream Providers / Mikrotik Servers) appear in the menu."
+                                    sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                    <MenuItem value="none">None — manage subscriptions/payments only</MenuItem>
+                                    <MenuItem value="upstream_bridge">Bridged — I'm a subreseller on an upstream's RADIUS portal</MenuItem>
+                                    <MenuItem value="local_mikrotik">Self-hosted — I run my own Mikrotik with local PPPoE</MenuItem>
+                                </TextField>
                             </Grid>
                         </Grid>
                         <Button type="submit" variant="contained" startIcon={bizLoading ? <CircularProgress size={18} color="inherit" /> : <SaveIcon />} disabled={bizLoading}

@@ -121,6 +121,28 @@ const rawApiService = {
     collectResellerPayment: (id, data) => api.post(`/resellers/${id}/collect_payment`, data),
     getResellerHistory: (id) => api.get(`/resellers/${id}/history`),
 
+    // Upstream Provider API methods (Concept A -- bridged RADIUS subresellers;
+    // see docs/superpowers/specs/2026-08-12-network-enforcement-design.md)
+    fetchUpstreamProviders: () => api.get('/upstream-providers'),
+    addUpstreamProvider: (data) => api.post('/upstream-providers', data),
+    updateUpstreamProvider: (id, data) => api.put(`/upstream-providers/${id}`, data),
+    deleteUpstreamProvider: (id) => api.delete(`/upstream-providers/${id}`),
+    getUpstreamProviderHistory: (id) => api.get(`/upstream-providers/${id}/history`),
+    topupUpstreamProvider: (id, data) => api.post(`/upstream-providers/${id}/topup`, data),
+    recordUpstreamRenewalCost: (id, data) => api.post(`/upstream-providers/${id}/renewal-cost`, data),
+
+    // Mikrotik Server API methods (Concept B -- self-hosted local PPPoE)
+    fetchMikrotikServers: () => api.get('/mikrotik-servers'),
+    addMikrotikServer: (data) => api.post('/mikrotik-servers', data),
+    updateMikrotikServer: (id, data) => api.put(`/mikrotik-servers/${id}`, data),
+    deleteMikrotikServer: (id) => api.delete(`/mikrotik-servers/${id}`),
+    testMikrotikConnection: (id) => api.post(`/mikrotik-servers/${id}/test-connection`),
+
+    // Customer <-> Mikrotik live actions (staff-confirmed only, see spec)
+    fetchCustomerMikrotikStatus: (customerId) => api.get(`/customers/${customerId}/mikrotik-status`),
+    suspendCustomerMikrotik: (customerId) => api.post(`/customers/${customerId}/mikrotik-suspend`),
+    unsuspendCustomerMikrotik: (customerId) => api.post(`/customers/${customerId}/mikrotik-unsuspend`),
+
     // Supplier API methods
     fetchSuppliers: () => api.get('/suppliers'),
     addSupplier: (data) => api.post('/suppliers', data),

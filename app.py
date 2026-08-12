@@ -85,6 +85,7 @@ from tenancy import (
 from crypto import EncryptedString
 import storage
 import email_util
+import mikrotik
 from itsdangerous import URLSafeTimedSerializer, BadData
 
 
@@ -181,6 +182,99 @@ class ResellerPayment(db.Model):
             'description': self.description
         }
 
+class UpstreamProvider(db.Model):
+    """A third-party upstream RADIUS operator the tenant is a subreseller of
+    (mode: 'upstream_bridge'). Money direction is the mirror of Reseller: the
+    tenant owes this provider, not the other way around."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    name = db.Column(db.String(100), nullable=False)
+    product = db.Column(db.String(20), nullable=False, default='manual')  # 'proradius', 'radiusnew', 'manual'
+    portal_url = db.Column(db.String(300), nullable=True)
+    portal_username = db.Column(db.String(100), nullable=True)
+    portal_password = db.Column(EncryptedString, nullable=True)  # encrypted at rest; unused until portal automation ships
+    balance = db.Column(db.Float, default=0.0)
+    status = db.Column(db.String(20), default='active')
+    customers = db.relationship('Customer', backref='upstream_provider', lazy=True)
+    payments = db.relationship('UpstreamProviderPayment', backref='upstream_provider', lazy=True, cascade="all, delete-orphan")
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'product': self.product,
+            'portal_url': self.portal_url or '',
+            'portal_username': self.portal_username or '',
+            'balance': float(self.balance),
+            'status': self.status
+        }
+
+class UpstreamProviderPayment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    upstream_provider_id = db.Column(db.Integer, db.ForeignKey('upstream_provider.id'), nullable=False)
+    # Set for a specific customer's renewal cost; null for provider-level manual top-ups.
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True, index=True)
+    amount = db.Column(db.Float, nullable=False)
+    type = db.Column(db.String(50), nullable=False)  # 'balance_topup', 'renewal_cost', 'manual_adjustment'
+    date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    description = db.Column(db.String(200))
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'upstream_provider_id': self.upstream_provider_id,
+            'customer_id': self.customer_id,
+            'amount': float(self.amount),
+            'type': self.type,
+            'date': self.date.strftime('%Y-%m-%d %H:%M:%S'),
+            'description': self.description
+        }
+
+class MikrotikServer(db.Model):
+    """A Mikrotik router the tenant owns, running its own local PPPoE server
+    (mode: 'local_mikrotik'). Unlike UpstreamProvider, this is the tenant's own
+    hardware -- credentials are for the RouterOS API, not a third-party portal."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    name = db.Column(db.String(100), nullable=False)
+    host = db.Column(db.String(255), nullable=False)
+    api_port = db.Column(db.Integer, nullable=False, default=8728)
+    use_tls = db.Column(db.Boolean, nullable=False, default=False)
+    username = db.Column(db.String(100), nullable=False)
+    password = db.Column(EncryptedString, nullable=False)  # encrypted at rest
+    # RouterOS /ppp/secret allows duplicate `name` values as long as `service`
+    # differs -- this happens for real when shared last-mile infrastructure
+    # carries more than one ISP's PPPoE traffic, so two unrelated ISPs can each
+    # have their own subscriber named e.g. "user1" on the same physical network.
+    # When set, every secret lookup/enable/disable on this router filters by
+    # (name, service) instead of name alone, so a username collision with some
+    # other ISP's subscriber can never cause this tenant's action to land on
+    # the wrong person's connection. Nullable/blank means "don't filter by
+    # service" (matches RouterOS's own 'any' default) -- safe for a tenant
+    # whose network has no such sharing and no collision risk.
+    service_name = db.Column(db.String(100), nullable=True)
+    status = db.Column(db.String(20), default='active')
+    # Set opportunistically by the most recent live call (test-connection or any
+    # enable/disable action) -- there is no standalone health-check job yet.
+    last_checked_at = db.Column(db.DateTime, nullable=True)
+    last_status = db.Column(db.String(20), nullable=True)  # 'online', 'unreachable', 'auth_failed'
+    customers = db.relationship('Customer', backref='mikrotik_server', lazy=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'host': self.host,
+            'api_port': self.api_port,
+            'use_tls': self.use_tls,
+            'username': self.username,
+            'service_name': self.service_name or '',
+            'status': self.status,
+            'last_checked_at': self.last_checked_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_checked_at else None,
+            'last_status': self.last_status
+        }
+
 class Customer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -196,6 +290,15 @@ class Customer(db.Model):
     discount = db.Column(db.Float, default=0.0)
     cost_override = db.Column(db.Float, nullable=True)
     reseller_id = db.Column(db.Integer, db.ForeignKey('reseller.id'), nullable=True)
+    # Populated only when the tenant's BusinessSettings.network_mode is
+    # 'upstream_bridge' -- the upstream RADIUS operator and this customer's
+    # login/account name on that operator's portal.
+    upstream_provider_id = db.Column(db.Integer, db.ForeignKey('upstream_provider.id'), nullable=True)
+    upstream_username = db.Column(db.String(100), nullable=True)
+    # Populated only when network_mode is 'local_mikrotik' -- the router this
+    # customer authenticates against and their /ppp/secret name on it.
+    mikrotik_server_id = db.Column(db.Integer, db.ForeignKey('mikrotik_server.id'), nullable=True)
+    pppoe_username = db.Column(db.String(100), nullable=True)
     payments = db.relationship('Payment', backref='customer', lazy=True, cascade="all, delete-orphan")
     generated_receipts = db.relationship('GeneratedReceipt', back_populates='customer', cascade="all, delete-orphan")
     addon_purchases = db.relationship('AddonPurchase', backref='customer', lazy=True, cascade="all, delete-orphan")
@@ -514,6 +617,12 @@ class BusinessSettings(db.Model):
     mobile = db.Column(db.String(20), nullable=False)
     email = db.Column(db.String(100), nullable=True)
     website = db.Column(db.String(200), nullable=True)
+    # Which of the 3 network-integration shapes this tenant uses (see
+    # docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
+    # 'none' (default, no network integration), 'upstream_bridge' (subreseller
+    # of an upstream's RADIUS portal -- see UpstreamProvider), or
+    # 'local_mikrotik' (tenant owns the edge -- see MikrotikServer).
+    network_mode = db.Column(db.String(20), nullable=False, default='none')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -532,6 +641,7 @@ class BusinessSettings(db.Model):
             'mobile': self.mobile,
             'email': self.email,
             'website': self.website,
+            'network_mode': self.network_mode or 'none',
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -716,6 +826,7 @@ TENANT_OWNED_MODELS = (
     CustomerFeedback, PaymentReminder, UpgradeRequest,
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
+    UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
 )
 
 from sqlalchemy import event as _sa_event
@@ -1566,6 +1677,38 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
 
 
 
+def _check_network_link_conflict(exclude_customer_id, mikrotik_server_id, pppoe_username,
+                                  upstream_provider_id, upstream_username):
+    """A given (server, username) pair identifies exactly one live network
+    account/secret. Two ServiceBills customer rows quietly pointing at the
+    same one is a real hazard -- e.g. a network account gets reused for a new
+    customer after the old one churned, and if the old customer's record
+    isn't unlinked first, a later action on either record (suspend, status
+    check) can silently land on the other customer's actual connection.
+    Returns an error message if `exclude_customer_id` isn't the sole holder
+    of either pair, else None. `exclude_customer_id` may be None (new
+    customer, nothing to exclude yet)."""
+    if mikrotik_server_id and pppoe_username:
+        q = tenant_query(Customer).filter_by(
+            mikrotik_server_id=mikrotik_server_id, pppoe_username=pppoe_username)
+        if exclude_customer_id:
+            q = q.filter(Customer.id != exclude_customer_id)
+        conflict = q.first()
+        if conflict:
+            return (f"Mikrotik username '{pppoe_username}' on this server is already linked "
+                     f"to customer '{conflict.name}' (id {conflict.id}). Unlink it there first.")
+    if upstream_provider_id and upstream_username:
+        q = tenant_query(Customer).filter_by(
+            upstream_provider_id=upstream_provider_id, upstream_username=upstream_username)
+        if exclude_customer_id:
+            q = q.filter(Customer.id != exclude_customer_id)
+        conflict = q.first()
+        if conflict:
+            return (f"Upstream username '{upstream_username}' on this provider is already linked "
+                     f"to customer '{conflict.name}' (id {conflict.id}). Unlink it there first.")
+    return None
+
+
 @app.route('/api/customers', methods=['GET'])
 @jwt_required()
 def get_customers():
@@ -1625,6 +1768,10 @@ def get_customers():
                 'discount': float(c.discount) if c.discount else 0.0,
                 'cost_override': float(c.cost_override) if c.cost_override is not None else None,
                 'reseller_id': c.reseller_id,
+                'upstream_provider_id': c.upstream_provider_id,
+                'upstream_username': c.upstream_username,
+                'mikrotik_server_id': c.mikrotik_server_id,
+                'pppoe_username': c.pppoe_username,
                 'subscription_plan': c.subscription_plan.to_dict() if c.subscription_plan else None
             }
             customers_with_plans.append(customer_dict)
@@ -1666,6 +1813,14 @@ def add_customer():
         raw_cost_override = data.get('cost_override')
         cost_override = float(raw_cost_override) if raw_cost_override not in (None, '') else None
 
+        conflict_error = _check_network_link_conflict(
+            None,
+            data.get('mikrotik_server_id') or None, data.get('pppoe_username') or None,
+            data.get('upstream_provider_id') or None, data.get('upstream_username') or None,
+        )
+        if conflict_error:
+            return jsonify({'error': conflict_error}), 400
+
         # Create new customer first
         new_customer = new_for_tenant(
             Customer,
@@ -1681,7 +1836,11 @@ def add_customer():
             subscription_expiry_date=subscription_start_date,
             is_subscription_active=True,
             balance=0.0,
-            reseller_id=data.get('reseller_id') if data.get('reseller_id') != "" else None
+            reseller_id=data.get('reseller_id') if data.get('reseller_id') != "" else None,
+            upstream_provider_id=data.get('upstream_provider_id') or None,
+            upstream_username=data.get('upstream_username') or None,
+            mikrotik_server_id=data.get('mikrotik_server_id') or None,
+            pppoe_username=data.get('pppoe_username') or None
         )
         db.session.add(new_customer)
         db.session.flush() # Flush to get new_customer.id
@@ -1877,7 +2036,37 @@ def update_customer(customer_id):
                         ))
 
             customer.reseller_id = new_reseller_id
-        
+
+        # Upstream provider / Mikrotik links are pure tracking metadata (unlike
+        # reseller_id above, no money moves when they change) -- plain assignment,
+        # but first check the *effective* new state (existing value unless this
+        # request overrides it) doesn't collide with some other customer already
+        # holding the same network account.
+        effective_mikrotik_server_id = (data['mikrotik_server_id'] if 'mikrotik_server_id' in data
+                                         else customer.mikrotik_server_id) or None
+        effective_pppoe_username = (data['pppoe_username'] if 'pppoe_username' in data
+                                     else customer.pppoe_username) or None
+        effective_upstream_provider_id = (data['upstream_provider_id'] if 'upstream_provider_id' in data
+                                           else customer.upstream_provider_id) or None
+        effective_upstream_username = (data['upstream_username'] if 'upstream_username' in data
+                                        else customer.upstream_username) or None
+        conflict_error = _check_network_link_conflict(
+            customer.id,
+            effective_mikrotik_server_id, effective_pppoe_username,
+            effective_upstream_provider_id, effective_upstream_username,
+        )
+        if conflict_error:
+            return jsonify({'error': conflict_error}), 400
+
+        if 'upstream_provider_id' in data:
+            customer.upstream_provider_id = effective_upstream_provider_id
+        if 'upstream_username' in data:
+            customer.upstream_username = effective_upstream_username
+        if 'mikrotik_server_id' in data:
+            customer.mikrotik_server_id = effective_mikrotik_server_id
+        if 'pppoe_username' in data:
+            customer.pppoe_username = effective_pppoe_username
+
         # Handle subscription plan change
         if 'subscription_plan_id' in data and data['subscription_plan_id'] != customer.subscription_plan_id:
             new_plan = tenant_query(SubscriptionPlan).filter_by(id=data['subscription_plan_id']).first()
@@ -1921,7 +2110,12 @@ def update_customer(customer_id):
                 'subscription_start_date': customer.subscription_start_date.strftime('%Y-%m-%d'),
                 'subscription_expiry_date': customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else None,
                 'is_subscription_active': customer.is_subscription_active,
-                'balance': float(customer.balance)
+                'balance': float(customer.balance),
+                'reseller_id': customer.reseller_id,
+                'upstream_provider_id': customer.upstream_provider_id,
+                'upstream_username': customer.upstream_username,
+                'mikrotik_server_id': customer.mikrotik_server_id,
+                'pppoe_username': customer.pppoe_username
             }
         }), 200
 
@@ -2532,6 +2726,35 @@ def _mark_payment_fully_paid(payment, customer, current_user):
     return amount_received
 
 
+def _maybe_restore_mikrotik_access(customer):
+    """Call after a payment/gratis commit that just settled a debt for a
+    customer linked to a MikrotikServer -- re-enables their /ppp/secret if (and
+    only if) it's currently disabled. Never called from anywhere that only
+    mechanically advances the billing cycle (_renew_subscription_core) without
+    money actually changing hands; see
+    docs/superpowers/specs/2026-08-12-network-enforcement-design.md.
+
+    Always runs after the caller's own commit -- never raises, never undoes or
+    blocks the billing side. Returns a small status dict for the caller to
+    fold into its response if useful, or None if there was nothing to do."""
+    if not customer.mikrotik_server_id:
+        return None
+    try:
+        server = tenant_query(MikrotikServer).filter_by(id=customer.mikrotik_server_id).first()
+        if not server or not customer.pppoe_username:
+            return None
+        ok, status = mikrotik.get_secret_status(server, customer.pppoe_username)
+        if not ok:
+            return {'attempted': True, 'ok': False, 'message': status}
+        if status != 'disabled':
+            return None  # already enabled (or not_found) -- nothing to restore
+        ok, message = mikrotik.set_secret_enabled(server, customer.pppoe_username, True)
+        return {'attempted': True, 'ok': ok, 'message': message}
+    except Exception as e:
+        logging.error(f"Mikrotik re-enable check failed for customer {customer.id}: {e}")
+        return {'attempted': True, 'ok': False, 'message': str(e)}
+
+
 @app.route('/api/payments/<int:payment_id>/mark_paid', methods=['PUT'])
 @jwt_required()
 def mark_payment_as_paid(payment_id):
@@ -2651,13 +2874,15 @@ def mark_payment_as_paid(payment_id):
 
         db.session.commit()
 
+        mikrotik_result = _maybe_restore_mikrotik_access(customer)
 
         return jsonify({
             'message': 'Payment updated successfully!',
             'remaining_amount': 0.0 if payment.paid else float(payment.amount),
             'paid': payment.paid,
             'customer_new_balance': float(customer.balance),
-            'amount_received_in_this_transaction': float(amount_received_in_this_transaction)
+            'amount_received_in_this_transaction': float(amount_received_in_this_transaction),
+            'mikrotik': mikrotik_result
         })
     except Exception as e:
         db.session.rollback()
@@ -2699,11 +2924,17 @@ def mark_payment_gratis(payment_id):
     customer.balance += payment.amount
     db.session.commit()
 
+    # Forgiving a charge is still a deliberate staff decision that settles the
+    # debt (the customer isn't required to pay it) -- treated the same as a
+    # real payment for purposes of restoring a suspended connection.
+    mikrotik_result = _maybe_restore_mikrotik_access(customer)
+
     return jsonify({
         'message': 'Payment marked gratis — no charge recorded.',
         'paid': payment.paid,
         'is_gratis': payment.is_gratis,
-        'customer_new_balance': float(customer.balance)
+        'customer_new_balance': float(customer.balance),
+        'mikrotik': mikrotik_result
     })
 
 
@@ -2794,6 +3025,10 @@ def bulk_mark_payments_paid():
 
     succeeded = []
     failed = [{'id': pid, 'error': 'Payment not found'} for pid in payment_ids if pid not in found_ids]
+    # A customer with several old unpaid rows settled in one batch only needs
+    # one Mikrotik check, not one per row -- the first settled row already
+    # re-enables them if they were disabled; re-checking per row is redundant.
+    mikrotik_checked_customer_ids = set()
 
     for payment in payments:
         try:
@@ -2801,9 +3036,13 @@ def bulk_mark_payments_paid():
             if not customer:
                 failed.append({'id': payment.id, 'error': 'Customer not found for this payment'})
                 continue
-            if not payment.paid:
+            just_settled = not payment.paid
+            if just_settled:
                 _mark_payment_fully_paid(payment, customer, current_user)
             db.session.commit()
+            if just_settled and customer.id not in mikrotik_checked_customer_ids:
+                mikrotik_checked_customer_ids.add(customer.id)
+                _maybe_restore_mikrotik_access(customer)
             succeeded.append(payment.id)
         except Exception as e:
             db.session.rollback()
@@ -3333,7 +3572,8 @@ def save_business_settings():
                 address=request.form.get('address', ""),
                 mobile=request.form.get('mobile', ""),
                 email=request.form.get('email', ""),
-                website=request.form.get('website', "")
+                website=request.form.get('website', ""),
+                network_mode=request.form.get('network_mode', "none")
             )
             db.session.add(settings)
 
@@ -3350,7 +3590,8 @@ def save_business_settings():
         settings.mobile = request.form.get('mobile', settings.mobile)
         settings.email = request.form.get('email', settings.email)
         settings.website = request.form.get('website', settings.website)
-        
+        settings.network_mode = request.form.get('network_mode', settings.network_mode)
+
         # Only update logo_url if a new file was uploaded
         if logo_url:
             settings.logo_url = logo_url 
@@ -3379,7 +3620,8 @@ def get_business_settings():
                 'address': "",
                 'mobile': "",
                 'email': "",
-                'website': ""
+                'website': "",
+                'network_mode': "none"
             }
         }), 200
 
@@ -5913,6 +6155,315 @@ def collect_reseller_payment(reseller_id):
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
 
+
+
+# --- Upstream Providers (bridged RADIUS subresellers) & Mikrotik Servers
+# (self-hosted local PPPoE) -- see
+# docs/superpowers/specs/2026-08-12-network-enforcement-design.md. A tenant only
+# ever uses one of the two, per BusinessSettings.network_mode; nothing here
+# forces either on a tenant who leaves network_mode at 'none'.
+
+@app.route('/api/upstream-providers', methods=['GET'])
+@jwt_required()
+def get_upstream_providers():
+    providers = tenant_query(UpstreamProvider).order_by(UpstreamProvider.name).all()
+    result = []
+    for p in providers:
+        data = p.to_dict()
+        data['customers'] = [c.id for c in p.customers]
+        result.append(data)
+    return jsonify(result), 200
+
+@app.route('/api/upstream-providers', methods=['POST'])
+@jwt_required()
+def create_upstream_provider():
+    data = request.json
+    try:
+        provider = UpstreamProvider(
+            name=data['name'],
+            product=data.get('product', 'manual'),
+            portal_url=data.get('portal_url') or None,
+            portal_username=data.get('portal_username') or None,
+            portal_password=data.get('portal_password') or None,
+            balance=float(data.get('balance', 0.0)),
+            status=data.get('status', 'active'),
+        )
+        db.session.add(provider)
+        db.session.commit()
+        return jsonify({'message': 'Upstream provider created successfully!', 'provider': provider.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/upstream-providers/<int:provider_id>', methods=['PUT'])
+@jwt_required()
+def update_upstream_provider(provider_id):
+    data = request.json
+    provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
+    if not provider:
+        return jsonify({'message': 'Upstream provider not found!'}), 404
+    try:
+        provider.name = data.get('name', provider.name)
+        provider.product = data.get('product', provider.product)
+        if 'portal_url' in data:
+            provider.portal_url = data['portal_url'] or None
+        if 'portal_username' in data:
+            provider.portal_username = data['portal_username'] or None
+        # Leave the stored password unchanged unless a new one is actually
+        # provided -- the edit form never pre-fills this field.
+        if data.get('portal_password'):
+            provider.portal_password = data['portal_password']
+        if 'status' in data:
+            provider.status = data['status']
+        if 'balance' in data:
+            provider.balance = float(data['balance'])
+        db.session.commit()
+        return jsonify({'message': 'Upstream provider updated successfully!', 'provider': provider.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/upstream-providers/<int:provider_id>', methods=['DELETE'])
+@jwt_required()
+def delete_upstream_provider(provider_id):
+    try:
+        provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
+        if not provider:
+            return jsonify({'message': 'Upstream provider not found!'}), 404
+
+        if tenant_query(Customer).filter_by(upstream_provider_id=provider.id).first():
+            return jsonify({'error': 'Cannot delete a provider with customers linked to it.'}), 400
+        if tenant_query(UpstreamProviderPayment).filter_by(upstream_provider_id=provider.id).first():
+            return jsonify({'error': 'Cannot delete a provider with existing ledger history.'}), 400
+
+        db.session.delete(provider)
+        db.session.commit()
+        return jsonify({'message': 'Upstream provider deleted successfully!'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/upstream-providers/<int:provider_id>/history', methods=['GET'])
+@jwt_required()
+def get_upstream_provider_history(provider_id):
+    provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
+    if not provider:
+        return jsonify({'message': 'Upstream provider not found!'}), 404
+
+    payments = tenant_query(UpstreamProviderPayment).filter_by(upstream_provider_id=provider_id).order_by(UpstreamProviderPayment.date.desc()).all()
+    return jsonify([p.to_dict() for p in payments]), 200
+
+@app.route('/api/upstream-providers/<int:provider_id>/topup', methods=['POST'])
+@jwt_required()
+def topup_upstream_provider(provider_id):
+    """Manual prepaid-credit top-up -- decreases balance, the same direction the
+    real portal's own balance figure moves when the tenant pays the upstream."""
+    data = request.json
+    provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
+    if not provider:
+        return jsonify({'message': 'Upstream provider not found!'}), 404
+
+    amount = float(data.get('amount', 0))
+    if amount <= 0:
+        return jsonify({'error': 'Amount must be positive'}), 400
+
+    try:
+        provider.balance -= amount
+        db.session.add(UpstreamProviderPayment(
+            upstream_provider_id=provider.id,
+            amount=amount,
+            type='balance_topup',
+            description=data.get('description', 'Manual balance top-up')
+        ))
+        db.session.commit()
+        return jsonify({'message': 'Top-up recorded successfully!', 'provider': provider.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/upstream-providers/<int:provider_id>/renewal-cost', methods=['POST'])
+@jwt_required()
+def record_upstream_renewal_cost(provider_id):
+    """Manual record of what a customer's renewal cost upstream -- how the
+    tenant tracks real per-customer cost until portal automation exists."""
+    data = request.json
+    provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
+    if not provider:
+        return jsonify({'message': 'Upstream provider not found!'}), 404
+
+    customer_id = data.get('customer_id')
+    if not customer_id:
+        return jsonify({'error': 'customer_id is required'}), 400
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
+    if not customer:
+        return jsonify({'message': 'Customer not found!'}), 404
+
+    amount = float(data.get('amount', 0))
+    if amount <= 0:
+        return jsonify({'error': 'Amount must be positive'}), 400
+
+    try:
+        provider.balance -= amount
+        db.session.add(UpstreamProviderPayment(
+            upstream_provider_id=provider.id,
+            customer_id=customer.id,
+            amount=amount,
+            type='renewal_cost',
+            description=data.get('description', f'Renewal cost for {customer.name}')
+        ))
+        db.session.commit()
+        return jsonify({'message': 'Renewal cost recorded successfully!', 'provider': provider.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/mikrotik-servers', methods=['GET'])
+@jwt_required()
+def get_mikrotik_servers():
+    servers = tenant_query(MikrotikServer).order_by(MikrotikServer.name).all()
+    result = []
+    for s in servers:
+        data = s.to_dict()
+        data['customers'] = [c.id for c in s.customers]
+        result.append(data)
+    return jsonify(result), 200
+
+@app.route('/api/mikrotik-servers', methods=['POST'])
+@jwt_required()
+def create_mikrotik_server():
+    data = request.json
+    try:
+        if not data.get('password'):
+            return jsonify({'error': 'password is required'}), 400
+        server = MikrotikServer(
+            name=data['name'],
+            host=data['host'],
+            api_port=int(data.get('api_port') or (8729 if data.get('use_tls') else 8728)),
+            use_tls=bool(data.get('use_tls', False)),
+            username=data['username'],
+            password=data['password'],
+            service_name=data.get('service_name') or None,
+            status=data.get('status', 'active'),
+        )
+        db.session.add(server)
+        db.session.commit()
+        return jsonify({'message': 'Mikrotik server created successfully!', 'server': server.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/mikrotik-servers/<int:server_id>', methods=['PUT'])
+@jwt_required()
+def update_mikrotik_server(server_id):
+    data = request.json
+    server = tenant_query(MikrotikServer).filter_by(id=server_id).first()
+    if not server:
+        return jsonify({'message': 'Mikrotik server not found!'}), 404
+    try:
+        server.name = data.get('name', server.name)
+        server.host = data.get('host', server.host)
+        if 'api_port' in data:
+            server.api_port = int(data['api_port'])
+        if 'use_tls' in data:
+            server.use_tls = bool(data['use_tls'])
+        server.username = data.get('username', server.username)
+        # Leave the stored password unchanged unless a new one is actually
+        # provided -- the edit form never pre-fills this field.
+        if data.get('password'):
+            server.password = data['password']
+        if 'service_name' in data:
+            server.service_name = data['service_name'] or None
+        if 'status' in data:
+            server.status = data['status']
+        db.session.commit()
+        return jsonify({'message': 'Mikrotik server updated successfully!', 'server': server.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/mikrotik-servers/<int:server_id>', methods=['DELETE'])
+@jwt_required()
+def delete_mikrotik_server(server_id):
+    try:
+        server = tenant_query(MikrotikServer).filter_by(id=server_id).first()
+        if not server:
+            return jsonify({'message': 'Mikrotik server not found!'}), 404
+
+        if tenant_query(Customer).filter_by(mikrotik_server_id=server.id).first():
+            return jsonify({'error': 'Cannot delete a server with customers linked to it.'}), 400
+
+        db.session.delete(server)
+        db.session.commit()
+        return jsonify({'message': 'Mikrotik server deleted successfully!'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/mikrotik-servers/<int:server_id>/test-connection', methods=['POST'])
+@jwt_required()
+def test_mikrotik_connection(server_id):
+    server = tenant_query(MikrotikServer).filter_by(id=server_id).first()
+    if not server:
+        return jsonify({'message': 'Mikrotik server not found!'}), 404
+    ok, message = mikrotik.test_connection(server)
+    db.session.commit()  # persists last_checked_at/last_status set by test_connection
+    return jsonify({'ok': ok, 'message': message, 'server': server.to_dict()}), 200
+
+
+# --- Live actions on a customer's PPPoE secret (Concept B). Staff-triggered
+# only -- nothing in the app calls these automatically off a billing rule. ---
+
+def _customer_mikrotik_context(customer_id):
+    """Shared lookup for the 3 routes below. Returns (customer, server,
+    error_response) -- error_response is a ready-to-return (body, status)
+    tuple when the customer/server/link isn't valid, else None."""
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
+    if not customer:
+        return None, None, ({'message': 'Customer not found!'}, 404)
+    if not customer.mikrotik_server_id or not customer.pppoe_username:
+        return None, None, ({'error': 'Customer is not linked to a Mikrotik server.'}, 400)
+    server = tenant_query(MikrotikServer).filter_by(id=customer.mikrotik_server_id).first()
+    if not server:
+        return None, None, ({'error': 'Linked Mikrotik server not found.'}, 404)
+    return customer, server, None
+
+@app.route('/api/customers/<int:customer_id>/mikrotik-status', methods=['GET'])
+@jwt_required()
+def get_customer_mikrotik_status(customer_id):
+    customer, server, err = _customer_mikrotik_context(customer_id)
+    if err:
+        return jsonify(err[0]), err[1]
+
+    secret_ok, secret_status = mikrotik.get_secret_status(server, customer.pppoe_username)
+    session_ok, session = mikrotik.get_active_session(server, customer.pppoe_username)
+
+    return jsonify({
+        'secret_status': secret_status if secret_ok else None,
+        'secret_error': None if secret_ok else secret_status,
+        'active_session': session if session_ok else None,
+        'session_error': None if session_ok else session,
+    }), 200
+
+@app.route('/api/customers/<int:customer_id>/mikrotik-suspend', methods=['POST'])
+@jwt_required()
+def suspend_customer_mikrotik(customer_id):
+    customer, server, err = _customer_mikrotik_context(customer_id)
+    if err:
+        return jsonify(err[0]), err[1]
+
+    ok, message = mikrotik.set_secret_enabled(server, customer.pppoe_username, False)
+    return jsonify({'ok': ok, 'message': message}), (200 if ok else 502)
+
+@app.route('/api/customers/<int:customer_id>/mikrotik-unsuspend', methods=['POST'])
+@jwt_required()
+def unsuspend_customer_mikrotik(customer_id):
+    customer, server, err = _customer_mikrotik_context(customer_id)
+    if err:
+        return jsonify(err[0]), err[1]
+
+    ok, message = mikrotik.set_secret_enabled(server, customer.pppoe_username, True)
+    return jsonify({'ok': ok, 'message': message}), (200 if ok else 502)
 
 
 # --- NEW: API Endpoints for Suppliers ---

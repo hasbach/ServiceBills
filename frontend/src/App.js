@@ -27,6 +27,8 @@ import {
     Storefront as ResellerIcon,
     Badge as PayrollIcon,
     KeyboardArrowUp as KeyboardArrowUpIcon,
+    CloudQueue as UpstreamProviderIcon,
+    Router as MikrotikIcon,
 } from '@mui/icons-material';
 import { AppContextProvider, useAppContext, apiService } from './context/AppContext.js';
 import DashboardView from './components/DashboardView.js';
@@ -51,6 +53,8 @@ import MessagingView from './components/MessagingView.js';
 import ResellerManagementView from './components/ResellerManagementView.js';
 import SuppliersView from './components/SuppliersView.js';
 import EmployeesView from './components/EmployeesView.js';
+import UpstreamProviderManagementView from './components/UpstreamProviderManagementView.js';
+import MikrotikServerManagementView from './components/MikrotikServerManagementView.js';
 
 // ── Navigation config ────────────────────────────────────────────────────────
 const NAV_ITEMS = [
@@ -58,6 +62,10 @@ const NAV_ITEMS = [
     { key: 'subscriptions',      label: 'Subscriptions',      icon: <PeopleIcon />,          group: 'main',      allowedRoles: ['admin', 'finance'] },
     { key: 'resellers',          label: 'Resellers',          icon: <ResellerIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
     { key: 'suppliers',          label: 'Suppliers',          icon: <ShoppingCartIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
+    // Concept A/B (see docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
+    // only one of these is ever relevant, gated by BusinessSettings.network_mode, not roles.
+    { key: 'upstream-providers',  label: 'Upstream Providers',  icon: <UpstreamProviderIcon />, group: 'main',    allowedRoles: ['admin', 'finance'], visibleWhen: (bs) => bs?.network_mode === 'upstream_bridge' },
+    { key: 'mikrotik-servers',    label: 'Mikrotik Servers',    icon: <MikrotikIcon />,         group: 'main',    allowedRoles: ['admin', 'finance'], visibleWhen: (bs) => bs?.network_mode === 'local_mikrotik' },
     { key: 'employees',          label: 'Payroll',            icon: <PayrollIcon />,             group: 'main',      allowedRoles: ['admin'] },
     { key: 'payments',           label: 'Payments',           icon: <PaymentIcon />,         group: 'main',      allowedRoles: ['admin', 'finance', 'collector'] },
     { key: 'receipts',           label: 'Receipts',           icon: <ReceiptIcon />,         group: 'main',      allowedRoles: ['admin', 'finance'] },
@@ -90,7 +98,7 @@ const DRAWER_WIDTH = 280;
 // ── MainApp ──────────────────────────────────────────────────────────────────
 const MainApp = ({
     customers, pagination, subscriptionPlans, businessSettings,
-    refetchCustomers, setSnackbar, setBusinessSettings,
+    refetchCustomers, refetchSubscriptionPlans, setSnackbar, setBusinessSettings,
     currentPage, setCurrentPage, itemsPerPage, setItemsPerPage,
     searchQuery, setSearchQuery, customerSortBy, setCustomerSortBy,
     customerResellerId, setCustomerResellerId
@@ -126,7 +134,10 @@ const MainApp = ({
         setDrawerOpen(false);
     };
 
-    const navItems = NAV_ITEMS.filter(item => !item.allowedRoles || item.allowedRoles.some(r => hasRole(r)));
+    const navItems = NAV_ITEMS.filter(item =>
+        (!item.allowedRoles || item.allowedRoles.some(r => hasRole(r))) &&
+        (!item.visibleWhen || item.visibleWhen(businessSettings))
+    );
     const currentLabel = navItems.find(n => n.key === currentView)?.label || 'Dashboard';
 
     // Per-tenant branding: resolve the logo (custom upload or app default) to an absolute URL.
@@ -250,20 +261,22 @@ const MainApp = ({
             case 'resellers': return <ResellerManagementView />;
             case 'suppliers': return <SuppliersView />;
             case 'employees': return <EmployeesView />;
-            case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
+            case 'upstream-providers': return <UpstreamProviderManagementView customers={customers} />;
+            case 'mikrotik-servers': return <MikrotikServerManagementView />;
+            case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
             case 'payments': return <PaymentsView />;
             case 'receipts': return <ReceiptsView />;
             case 'expenses': return <ExpensesView />;
             case 'reports': return <ReportsView />;
             case 'service': return <ServiceManagementView />;
             case 'enhanced-reports': return <EnhancedReportsView />;
-            case 'subscription-plans': return <SubscriptionPlansView subscriptionPlans={subscriptionPlans} refetchSubscriptionPlans={() => { }} setSnackbar={setSnackbar} />;
+            case 'subscription-plans': return <SubscriptionPlansView subscriptionPlans={subscriptionPlans} refetchSubscriptionPlans={refetchSubscriptionPlans} setSnackbar={setSnackbar} />;
             case 'messaging': return hasRole('admin') ? <MessagingView /> : <Typography>Access Denied</Typography>;
             case 'settings': return hasRole('admin') ? <SettingsView businessSettings={businessSettings} setBusinessSettings={setBusinessSettings} setSnackbar={setSnackbar} /> : <Typography>Access Denied</Typography>;
             case 'billing': return hasRole('admin') ? <BillingView /> : <Typography>Access Denied</Typography>;
-            default: 
+            default:
                 if (hasRole('employee') || hasRole('technician')) return <ServiceManagementView />;
-                return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
+                return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
         }
     };
 
@@ -379,6 +392,16 @@ const AppContent = () => {
         }
     }, [businessSettings]);
 
+    const refetchSubscriptionPlans = useCallback(async () => {
+        try {
+            const plansRes = await apiService.fetchSubscriptionPlans();
+            setSubscriptionPlans(plansRes || []);
+        } catch (error) {
+            console.error("Error fetching subscription plans:", error);
+            setSnackbar({ open: true, message: 'Failed to refresh subscription plans.', severity: 'error' });
+        }
+    }, [setSnackbar]);
+
     const refetchCustomers = useCallback(async (page = 1, per_page = 25, searchQuery = '', sortBy = 'expiry_date', resellerId = '') => {
         try {
             // The apiService.fetchCustomers already returns the data object.
@@ -481,6 +504,7 @@ const AppContent = () => {
         subscriptionPlans={subscriptionPlans}
         businessSettings={businessSettings}
         refetchCustomers={refetchCustomers}
+        refetchSubscriptionPlans={refetchSubscriptionPlans}
         setSnackbar={setSnackbar}
         setBusinessSettings={setBusinessSettings}
         currentPage={currentPage}

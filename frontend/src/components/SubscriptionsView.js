@@ -174,6 +174,7 @@ const SubscriptionsView = ({
     customers,
     pagination,
     subscriptionPlans,
+    businessSettings,
     refetchCustomers,
     setSnackbar,
     // --- PAGINATION STATE FROM PARENT ---
@@ -197,6 +198,10 @@ const SubscriptionsView = ({
         address: '',
         subscription_plan_id: '',
         reseller_id: '',
+        upstream_provider_id: '',
+        upstream_username: '',
+        mikrotik_server_id: '',
+        pppoe_username: '',
         discount: 0.0,
         cost_override: '',
         subscription_start_date: new Date().toISOString().split('T')[0],
@@ -218,10 +223,19 @@ const SubscriptionsView = ({
     const [statusFilter, setStatusFilter] = useState('active'); // 'active', 'canceled', 'all'
     const [resellers, setResellers] = useState([]);
     const [sectors, setSectors] = useState([]);
+    const [upstreamProviders, setUpstreamProviders] = useState([]);
+    const [mikrotikServers, setMikrotikServers] = useState([]);
+
+    // Network-status panel (Concept B -- see docs/superpowers/specs/2026-08-12-network-enforcement-design.md)
+    const [mikrotikStatus, setMikrotikStatus] = useState(null);
+    const [mikrotikStatusLoading, setMikrotikStatusLoading] = useState(false);
+    const [mikrotikActionLoading, setMikrotikActionLoading] = useState(false);
 
     useEffect(() => {
         apiService.fetchResellers().then(res => setResellers(res.data)).catch(err => console.error("Failed to load resellers", err));
         apiService.fetchSectors().then(res => setSectors(res.data)).catch(err => console.error("Failed to load sectors", err));
+        apiService.fetchUpstreamProviders().then(res => setUpstreamProviders(res.data)).catch(err => console.error("Failed to load upstream providers", err));
+        apiService.fetchMikrotikServers().then(res => setMikrotikServers(res.data)).catch(err => console.error("Failed to load Mikrotik servers", err));
     }, []);
     const [selected, setSelected] = useState([]); // Array of customer IDs
     const [bulkActionLoading, setBulkActionLoading] = useState(false);
@@ -455,6 +469,43 @@ const SubscriptionsView = ({
     // --- End of NEW Bulk Action Handlers ---
 
 
+    // Network Status panel (Concept B) -- fetch fresh whenever the edit dialog
+    // opens for a Mikrotik-linked customer; never fires on its own otherwise.
+    useEffect(() => {
+        if (editDialogOpen && editingCustomer?.mikrotik_server_id && editingCustomer?.pppoe_username) {
+            fetchMikrotikStatus(editingCustomer.id);
+        } else {
+            setMikrotikStatus(null);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [editDialogOpen, editingCustomer?.id]);
+
+    const fetchMikrotikStatus = async (customerId) => {
+        setMikrotikStatusLoading(true);
+        try {
+            const response = await apiService.fetchCustomerMikrotikStatus(customerId);
+            setMikrotikStatus(response.data);
+        } catch (error) {
+            setMikrotikStatus({ secret_status: null, secret_error: error.response?.data?.error || error.response?.data?.message || 'Failed to check status' });
+        } finally {
+            setMikrotikStatusLoading(false);
+        }
+    };
+
+    const handleMikrotikAction = async (customerId, action) => {
+        setMikrotikActionLoading(true);
+        try {
+            const call = action === 'suspend' ? apiService.suspendCustomerMikrotik : apiService.unsuspendCustomerMikrotik;
+            const response = await call(customerId);
+            setSnackbar({ open: true, message: response.data.message, severity: response.data.ok ? 'success' : 'error' });
+            await fetchMikrotikStatus(customerId);
+        } catch (error) {
+            setSnackbar({ open: true, message: error.response?.data?.message || `Failed to ${action} connection`, severity: 'error' });
+        } finally {
+            setMikrotikActionLoading(false);
+        }
+    };
+
     const handleUpdateCustomer = useCallback(async () => {
         if (!editingCustomer) return;
 
@@ -468,7 +519,11 @@ const SubscriptionsView = ({
                 discount: editingCustomer.discount,
                 cost_override: editingCustomer.cost_override,
                 balance: editingCustomer.balance !== undefined ? editingCustomer.balance : 0,
-                reseller_id: editingCustomer.reseller_id || ""
+                reseller_id: editingCustomer.reseller_id || "",
+                upstream_provider_id: editingCustomer.upstream_provider_id || "",
+                upstream_username: editingCustomer.upstream_username || "",
+                mikrotik_server_id: editingCustomer.mikrotik_server_id || "",
+                pppoe_username: editingCustomer.pppoe_username || ""
             });
 
             setSnackbar({
@@ -504,7 +559,7 @@ const SubscriptionsView = ({
             await apiService.addCustomer(newCustomer);
             setSnackbar({ open: true, message: 'Customer added successfully!', severity: 'success' });
             setShowAddCustomerForm(false);
-            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
+            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', reseller_id: '', upstream_provider_id: '', upstream_username: '', mikrotik_server_id: '', pppoe_username: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
             refetchCustomers(1, itemsPerPage, ''); // Go to first page after adding
         } catch (error) {
             console.error('Error adding customer:', error);
@@ -672,6 +727,32 @@ const SubscriptionsView = ({
                                 {subscriptionPlans.map(plan => (<MenuItem key={plan.id} value={plan.id}>{plan.name} - ${plan.price}</MenuItem>))}
                             </TextField>
                         </Grid>
+                        {businessSettings?.network_mode === 'upstream_bridge' && (
+                            <>
+                                <Grid item xs={12} md={6}>
+                                    <TextField fullWidth select label="Upstream Provider (Optional)" value={newCustomer.upstream_provider_id || ''} onChange={(e) => setNewCustomer({ ...newCustomer, upstream_provider_id: e.target.value })}>
+                                        <MenuItem value="">None</MenuItem>
+                                        {upstreamProviders.map(p => <MenuItem key={p.id} value={p.id}>{p.name}</MenuItem>)}
+                                    </TextField>
+                                </Grid>
+                                <Grid item xs={12} md={6}>
+                                    <TextField fullWidth label="Upstream Username (Optional)" value={newCustomer.upstream_username || ''} onChange={(e) => setNewCustomer({ ...newCustomer, upstream_username: e.target.value })} />
+                                </Grid>
+                            </>
+                        )}
+                        {businessSettings?.network_mode === 'local_mikrotik' && (
+                            <>
+                                <Grid item xs={12} md={6}>
+                                    <TextField fullWidth select label="Mikrotik Server (Optional)" value={newCustomer.mikrotik_server_id || ''} onChange={(e) => setNewCustomer({ ...newCustomer, mikrotik_server_id: e.target.value })}>
+                                        <MenuItem value="">None</MenuItem>
+                                        {mikrotikServers.map(s => <MenuItem key={s.id} value={s.id}>{s.name}</MenuItem>)}
+                                    </TextField>
+                                </Grid>
+                                <Grid item xs={12} md={6}>
+                                    <TextField fullWidth label="PPPoE Username (Optional)" value={newCustomer.pppoe_username || ''} onChange={(e) => setNewCustomer({ ...newCustomer, pppoe_username: e.target.value })} />
+                                </Grid>
+                            </>
+                        )}
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount (Fixed Amount)" value={newCustomer.discount} onChange={(e) => setNewCustomer({ ...newCustomer, discount: parseFloat(e.target.value) || 0.0 })} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={newCustomer.cost_override} onChange={(e) => setNewCustomer({ ...newCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="date" label="Subscription Start Date" value={newCustomer.subscription_start_date} onChange={(e) => setNewCustomer({ ...newCustomer, subscription_start_date: e.target.value })} InputLabelProps={{ shrink: true }} /></Grid>
@@ -991,9 +1072,74 @@ const SubscriptionsView = ({
                                 {subscriptionPlans.map(plan => (<MenuItem key={plan.id} value={plan.id}>{plan.name} - ${plan.price}</MenuItem>))}
                             </TextField>
                         </Grid>
+                        {businessSettings?.network_mode === 'upstream_bridge' && (
+                            <>
+                                <Grid item xs={12} md={6}>
+                                    <TextField fullWidth select label="Upstream Provider (Optional)" value={editingCustomer?.upstream_provider_id || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, upstream_provider_id: e.target.value })}>
+                                        <MenuItem value="">None</MenuItem>
+                                        {upstreamProviders.map(p => <MenuItem key={p.id} value={p.id}>{p.name}</MenuItem>)}
+                                    </TextField>
+                                </Grid>
+                                <Grid item xs={12} md={6}>
+                                    <TextField fullWidth label="Upstream Username (Optional)" value={editingCustomer?.upstream_username || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, upstream_username: e.target.value })} />
+                                </Grid>
+                            </>
+                        )}
+                        {businessSettings?.network_mode === 'local_mikrotik' && (
+                            <>
+                                <Grid item xs={12} md={6}>
+                                    <TextField fullWidth select label="Mikrotik Server (Optional)" value={editingCustomer?.mikrotik_server_id || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, mikrotik_server_id: e.target.value })}>
+                                        <MenuItem value="">None</MenuItem>
+                                        {mikrotikServers.map(s => <MenuItem key={s.id} value={s.id}>{s.name}</MenuItem>)}
+                                    </TextField>
+                                </Grid>
+                                <Grid item xs={12} md={6}>
+                                    <TextField fullWidth label="PPPoE Username (Optional)" value={editingCustomer?.pppoe_username || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, pppoe_username: e.target.value })} />
+                                </Grid>
+                            </>
+                        )}
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount ($)" value={editingCustomer?.discount || 0} onChange={(e) => setEditingCustomer({ ...editingCustomer, discount: parseFloat(e.target.value) || 0 })} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={editingCustomer?.cost_override ?? ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Account Balance ($)" value={editingCustomer?.balance !== undefined ? editingCustomer.balance : 0} helperText="Negative value = Customer owes money. 0 = Paid." onChange={(e) => setEditingCustomer({ ...editingCustomer, balance: parseFloat(e.target.value) || 0 })} /></Grid>
+
+                        {businessSettings?.network_mode === 'local_mikrotik' && editingCustomer?.mikrotik_server_id && editingCustomer?.pppoe_username && (
+                            <Grid item xs={12}>
+                                <Box sx={{ p: 2, borderRadius: '12px', border: `1px solid ${alpha(theme.palette.divider, 0.15)}`, bgcolor: '#f8fafc' }}>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
+                                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>Network Status (Mikrotik)</Typography>
+                                        <Button size="small" onClick={() => fetchMikrotikStatus(editingCustomer.id)} disabled={mikrotikStatusLoading}>
+                                            {mikrotikStatusLoading ? <CircularProgress size={16} /> : 'Refresh'}
+                                        </Button>
+                                    </Box>
+                                    {mikrotikStatus ? (
+                                        <Box sx={{ mt: 1, display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
+                                            <Chip
+                                                size="small"
+                                                label={mikrotikStatus.secret_error ? `Error: ${mikrotikStatus.secret_error}` : `Secret: ${mikrotikStatus.secret_status || 'unknown'}`}
+                                                color={mikrotikStatus.secret_status === 'enabled' ? 'success' : mikrotikStatus.secret_status === 'disabled' ? 'error' : 'default'}
+                                            />
+                                            <Chip
+                                                size="small"
+                                                variant="outlined"
+                                                label={mikrotikStatus.active_session ? 'Currently connected' : 'Not connected'}
+                                            />
+                                            <Button size="small" variant="outlined" color="error" disabled={mikrotikActionLoading}
+                                                onClick={() => handleMikrotikAction(editingCustomer.id, 'suspend')}>
+                                                Suspend
+                                            </Button>
+                                            <Button size="small" variant="outlined" color="success" disabled={mikrotikActionLoading}
+                                                onClick={() => handleMikrotikAction(editingCustomer.id, 'unsuspend')}>
+                                                Unsuspend
+                                            </Button>
+                                        </Box>
+                                    ) : (
+                                        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                                            {mikrotikStatusLoading ? 'Checking…' : 'No status loaded yet.'}
+                                        </Typography>
+                                    )}
+                                </Box>
+                            </Grid>
+                        )}
                     </Grid>
                 </DialogContent>
                 <DialogActions>

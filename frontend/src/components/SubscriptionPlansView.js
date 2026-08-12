@@ -5,7 +5,7 @@ import { Dialog, Button, Box, Typography } from '@mui/material';
 import { useAppContext } from '../context/AppContext';
 import SubscriptionPlanForm from './SubscriptionPlanForm';
 
-const SubscriptionPlansView = () => {
+const SubscriptionPlansView = ({ refetchSubscriptionPlans }) => {
   const { apiService, setSnackbar } = useAppContext();
   const [plans, setPlans] = useState([]);
   const [selectedPlan, setSelectedPlan] = useState(null);
@@ -42,7 +42,11 @@ const SubscriptionPlansView = () => {
   };
 
   const handleSave = async () => {
-    await fetchPlans(); // Refresh list after save
+    await fetchPlans(); // Refresh this view's own list after save
+    // Also refresh the shared list held by App.js (used by SubscriptionsView's
+    // plan dropdowns) -- this view keeps its own separate copy, so without this
+    // a newly added/edited plan wouldn't show up there until a full page reload.
+    await refetchSubscriptionPlans?.();
     setOpenForm(false);
     setSnackbar({ open: true, message: 'Plan saved successfully', severity: 'success' });
   };
