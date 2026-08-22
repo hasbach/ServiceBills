@@ -2840,6 +2840,29 @@ def _maybe_restore_mikrotik_access(customer):
         return {'attempted': True, 'ok': False, 'message': str(e)}
 
 
+def _compute_upstream_drift(customer):
+    """Compare ServiceBills' own subscription_expiry_date against the last
+    upstream_actual_expiry synced from the portal. Computed on every read,
+    never stored -- always consistent with whatever the two dates currently
+    are. Returns None if nothing has been synced yet or the two dates match;
+    otherwise {'severity': 'info'|'alert', 'days': <positive int>}.
+
+    'info' means the upstream has MORE runway than ServiceBills' billing
+    cycle (e.g. staff manually topped up on the portal) -- harmless.
+    'alert' means the upstream expires SOONER than ServiceBills' billing
+    cycle -- a real risk the customer could be cut off despite showing
+    paid/active in ServiceBills. See
+    docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md."""
+    if not customer.upstream_actual_expiry or not customer.subscription_expiry_date:
+        return None
+    delta_days = (customer.upstream_actual_expiry.date() - customer.subscription_expiry_date.date()).days
+    if delta_days > 0:
+        return {'severity': 'info', 'days': delta_days}
+    if delta_days < 0:
+        return {'severity': 'alert', 'days': abs(delta_days)}
+    return None
+
+
 @app.route('/api/payments/<int:payment_id>/mark_paid', methods=['PUT'])
 @jwt_required()
 def mark_payment_as_paid(payment_id):
