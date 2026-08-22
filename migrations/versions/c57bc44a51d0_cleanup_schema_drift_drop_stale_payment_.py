@@ -74,7 +74,32 @@ def _duplicate_values(bind, table, column):
     return [row[0] for row in result]
 
 
+def _constraint_already_exists(bind, table, constraint_name):
+    """True if `constraint_name` already exists on `table`, as either a named
+    UNIQUE constraint or a UNIQUE index -- Postgres can end up with either
+    depending on how it was originally created (a direct `ADD CONSTRAINT`
+    vs. some other path), and a same-named index also blocks `ADD
+    CONSTRAINT ... UNIQUE` with a DuplicateTable error even though it isn't
+    itself a constraint."""
+    inspector = inspect(bind)
+    names = {c['name'] for c in inspector.get_unique_constraints(table)}
+    names |= {i['name'] for i in inspector.get_indexes(table)}
+    return constraint_name in names
+
+
 def _add_unique_constraint_if_safe(bind, table, column, constraint_name):
+    # PRODUCTION INCIDENT (2026-08-23): uq_tenant_slug already existed on the
+    # real production database under this exact name -- same class of
+    # pre-migration-history drift as payment.reseller_id above (created out
+    # of band, before Alembic was tracking this table), just in the opposite
+    # direction (already present instead of missing). `ADD CONSTRAINT`
+    # doesn't no-op on an existing same-named constraint, it errors, so this
+    # must be checked for explicitly -- confirmed missing until this fix,
+    # and fixed defensively for all three constraints this function adds,
+    # not just the one that happened to fail first.
+    if _constraint_already_exists(bind, table, constraint_name):
+        print(f"NOTE: {constraint_name} on {table} already exists -- skipping create (nothing to do).")
+        return
     dupes = _duplicate_values(bind, table, column)
     if dupes:
         print(f"WARNING: skipping unique constraint {constraint_name} on "
