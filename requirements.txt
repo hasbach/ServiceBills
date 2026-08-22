@@ -18,3 +18,4 @@ stripe
 itsdangerous
 boto3
 librouteros
+playwright
