@@ -86,6 +86,7 @@ from crypto import EncryptedString
 import storage
 import email_util
 import mikrotik
+import upstream_portal
 from itsdangerous import URLSafeTimedSerializer, BadData
 
 
@@ -1855,6 +1856,10 @@ def get_customers():
                 'reseller_id': c.reseller_id,
                 'upstream_provider_id': c.upstream_provider_id,
                 'upstream_username': c.upstream_username,
+                'upstream_actual_expiry': c.upstream_actual_expiry.strftime('%Y-%m-%d') if c.upstream_actual_expiry else None,
+                'upstream_last_status': c.upstream_last_status,
+                'upstream_last_synced_at': c.upstream_last_synced_at.strftime('%Y-%m-%d %H:%M:%S') if c.upstream_last_synced_at else None,
+                'upstream_drift': _compute_upstream_drift(c),
                 'mikrotik_server_id': c.mikrotik_server_id,
                 'pppoe_username': c.pppoe_username,
                 'subscription_plan': c.subscription_plan.to_dict() if c.subscription_plan else None
@@ -6407,6 +6412,42 @@ def record_upstream_renewal_cost(provider_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
+
+
+# --- Read-only status sync against a customer's upstream portal account
+# (Terra/PROradius first -- see
+# docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md). Never
+# clicks anything on the portal, staff-triggered only, one customer at a
+# time -- no scheduler calls this.
+
+@app.route('/api/customers/<int:customer_id>/upstream-status-sync', methods=['POST'])
+@jwt_required()
+def sync_customer_upstream_status(customer_id):
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
+    if not customer:
+        return jsonify({'message': 'Customer not found!'}), 404
+    if not customer.upstream_provider_id or not customer.upstream_username:
+        return jsonify({'error': 'Customer is not linked to an Upstream Provider.'}), 400
+    provider = tenant_query(UpstreamProvider).filter_by(id=customer.upstream_provider_id).first()
+    if not provider:
+        return jsonify({'error': 'Linked Upstream Provider not found.'}), 404
+
+    ok, result = upstream_portal.get_subscriber_status(provider, customer.upstream_username)
+    if not ok:
+        return jsonify({'ok': False, 'error': result}), 502
+
+    customer.upstream_last_status = result['status']
+    customer.upstream_actual_expiry = result['expiry']
+    customer.upstream_last_synced_at = datetime.utcnow()
+    db.session.commit()
+
+    return jsonify({
+        'ok': True,
+        'upstream_last_status': customer.upstream_last_status,
+        'upstream_actual_expiry': customer.upstream_actual_expiry.strftime('%Y-%m-%d') if customer.upstream_actual_expiry else None,
+        'upstream_last_synced_at': customer.upstream_last_synced_at.strftime('%Y-%m-%d %H:%M:%S'),
+        'upstream_drift': _compute_upstream_drift(customer),
+    }), 200
 
 
 @app.route('/api/mikrotik-servers', methods=['GET'])
