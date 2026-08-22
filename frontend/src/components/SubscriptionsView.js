@@ -272,6 +272,44 @@ const SubscriptionsView = ({
         const colors = { 'basic': '#4F46E5', 'premium': '#10B981', 'pro': '#F59E0B', 'enterprise': '#8B5CF6', 'default': '#6B7280' };
         return colors[planName?.toLowerCase()] || colors.default;
     };
+    const getUpstreamStatusColor = (status) => ({ online: '#10B981', offline: '#EF4444', expired: '#F59E0B' }[status] || '#6B7280');
+
+    // Last-synced upstream status + drift, shown directly on the list/grid so
+    // staff don't have to open Edit just to see it (the data is already on
+    // the customer object from the list API -- this never triggers a fresh
+    // live check, only Refresh Upstream Status inside Edit does that).
+    const renderUpstreamStatusChip = (customer) => {
+        if (businessSettings?.network_mode !== 'upstream_bridge' || !customer.upstream_provider_id || !customer.upstream_username) {
+            return null;
+        }
+        if (!customer.upstream_last_synced_at) {
+            return <Chip size="small" variant="outlined" label="Upstream: not synced" sx={{ fontSize: '0.7rem' }} />;
+        }
+        const color = getUpstreamStatusColor(customer.upstream_last_status);
+        const alertDrift = customer.upstream_drift?.severity === 'alert';
+        return (
+            <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                <Chip
+                    size="small"
+                    label={`Upstream: ${customer.upstream_last_status || 'unknown'}`}
+                    sx={{ backgroundColor: alpha(color, 0.1), color, fontWeight: 600, fontSize: '0.7rem', border: `1px solid ${alpha(color, 0.2)}` }}
+                />
+                {customer.upstream_drift && (
+                    <Chip
+                        size="small"
+                        label={alertDrift ? `⚠ ${customer.upstream_drift.days}d early` : `+${customer.upstream_drift.days}d`}
+                        sx={{
+                            backgroundColor: alpha(alertDrift ? '#EF4444' : '#3B82F6', 0.1),
+                            color: alertDrift ? '#EF4444' : '#3B82F6',
+                            fontWeight: 600,
+                            fontSize: '0.7rem',
+                            border: `1px solid ${alpha(alertDrift ? '#EF4444' : '#3B82F6', 0.2)}`,
+                        }}
+                    />
+                )}
+            </Box>
+        );
+    };
 
     const fetchCustomerPayments = useCallback(async (customerId, customerObj = null) => {
         if (!customerObj && expandedCustomerId === customerId) {
@@ -886,6 +924,7 @@ const SubscriptionsView = ({
                                                     />
                                                     <Chip label={customer.is_subscription_active ? 'Active' : 'Canceled'} size="small" sx={{ backgroundColor: alpha(getStatusColor(customer.is_subscription_active), 0.1), color: getStatusColor(customer.is_subscription_active), fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(getStatusColor(customer.is_subscription_active), 0.2)}` }} />
                                                     <Chip label={`Balance: $${customer.balance.toFixed(2)}`} size="small" sx={{ backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1), color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.2)}` }} />
+                                                    {renderUpstreamStatusChip(customer)}
                                                 </Box>
                                             </Box>
                                             <Divider sx={{ my: 2, opacity: 0.6 }} />
@@ -1012,15 +1051,18 @@ const SubscriptionsView = ({
                                                 <Typography variant="caption" color="text.secondary">${((plan?.price || 0) - customer.discount).toFixed(2)}</Typography>
                                             </TableCell>
                                             <TableCell>
-                                                <Chip
-                                                    label={customer.is_subscription_active ? 'Active' : 'Canceled'}
-                                                    size="small"
-                                                    sx={{
-                                                        backgroundColor: alpha(getStatusColor(customer.is_subscription_active), 0.1),
-                                                        color: getStatusColor(customer.is_subscription_active),
-                                                        fontWeight: 600,
-                                                    }}
-                                                />
+                                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, alignItems: 'flex-start' }}>
+                                                    <Chip
+                                                        label={customer.is_subscription_active ? 'Active' : 'Canceled'}
+                                                        size="small"
+                                                        sx={{
+                                                            backgroundColor: alpha(getStatusColor(customer.is_subscription_active), 0.1),
+                                                            color: getStatusColor(customer.is_subscription_active),
+                                                            fontWeight: 600,
+                                                        }}
+                                                    />
+                                                    {renderUpstreamStatusChip(customer)}
+                                                </Box>
                                             </TableCell>
                                             <TableCell onClick={(e) => e.stopPropagation()}>
                                                 <Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />
