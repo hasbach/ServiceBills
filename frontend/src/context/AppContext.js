@@ -143,6 +143,9 @@ const rawApiService = {
     suspendCustomerMikrotik: (customerId) => api.post(`/customers/${customerId}/mikrotik-suspend`),
     unsuspendCustomerMikrotik: (customerId) => api.post(`/customers/${customerId}/mikrotik-unsuspend`),
 
+    // Customer <-> Upstream Portal read-only status sync (staff-triggered, see spec)
+    syncCustomerUpstreamStatus: (customerId) => api.post(`/customers/${customerId}/upstream-status-sync`),
+
     // Supplier API methods
     fetchSuppliers: () => api.get('/suppliers'),
     addSupplier: (data) => api.post('/suppliers', data),

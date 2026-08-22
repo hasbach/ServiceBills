@@ -170,6 +170,16 @@ const DebouncedSearchInput = ({ value, onChange, ...props }) => {
     );
 };
 
+// Staff-facing translations of upstream_portal.py's failure-reason enum
+// (see the spec's Error Handling table) -- raw reasons like "auth_failed"
+// are meaningless jargon to a non-developer.
+const UPSTREAM_SYNC_ERROR_MESSAGES = {
+    auth_failed: "Couldn't log into the upstream portal — check the provider's portal credentials.",
+    not_found: "No subscriber found on the upstream portal matching this username — check for a typo or a renamed account.",
+    timeout: "The upstream portal didn't respond in time — try again shortly.",
+    scrape_failed: "The upstream portal's page format may have changed, or an unexpected match was found — this needs a code fix, not a data fix.",
+};
+
 const SubscriptionsView = ({
     customers,
     pagination,
@@ -230,6 +240,8 @@ const SubscriptionsView = ({
     const [mikrotikStatus, setMikrotikStatus] = useState(null);
     const [mikrotikStatusLoading, setMikrotikStatusLoading] = useState(false);
     const [mikrotikActionLoading, setMikrotikActionLoading] = useState(false);
+    const [upstreamSyncStatus, setUpstreamSyncStatus] = useState(null);
+    const [upstreamSyncLoading, setUpstreamSyncLoading] = useState(false);
 
     useEffect(() => {
         apiService.fetchResellers().then(res => setResellers(res.data)).catch(err => console.error("Failed to load resellers", err));
@@ -479,6 +491,38 @@ const SubscriptionsView = ({
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [editDialogOpen, editingCustomer?.id]);
+
+    // Upstream status sync (Concept A) is manual-only -- a real headless-browser
+    // check takes several seconds, unlike the instant Mikrotik API call above, so
+    // it never auto-fires on dialog open. Seed from the customer's last persisted
+    // sync (so the panel is "always visible" per spec, even before a fresh click)
+    // instead of always nulling; clicking Refresh still triggers and displays a
+    // live check exactly as before.
+    useEffect(() => {
+        if (editDialogOpen && editingCustomer && editingCustomer.upstream_last_synced_at) {
+            setUpstreamSyncStatus({
+                ok: true,
+                upstream_last_status: editingCustomer.upstream_last_status,
+                upstream_actual_expiry: editingCustomer.upstream_actual_expiry,
+                upstream_last_synced_at: editingCustomer.upstream_last_synced_at,
+                upstream_drift: editingCustomer.upstream_drift,
+            });
+        } else {
+            setUpstreamSyncStatus(null);
+        }
+    }, [editDialogOpen, editingCustomer?.id]);
+
+    const fetchUpstreamStatus = async (customerId) => {
+        setUpstreamSyncLoading(true);
+        try {
+            const response = await apiService.syncCustomerUpstreamStatus(customerId);
+            setUpstreamSyncStatus(response.data);
+        } catch (error) {
+            setUpstreamSyncStatus({ ok: false, error: error.response?.data?.error || error.response?.data?.message || 'Failed to sync status' });
+        } finally {
+            setUpstreamSyncLoading(false);
+        }
+    };
 
     const fetchMikrotikStatus = async (customerId) => {
         setMikrotikStatusLoading(true);
@@ -1135,6 +1179,57 @@ const SubscriptionsView = ({
                                     ) : (
                                         <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
                                             {mikrotikStatusLoading ? 'Checking…' : 'No status loaded yet.'}
+                                        </Typography>
+                                    )}
+                                </Box>
+                            </Grid>
+                        )}
+                        {businessSettings?.network_mode === 'upstream_bridge' && editingCustomer?.upstream_provider_id && editingCustomer?.upstream_username && (
+                            <Grid item xs={12}>
+                                <Box sx={{ p: 2, borderRadius: '12px', border: `1px solid ${alpha(theme.palette.divider, 0.15)}`, bgcolor: '#f8fafc' }}>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
+                                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>Network Status (Upstream Portal)</Typography>
+                                        <Button size="small" onClick={() => fetchUpstreamStatus(editingCustomer.id)} disabled={upstreamSyncLoading}>
+                                            {upstreamSyncLoading ? <CircularProgress size={16} /> : 'Refresh Upstream Status'}
+                                        </Button>
+                                    </Box>
+                                    {upstreamSyncStatus ? (
+                                        upstreamSyncStatus.ok === false ? (
+                                            <Typography variant="body2" color="error" sx={{ mt: 1 }}>
+                                                {(upstreamSyncStatus.error && (UPSTREAM_SYNC_ERROR_MESSAGES[upstreamSyncStatus.error] || upstreamSyncStatus.error)) || 'Sync failed'}
+                                            </Typography>
+                                        ) : (
+                                            <Box sx={{ mt: 1, display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
+                                                <Chip
+                                                    size="small"
+                                                    label={`Portal status: ${upstreamSyncStatus.upstream_last_status || 'unknown'}`}
+                                                    color={
+                                                        upstreamSyncStatus.upstream_last_status === 'online' ? 'success' :
+                                                        upstreamSyncStatus.upstream_last_status === 'offline' ? 'error' :
+                                                        upstreamSyncStatus.upstream_last_status === 'expired' ? 'warning' : 'default'
+                                                    }
+                                                />
+                                                <Chip
+                                                    size="small"
+                                                    variant="outlined"
+                                                    label={`As of ${upstreamSyncStatus.upstream_last_synced_at || 'now'}`}
+                                                />
+                                                {upstreamSyncStatus.upstream_drift && (
+                                                    <Chip
+                                                        size="small"
+                                                        color={upstreamSyncStatus.upstream_drift.severity === 'alert' ? 'error' : 'info'}
+                                                        label={
+                                                            upstreamSyncStatus.upstream_drift.severity === 'alert'
+                                                                ? `⚠ Upstream expires ${upstreamSyncStatus.upstream_drift.days} day(s) before ServiceBills`
+                                                                : `Upstream has ${upstreamSyncStatus.upstream_drift.days} extra day(s)`
+                                                        }
+                                                    />
+                                                )}
+                                            </Box>
+                                        )
+                                    ) : (
+                                        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                                            {upstreamSyncLoading ? 'Checking…' : 'No status loaded yet.'}
                                         </Typography>
                                     )}
                                 </Box>
