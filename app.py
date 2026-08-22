@@ -295,6 +295,14 @@ class Customer(db.Model):
     # login/account name on that operator's portal.
     upstream_provider_id = db.Column(db.Integer, db.ForeignKey('upstream_provider.id'), nullable=True)
     upstream_username = db.Column(db.String(100), nullable=True)
+    # Read-only mirror of this customer's real state on the upstream portal,
+    # written only by upstream_portal.get_subscriber_status() via the
+    # /upstream-status-sync endpoint -- never by billing logic. A failed sync
+    # leaves all three untouched rather than clearing them. See
+    # docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md.
+    upstream_actual_expiry = db.Column(db.DateTime, nullable=True)
+    upstream_last_status = db.Column(db.String(20), nullable=True)  # 'online' | 'offline' | 'expired' | 'unknown'
+    upstream_last_synced_at = db.Column(db.DateTime, nullable=True)
     # Populated only when network_mode is 'local_mikrotik' -- the router this
     # customer authenticates against and their /ppp/secret name on it.
     mikrotik_server_id = db.Column(db.Integer, db.ForeignKey('mikrotik_server.id'), nullable=True)
