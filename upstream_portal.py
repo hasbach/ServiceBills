@@ -15,6 +15,7 @@ tenant, do NOT target that new address; this module stays pointed at the
 current site until told otherwise.
 """
 import logging
+from urllib.parse import urljoin
 
 from dateutil import parser as date_parser
 from playwright.sync_api import sync_playwright
@@ -33,6 +34,12 @@ LOGIN_SUBMIT_SELECTOR = 'button[type="submit"]'
 # after login -- "Balance" is in the page header on every authenticated
 # page instead, confirmed present immediately after a successful login.
 LOGIN_SUCCESS_SELECTOR = 'text=Balance'
+# Login lands on the Dashboard, NOT the subscriber list -- confirmed live
+# (missed in the original design, caught by the supervised smoke test): the
+# subscriber table only exists on this separate page, reached via the
+# sidebar's Users -> List Users link. Resolved against provider.portal_url's
+# origin, since that URL is the login page, not the site root.
+SUBSCRIBER_LIST_PATH = '/users'
 SUBSCRIBER_TABLE_SELECTOR = 'table'
 
 # The subscriber table's real column order, confirmed live: Username,
@@ -76,7 +83,19 @@ def _login(page, provider):
         raise LoginFailed("Login did not reach the logged-in page")
 
 
+def _goto_subscriber_list(page, provider):
+    page.goto(urljoin(provider.portal_url, SUBSCRIBER_LIST_PATH), timeout=_TIMEOUT_MS)
+
+
 def _find_subscriber_row(page, username):
+    # The subscriber list is a React SPA page -- its rows render after an
+    # async fetch completes, not immediately on navigation. `.count()` never
+    # auto-waits, so without this the row lookup below can run before any
+    # row exists at all (caught live: this was originally missing, and
+    # every lookup failed as a false "not_found"). A genuine timeout here
+    # (table never loads) propagates as PlaywrightTimeoutError -> 'timeout',
+    # not 'not_found' -- intentionally not caught in this function.
+    page.wait_for_selector(f"{SUBSCRIBER_TABLE_SELECTOR} tr", timeout=_TIMEOUT_MS)
     row = page.locator(f"{SUBSCRIBER_TABLE_SELECTOR} tr", has_text=username)
     if row.count() == 0:
         raise SubscriberNotFound(username)
@@ -123,6 +142,7 @@ def get_subscriber_status(provider, username):
                 page = browser.new_page()
                 page.set_default_timeout(_TIMEOUT_MS)
                 _login(page, provider)
+                _goto_subscriber_list(page, provider)
                 row = _find_subscriber_row(page, username)
                 status = _parse_status(row)
                 expiry = _parse_expiry(row)
