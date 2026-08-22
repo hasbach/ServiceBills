@@ -63,3 +63,6 @@ app_copy.py
 # Compiled frontend (built by Docker/CI, not tracked)
 frontend/build/
 frontend/build.zip
+
+# Local git worktrees (scratch, not tracked)
+.worktrees/
