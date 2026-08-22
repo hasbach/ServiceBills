@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import app as appmod
 from tests.conftest import make_tenant

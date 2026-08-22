@@ -6437,9 +6437,14 @@ def sync_customer_upstream_status(customer_id):
         return jsonify({'ok': False, 'error': result}), 502
 
     customer.upstream_last_status = result['status']
-    customer.upstream_actual_expiry = result['expiry']
+    if result['expiry'] is not None:
+        customer.upstream_actual_expiry = result['expiry']
     customer.upstream_last_synced_at = datetime.utcnow()
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
 
     return jsonify({
         'ok': True,

@@ -5,7 +5,6 @@ discovery (2026-08-23): status is a CSS class on a chip in the username
 cell, and expiry is a specific table column (index 9), not free row text."""
 import types
 
-import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -16,30 +15,44 @@ def make_provider(id=1, portal_url="https://example.test/login", portal_username
     return types.SimpleNamespace(id=id, portal_url=portal_url, portal_username=portal_username, portal_password=portal_password)
 
 
+def make_cells_with_username(username, expiry="2026-09-01 17:38"):
+    # 10 columns, matching Terra's real order; only the username (column 0)
+    # and Expiry (column 9) are ever read by the code under test, the rest
+    # are unused placeholders.
+    return [username, "Full Name", "Address", "Phone", "Reseller", "Service", "MAC", "IP", "2026-01-01 00:00", expiry]
+
+
 def make_cells(expiry="2026-09-01 17:38"):
-    # 10 columns, matching Terra's real order; only the Expiry column
-    # (index 9) is ever read by the code under test, the rest are unused
-    # placeholders.
-    return ["user1", "Full Name", "Address", "Phone", "Reseller", "Service", "MAC", "IP", "2026-01-01 00:00", expiry]
+    return make_cells_with_username("user1", expiry)
 
 
 class FakeCell:
-    def __init__(self, text):
+    def __init__(self, text, chip_class=None):
         self._text = text
+        # Only the username cell (column 0) carries a status chip in the
+        # real portal -- non-username cells get chip_class=None.
+        self._chip_class = chip_class
 
     def inner_text(self):
         return self._text
 
+    def locator(self, selector, has_text=None):
+        return FakeChipLocator(self._chip_class)
+
 
 class FakeCellsLocator:
-    def __init__(self, cell_texts):
+    def __init__(self, cell_texts, chip_class=None):
         self._cell_texts = cell_texts
+        self._chip_class = chip_class
 
     def count(self):
         return len(self._cell_texts)
 
     def nth(self, i):
-        return FakeCell(self._cell_texts[i] if i < len(self._cell_texts) else "")
+        if i >= len(self._cell_texts):
+            return FakeCell("")
+        chip_class = self._chip_class if i == 0 else None
+        return FakeCell(self._cell_texts[i], chip_class=chip_class)
 
 
 class FakeChipLocator:
@@ -58,42 +71,60 @@ class FakeChipLocator:
 
 
 class FakeRowLocator:
-    def __init__(self, found=True, chip_class="bg-success/20 text-success-700", cell_texts=None):
-        self._found = found
+    """A single fake <tr>. `chip_class` models the status chip that lives in
+    the username cell (column 0) only."""
+
+    def __init__(self, cell_texts, chip_class="bg-success/20 text-success-700"):
+        self._cell_texts = cell_texts
         self._chip_class = chip_class
-        self._cell_texts = cell_texts if cell_texts is not None else make_cells()
-
-    def count(self):
-        return 1 if self._found else 0
-
-    @property
-    def first(self):
-        return self
 
     def locator(self, selector, has_text=None):
         if selector == "td":
-            return FakeCellsLocator(self._cell_texts)
+            return FakeCellsLocator(self._cell_texts, chip_class=self._chip_class)
         return FakeChipLocator(self._chip_class)
 
     def inner_text(self):
+        # Used to emulate Playwright's `has_text` pre-filter, which matches
+        # anywhere in the row's full text, not just the username cell.
         return " ".join(self._cell_texts)
+
+
+class FakeRowsLocator:
+    """Models `page.locator(selector, has_text=...)` over multiple <tr>s."""
+
+    def __init__(self, rows, has_text=None):
+        if has_text is not None:
+            self._rows = [r for r in rows if has_text in r.inner_text()]
+        else:
+            self._rows = list(rows)
+
+    def count(self):
+        return len(self._rows)
+
+    def nth(self, i):
+        return self._rows[i]
 
 
 class FakePage:
     def __init__(self, row_found=True, chip_class="bg-success/20 text-success-700", cell_texts=None,
-                 login_succeeds=True, goto_raises=None):
-        self._row_found = row_found
-        self._chip_class = chip_class
-        self._cell_texts = cell_texts
+                 rows=None, login_succeeds=True, goto_raises=None):
         self._login_succeeds = login_succeeds
         self._goto_raises = goto_raises
         self.filled = {}
         self.clicked = []
+        self.goto_calls = []
+        if rows is not None:
+            self._rows = rows
+        elif row_found:
+            self._rows = [FakeRowLocator(cell_texts if cell_texts is not None else make_cells(), chip_class=chip_class)]
+        else:
+            self._rows = []
 
     def set_default_timeout(self, ms):
         pass
 
     def goto(self, url, timeout=None):
+        self.goto_calls.append(url)
         if self._goto_raises:
             raise self._goto_raises
 
@@ -108,7 +139,7 @@ class FakePage:
             raise PlaywrightTimeoutError("timed out waiting for login")
 
     def locator(self, selector, has_text=None):
-        return FakeRowLocator(found=self._row_found, chip_class=self._chip_class, cell_texts=self._cell_texts)
+        return FakeRowsLocator(self._rows, has_text=has_text)
 
 
 class FakeBrowser:
@@ -247,3 +278,38 @@ def test_browser_always_closed_even_on_failure(monkeypatch):
     upstream_portal.get_subscriber_status(make_provider(), "user1")
 
     assert browser_holder["browser"].closed is True
+
+
+# --- Regression tests for bugs the live smoke test caught ---
+
+def test_navigates_to_login_then_subscriber_list(monkeypatch):
+    page = FakePage()
+    patch_playwright(monkeypatch, page)
+
+    upstream_portal.get_subscriber_status(make_provider(portal_url="https://example.test/login/"), "user1")
+
+    assert page.goto_calls == ["https://example.test/login/", "https://example.test/users"]
+
+
+def test_get_subscriber_status_rejects_substring_match(monkeypatch):
+    # "user1" must not match a row whose username cell is "user10"
+    page = FakePage(cell_texts=make_cells_with_username("user10"))
+    patch_playwright(monkeypatch, page)
+
+    ok, reason = upstream_portal.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, reason) == (False, "not_found")
+
+
+def test_get_subscriber_status_ambiguous_match_is_scrape_failed(monkeypatch):
+    # Two rows whose username cells both exactly equal the searched username
+    # is a real anomaly -- refuse to silently guess which one is correct.
+    page = FakePage(rows=[
+        FakeRowLocator(make_cells_with_username("user1")),
+        FakeRowLocator(make_cells_with_username("user1")),
+    ])
+    patch_playwright(monkeypatch, page)
+
+    ok, reason = upstream_portal.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, reason) == (False, "scrape_failed")

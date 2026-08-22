@@ -170,6 +170,16 @@ const DebouncedSearchInput = ({ value, onChange, ...props }) => {
     );
 };
 
+// Staff-facing translations of upstream_portal.py's failure-reason enum
+// (see the spec's Error Handling table) -- raw reasons like "auth_failed"
+// are meaningless jargon to a non-developer.
+const UPSTREAM_SYNC_ERROR_MESSAGES = {
+    auth_failed: "Couldn't log into the upstream portal — check the provider's portal credentials.",
+    not_found: "No subscriber found on the upstream portal matching this username — check for a typo or a renamed account.",
+    timeout: "The upstream portal didn't respond in time — try again shortly.",
+    scrape_failed: "The upstream portal's page format may have changed, or an unexpected match was found — this needs a code fix, not a data fix.",
+};
+
 const SubscriptionsView = ({
     customers,
     pagination,
@@ -484,10 +494,22 @@ const SubscriptionsView = ({
 
     // Upstream status sync (Concept A) is manual-only -- a real headless-browser
     // check takes several seconds, unlike the instant Mikrotik API call above, so
-    // it never auto-fires on dialog open. Only clear a stale result from whatever
-    // customer was previously open.
+    // it never auto-fires on dialog open. Seed from the customer's last persisted
+    // sync (so the panel is "always visible" per spec, even before a fresh click)
+    // instead of always nulling; clicking Refresh still triggers and displays a
+    // live check exactly as before.
     useEffect(() => {
-        setUpstreamSyncStatus(null);
+        if (editDialogOpen && editingCustomer && editingCustomer.upstream_last_synced_at) {
+            setUpstreamSyncStatus({
+                ok: true,
+                upstream_last_status: editingCustomer.upstream_last_status,
+                upstream_actual_expiry: editingCustomer.upstream_actual_expiry,
+                upstream_last_synced_at: editingCustomer.upstream_last_synced_at,
+                upstream_drift: editingCustomer.upstream_drift,
+            });
+        } else {
+            setUpstreamSyncStatus(null);
+        }
     }, [editDialogOpen, editingCustomer?.id]);
 
     const fetchUpstreamStatus = async (customerId) => {
@@ -1174,7 +1196,7 @@ const SubscriptionsView = ({
                                     {upstreamSyncStatus ? (
                                         upstreamSyncStatus.ok === false ? (
                                             <Typography variant="body2" color="error" sx={{ mt: 1 }}>
-                                                {upstreamSyncStatus.error || 'Sync failed'}
+                                                {(upstreamSyncStatus.error && (UPSTREAM_SYNC_ERROR_MESSAGES[upstreamSyncStatus.error] || upstreamSyncStatus.error)) || 'Sync failed'}
                                             </Typography>
                                         ) : (
                                             <Box sx={{ mt: 1, display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>

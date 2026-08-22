@@ -3,7 +3,8 @@ RADIUS reseller portals (Concept A / 'upstream_bridge'). See
 docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md.
 
 Read-only only: this module never clicks Renew/Block/Unblock or any other
-mutating action, only logs in, reads one subscriber's row, and logs out.
+mutating action, only logs in, reads one subscriber's row, and closes the
+browser.
 Every public function returns (ok: bool, value) and never raises -- a scrape
 failure must never block or crash a billing-side request, same contract as
 mikrotik.py.
@@ -24,7 +25,15 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUT_MS = 25_000
+# Applied to each of ~6 sequential Playwright waits (login goto, wait-for-
+# login-success, goto /users, wait-for-rows, plus default timeouts on other
+# calls) -- worst case must stay comfortably under the Dockerfile's
+# `gunicorn --timeout 120`, since a worker killed mid-scrape returns nothing
+# clean to the caller instead of a proper 'timeout' reason. The spec's
+# ~20-30s figure was for the whole call, not each individual wait, so 25s
+# per-wait was far too generous; 10s per wait keeps the realistic worst-case
+# total (~6 waits) under the 120s worker timeout with a wide margin.
+_TIMEOUT_MS = 10_000
 
 # Confirmed against the real Terra login page.
 LOGIN_USERNAME_SELECTOR = 'input[name="username"]'
@@ -72,6 +81,10 @@ class SubscriberNotFound(Exception):
     pass
 
 
+class AmbiguousSubscriberMatch(Exception):
+    pass
+
+
 def _login(page, provider):
     page.goto(provider.portal_url, timeout=_TIMEOUT_MS)
     page.fill(LOGIN_USERNAME_SELECTOR, provider.portal_username)
@@ -95,15 +108,30 @@ def _find_subscriber_row(page, username):
     # every lookup failed as a false "not_found"). A genuine timeout here
     # (table never loads) propagates as PlaywrightTimeoutError -> 'timeout',
     # not 'not_found' -- intentionally not caught in this function.
-    page.wait_for_selector(f"{SUBSCRIBER_TABLE_SELECTOR} tr", timeout=_TIMEOUT_MS)
-    row = page.locator(f"{SUBSCRIBER_TABLE_SELECTOR} tr", has_text=username)
-    if row.count() == 0:
+    page.wait_for_selector(f"{SUBSCRIBER_TABLE_SELECTOR} tbody tr", timeout=_TIMEOUT_MS)
+    # `has_text` is a coarse pre-filter across the WHOLE row (all 10 columns
+    # -- Fullname, Address, Phone, Reseller, Service, MAC, IP could all
+    # coincidentally contain the username as a substring). The exact-match
+    # check below against just the username cell (column 0) is what
+    # actually determines a real match -- this prevents ever silently
+    # persisting a different subscriber's status/expiry as this customer's.
+    candidates = page.locator(f"{SUBSCRIBER_TABLE_SELECTOR} tbody tr", has_text=username)
+    matches = []
+    for i in range(candidates.count()):
+        row = candidates.nth(i)
+        username_cell_text = row.locator("td").nth(0).inner_text().strip()
+        if username_cell_text == username:
+            matches.append(row)
+    if len(matches) == 0:
         raise SubscriberNotFound(username)
-    return row.first
+    if len(matches) > 1:
+        raise AmbiguousSubscriberMatch(username, len(matches))
+    return matches[0]
 
 
 def _parse_status(row):
-    chip = row.locator('[class*="bg-success"], [class*="bg-warning"], [class*="bg-danger"]').first
+    username_cell = row.locator("td").nth(0)
+    chip = username_cell.locator('[class*="bg-success"], [class*="bg-warning"], [class*="bg-danger"]').first
     if chip.count() == 0:
         return "unknown"
     class_attr = chip.get_attribute("class") or ""
@@ -153,6 +181,13 @@ def get_subscriber_status(provider, username):
         return False, "auth_failed"
     except SubscriberNotFound:
         return False, "not_found"
+    except AmbiguousSubscriberMatch as e:
+        matched_username, match_count = e.args
+        logger.warning(
+            "Upstream portal lookup for username %r on provider %s matched %d rows exactly -- "
+            "refusing to guess which is correct", matched_username, provider.id, match_count
+        )
+        return False, "scrape_failed"
     except PlaywrightTimeoutError as e:
         logger.warning("Upstream portal timed out for provider %s: %s", provider.id, e)
         return False, "timeout"
