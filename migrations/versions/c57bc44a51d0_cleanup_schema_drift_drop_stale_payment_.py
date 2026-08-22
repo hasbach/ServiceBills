@@ -53,6 +53,7 @@ copy-and-recreate batch strategy -- Postgres (production) executes a direct
 """
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 
 
 # revision identifiers, used by Alembic.
@@ -95,8 +96,25 @@ def upgrade():
     # dropping the column is sufficient on its own: batch mode recreates the
     # table from scratch without it, so the FK (defined on that column) simply
     # can't exist in the new table either. No separate drop_constraint call.
-    with op.batch_alter_table('payment', schema=None) as batch_op:
-        batch_op.drop_column('reseller_id')
+    #
+    # PRODUCTION INCIDENT (2026-08-23): this column never existed on the real
+    # production database -- it only existed on the local dev DB this
+    # migration was originally written and tested against (created there by
+    # an ad hoc db.create_all() at some earlier point when the model still
+    # declared it, never via a migration). Production's `payment` table was
+    # built entirely through the migration chain, and the baseline migration
+    # never created this column, so `DROP COLUMN reseller_id` failed there
+    # with UndefinedColumn on every deploy attempt, blocking this migration
+    # (and everything after it) from ever completing on production. Postgres
+    # DDL is transactional, so every failed attempt rolled back cleanly with
+    # no data impact -- but the fix is to check existence first, the same
+    # defensive discipline already used below for the unique constraints.
+    payment_columns = {c['name'] for c in inspect(bind).get_columns('payment')}
+    if 'reseller_id' in payment_columns:
+        with op.batch_alter_table('payment', schema=None) as batch_op:
+            batch_op.drop_column('reseller_id')
+    else:
+        print("NOTE: payment.reseller_id already absent -- skipping drop (nothing to do).")
 
     _add_unique_constraint_if_safe(bind, 'tenant', 'slug', 'uq_tenant_slug')
     _add_unique_constraint_if_safe(bind, 'user', 'username', 'uq_user_username')
@@ -120,6 +138,11 @@ def downgrade():
     _drop_unique_constraint_if_present('user', 'uq_user_username')
     _drop_unique_constraint_if_present('tenant', 'uq_tenant_slug')
 
-    with op.batch_alter_table('payment', schema=None) as batch_op:
-        batch_op.add_column(sa.Column('reseller_id', sa.INTEGER(), nullable=True))
-        batch_op.create_foreign_key(None, 'reseller', ['reseller_id'], ['id'])
+    bind = op.get_bind()
+    payment_columns = {c['name'] for c in inspect(bind).get_columns('payment')}
+    if 'reseller_id' not in payment_columns:
+        with op.batch_alter_table('payment', schema=None) as batch_op:
+            batch_op.add_column(sa.Column('reseller_id', sa.INTEGER(), nullable=True))
+            batch_op.create_foreign_key(None, 'reseller', ['reseller_id'], ['id'])
+    else:
+        print("NOTE: payment.reseller_id already present -- skipping re-add (nothing to do).")
