@@ -8,14 +8,13 @@ Every public function returns (ok: bool, value) and never raises -- a scrape
 failure must never block or crash a billing-side request, same contract as
 mikrotik.py.
 
-Written and proven against Terra (PROradius product) first; parameterized by
-provider.portal_url so the same code should serve the other PROradius
-upstreams (IDM, Northern Telecom, Net360, Eaglenet) later without changes,
-once the selector constants below are confirmed against each. The CAPTCHA'd
-'radiusnew' family is explicitly out of scope for this module.
+Confirmed against the real Terra portal (PROradius product,
+acppro.terra.net.lb) via live discovery on 2026-08-23. Terra has announced a
+migration to a new "ProRadiusV5" portal at a different address -- per the
+tenant, do NOT target that new address; this module stays pointed at the
+current site until told otherwise.
 """
 import logging
-import re
 
 from dateutil import parser as date_parser
 from playwright.sync_api import sync_playwright
@@ -26,22 +25,35 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT_MS = 25_000
 
-# Best-guess selectors for Terra's PROradius portal, NOT yet confirmed
-# against the live site -- see the "Live discovery against Terra" task in
-# docs/superpowers/plans/2026-08-22-upstream-status-sync.md. Update these
-# constants (and _parse_status's text matching, if needed) once that task
-# runs -- nothing else in this module should need to change just because one
-# of these guesses was wrong.
+# Confirmed against the real Terra login page.
 LOGIN_USERNAME_SELECTOR = 'input[name="username"]'
 LOGIN_PASSWORD_SELECTOR = 'input[name="password"]'
 LOGIN_SUBMIT_SELECTOR = 'button[type="submit"]'
-LOGIN_SUCCESS_SELECTOR = 'text=Logout'  # presence after submit == login succeeded
+# "Log Out" only exists inside a closed dropdown menu, not visible right
+# after login -- "Balance" is in the page header on every authenticated
+# page instead, confirmed present immediately after a successful login.
+LOGIN_SUCCESS_SELECTOR = 'text=Balance'
 SUBSCRIBER_TABLE_SELECTOR = 'table'
 
-_STATUS_TEXT_MAP = (
-    ('expired', 'expired'),
-    ('offline', 'offline'),
-    ('online', 'online'),
+# The subscriber table's real column order, confirmed live: Username,
+# Fullname, Address, Phone, Reseller, Service, MAC, IP, Last Activity,
+# Expiry -- 0-indexed, so Expiry is column 9.
+EXPIRY_COLUMN_INDEX = 9
+
+# Status is conveyed by a CSS utility class on a colored "chip" within the
+# username cell, NOT by any visible text -- confirmed live: bg-success
+# (green) for an active/current subscriber, bg-warning (yellow) for one
+# whose Expiry date has already passed. bg-danger (red, for an active
+# subscriber who is simply offline right now) was not directly observed --
+# no test account happened to be in that state during discovery -- but is
+# inferred with high confidence from this same UI component's standard
+# 3-color convention (success/warning/danger) and matches the reseller's
+# own description of the portal (green/red/yellow). Reconfirm against a
+# real offline account if one becomes available.
+_STATUS_CLASS_MAP = (
+    ('bg-danger', 'offline'),
+    ('bg-warning', 'expired'),
+    ('bg-success', 'online'),
 )
 
 
@@ -71,28 +83,26 @@ def _find_subscriber_row(page, username):
     return row.first
 
 
-def _parse_status(row_text):
-    lowered = row_text.lower()
-    for needle, status in _STATUS_TEXT_MAP:
-        if needle in lowered:
+def _parse_status(row):
+    chip = row.locator('[class*="bg-success"], [class*="bg-warning"], [class*="bg-danger"]').first
+    if chip.count() == 0:
+        return "unknown"
+    class_attr = chip.get_attribute("class") or ""
+    for needle, status in _STATUS_CLASS_MAP:
+        if needle in class_attr:
             return status
     return "unknown"
 
 
-_ISO_DATE_PATTERN = re.compile(r'\d{4}-\d{2}-\d{2}')
-
-
-def _parse_expiry(row_text):
-    # Row text usually also contains the subscriber's username (e.g.
-    # "user1  Online  Expires 2026-09-01"), which can include digits that
-    # confuse dateutil's fuzzy tokenizer (it may raise ParserError trying to
-    # reconcile unrelated numeric fragments into one date). Extract an
-    # unambiguous ISO date substring first when present, and only fall back
-    # to a full fuzzy parse of the row text otherwise.
-    match = _ISO_DATE_PATTERN.search(row_text)
-    candidate = match.group(0) if match else row_text
+def _parse_expiry(row):
+    cells = row.locator("td")
+    if cells.count() <= EXPIRY_COLUMN_INDEX:
+        return None
+    text = cells.nth(EXPIRY_COLUMN_INDEX).inner_text().strip()
+    if not text:
+        return None
     try:
-        return date_parser.parse(candidate, fuzzy=True)
+        return date_parser.parse(text)
     except (ValueError, OverflowError):
         return None
 
@@ -114,7 +124,8 @@ def get_subscriber_status(provider, username):
                 page.set_default_timeout(_TIMEOUT_MS)
                 _login(page, provider)
                 row = _find_subscriber_row(page, username)
-                row_text = row.inner_text()
+                status = _parse_status(row)
+                expiry = _parse_expiry(row)
             finally:
                 browser.close()
     except LoginFailed as e:
@@ -129,4 +140,4 @@ def get_subscriber_status(provider, username):
         logger.warning("Upstream portal scrape failed for provider %s: %s", provider.id, e)
         return False, "scrape_failed"
 
-    return True, {"status": _parse_status(row_text), "expiry": _parse_expiry(row_text)}
+    return True, {"status": status, "expiry": expiry}

@@ -1,8 +1,8 @@
 """Tests for upstream_portal.py -- no real browser or real portal involved.
 `sync_playwright` is monkeypatched to a small fake Playwright/Browser/Page
-double, mirroring the approach tests/test_mikrotik.py uses for librouteros:
-assert on orchestration and error classification, not on Terra's real DOM
-(which these fakes don't attempt to model)."""
+double. These fakes model the real Terra page structure confirmed via live
+discovery (2026-08-23): status is a CSS class on a chip in the username
+cell, and expiry is a specific table column (index 9), not free row text."""
 import types
 
 import pytest
@@ -16,10 +16,52 @@ def make_provider(id=1, portal_url="https://example.test/login", portal_username
     return types.SimpleNamespace(id=id, portal_url=portal_url, portal_username=portal_username, portal_password=portal_password)
 
 
-class FakeLocator:
-    def __init__(self, text, found):
+def make_cells(expiry="2026-09-01 17:38"):
+    # 10 columns, matching Terra's real order; only the Expiry column
+    # (index 9) is ever read by the code under test, the rest are unused
+    # placeholders.
+    return ["user1", "Full Name", "Address", "Phone", "Reseller", "Service", "MAC", "IP", "2026-01-01 00:00", expiry]
+
+
+class FakeCell:
+    def __init__(self, text):
         self._text = text
+
+    def inner_text(self):
+        return self._text
+
+
+class FakeCellsLocator:
+    def __init__(self, cell_texts):
+        self._cell_texts = cell_texts
+
+    def count(self):
+        return len(self._cell_texts)
+
+    def nth(self, i):
+        return FakeCell(self._cell_texts[i] if i < len(self._cell_texts) else "")
+
+
+class FakeChipLocator:
+    def __init__(self, chip_class):
+        self._chip_class = chip_class
+
+    def count(self):
+        return 1 if self._chip_class else 0
+
+    @property
+    def first(self):
+        return self
+
+    def get_attribute(self, name):
+        return self._chip_class if name == "class" else None
+
+
+class FakeRowLocator:
+    def __init__(self, found=True, chip_class="bg-success/20 text-success-700", cell_texts=None):
         self._found = found
+        self._chip_class = chip_class
+        self._cell_texts = cell_texts if cell_texts is not None else make_cells()
 
     def count(self):
         return 1 if self._found else 0
@@ -28,14 +70,21 @@ class FakeLocator:
     def first(self):
         return self
 
+    def locator(self, selector, has_text=None):
+        if selector == "td":
+            return FakeCellsLocator(self._cell_texts)
+        return FakeChipLocator(self._chip_class)
+
     def inner_text(self):
-        return self._text
+        return " ".join(self._cell_texts)
 
 
 class FakePage:
-    def __init__(self, row_text="", row_found=True, login_succeeds=True, goto_raises=None):
-        self._row_text = row_text
+    def __init__(self, row_found=True, chip_class="bg-success/20 text-success-700", cell_texts=None,
+                 login_succeeds=True, goto_raises=None):
         self._row_found = row_found
+        self._chip_class = chip_class
+        self._cell_texts = cell_texts
         self._login_succeeds = login_succeeds
         self._goto_raises = goto_raises
         self.filled = {}
@@ -59,7 +108,7 @@ class FakePage:
             raise PlaywrightTimeoutError("timed out waiting for login")
 
     def locator(self, selector, has_text=None):
-        return FakeLocator(self._row_text, found=self._row_found)
+        return FakeRowLocator(found=self._row_found, chip_class=self._chip_class, cell_texts=self._cell_texts)
 
 
 class FakeBrowser:
@@ -105,7 +154,7 @@ def patch_playwright(monkeypatch, page):
 # --- Success cases ---
 
 def test_get_subscriber_status_online(monkeypatch):
-    page = FakePage(row_text="user1  Online  Expires 2026-09-01", row_found=True)
+    page = FakePage(chip_class="bg-success/20 text-success-700", cell_texts=make_cells("2026-09-01 17:38"))
     patch_playwright(monkeypatch, page)
 
     ok, value = upstream_portal.get_subscriber_status(make_provider(), "user1")
@@ -116,7 +165,7 @@ def test_get_subscriber_status_online(monkeypatch):
 
 
 def test_get_subscriber_status_expired(monkeypatch):
-    page = FakePage(row_text="user1  Expired  Expires 2026-01-15", row_found=True)
+    page = FakePage(chip_class="bg-warning/20 text-warning-700", cell_texts=make_cells("2026-01-15 00:00"))
     patch_playwright(monkeypatch, page)
 
     ok, value = upstream_portal.get_subscriber_status(make_provider(), "user1")
@@ -124,8 +173,17 @@ def test_get_subscriber_status_expired(monkeypatch):
     assert (ok, value["status"]) == (True, "expired")
 
 
+def test_get_subscriber_status_offline(monkeypatch):
+    page = FakePage(chip_class="bg-danger/20 text-danger-700", cell_texts=make_cells("2026-09-01 17:38"))
+    patch_playwright(monkeypatch, page)
+
+    ok, value = upstream_portal.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, value["status"]) == (True, "offline")
+
+
 def test_login_fills_credentials_and_submits(monkeypatch):
-    page = FakePage(row_text="user1 Online", row_found=True)
+    page = FakePage()
     patch_playwright(monkeypatch, page)
 
     upstream_portal.get_subscriber_status(make_provider(portal_username="alice", portal_password="s3cret"), "user1")
@@ -138,7 +196,7 @@ def test_login_fills_credentials_and_submits(monkeypatch):
 # --- Failure cases ---
 
 def test_get_subscriber_status_not_found(monkeypatch):
-    page = FakePage(row_text="", row_found=False)
+    page = FakePage(row_found=False)
     patch_playwright(monkeypatch, page)
 
     ok, reason = upstream_portal.get_subscriber_status(make_provider(), "ghost")
