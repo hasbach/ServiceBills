@@ -60,9 +60,6 @@ SUBSCRIBER_TABLE_SELECTOR = 'table'
 # (data-key="username") on both Terra and Northern, same underlying
 # component library.
 USERNAME_FILTER_SELECTOR = 'th[data-key="username"] input'
-# How long to let the table's debounced search settle after filling the
-# filter box, before trusting what rows are currently rendered.
-_FILTER_DEBOUNCE_MS = 600
 
 # The subscriber table's real column order, confirmed live: Username,
 # Fullname, Address, Phone, Reseller, Service, MAC, IP, Last Activity,
@@ -123,7 +120,22 @@ def _find_subscriber_row(page, username):
     # not 'not_found' -- intentionally not caught in this function.
     page.wait_for_selector(f"{SUBSCRIBER_TABLE_SELECTOR} tbody tr", timeout=_TIMEOUT_MS)
     page.fill(USERNAME_FILTER_SELECTOR, username)
-    page.wait_for_timeout(_FILTER_DEBOUNCE_MS)
+    # PRODUCTION REGRESSION (2026-08-23): the filter re-queries the portal's
+    # own backend -- a real network round trip, not an instant client-side
+    # operation. A fixed short wait here worked in manual testing (same
+    # machine, near-zero latency) but caused real false "not_found" results
+    # in production for users who used to be found fine (including ones on
+    # page 1, unaffected by pagination), because the filtered results
+    # genuinely hadn't arrived yet by the time the row search ran. Actively
+    # waiting for a matching row to appear -- succeeding as soon as it does,
+    # up to the full timeout -- is the correct fix; a timeout here means the
+    # portal's own search genuinely found nothing within budget, which is a
+    # real 'not_found', not the generic 'timeout' reserved for the table
+    # failing to load at all (the wait above).
+    try:
+        page.wait_for_selector(f'{SUBSCRIBER_TABLE_SELECTOR} tbody tr:has-text("{username}")', timeout=_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        raise SubscriberNotFound(username)
     # `has_text` is a coarse pre-filter across the WHOLE row (all 10 columns
     # -- Fullname, Address, Phone, Reseller, Service, MAC, IP could all
     # coincidentally contain the username as a substring). The exact-match

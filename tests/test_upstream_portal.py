@@ -107,9 +107,10 @@ class FakeRowsLocator:
 
 class FakePage:
     def __init__(self, row_found=True, chip_class="bg-success/20 text-success-700", cell_texts=None,
-                 rows=None, login_succeeds=True, goto_raises=None):
+                 rows=None, login_succeeds=True, goto_raises=None, filtered_wait_times_out=False):
         self._login_succeeds = login_succeeds
         self._goto_raises = goto_raises
+        self._filtered_wait_times_out = filtered_wait_times_out
         self.filled = {}
         self.clicked = []
         self.goto_calls = []
@@ -137,9 +138,8 @@ class FakePage:
     def wait_for_selector(self, selector, timeout=None):
         if not self._login_succeeds:
             raise PlaywrightTimeoutError("timed out waiting for login")
-
-    def wait_for_timeout(self, ms):
-        pass
+        if self._filtered_wait_times_out and "has-text" in selector:
+            raise PlaywrightTimeoutError("timed out waiting for filtered row")
 
     def locator(self, selector, has_text=None):
         return FakeRowsLocator(self._rows, has_text=has_text)
@@ -316,6 +316,20 @@ def test_fills_username_filter_before_searching_rows(monkeypatch):
     upstream_portal.get_subscriber_status(make_provider(), "user1")
 
     assert page.filled[upstream_portal.USERNAME_FILTER_SELECTOR] == "user1"
+
+
+def test_filtered_search_timeout_is_not_found_not_timeout(monkeypatch):
+    # Regression test for the second production bug: a genuine timeout
+    # waiting for the FILTERED row (the portal's own search never turned up
+    # a match within budget) means the user really isn't there -- must be
+    # reported as 'not_found', not the generic 'timeout' reserved for the
+    # table failing to load at all.
+    page = FakePage(filtered_wait_times_out=True)
+    patch_playwright(monkeypatch, page)
+
+    ok, reason = upstream_portal.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, reason) == (False, "not_found")
 
 
 def test_get_subscriber_status_ambiguous_match_is_scrape_failed(monkeypatch):
