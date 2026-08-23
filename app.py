@@ -87,6 +87,7 @@ import storage
 import email_util
 import mikrotik
 import upstream_portal
+import upstream_portal_krypton
 from itsdangerous import URLSafeTimedSerializer, BadData
 
 
@@ -190,7 +191,7 @@ class UpstreamProvider(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
-    product = db.Column(db.String(20), nullable=False, default='manual')  # 'proradius', 'radiusnew', 'manual'
+    product = db.Column(db.String(20), nullable=False, default='manual')  # 'proradius', 'radiusnew', 'krypton', 'manual'
     portal_url = db.Column(db.String(300), nullable=True)
     portal_username = db.Column(db.String(100), nullable=True)
     portal_password = db.Column(EncryptedString, nullable=True)  # encrypted at rest; unused until portal automation ships
@@ -6464,7 +6465,10 @@ def sync_customer_upstream_status(customer_id):
     if not provider:
         return jsonify({'error': 'Linked Upstream Provider not found.'}), 404
 
-    ok, result = upstream_portal.get_subscriber_status(provider, customer.upstream_username)
+    if provider.product == 'krypton':
+        ok, result = upstream_portal_krypton.get_subscriber_status(provider, customer.upstream_username)
+    else:
+        ok, result = upstream_portal.get_subscriber_status(provider, customer.upstream_username)
     if not ok:
         return jsonify({'ok': False, 'error': result}), 502
 
