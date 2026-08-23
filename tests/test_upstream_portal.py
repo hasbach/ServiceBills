@@ -138,6 +138,9 @@ class FakePage:
         if not self._login_succeeds:
             raise PlaywrightTimeoutError("timed out waiting for login")
 
+    def wait_for_timeout(self, ms):
+        pass
+
     def locator(self, selector, has_text=None):
         return FakeRowsLocator(self._rows, has_text=has_text)
 
@@ -299,6 +302,20 @@ def test_get_subscriber_status_rejects_substring_match(monkeypatch):
     ok, reason = upstream_portal.get_subscriber_status(make_provider(), "user1")
 
     assert (ok, reason) == (False, "not_found")
+
+
+def test_fills_username_filter_before_searching_rows(monkeypatch):
+    # Regression test for the pagination bug found live on Northern Telecom
+    # (50 customers, 10/page -- Terra's <10 customers happened to fit on one
+    # page, masking this during Terra-only discovery). The username filter
+    # box must be filled BEFORE the row lookup, so a match beyond whatever
+    # page happens to be showing is never missed.
+    page = FakePage(cell_texts=make_cells_with_username("user1"))
+    patch_playwright(monkeypatch, page)
+
+    upstream_portal.get_subscriber_status(make_provider(), "user1")
+
+    assert page.filled[upstream_portal.USERNAME_FILTER_SELECTOR] == "user1"
 
 
 def test_get_subscriber_status_ambiguous_match_is_scrape_failed(monkeypatch):

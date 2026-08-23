@@ -50,6 +50,19 @@ LOGIN_SUCCESS_SELECTOR = 'text=Balance'
 # origin, since that URL is the login page, not the site root.
 SUBSCRIBER_LIST_PATH = '/users'
 SUBSCRIBER_TABLE_SELECTOR = 'table'
+# The subscriber list paginates once a reseller has enough customers --
+# confirmed live on Northern Telecom (50 customers, 10 per page, 5 pages);
+# Terra's <10 customers happened to fit on one page, which is exactly why
+# this was missed during Terra-only discovery ("some users sync, others
+# don't" was reported after Northern was linked). The Username column's own
+# search box narrows the FULL dataset server-side before any row lookup, so
+# pagination can never hide a match -- confirmed identical markup
+# (data-key="username") on both Terra and Northern, same underlying
+# component library.
+USERNAME_FILTER_SELECTOR = 'th[data-key="username"] input'
+# How long to let the table's debounced search settle after filling the
+# filter box, before trusting what rows are currently rendered.
+_FILTER_DEBOUNCE_MS = 600
 
 # The subscriber table's real column order, confirmed live: Username,
 # Fullname, Address, Phone, Reseller, Service, MAC, IP, Last Activity,
@@ -109,6 +122,8 @@ def _find_subscriber_row(page, username):
     # (table never loads) propagates as PlaywrightTimeoutError -> 'timeout',
     # not 'not_found' -- intentionally not caught in this function.
     page.wait_for_selector(f"{SUBSCRIBER_TABLE_SELECTOR} tbody tr", timeout=_TIMEOUT_MS)
+    page.fill(USERNAME_FILTER_SELECTOR, username)
+    page.wait_for_timeout(_FILTER_DEBOUNCE_MS)
     # `has_text` is a coarse pre-filter across the WHOLE row (all 10 columns
     # -- Fullname, Address, Phone, Reseller, Service, MAC, IP could all
     # coincidentally contain the username as a substring). The exact-match
