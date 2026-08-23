@@ -15,7 +15,7 @@ import {
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
 
-const PRODUCT_LABELS = { proradius: 'PROradius', radiusnew: 'radiusnew', manual: 'Manual' };
+const PRODUCT_LABELS = { proradius: 'PROradius', radiusnew: 'radiusnew', krypton: 'Krypton', manual: 'Manual' };
 
 // Upstream RADIUS operator the tenant is a subreseller of (mode: 'upstream_bridge').
 // Data-model + manual tracking only -- no portal automation exists yet, see
@@ -227,6 +227,7 @@ const UpstreamProviderManagementView = ({ customers = [] }) => {
                                 <MenuItem value="manual">Manual (not yet classified / no automation planned)</MenuItem>
                                 <MenuItem value="proradius">PROradius</MenuItem>
                                 <MenuItem value="radiusnew">radiusnew</MenuItem>
+                                <MenuItem value="krypton">Krypton</MenuItem>
                             </TextField>
                         </Grid>
                         <Grid item xs={12}>
