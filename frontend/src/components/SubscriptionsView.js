@@ -201,11 +201,14 @@ const SubscriptionsView = ({
 }) => {
     const theme = useTheme();
     const { apiService, user } = useAppContext();
-    // 'employee' (and anyone else without admin/finance) gets a read-only
-    // view of Subscriptions: status only, no balance, no action buttons --
-    // enforced here for the UI and separately on the backend
-    // (admin_or_finance_required() in app.py) for the actions themselves,
-    // so hiding these isn't just cosmetic.
+    // 'employee'/'collector' (and anyone else without admin/finance) get a
+    // read-only view of Subscriptions: status only, no balance, no header
+    // stats, no action buttons -- enforced here for the UI and separately
+    // on the backend (admin_or_finance_required() in app.py) for the
+    // actions themselves, so hiding these isn't just cosmetic. A combined
+    // role (e.g. "employee,collector") stays read-only too, since this is a
+    // positive check for admin/finance, not an absence check for the
+    // restricted roles.
     const userRoles = user?.role ? user.role.split(',').map(r => r.trim().toLowerCase()) : [];
     const canManageSubscriptions = userRoles.includes('admin') || userRoles.includes('finance');
     const [showAddCustomerForm, setShowAddCustomerForm] = useState(false);
@@ -807,33 +810,35 @@ const SubscriptionsView = ({
                             </Box>
                         )}
                     </Box>
-                    <Box sx={{ display: 'flex', gap: 3, alignItems: 'center', flexWrap: 'wrap' }}>
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                            <GroupIcon sx={{ fontSize: 20 }} />
-                            <Box>
-                                <Typography variant="caption" sx={{ opacity: 0.8, display: 'block' }}>Total Customers</Typography>
-                                <Typography variant="h6" sx={{ fontWeight: 700 }}>{pagination?.total || 0}</Typography>
+                    {canManageSubscriptions && (
+                        <Box sx={{ display: 'flex', gap: 3, alignItems: 'center', flexWrap: 'wrap' }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                <GroupIcon sx={{ fontSize: 20 }} />
+                                <Box>
+                                    <Typography variant="caption" sx={{ opacity: 0.8, display: 'block' }}>Total Customers</Typography>
+                                    <Typography variant="h6" sx={{ fontWeight: 700 }}>{pagination?.total || 0}</Typography>
+                                </Box>
+                            </Box>
+                            <Divider orientation="vertical" flexItem sx={{ bgcolor: 'rgba(255,255,255,0.3)' }} />
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                <CheckCircleIcon sx={{ fontSize: 20 }} />
+                                <Box>
+                                    <Typography variant="caption" sx={{ opacity: 0.8, display: 'block' }}>Active Subscriptions</Typography>
+                                    <Typography variant="h6" sx={{ fontWeight: 700 }}>{customers.filter(c => c.is_subscription_active).length}</Typography>
+                                </Box>
+                            </Box>
+                            <Divider orientation="vertical" flexItem sx={{ bgcolor: 'rgba(255,255,255,0.3)' }} />
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                <TrendingUpIcon sx={{ fontSize: 20 }} />
+                                <Box>
+                                    <Typography variant="caption" sx={{ opacity: 0.8, display: 'block' }}>Est. Monthly Revenue</Typography>
+                                    <Typography variant="h6" sx={{ fontWeight: 700 }}>
+                                        ${estimatedRevenue}
+                                    </Typography>
+                                </Box>
                             </Box>
                         </Box>
-                        <Divider orientation="vertical" flexItem sx={{ bgcolor: 'rgba(255,255,255,0.3)' }} />
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                            <CheckCircleIcon sx={{ fontSize: 20 }} />
-                            <Box>
-                                <Typography variant="caption" sx={{ opacity: 0.8, display: 'block' }}>Active Subscriptions</Typography>
-                                <Typography variant="h6" sx={{ fontWeight: 700 }}>{customers.filter(c => c.is_subscription_active).length}</Typography>
-                            </Box>
-                        </Box>
-                        <Divider orientation="vertical" flexItem sx={{ bgcolor: 'rgba(255,255,255,0.3)' }} />
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                            <TrendingUpIcon sx={{ fontSize: 20 }} />
-                            <Box>
-                                <Typography variant="caption" sx={{ opacity: 0.8, display: 'block' }}>Est. Monthly Revenue</Typography>
-                                <Typography variant="h6" sx={{ fontWeight: 700 }}>
-                                    ${estimatedRevenue}
-                                </Typography>
-                            </Box>
-                        </Box>
-                    </Box>
+                    )}
                 </Box>
             </Paper>
 

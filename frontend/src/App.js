@@ -59,9 +59,11 @@ import MikrotikServerManagementView from './components/MikrotikServerManagementV
 // ── Navigation config ────────────────────────────────────────────────────────
 const NAV_ITEMS = [
     { key: 'dashboard',          label: 'Dashboard',          icon: <DashboardIcon />,      group: 'main',      allowedRoles: ['admin', 'finance'] },
-    // 'employee' gets a read-only view here (status only, no balance/actions)
-    // -- enforced inside SubscriptionsView.js, not by this nav entry.
-    { key: 'subscriptions',      label: 'Subscriptions',      icon: <PeopleIcon />,          group: 'main',      allowedRoles: ['admin', 'finance', 'employee'] },
+    // 'employee'/'collector' get a read-only view here (status only, no
+    // balance/actions) -- enforced inside SubscriptionsView.js, not by this
+    // nav entry. A combined role like "employee,collector" stays read-only
+    // too, since that check only grants the full view for admin/finance.
+    { key: 'subscriptions',      label: 'Subscriptions',      icon: <PeopleIcon />,          group: 'main',      allowedRoles: ['admin', 'finance', 'employee', 'collector'] },
     { key: 'resellers',          label: 'Resellers',          icon: <ResellerIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
     { key: 'suppliers',          label: 'Suppliers',          icon: <ShoppingCartIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
     // Concept A/B (see docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
