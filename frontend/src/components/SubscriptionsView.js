@@ -281,21 +281,62 @@ const SubscriptionsView = ({
     };
     const getUpstreamStatusColor = (status) => ({ online: '#10B981', offline: '#EF4444', expired: '#F59E0B' }[status] || '#6B7280');
 
+    // Lets anyone who can SEE the chip (including 'employee', who has no
+    // Edit access at all) trigger a fresh live check without it -- this
+    // endpoint only ever updates status/expiry fields, never balance or
+    // subscription state, so it was never one of the actions employees are
+    // restricted from.
+    const [syncingCustomerIds, setSyncingCustomerIds] = useState(new Set());
+    const handleQuickRefreshUpstreamStatus = async (customerId) => {
+        setSyncingCustomerIds(prev => new Set(prev).add(customerId));
+        try {
+            const response = await apiService.syncCustomerUpstreamStatus(customerId);
+            setSnackbar({
+                open: true,
+                message: response.data?.ok
+                    ? `Upstream status: ${response.data.upstream_last_status || 'unknown'}`
+                    : (response.data?.error || 'Failed to sync upstream status'),
+                severity: response.data?.ok ? 'success' : 'error',
+            });
+        } catch (error) {
+            setSnackbar({ open: true, message: error.response?.data?.error || error.response?.data?.message || 'Failed to sync upstream status', severity: 'error' });
+        } finally {
+            setSyncingCustomerIds(prev => { const next = new Set(prev); next.delete(customerId); return next; });
+            refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery);
+        }
+    };
+
     // Last-synced upstream status + drift, shown directly on the list/grid so
     // staff don't have to open Edit just to see it (the data is already on
-    // the customer object from the list API -- this never triggers a fresh
-    // live check, only Refresh Upstream Status inside Edit does that).
+    // the customer object from the list API). The refresh icon here is the
+    // only trigger for a fresh live check available to 'employee'; Edit's
+    // own "Refresh Upstream Status" panel still exists for admin/finance.
     const renderUpstreamStatusChip = (customer) => {
         if (businessSettings?.network_mode !== 'upstream_bridge' || !customer.upstream_provider_id || !customer.upstream_username) {
             return null;
         }
+        const isSyncing = syncingCustomerIds.has(customer.id);
+        const refreshButton = (
+            <Tooltip title="Refresh upstream status">
+                <span>
+                    <IconButton size="small" onClick={(e) => { e.stopPropagation(); handleQuickRefreshUpstreamStatus(customer.id); }} disabled={isSyncing} sx={{ p: 0.25 }}>
+                        {isSyncing ? <CircularProgress size={14} /> : <RefreshIcon sx={{ fontSize: 14 }} />}
+                    </IconButton>
+                </span>
+            </Tooltip>
+        );
         if (!customer.upstream_last_synced_at) {
-            return <Chip size="small" variant="outlined" label="Upstream: not synced" sx={{ fontSize: '0.7rem' }} />;
+            return (
+                <Box sx={{ display: 'flex', gap: 0.25, alignItems: 'center' }}>
+                    <Chip size="small" variant="outlined" label="Upstream: not synced" sx={{ fontSize: '0.7rem' }} />
+                    {refreshButton}
+                </Box>
+            );
         }
         const color = getUpstreamStatusColor(customer.upstream_last_status);
         const alertDrift = customer.upstream_drift?.severity === 'alert';
         return (
-            <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+            <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center', flexWrap: 'wrap' }}>
                 <Chip
                     size="small"
                     label={`Upstream: ${customer.upstream_last_status || 'unknown'}`}
@@ -314,6 +355,7 @@ const SubscriptionsView = ({
                         }}
                     />
                 )}
+                {refreshButton}
             </Box>
         );
     };
