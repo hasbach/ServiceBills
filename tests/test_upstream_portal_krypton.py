@@ -395,7 +395,7 @@ def test_reads_correct_columns_when_visible_order_differs_from_default(monkeypat
     cells = ["placeholder"] * 12
     cells[4] = "user1"          # Username now at index 4
     cells[3] = "Online"         # Status now at index 3
-    cells[11] = "2026-09-06 12:30:00"
+    cells[11] = DEFAULT_TEST_EXPIRY  # far-future -- see DEFAULT_TEST_EXPIRY's comment
     page = FakePage(cell_texts=cells, column_indices=custom_indices)
     patch_playwright(monkeypatch, page)
 
