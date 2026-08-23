@@ -878,6 +878,29 @@ def admin_required():
     return wrapper
 
 
+def admin_or_finance_required():
+    """Same admin/finance boundary already enforced (via a duplicated inline
+    check) on the payment endpoints -- applied here to the subscription-
+    mutating actions (renew/cancel/activate/delete) so that giving
+    'employee' users read access to the Subscriptions page doesn't also
+    silently hand them the ability to call these directly, bypassing a
+    frontend that merely hides the buttons. role is a comma-separated
+    string (e.g. 'admin,finance'), unlike admin_required()'s strict
+    equality check above -- split and check membership, not equality."""
+    def wrapper(fn):
+        @wraps(fn)
+        def decorator(*args, **kwargs):
+            verify_jwt_in_request()
+            claims = get_jwt()
+            roles = [r.strip().lower() for r in (claims.get('role') or '').split(',')]
+            if 'admin' in roles or 'finance' in roles:
+                return fn(*args, **kwargs)
+            else:
+                return jsonify(msg="Admins or finance only!"), 403
+        return decorator
+    return wrapper
+
+
 UPLOAD_FOLDER = 'uploads/'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -1879,6 +1902,7 @@ from datetime import datetime, timezone
 
 @app.route('/api/customers', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def add_customer():
     try:
         # Plan-gating: enforce the tenant's customer limit (None = unlimited).
@@ -2032,6 +2056,7 @@ def add_customer():
 
 @app.route('/api/customers/<int:customer_id>', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def update_customer(customer_id):
     try:
         customer = tenant_query(Customer).filter_by(id=customer_id).first()
@@ -2224,6 +2249,7 @@ def _delete_customer_core(customer):
 
 @app.route('/api/customers/<int:customer_id>', methods=['DELETE'])
 @jwt_required()
+@admin_or_finance_required()
 def delete_customer(customer_id):
     try:
         customer = tenant_query(Customer).filter_by(id=customer_id).first()
@@ -2244,6 +2270,7 @@ def delete_customer(customer_id):
 
 @app.route('/api/customers/bulk_delete', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def bulk_delete_customers():
     """Delete a batch of customers in a single request instead of one HTTP
     round trip per row. Recomputes estimated profit once for the whole batch
@@ -3203,6 +3230,7 @@ def bulk_delete_payments():
 
 @app.route('/api/customers/<int:customer_id>/activate_subscription', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def activate_subscription(customer_id):
     customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
@@ -3298,6 +3326,7 @@ def _cancel_subscription_core(customer):
 
 @app.route('/api/customers/<int:customer_id>/cancel_subscription', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def cancel_subscription(customer_id):
     customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
@@ -3326,6 +3355,7 @@ def cancel_subscription(customer_id):
 
 @app.route('/api/customers/bulk_cancel_subscription', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def bulk_cancel_subscriptions():
     """Cancel a batch of customer subscriptions in a single request instead of
     one HTTP round trip per row. Recomputes estimated profit once for the
@@ -5287,6 +5317,7 @@ def _renew_subscription_core(customer):
 
 @app.route('/api/customers/<int:customer_id>/renew_subscription', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def renew_subscription(customer_id):
     try:
         customer = tenant_query(Customer).filter_by(id=customer_id).first()
@@ -5306,6 +5337,7 @@ def renew_subscription(customer_id):
 
 @app.route('/api/customers/bulk_renew_subscription', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def bulk_renew_subscriptions():
     """Renew a batch of customer subscriptions in a single request instead of
     one HTTP round trip per row."""

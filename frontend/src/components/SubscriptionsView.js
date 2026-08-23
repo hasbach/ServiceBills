@@ -200,7 +200,14 @@ const SubscriptionsView = ({
     setCustomerResellerId
 }) => {
     const theme = useTheme();
-    const { apiService } = useAppContext();
+    const { apiService, user } = useAppContext();
+    // 'employee' (and anyone else without admin/finance) gets a read-only
+    // view of Subscriptions: status only, no balance, no action buttons --
+    // enforced here for the UI and separately on the backend
+    // (admin_or_finance_required() in app.py) for the actions themselves,
+    // so hiding these isn't just cosmetic.
+    const userRoles = user?.role ? user.role.split(',').map(r => r.trim().toLowerCase()) : [];
+    const canManageSubscriptions = userRoles.includes('admin') || userRoles.includes('finance');
     const [showAddCustomerForm, setShowAddCustomerForm] = useState(false);
     const [newCustomer, setNewCustomer] = useState({
         name: '',
@@ -701,9 +708,11 @@ const SubscriptionsView = ({
                 <Typography variant="body2" sx={{ color: 'text.disabled', mb: 3 }}>
                     {searchQuery || statusFilter !== 'all' ? "Try adjusting your filters or search query." : "Start by adding your first customer."}
                 </Typography>
-                <Button variant="contained" startIcon={<AddIcon />} onClick={() => setShowAddCustomerForm(true)} sx={{ borderRadius: '12px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5 }}>
-                    Add Customer
-                </Button>
+                {canManageSubscriptions && (
+                    <Button variant="contained" startIcon={<AddIcon />} onClick={() => setShowAddCustomerForm(true)} sx={{ borderRadius: '12px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5 }}>
+                        Add Customer
+                    </Button>
+                )}
             </Box>
         </Fade>
     );
@@ -745,14 +754,16 @@ const SubscriptionsView = ({
                             <Typography variant="h4" sx={{ fontWeight: 700, mb: 1 }}>Subscriptions Management</Typography>
                             <Typography variant="body1" sx={{ opacity: 0.9 }}>Manage customer subscriptions and track payments</Typography>
                         </Box>
-                        <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, gap: 2 }}>
-                            <Button variant="contained" startIcon={<DownloadIcon />} onClick={handleExportCSV} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
-                                Export CSV
-                            </Button>
-                            <Button variant="contained" startIcon={<AddIcon />} onClick={() => setShowAddCustomerForm(!showAddCustomerForm)} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
-                                {showAddCustomerForm ? 'Hide Form' : 'Add Customer'}
-                            </Button>
-                        </Box>
+                        {canManageSubscriptions && (
+                            <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, gap: 2 }}>
+                                <Button variant="contained" startIcon={<DownloadIcon />} onClick={handleExportCSV} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
+                                    Export CSV
+                                </Button>
+                                <Button variant="contained" startIcon={<AddIcon />} onClick={() => setShowAddCustomerForm(!showAddCustomerForm)} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
+                                    {showAddCustomerForm ? 'Hide Form' : 'Add Customer'}
+                                </Button>
+                            </Box>
+                        )}
                     </Box>
                     <Box sx={{ display: 'flex', gap: 3, alignItems: 'center', flexWrap: 'wrap' }}>
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -916,14 +927,18 @@ const SubscriptionsView = ({
                                                     </Box>
                                                 </Box>
                                                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, alignItems: 'flex-end' }}>
-                                                    <FormControlLabel 
-                                                        control={<Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />} 
-                                                        label={<Typography variant="caption" sx={{ fontWeight: 600 }}>WA Alerts</Typography>}
-                                                        labelPlacement="start"
-                                                        sx={{ m: 0 }}
-                                                    />
+                                                    {canManageSubscriptions && (
+                                                        <FormControlLabel
+                                                            control={<Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />}
+                                                            label={<Typography variant="caption" sx={{ fontWeight: 600 }}>WA Alerts</Typography>}
+                                                            labelPlacement="start"
+                                                            sx={{ m: 0 }}
+                                                        />
+                                                    )}
                                                     <Chip label={customer.is_subscription_active ? 'Active' : 'Canceled'} size="small" sx={{ backgroundColor: alpha(getStatusColor(customer.is_subscription_active), 0.1), color: getStatusColor(customer.is_subscription_active), fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(getStatusColor(customer.is_subscription_active), 0.2)}` }} />
-                                                    <Chip label={`Balance: $${customer.balance.toFixed(2)}`} size="small" sx={{ backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1), color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.2)}` }} />
+                                                    {canManageSubscriptions && (
+                                                        <Chip label={`Balance: $${customer.balance.toFixed(2)}`} size="small" sx={{ backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1), color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.2)}` }} />
+                                                    )}
                                                     {renderUpstreamStatusChip(customer)}
                                                 </Box>
                                             </Box>
@@ -934,19 +949,23 @@ const SubscriptionsView = ({
                                                 <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Start Date</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{new Date(customer.subscription_start_date).toLocaleDateString()}</Typography></Box></Grid>
                                                 <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Expiry Date</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{new Date(customer.subscription_expiry_date).toLocaleDateString()}</Typography></Box></Grid>
                                             </Grid>
-                                            <Divider sx={{ my: 2, opacity: 0.6 }} />
-                                            <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                                                <Button size="small" variant="outlined" startIcon={isExpanded ? <VisibilityOffIcon /> : <VisibilityIcon />} onClick={() => fetchCustomerPayments(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>{isExpanded ? 'Hide' : 'Payments'}</Button>
-                                                <Button size="small" variant="outlined" color="info" startIcon={<EditIcon />} onClick={() => { setEditingCustomer(customer); setEditDialogOpen(true); }} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Edit</Button>
-                                                <Button size="small" variant="outlined" color="success" startIcon={<RefreshIcon />} onClick={() => handleSubscriptionAction(apiService.renewSubscription, customer.id, "Renew subscription? (Reseller customers will have their reseller charged, others will get a new pending payment)")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Renew</Button>
-                                                <Button size="small" variant="outlined" color="primary" startIcon={<ChatIcon />} onClick={() => handleSendWAReminder(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>WA Reminder</Button>
-                                                {customer.is_subscription_active ? (
-                                                    <Button size="small" variant="outlined" color="warning" startIcon={<CancelIcon />} onClick={() => handleSubscriptionAction(apiService.cancelSubscription, customer.id, "Cancel subscription?")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Cancel</Button>
-                                                ) : (
-                                                    <Button size="small" variant="outlined" color="success" startIcon={<PlayArrowIcon />} onClick={() => handleSubscriptionAction(apiService.activateSubscription, customer.id, "Activate subscription?")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Activate</Button>
-                                                )}
-                                                <Button size="small" variant="outlined" color="error" startIcon={<DeleteIcon />} onClick={() => handleDeleteCustomer(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Delete</Button>
-                                            </Box>
+                                            {canManageSubscriptions && (
+                                                <>
+                                                    <Divider sx={{ my: 2, opacity: 0.6 }} />
+                                                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                                                        <Button size="small" variant="outlined" startIcon={isExpanded ? <VisibilityOffIcon /> : <VisibilityIcon />} onClick={() => fetchCustomerPayments(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>{isExpanded ? 'Hide' : 'Payments'}</Button>
+                                                        <Button size="small" variant="outlined" color="info" startIcon={<EditIcon />} onClick={() => { setEditingCustomer(customer); setEditDialogOpen(true); }} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Edit</Button>
+                                                        <Button size="small" variant="outlined" color="success" startIcon={<RefreshIcon />} onClick={() => handleSubscriptionAction(apiService.renewSubscription, customer.id, "Renew subscription? (Reseller customers will have their reseller charged, others will get a new pending payment)")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Renew</Button>
+                                                        <Button size="small" variant="outlined" color="primary" startIcon={<ChatIcon />} onClick={() => handleSendWAReminder(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>WA Reminder</Button>
+                                                        {customer.is_subscription_active ? (
+                                                            <Button size="small" variant="outlined" color="warning" startIcon={<CancelIcon />} onClick={() => handleSubscriptionAction(apiService.cancelSubscription, customer.id, "Cancel subscription?")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Cancel</Button>
+                                                        ) : (
+                                                            <Button size="small" variant="outlined" color="success" startIcon={<PlayArrowIcon />} onClick={() => handleSubscriptionAction(apiService.activateSubscription, customer.id, "Activate subscription?")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Activate</Button>
+                                                        )}
+                                                        <Button size="small" variant="outlined" color="error" startIcon={<DeleteIcon />} onClick={() => handleDeleteCustomer(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Delete</Button>
+                                                    </Box>
+                                                </>
+                                            )}
                                             <Collapse in={isExpanded}>
                                                 <Box sx={{ mt: 3, p: 2, backgroundColor: alpha(theme.palette.primary.main, 0.02), borderRadius: '12px' }}>
                                                     <Typography variant="h6" sx={{ mb: 2, fontWeight: 700 }}>Payments</Typography>
@@ -979,34 +998,38 @@ const SubscriptionsView = ({
             ) : (
                 // --- LIST VIEW (New) ---
                 <Paper sx={{ width: '100%', mb: 2, borderRadius: '16px', overflow: 'hidden' }}>
-                    <EnhancedTableToolbar
-                        numSelected={selected.length}
-                        onRenew={handleBulkRenew}
-                        onCancel={handleBulkCancel}
-                        onDelete={handleBulkDelete}
-                        disabled={bulkActionLoading}
-                    />
+                    {canManageSubscriptions && (
+                        <EnhancedTableToolbar
+                            numSelected={selected.length}
+                            onRenew={handleBulkRenew}
+                            onCancel={handleBulkCancel}
+                            onDelete={handleBulkDelete}
+                            disabled={bulkActionLoading}
+                        />
+                    )}
                     <TableContainer>
                         <Table sx={{ minWidth: 750 }} aria-labelledby="tableTitle">
                             <TableHead sx={{ backgroundColor: alpha(theme.palette.primary.main, 0.05) }}>
                                 <TableRow>
-                                    <TableCell padding="checkbox">
-                                        <Checkbox
-                                            color="primary"
-                                            indeterminate={selected.length > 0 && selected.length < sortedCustomers.length}
-                                            checked={sortedCustomers.length > 0 && selected.length === sortedCustomers.length}
-                                            onChange={handleSelectAllClick}
-                                            inputProps={{ 'aria-label': 'select all customers' }}
-                                        />
-                                    </TableCell>
+                                    {canManageSubscriptions && (
+                                        <TableCell padding="checkbox">
+                                            <Checkbox
+                                                color="primary"
+                                                indeterminate={selected.length > 0 && selected.length < sortedCustomers.length}
+                                                checked={sortedCustomers.length > 0 && selected.length === sortedCustomers.length}
+                                                onChange={handleSelectAllClick}
+                                                inputProps={{ 'aria-label': 'select all customers' }}
+                                            />
+                                        </TableCell>
+                                    )}
                                     <TableCell sx={{ fontWeight: 700 }}>Customer</TableCell>
                                     <TableCell sx={{ fontWeight: 700 }}>Contact</TableCell>
                                     <TableCell sx={{ fontWeight: 700 }}>Plan</TableCell>
                                     <TableCell sx={{ fontWeight: 700 }}>Status</TableCell>
-                                    <TableCell sx={{ fontWeight: 700 }}>WA Alerts</TableCell>
-                                    <TableCell sx={{ fontWeight: 700 }}>Balance</TableCell>
+                                    {canManageSubscriptions && <TableCell sx={{ fontWeight: 700 }}>WA Alerts</TableCell>}
+                                    {canManageSubscriptions && <TableCell sx={{ fontWeight: 700 }}>Balance</TableCell>}
                                     <TableCell sx={{ fontWeight: 700 }}>Expiry Date</TableCell>
-                                    <TableCell sx={{ fontWeight: 700 }}>Actions</TableCell>
+                                    {canManageSubscriptions && <TableCell sx={{ fontWeight: 700 }}>Actions</TableCell>}
                                 </TableRow>
                             </TableHead>
                             <TableBody>
@@ -1018,21 +1041,23 @@ const SubscriptionsView = ({
                                     return (
                                         <TableRow
                                             hover
-                                            onClick={(event) => handleSelectClick(event, customer.id)}
+                                            onClick={canManageSubscriptions ? (event) => handleSelectClick(event, customer.id) : undefined}
                                             role="checkbox"
                                             aria-checked={isItemSelected}
                                             tabIndex={-1}
                                             key={customer.id}
                                             selected={isItemSelected}
-                                            sx={{ cursor: 'pointer', '&.Mui-selected': { backgroundColor: alpha(theme.palette.primary.main, 0.08) } }}
+                                            sx={{ cursor: canManageSubscriptions ? 'pointer' : 'default', '&.Mui-selected': { backgroundColor: alpha(theme.palette.primary.main, 0.08) } }}
                                         >
-                                            <TableCell padding="checkbox">
-                                                <Checkbox
-                                                    color="primary"
-                                                    checked={isItemSelected}
-                                                    inputProps={{ 'aria-labelledby': labelId }}
-                                                />
-                                            </TableCell>
+                                            {canManageSubscriptions && (
+                                                <TableCell padding="checkbox">
+                                                    <Checkbox
+                                                        color="primary"
+                                                        checked={isItemSelected}
+                                                        inputProps={{ 'aria-labelledby': labelId }}
+                                                    />
+                                                </TableCell>
+                                            )}
                                             <TableCell component="th" id={labelId} scope="row" padding="none">
                                                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, p: 1 }}>
                                                     <Avatar sx={{ background: `linear-gradient(135deg, ${getPlanColor(plan?.name)}, ${alpha(getPlanColor(plan?.name), 0.7)})` }}>
@@ -1064,62 +1089,68 @@ const SubscriptionsView = ({
                                                     {renderUpstreamStatusChip(customer)}
                                                 </Box>
                                             </TableCell>
-                                            <TableCell onClick={(e) => e.stopPropagation()}>
-                                                <Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />
-                                            </TableCell>
-                                            <TableCell>
-                                                <Chip
-                                                    label={`$${customer.balance.toFixed(2)}`}
-                                                    size="small"
-                                                    sx={{
-                                                        backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1),
-                                                        color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main,
-                                                        fontWeight: 600,
-                                                    }}
-                                                />
-                                            </TableCell>
+                                            {canManageSubscriptions && (
+                                                <TableCell onClick={(e) => e.stopPropagation()}>
+                                                    <Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />
+                                                </TableCell>
+                                            )}
+                                            {canManageSubscriptions && (
+                                                <TableCell>
+                                                    <Chip
+                                                        label={`$${customer.balance.toFixed(2)}`}
+                                                        size="small"
+                                                        sx={{
+                                                            backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1),
+                                                            color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main,
+                                                            fontWeight: 600,
+                                                        }}
+                                                    />
+                                                </TableCell>
+                                            )}
                                             <TableCell>{new Date(customer.subscription_expiry_date).toLocaleDateString()}</TableCell>
-                                            <TableCell onClick={(e) => e.stopPropagation()} sx={{ whiteSpace: 'nowrap' }}>
-                                                {/* Stop propagation so clicking buttons doesn't select the row */}
-                                                <Tooltip title="Payments History">
-                                                    <IconButton size="small" color="secondary" onClick={() => fetchCustomerPayments(customer.id, customer)}>
-                                                        <ReceiptIcon fontSize="small" />
-                                                    </IconButton>
-                                                </Tooltip>
-                                                <Tooltip title="Edit">
-                                                    <IconButton size="small" color="info" onClick={() => { setEditingCustomer(customer); setEditDialogOpen(true); }}>
-                                                        <EditIcon fontSize="small" />
-                                                    </IconButton>
-                                                </Tooltip>
-                                                <Tooltip title="Renew">
-                                                    <IconButton size="small" color="success" onClick={() => handleSubscriptionAction(apiService.renewSubscription, customer.id, "Renew subscription? (Reseller customers will have their reseller charged, others will get a new pending payment)")}>
-                                                        <RefreshIcon fontSize="small" />
-                                                    </IconButton>
-                                                </Tooltip>
-                                                <Tooltip title="WA Reminder">
-                                                    <IconButton size="small" color="primary" onClick={() => handleSendWAReminder(customer.id)}>
-                                                        <ChatIcon fontSize="small" />
-                                                    </IconButton>
-                                                </Tooltip>
-                                                {customer.is_subscription_active ? (
-                                                    <Tooltip title="Cancel">
-                                                        <IconButton size="small" color="warning" onClick={() => handleSubscriptionAction(apiService.cancelSubscription, customer.id, "Cancel subscription?")}>
-                                                            <CancelIcon fontSize="small" />
+                                            {canManageSubscriptions && (
+                                                <TableCell onClick={(e) => e.stopPropagation()} sx={{ whiteSpace: 'nowrap' }}>
+                                                    {/* Stop propagation so clicking buttons doesn't select the row */}
+                                                    <Tooltip title="Payments History">
+                                                        <IconButton size="small" color="secondary" onClick={() => fetchCustomerPayments(customer.id, customer)}>
+                                                            <ReceiptIcon fontSize="small" />
                                                         </IconButton>
                                                     </Tooltip>
-                                                ) : (
-                                                    <Tooltip title="Activate">
-                                                        <IconButton size="small" color="success" onClick={() => handleSubscriptionAction(apiService.activateSubscription, customer.id, "Activate subscription?")}>
-                                                            <PlayArrowIcon fontSize="small" />
+                                                    <Tooltip title="Edit">
+                                                        <IconButton size="small" color="info" onClick={() => { setEditingCustomer(customer); setEditDialogOpen(true); }}>
+                                                            <EditIcon fontSize="small" />
                                                         </IconButton>
                                                     </Tooltip>
-                                                )}
-                                                <Tooltip title="Delete">
-                                                    <IconButton size="small" color="error" onClick={() => handleDeleteCustomer(customer.id)}>
-                                                        <DeleteIcon fontSize="small" />
-                                                    </IconButton>
-                                                </Tooltip>
-                                            </TableCell>
+                                                    <Tooltip title="Renew">
+                                                        <IconButton size="small" color="success" onClick={() => handleSubscriptionAction(apiService.renewSubscription, customer.id, "Renew subscription? (Reseller customers will have their reseller charged, others will get a new pending payment)")}>
+                                                            <RefreshIcon fontSize="small" />
+                                                        </IconButton>
+                                                    </Tooltip>
+                                                    <Tooltip title="WA Reminder">
+                                                        <IconButton size="small" color="primary" onClick={() => handleSendWAReminder(customer.id)}>
+                                                            <ChatIcon fontSize="small" />
+                                                        </IconButton>
+                                                    </Tooltip>
+                                                    {customer.is_subscription_active ? (
+                                                        <Tooltip title="Cancel">
+                                                            <IconButton size="small" color="warning" onClick={() => handleSubscriptionAction(apiService.cancelSubscription, customer.id, "Cancel subscription?")}>
+                                                                <CancelIcon fontSize="small" />
+                                                            </IconButton>
+                                                        </Tooltip>
+                                                    ) : (
+                                                        <Tooltip title="Activate">
+                                                            <IconButton size="small" color="success" onClick={() => handleSubscriptionAction(apiService.activateSubscription, customer.id, "Activate subscription?")}>
+                                                                <PlayArrowIcon fontSize="small" />
+                                                            </IconButton>
+                                                        </Tooltip>
+                                                    )}
+                                                    <Tooltip title="Delete">
+                                                        <IconButton size="small" color="error" onClick={() => handleDeleteCustomer(customer.id)}>
+                                                            <DeleteIcon fontSize="small" />
+                                                        </IconButton>
+                                                    </Tooltip>
+                                                </TableCell>
+                                            )}
                                         </TableRow>
                                     );
                                 })}
