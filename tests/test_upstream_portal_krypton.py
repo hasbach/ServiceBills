@@ -142,6 +142,7 @@ class FakePage:
         self.filled = {}
         self.clicked = []
         self.goto_calls = []
+        self.goto_wait_until_calls = []
         if rows is not None:
             self._rows = rows
         elif row_found:
@@ -152,8 +153,9 @@ class FakePage:
     def set_default_timeout(self, ms):
         pass
 
-    def goto(self, url, timeout=None):
+    def goto(self, url, timeout=None, wait_until=None):
         self.goto_calls.append(url)
+        self.goto_wait_until_calls.append(wait_until)
         if self._goto_raises:
             raise self._goto_raises
 
@@ -429,6 +431,23 @@ def test_navigates_to_login_page(monkeypatch):
     krypton.get_subscriber_status(make_provider(portal_url="https://example.test/login.php"), "user1")
 
     assert page.goto_calls == ["https://example.test/login.php"]
+
+
+def test_goto_waits_for_domcontentloaded_not_load(monkeypatch):
+    # Confirmed via a real production timeout on Smart Networks, 2026-08-24:
+    # Playwright's default wait_until="load" waits for every subresource
+    # (images, fonts, third-party scripts) to finish, and something on
+    # this portal's page never does from Render's network even though the
+    # page itself is fully usable well before that -- `Page.goto: Timeout
+    # 20000ms exceeded ... waiting until "load"` regardless of which
+    # configured URL was tried. Waiting for domcontentloaded only, which
+    # is all the code actually needs, fixed it.
+    page = FakePage()
+    patch_playwright(monkeypatch, page)
+
+    krypton.get_subscriber_status(make_provider(), "user1")
+
+    assert page.goto_wait_until_calls == ["domcontentloaded"]
 
 
 # --- Failure cases ---

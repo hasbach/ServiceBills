@@ -138,7 +138,17 @@ class ScrapeStructureChanged(Exception):
 
 
 def _login(page, provider):
-    page.goto(provider.portal_url, timeout=_TIMEOUT_MS)
+    # wait_until="domcontentloaded", not Playwright's default "load":
+    # confirmed via a real production timeout on Smart Networks, 2026-08-23
+    # -- `Page.goto: Timeout 20000ms exceeded` waiting for "load" on
+    # `resellerUsers.php`/`login.php` regardless of which one was
+    # configured, ruling out a bad URL. "load" only fires once every
+    # subresource (images, fonts, third-party scripts, etc.) finishes, and
+    # something on this portal's page apparently never does from Render's
+    # network even though the page itself is fully usable long before
+    # that -- a well-known Playwright gotcha. domcontentloaded only needs
+    # the DOM parsed, which is all the code below actually requires.
+    page.goto(provider.portal_url, timeout=_TIMEOUT_MS, wait_until="domcontentloaded")
     page.fill(LOGIN_USERNAME_SELECTOR, provider.portal_username)
     page.fill(LOGIN_PASSWORD_SELECTOR, provider.portal_password)
     page.click(LOGIN_SUBMIT_SELECTOR)
