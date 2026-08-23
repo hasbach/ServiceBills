@@ -4,11 +4,11 @@ import app as appmod
 from tests.conftest import make_tenant
 
 
-def _setup_bridged_customer(client, hdr, upstream_username="cust1"):
+def _setup_bridged_customer(client, hdr, upstream_username="cust1", product="proradius"):
     plan_id = client.post("/api/subscription_plans", headers=hdr,
                           json={"name": "P", "price": 10, "billing_cycle": "monthly"}).get_json()["plan"]["id"]
     provider_id = client.post("/api/upstream-providers", headers=hdr,
-                              json={"name": "Terra", "product": "proradius",
+                              json={"name": "Terra", "product": product,
                                     "portal_url": "https://acppro.terra.net.lb/login/",
                                     "portal_username": "reseller1", "portal_password": "pw"}
                               ).get_json()["provider"]["id"]
@@ -102,3 +102,23 @@ def test_customer_list_includes_upstream_drift(app, client, monkeypatch):
     listed = [c for c in resp.get_json()["customers"] if c["id"] == customer_id][0]
     assert listed["upstream_last_status"] == "expired"
     assert listed["upstream_drift"] == {"severity": "alert", "days": 2}
+
+
+def test_sync_dispatches_to_krypton_adapter_for_krypton_product(client, monkeypatch):
+    hdr = make_tenant(client, "Biz E", "e_admin")
+    customer_id = _setup_bridged_customer(client, hdr, product="krypton")
+    assert customer_id is not None
+
+    monkeypatch.setattr(
+        appmod.upstream_portal_krypton, "get_subscriber_status",
+        lambda provider, username: (True, {"status": "online", "expiry": None}),
+    )
+    monkeypatch.setattr(
+        appmod.upstream_portal, "get_subscriber_status",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("PROradius adapter must not be called for a krypton provider")),
+    )
+
+    resp = client.post(f"/api/customers/{customer_id}/upstream-status-sync", headers=hdr)
+
+    assert resp.status_code == 200
+    assert resp.get_json()["upstream_last_status"] == "online"

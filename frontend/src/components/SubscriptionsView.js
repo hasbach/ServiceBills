@@ -282,7 +282,20 @@ const SubscriptionsView = ({
         const colors = { 'basic': '#4F46E5', 'premium': '#10B981', 'pro': '#F59E0B', 'enterprise': '#8B5CF6', 'default': '#6B7280' };
         return colors[planName?.toLowerCase()] || colors.default;
     };
-    const getUpstreamStatusColor = (status) => ({ online: '#10B981', offline: '#EF4444', expired: '#F59E0B' }[status] || '#6B7280');
+    // 'blocked'/'near_expiry'/'quota_exceeded' are Krypton-only values (see
+    // upstream_portal_krypton.py) -- deliberately NOT copying Krypton's own
+    // portal colors (it renders blocked=orange, offline=light blue) since
+    // this app's status colors already mean the same thing across every
+    // upstream product (offline=red, expired=orange from the PROradius
+    // work) regardless of any one portal's own theme.
+    const getUpstreamStatusColor = (status) => ({
+        online: '#10B981',
+        offline: '#EF4444',
+        expired: '#F59E0B',
+        blocked: '#DC2626',
+        near_expiry: '#EAB308',
+        quota_exceeded: '#8B5CF6',
+    }[status] || '#6B7280');
 
     // Lets anyone who can SEE the chip (including 'employee', who has no
     // Edit access at all) trigger a fresh live check without it -- this
