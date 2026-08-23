@@ -108,27 +108,20 @@ class FakeRowsLocator:
         return self._rows[i]
 
 
-class FakeFilterInput:
-    def __init__(self, holder, key):
-        self._holder = holder
-        self._key = key
-
-    def fill(self, value):
-        self._holder[self._key] = value
-
-
 class FakeHeaderCell:
     """Models `page.locator('thead th:visible').nth(i)` -- only its
-    `.locator('input')` (the per-column filter box) is used by the code
-    under test."""
+    `.evaluate(script, arg)` is used by the code under test, driving the
+    DataTable's own column-search API directly (see
+    _find_subscriber_row -- filling the visible per-column filter <input>
+    was confirmed live not to reliably trigger this portal's search, so
+    the real code no longer does that)."""
 
     def __init__(self, filled_holder, index):
         self._filled_holder = filled_holder
         self._index = index
 
-    def locator(self, selector):
-        assert selector == "input", f"unexpected header-cell selector {selector!r}"
-        return FakeFilterInput(self._filled_holder, self._index)
+    def evaluate(self, script, arg=None):
+        self._filled_holder[self._index] = arg
 
 
 class FakeVisibleHeadersLocator:
@@ -488,11 +481,11 @@ def test_get_subscriber_status_ambiguous_match_is_scrape_failed(monkeypatch):
     assert (ok, reason) == (False, "scrape_failed")
 
 
-def test_fills_username_filter_before_searching_rows(monkeypatch):
+def test_searches_username_column_before_searching_rows(monkeypatch):
     # Regression-shaped test mirroring the PROradius pagination fix: the
-    # username filter box (resolved dynamically -- the fake records what
-    # was filled via the same holder dict the real filter input would use)
-    # must be filled before the row lookup.
+    # column search (resolved dynamically -- the fake records what was
+    # searched via the same holder dict the real DataTable API call would
+    # use) must be triggered before the row lookup.
     page = FakePage(cell_texts=make_cells(username="user1"))
     patch_playwright(monkeypatch, page)
 

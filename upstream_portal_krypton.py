@@ -11,7 +11,9 @@ public function returns (ok: bool, value) and never raises, same as
 mikrotik.py and upstream_portal.py.
 
 Read-only only: never clicks Renew/Block/Unblock or any other mutating
-action, only logs in, fills the Username column's own search box, and
+action, only logs in, searches the Username column via the table's own
+DataTable API (see _find_subscriber_row -- not by filling the visible
+search box, which was confirmed live not to reliably trigger it), and
 reads text -- no clicks anywhere on the subscriber list itself.
 
 CAPTCHA HANDLING (deliberate, not a gap): a `captcha` input exists in both
@@ -177,8 +179,32 @@ def _resolve_column_indices(page):
 
 
 def _find_subscriber_row(page, username, username_col_index):
-    filter_input = page.locator('thead th:visible').nth(username_col_index).locator('input')
-    filter_input.fill(username)
+    # Confirmed live on MyISP, 2026-08-24, after the first real production
+    # sync failed "not found" against a subscriber ("bach033") confirmed
+    # to genuinely exist: filling the per-column filter <input> only
+    # dispatches a single 'input' event -- exactly what Playwright's
+    # .fill() does -- and this portal's server-side search NEVER fired
+    # from that alone (verified live: the table sat completely unfiltered
+    # for 25+ seconds). The production failure was this literally --
+    # `wait_for_selector` below was searching the unfiltered first page,
+    # which "bach033" (and most real subscribers) simply isn't on. Driving
+    # the DataTable's own search API directly is what's actually reliable
+    # -- matched by the resolved header NODE itself, not a positional
+    # index, so this stays correct even under the portal's own "Column
+    # visibility" customization (a definition-order index would silently
+    # diverge from the visible-order index _resolve_column_indices
+    # resolves). This also sidesteps needing the filter <input> to be
+    # Playwright-actionable (visible, stable, enabled) at all -- only that
+    # the header node exists in the DOM, which it must, since column
+    # resolution already succeeded before this is called.
+    th = page.locator('thead th:visible').nth(username_col_index)
+    th.evaluate(
+        """(thEl, value) => {
+            const table = thEl.closest('table');
+            window.jQuery(table).DataTable().column(thEl).search(value).draw();
+        }""",
+        username,
+    )
     # Confirmed live: filtering re-queries the portal's own backend (real
     # server-side search, not instant client-side) on both MyISP and Smart
     # Networks. Actively waiting for a matching row -- succeeding as soon
