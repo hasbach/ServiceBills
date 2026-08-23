@@ -434,7 +434,7 @@ def test_navigates_to_login_page(monkeypatch):
 
 
 def test_goto_waits_for_domcontentloaded_not_load(monkeypatch):
-    # Confirmed via a real production timeout on Smart Networks, 2026-08-24:
+    # Confirmed via a real production timeout on Smart Networks, 2026-08-23:
     # Playwright's default wait_until="load" waits for every subresource
     # (images, fonts, third-party scripts) to finish, and something on
     # this portal's page never does from Render's network even though the

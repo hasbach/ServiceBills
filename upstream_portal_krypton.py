@@ -42,16 +42,19 @@ logger = logging.getLogger(__name__)
 
 # Same reasoning as upstream_portal.py's _TIMEOUT_MS (keep the realistic
 # worst-case total comfortably under the Dockerfile's `gunicorn --timeout
-# 120`), but a higher budget than PROradius's 10_000: live discovery
-# already saw the server-side search debounce take up to ~8s on MyISP in
-# an interactive session, and the first real production sync confirmed
-# this isn't a fluke -- a genuinely existing MyISP subscriber ("bach033",
-# confirmed to exist by direct DataTable API search) came back "not
-# found", and Smart Networks came back "timeout", both on 2026-08-24,
-# consistent with the search or login wait exceeding the old 10s budget
-# under real production latency. Worst case is still ~3 sequential waits
-# (login goto, wait-for-subscriber-list, wait-for-filtered-row), so
-# 20_000 x 3 = 60s stays comfortably under the 120s ceiling.
+# 120`), but a higher budget than PROradius's 10_000 as extra headroom:
+# live discovery saw the server-side search debounce take up to ~8s on
+# MyISP interactively. NOTE: the first production sync's actual failures
+# ("bach033" not found on MyISP, Smart Networks timing out, both
+# 2026-08-23 per Render's own logs) were NOT caused by this budget being
+# too tight -- they were separately root-caused and fixed as
+# _find_subscriber_row's .fill() never triggering the search at all, and
+# _login's page.goto() waiting on Playwright's default "load" (see the
+# comments there). This constant wasn't the fix for either; it's kept
+# only as reasonable slack. Worst
+# case is still ~3 sequential waits (login goto, wait-for-subscriber-
+# list, wait-for-filtered-row), so 20_000 x 3 = 60s stays comfortably
+# under the 120s ceiling.
 _TIMEOUT_MS = 20_000
 
 # Confirmed live on both MyISP (pi.myisp.live) and Smart Networks

@@ -298,12 +298,15 @@ class Customer(db.Model):
     upstream_provider_id = db.Column(db.Integer, db.ForeignKey('upstream_provider.id'), nullable=True)
     upstream_username = db.Column(db.String(100), nullable=True)
     # Read-only mirror of this customer's real state on the upstream portal,
-    # written only by upstream_portal.get_subscriber_status() via the
-    # /upstream-status-sync endpoint -- never by billing logic. A failed sync
-    # leaves all three untouched rather than clearing them. See
-    # docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md.
+    # written only by upstream_portal.get_subscriber_status() or
+    # upstream_portal_krypton.get_subscriber_status() (dispatched by
+    # UpstreamProvider.product) via the /upstream-status-sync endpoint --
+    # never by billing logic. A failed sync leaves all three untouched
+    # rather than clearing them. See
+    # docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md and
+    # docs/superpowers/specs/2026-08-23-krypton-upstream-status-sync-design.md.
     upstream_actual_expiry = db.Column(db.DateTime, nullable=True)
-    upstream_last_status = db.Column(db.String(20), nullable=True)  # 'online' | 'offline' | 'expired' | 'unknown'
+    upstream_last_status = db.Column(db.String(20), nullable=True)  # 'online' | 'offline' | 'expired' | 'near_expiry' | 'blocked' | 'quota_exceeded' | 'unknown'
     upstream_last_synced_at = db.Column(db.DateTime, nullable=True)
     # Populated only when network_mode is 'local_mikrotik' -- the router this
     # customer authenticates against and their /ppp/secret name on it.
@@ -6447,11 +6450,13 @@ def record_upstream_renewal_cost(provider_id):
         return jsonify({'error': str(e)}), 400
 
 
-# --- Read-only status sync against a customer's upstream portal account
-# (Terra/PROradius first -- see
-# docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md). Never
-# clicks anything on the portal, staff-triggered only, one customer at a
-# time -- no scheduler calls this.
+# --- Read-only status sync against a customer's upstream portal account.
+# Dispatches by UpstreamProvider.product: PROradius (Terra, Northern -- see
+# docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md) or
+# Krypton (MyISP, Smart Networks, Wise-ISP -- see
+# docs/superpowers/specs/2026-08-23-krypton-upstream-status-sync-design.md).
+# Never clicks anything on the portal, staff-triggered only, one customer
+# at a time -- no scheduler calls this.
 
 @app.route('/api/customers/<int:customer_id>/upstream-status-sync', methods=['POST'])
 @jwt_required()

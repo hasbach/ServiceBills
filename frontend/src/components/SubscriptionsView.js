@@ -297,6 +297,23 @@ const SubscriptionsView = ({
         quota_exceeded: '#8B5CF6',
     }[status] || '#6B7280');
 
+    // Single source of truth for both the list-row chip and the Edit
+    // dialog's "Network Status" chip -- the two used to be colored
+    // independently and only one got updated for Krypton's new values,
+    // leaving the dialog rendering blocked/near_expiry/quota_exceeded as a
+    // plain grey chip with no error. Also fixes the raw snake_case label
+    // ("quota_exceeded") that was otherwise shown verbatim in the UI.
+    const UPSTREAM_STATUS_LABELS = {
+        online: 'Online',
+        offline: 'Offline',
+        expired: 'Expired',
+        blocked: 'Blocked',
+        near_expiry: 'Near Expiry',
+        quota_exceeded: 'Quota Exceeded',
+        unknown: 'Unknown',
+    };
+    const getUpstreamStatusLabel = (status) => UPSTREAM_STATUS_LABELS[status] || status || 'unknown';
+
     // Lets anyone who can SEE the chip (including 'employee', who has no
     // Edit access at all) trigger a fresh live check without it -- this
     // endpoint only ever updates status/expiry fields, never balance or
@@ -355,7 +372,7 @@ const SubscriptionsView = ({
             <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center', flexWrap: 'wrap' }}>
                 <Chip
                     size="small"
-                    label={`Upstream: ${customer.upstream_last_status || 'unknown'}`}
+                    label={`Upstream: ${getUpstreamStatusLabel(customer.upstream_last_status)}`}
                     sx={{ backgroundColor: alpha(color, 0.1), color, fontWeight: 600, fontSize: '0.7rem', border: `1px solid ${alpha(color, 0.2)}` }}
                 />
                 {customer.upstream_drift && (
@@ -1335,12 +1352,11 @@ const SubscriptionsView = ({
                                             <Box sx={{ mt: 1, display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
                                                 <Chip
                                                     size="small"
-                                                    label={`Portal status: ${upstreamSyncStatus.upstream_last_status || 'unknown'}`}
-                                                    color={
-                                                        upstreamSyncStatus.upstream_last_status === 'online' ? 'success' :
-                                                        upstreamSyncStatus.upstream_last_status === 'offline' ? 'error' :
-                                                        upstreamSyncStatus.upstream_last_status === 'expired' ? 'warning' : 'default'
-                                                    }
+                                                    label={`Portal status: ${getUpstreamStatusLabel(upstreamSyncStatus.upstream_last_status)}`}
+                                                    sx={(() => {
+                                                        const color = getUpstreamStatusColor(upstreamSyncStatus.upstream_last_status);
+                                                        return { backgroundColor: alpha(color, 0.1), color, fontWeight: 600, border: `1px solid ${alpha(color, 0.2)}` };
+                                                    })()}
                                                 />
                                                 <Chip
                                                     size="small"
