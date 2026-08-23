@@ -29,6 +29,7 @@ indistinguishable from any other login failure. Do not add code that tries
 to detect or react to the CAPTCHA specifically.
 """
 import logging
+from datetime import datetime
 
 from dateutil import parser as date_parser
 from playwright.sync_api import sync_playwright
@@ -73,14 +74,41 @@ _REQUIRED_COLUMNS = ("Username", "Status", "Expiry Date")
 # -- it falls through to 'unknown', same safe fallback as any unrecognized
 # text. Substring matching (not exact-equality) so "Offline > 2 days"
 # still matches the 'offline' entry.
+#
+# 'disabled' -> 'blocked' confirmed live on MyISP, 2026-08-23: filtering
+# the Status column to the "Blocked" dropdown option returns rows whose
+# own displayed Status text reads "Disabled", never literally "Blocked" --
+# the filter's category name and the rendered text are not the same
+# string on this portal.
+#
+# 'near expiry' is kept here even though live discovery found it never
+# actually appears in the Status text on MyISP (see
+# _apply_near_expiry_override below, which is what actually produces
+# 'near_expiry' for the common case) -- harmless to leave in case some
+# other Krypton-family portal (Smart Networks, Wise-ISP -- neither
+# live-verified yet) renders it as literal text after all.
 _STATUS_TEXT_MAP = (
     ('near expiry', 'near_expiry'),
     ('expired', 'expired'),
     ('q-exceeded', 'quota_exceeded'),
     ('blocked', 'blocked'),
+    ('disabled', 'blocked'),
     ('offline', 'offline'),
     ('online', 'online'),
 )
+
+# Confirmed live on MyISP, 2026-08-23: the Status column's "Near Expiry"
+# filter category is a server-side query condition, not something
+# reflected in the Status cell's own text -- filtering to "Near Expiry"
+# returned real subscribers whose Status cell read plain "Online" (their
+# actual connection state; the underlying `available` field is computed
+# per-row for display, independent of the filter's semantic categories).
+# Text-matching alone can therefore never produce 'near_expiry' for the
+# common case of an online-but-expiring-soon subscriber, so it's computed
+# here instead, from the same Expiry Date already parsed for every
+# subscriber. 5-day window matches MyISP's own dashboard widget, which
+# labels this exact bucket "Near Expiry ... WITHIN 5 DAYS".
+_NEAR_EXPIRY_WINDOW_DAYS = 5
 
 
 class LoginFailed(Exception):
@@ -185,6 +213,22 @@ def _parse_status(row, status_col_index):
     return "unknown"
 
 
+def _apply_near_expiry_override(status, expiry):
+    """Overrides 'online' or 'unknown' with 'near_expiry' when `expiry` is
+    today or within the next _NEAR_EXPIRY_WINDOW_DAYS days -- see the
+    _NEAR_EXPIRY_WINDOW_DAYS comment above for why this can't be done from
+    Status text alone. Deliberately does NOT override 'offline', 'expired',
+    'blocked', or 'quota_exceeded' -- those are already more specific,
+    already-confirmed-live signals and take priority over a computed one.
+    """
+    if status not in ("online", "unknown") or expiry is None:
+        return status
+    days_until_expiry = (expiry.date() - datetime.utcnow().date()).days
+    if 0 <= days_until_expiry <= _NEAR_EXPIRY_WINDOW_DAYS:
+        return "near_expiry"
+    return status
+
+
 def _parse_expiry(row, expiry_col_index):
     cells = row.locator("td:visible")
     if cells.count() <= expiry_col_index:
@@ -219,6 +263,7 @@ def get_subscriber_status(provider, username):
                 row = _find_subscriber_row(page, username, columns["Username"])
                 status = _parse_status(row, columns["Status"])
                 expiry = _parse_expiry(row, columns["Expiry Date"])
+                status = _apply_near_expiry_override(status, expiry)
             finally:
                 browser.close()
     except LoginFailed as e:

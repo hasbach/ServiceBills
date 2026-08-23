@@ -9,6 +9,7 @@ of defined columns render at once), and the subscriber list uses real
 server-side search (a genuine network round trip on filter, not an instant
 client-side operation)."""
 import types
+from datetime import datetime, timedelta
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -27,7 +28,26 @@ def make_provider(id=1, portal_url="https://example.test/login.php", portal_user
 DEFAULT_COLUMN_INDICES = {"Username": 3, "Status": 4, "Expiry Date": 11}
 
 
-def make_cells(username="user1", status_text="Online", expiry="2026-09-06 12:30:00", n_cols=12):
+# Fixed far-future default -- deliberately NOT close to "now" by any
+# realistic margin. _apply_near_expiry_override() (added after live
+# discovery found 'near_expiry' can't be text-matched for the common
+# case -- see upstream_portal_krypton.py) computes off the real clock, so
+# a default expiry that was merely "months out" when this file was
+# written would eventually drift inside the near-expiry window and start
+# silently flipping the status-text-mapping tests below that use "Online"
+# or "Active" (which fall through to 'unknown') without ever touching the
+# override's own dedicated tests.
+DEFAULT_TEST_EXPIRY = "2030-01-01 12:30:00"
+
+
+def days_from_now(n):
+    """Returns an expiry-cell-formatted string N days from the real
+    clock -- used only by the near-expiry override tests below, which
+    must test relative to "today" rather than a fixed date."""
+    return (datetime.utcnow() + timedelta(days=n)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def make_cells(username="user1", status_text="Online", expiry=DEFAULT_TEST_EXPIRY, n_cols=12):
     # A row wide enough to cover the default column positions; unused
     # positions are harmless placeholders.
     cells = ["placeholder"] * n_cols
@@ -220,7 +240,7 @@ def test_get_subscriber_status_online(monkeypatch):
 
     assert ok is True
     assert value["status"] == "online"
-    assert value["expiry"].year == 2026 and value["expiry"].month == 9 and value["expiry"].day == 6
+    assert value["expiry"].year == 2030 and value["expiry"].month == 1 and value["expiry"].day == 1
 
 
 def test_get_subscriber_status_offline_over_2_days_maps_to_offline(monkeypatch):
@@ -277,6 +297,88 @@ def test_get_subscriber_status_active_is_unknown(monkeypatch):
     ok, value = krypton.get_subscriber_status(make_provider(), "user1")
 
     assert (ok, value["status"]) == (True, "unknown")
+
+
+def test_get_subscriber_status_disabled_maps_to_blocked(monkeypatch):
+    # Confirmed live on MyISP, 2026-08-23: filtering the Status column to
+    # its "Blocked" dropdown option returns rows whose own Status cell
+    # reads "Disabled", never literally "Blocked" -- the filter category
+    # name and the rendered text are different strings on this portal.
+    page = FakePage(cell_texts=make_cells(status_text="Disabled"))
+    patch_playwright(monkeypatch, page)
+
+    ok, value = krypton.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, value["status"]) == (True, "blocked")
+
+
+# --- Near-expiry override (computed from the Expiry Date, not text) ---
+# Confirmed live on MyISP, 2026-08-23: filtering to the "Near Expiry"
+# Status category returns real subscribers whose own Status cell reads
+# plain "Online" -- the category is a server-side query condition, never
+# reflected in the cell's own text. _apply_near_expiry_override() computes
+# this instead from the already-parsed Expiry Date. These tests use
+# days_from_now() (relative to the real clock), not a fixed date string,
+# because the thing under test is itself relative to "today".
+
+def test_get_subscriber_status_online_near_expiry_overrides_to_near_expiry(monkeypatch):
+    page = FakePage(cell_texts=make_cells(status_text="Online", expiry=days_from_now(2)))
+    patch_playwright(monkeypatch, page)
+
+    ok, value = krypton.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, value["status"]) == (True, "near_expiry")
+
+
+def test_get_subscriber_status_unknown_near_expiry_overrides_to_near_expiry(monkeypatch):
+    # "Active" (falls through to 'unknown') is also eligible for the
+    # override -- surfacing a computed near_expiry beats leaving a
+    # genuinely useful signal as an uninformative 'unknown'.
+    page = FakePage(cell_texts=make_cells(status_text="Active", expiry=days_from_now(3)))
+    patch_playwright(monkeypatch, page)
+
+    ok, value = krypton.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, value["status"]) == (True, "near_expiry")
+
+
+def test_get_subscriber_status_offline_not_overridden_even_when_near_expiry(monkeypatch):
+    # A more specific, already-confirmed-live text signal (offline,
+    # expired, blocked, quota_exceeded) takes priority over the computed
+    # override -- only 'online'/'unknown' are eligible.
+    page = FakePage(cell_texts=make_cells(status_text="Offline", expiry=days_from_now(1)))
+    patch_playwright(monkeypatch, page)
+
+    ok, value = krypton.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, value["status"]) == (True, "offline")
+
+
+def test_get_subscriber_status_near_expiry_boundary_expires_today(monkeypatch):
+    page = FakePage(cell_texts=make_cells(status_text="Online", expiry=days_from_now(0)))
+    patch_playwright(monkeypatch, page)
+
+    ok, value = krypton.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, value["status"]) == (True, "near_expiry")
+
+
+def test_get_subscriber_status_near_expiry_boundary_5_days_included(monkeypatch):
+    page = FakePage(cell_texts=make_cells(status_text="Online", expiry=days_from_now(5)))
+    patch_playwright(monkeypatch, page)
+
+    ok, value = krypton.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, value["status"]) == (True, "near_expiry")
+
+
+def test_get_subscriber_status_near_expiry_boundary_6_days_excluded(monkeypatch):
+    page = FakePage(cell_texts=make_cells(status_text="Online", expiry=days_from_now(6)))
+    patch_playwright(monkeypatch, page)
+
+    ok, value = krypton.get_subscriber_status(make_provider(), "user1")
+
+    assert (ok, value["status"]) == (True, "online")
 
 
 # --- Column resolution ---
