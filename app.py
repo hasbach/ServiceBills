@@ -162,11 +162,20 @@ class Tenant(db.Model):
     plan = db.Column(db.String(20), nullable=False, default="free")      # free, pro, ...
     stripe_customer_id = db.Column(db.String(120), nullable=True)
     stripe_subscription_id = db.Column(db.String(120), nullable=True)
+    # Self-serve Pro via Whish (see docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md):
+    # null for Free; the paid-through timestamp for Pro. Whish has no
+    # recurring-billing concept, so this is advanced manually on each
+    # successful checkout, not by any webhook/subscription-lifecycle event.
+    plan_expires_at = db.Column(db.DateTime, nullable=True)
+    # Set once the pre-expiry reminder email has gone out, so the daily
+    # scheduler job sends it once per expiry cycle, not once per tick.
+    plan_expiry_reminder_sent_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "slug": self.slug,
-                "status": self.status, "plan": self.plan}
+                "status": self.status, "plan": self.plan,
+                "plan_expires_at": self.plan_expires_at.strftime('%Y-%m-%d %H:%M:%S') if self.plan_expires_at else None}
 
 
 class User(db.Model):
@@ -903,6 +912,24 @@ class UpgradeRequest(db.Model):
         }
 
 
+class BillingPaymentAttempt(db.Model):
+    """One Whish checkout attempt for a Pro-plan payment. Whish's API has no
+    subscription/order object to query later -- this table is our own record
+    of what a payment was for, looked up by whish_external_id when Whish's
+    success/failure callback lands. See
+    docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    billing_cycle = db.Column(db.String(10), nullable=False)  # 'monthly' or 'yearly'
+    amount = db.Column(db.Float, nullable=False)
+    currency = db.Column(db.String(3), nullable=False, default='USD')
+    whish_external_id = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    callback_token = db.Column(db.String(64), nullable=False)
+    status = db.Column(db.String(10), nullable=False, default='pending')  # pending, succeeded, failed, expired
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+
+
 # --- Tenant write scoping (defense in depth) ---------------------------------
 # Every tenant-owned model. New rows of these get tenant_id stamped from the
 # request's JWT tenant automatically at flush time, so a bare `Model(...)` create
@@ -914,7 +941,7 @@ TENANT_OWNED_MODELS = (
     SupplierPayment, ExpenseCategory, Expense, Payment, GeneratedReceipt,
     AddonPurchase, BusinessSettings, WhatsAppSettings,
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
-    CustomerFeedback, PaymentReminder, UpgradeRequest,
+    CustomerFeedback, PaymentReminder, UpgradeRequest, BillingPaymentAttempt,
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
