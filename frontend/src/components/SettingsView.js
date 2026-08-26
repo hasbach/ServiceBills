@@ -88,7 +88,8 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
 
     // ── Business form state ───────────────────────────────────────────────────
     const [bizForm, setBizForm] = useState({
-        business_name: '', address: '', mobile: '', email: '', website: '', network_mode: 'none'
+        business_name: '', address: '', mobile: '', email: '', website: '', network_mode: 'none',
+        upstream_sync_automation_enabled: false
     });
     const [logoFile, setLogoFile] = useState(null);
     const [logoPreview, setLogoPreview] = useState(null);
@@ -102,7 +103,8 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 mobile: businessSettings.mobile || '',
                 email: businessSettings.email || '',
                 website: businessSettings.website || '',
-                network_mode: businessSettings.network_mode || 'none'
+                network_mode: businessSettings.network_mode || 'none',
+                upstream_sync_automation_enabled: !!businessSettings.upstream_sync_automation_enabled
             });
             if (businessSettings.logo_url) {
                 const url = businessSettings.logo_url;
@@ -246,6 +248,27 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                     <MenuItem value="upstream_bridge">Bridged — I'm a subreseller on an upstream's RADIUS portal</MenuItem>
                                     <MenuItem value="local_mikrotik">Self-hosted — I run my own Mikrotik with local PPPoE</MenuItem>
                                 </TextField>
+                            </Grid>
+                            <Grid item xs={12}>
+                                <Collapse in={bizForm.network_mode === 'upstream_bridge'}>
+                                    <Alert severity="info" icon={<InfoIcon />} sx={{ borderRadius: '12px', mb: 1 }}>
+                                        <FormControlLabel
+                                            control={
+                                                <Switch
+                                                    checked={bizForm.upstream_sync_automation_enabled}
+                                                    onChange={e => setBizForm(f => ({ ...f, upstream_sync_automation_enabled: e.target.checked }))}
+                                                />
+                                            }
+                                            label="Automatically refresh upstream status daily (beta)"
+                                        />
+                                        <Typography variant="body2" sx={{ mt: 0.5, opacity: 0.85 }}>
+                                            When on, each linked customer's upstream status/expiry is refreshed automatically once a day
+                                            instead of only when someone clicks "Refresh" on their record. Read-only — this never
+                                            suspends or unsuspends anyone's connection on its own, it only keeps the status shown in
+                                            ServiceBills up to date. Off by default while this rolls out.
+                                        </Typography>
+                                    </Alert>
+                                </Collapse>
                             </Grid>
                         </Grid>
                         <Button type="submit" variant="contained" startIcon={bizLoading ? <CircularProgress size={18} color="inherit" /> : <SaveIcon />} disabled={bizLoading}
