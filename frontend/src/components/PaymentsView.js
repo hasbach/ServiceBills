@@ -60,6 +60,7 @@ import {
     Undo as UndoIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
+import { escapeHtml } from '../utils/escapeHtml.js';
 
 
 // Revenue helpers — kept outside component so they are never recreated
@@ -406,7 +407,6 @@ const PaymentCardItem = React.memo(({
         </Fade>
     );
 });
-
 
 const PaymentsView = () => {
     const { user, apiService, setSnackbar } = useAppContext();
@@ -962,20 +962,20 @@ const handlePrint = () => {
                 <div class="receipt-container">
                     <div class="main-part">
                         <div class="receipt-details">
-                            <span>الإسم: ${receiptData.customer_name}</span>
-                            <span>العنوان: ${receiptData.customer_address}</span>
-                            <span>الهاتف: ${receiptData.customer_phone}</span>
-                            <span>تاريخ الإيصال: ${receiptData.payment_date}</span>
-                            <span>الدفعة الشهرية: ${(parseFloat(receiptData.subscription_plan_details?.price) || 0).toFixed(2)}$ - الخدمة: ${receiptData.subscription_plan_details?.name || 'انترنت'}</span>
+                            <span>الإسم: ${escapeHtml(receiptData.customer_name)}</span>
+                            <span>العنوان: ${escapeHtml(receiptData.customer_address)}</span>
+                            <span>الهاتف: ${escapeHtml(receiptData.customer_phone)}</span>
+                            <span>تاريخ الإيصال: ${escapeHtml(receiptData.payment_date)}</span>
+                            <span>الدفعة الشهرية: ${(parseFloat(receiptData.subscription_plan_details?.price) || 0).toFixed(2)}$ - الخدمة: ${escapeHtml(receiptData.subscription_plan_details?.name || 'انترنت')}</span>
                             <span>عن شهر: ${arabicMonthYear}</span>
                             <span style="font-weight: bold;">الرصيد الحالي: ${currentBalance}$ - الرصيد السابق: ${previousBalance}$</span>
                         </div>
                     </div>
                     <div class="mini-part">
                         <div class="receipt-details">
-                            <span>الإسم: ${receiptData.customer_name}</span>
-                            <span>العنوان: ${receiptData.customer_address}</span>
-                            <span>الهاتف: ${receiptData.customer_phone}</span>
+                            <span>الإسم: ${escapeHtml(receiptData.customer_name)}</span>
+                            <span>العنوان: ${escapeHtml(receiptData.customer_address)}</span>
+                            <span>الهاتف: ${escapeHtml(receiptData.customer_phone)}</span>
                             <span>الدفعة الشهرية: ${(parseFloat(receiptData.subscription_plan_details?.price) || 0).toFixed(2)}$</span>
                             <span>الرصيد الحالي: ${currentBalance}$</span>
                             <span>الرصيد السابق: ${previousBalance}$</span>
