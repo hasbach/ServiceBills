@@ -30,3 +30,11 @@ def test_billing_payment_attempt_model_roundtrip(app, client):
         assert fetched.status == "pending"
         assert fetched.tenant_id == tenant.id
         assert fetched.completed_at is None
+
+
+import plans as plansmod
+
+
+def test_pro_plan_has_whish_prices():
+    assert plansmod.PLANS['pro']['whish_price_monthly'] == 120.0
+    assert plansmod.PLANS['pro']['whish_price_yearly'] == 1000.0
