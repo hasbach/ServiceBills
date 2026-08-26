@@ -130,3 +130,40 @@ def test_create_payment_raises_on_non_2xx_status_even_if_json_looks_successful(m
             requestee="Biz", target="+961700", email="a@b.com", invoice="inv",
         )
     assert "500" in str(exc_info.value)
+
+
+def test_whish_checkout_rejects_bad_cycle(app, client):
+    hdr = make_tenant(client, "Biz Checkout", "checkout_admin")
+    r = client.post("/api/billing/whish/checkout", headers=hdr, json={"cycle": "weekly"})
+    assert r.status_code == 400
+
+
+def test_whish_checkout_creates_attempt_and_returns_redirect(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz Checkout2", "checkout2_admin")
+
+    def fake_create_payment(external_id, amount, currency, callback_token, requestee, target, email, invoice):
+        # Exact-signature fake (not **kwargs) so a keyword-wiring bug in the
+        # route (a typo'd or missing argument name) fails this test with a
+        # TypeError, matching test_billing.py's test_checkout_route convention.
+        assert amount == 120.0 and currency == 'USD'
+        return "https://whish.money/pay/xyz"
+    monkeypatch.setattr(appmod.whish_billing, "create_payment", fake_create_payment)
+    r = client.post("/api/billing/whish/checkout", headers=hdr, json={"cycle": "monthly"})
+    assert r.status_code == 200
+    assert r.get_json()["redirect"] == "https://whish.money/pay/xyz"
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Checkout2").first()
+        attempt = appmod.BillingPaymentAttempt.query.filter_by(tenant_id=tenant.id).first()
+        assert attempt is not None
+        assert attempt.billing_cycle == "monthly"
+        assert attempt.amount == 120.0
+        assert attempt.status == "pending"
+
+
+def test_whish_checkout_returns_502_when_whish_fails(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz Checkout3", "checkout3_admin")
+    def raise_error(external_id, amount, currency, callback_token, requestee, target, email, invoice):
+        raise appmod.whish_billing.WhishAPIError("boom")
+    monkeypatch.setattr(appmod.whish_billing, "create_payment", raise_error)
+    r = client.post("/api/billing/whish/checkout", headers=hdr, json={"cycle": "yearly"})
+    assert r.status_code == 502

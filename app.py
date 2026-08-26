@@ -5,6 +5,7 @@ import hashlib
 import math
 import time
 import threading
+import uuid
 import requests
 import traceback
 from flask import Flask, jsonify, request
@@ -1252,6 +1253,52 @@ def billing_portal():
         logging.error(f"Stripe portal failed: {e}")
         return jsonify({"msg": "Could not open billing portal"}), 502
     return jsonify({"url": url}), 200
+
+
+import whish_billing
+
+
+@app.route('/api/billing/whish/checkout', methods=['POST'])
+@jwt_required()
+@admin_required()
+def billing_whish_checkout():
+    data = request.json or {}
+    cycle = data.get('cycle')
+    if cycle not in ('monthly', 'yearly'):
+        return jsonify({"msg": "cycle must be 'monthly' or 'yearly'"}), 400
+
+    amount = plans.whish_price('pro', cycle)
+    if amount is None:
+        return jsonify({"msg": "Pro plan is not purchasable via Whish"}), 400
+
+    tenant = current_tenant()
+    settings = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+
+    external_id = uuid.uuid4().hex
+    callback_token = uuid.uuid4().hex
+    attempt = new_for_tenant(
+        BillingPaymentAttempt,
+        billing_cycle=cycle, amount=amount, currency='USD',
+        whish_external_id=external_id, callback_token=callback_token, status='pending',
+    )
+    db.session.add(attempt)
+    db.session.commit()
+
+    try:
+        redirect_url = whish_billing.create_payment(
+            external_id=external_id, amount=amount, currency='USD', callback_token=callback_token,
+            requestee=(settings.business_name if settings else tenant.name),
+            target=(settings.mobile if settings else ''),
+            email=(settings.email if settings else ''),
+            invoice='ServiceBills Pro subscription',
+        )
+    except whish_billing.WhishAPIError as e:
+        logging.error(f"Whish checkout failed for tenant {tenant.id}: {e}")
+        attempt.status = 'failed'
+        db.session.commit()
+        return jsonify({"msg": "Could not start Whish checkout"}), 502
+
+    return jsonify({"redirect": redirect_url}), 200
 
 
 @app.route('/api/tenant/me', methods=['GET'])
