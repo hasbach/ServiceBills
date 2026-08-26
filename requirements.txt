@@ -19,3 +19,4 @@ itsdangerous
 boto3
 librouteros
 playwright
+sentry-sdk[flask]==2.19.0

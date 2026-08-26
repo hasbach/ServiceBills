@@ -1,0 +1,31 @@
+name: Backend Test Suite
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+        # No `playwright install` step: the upstream-portal tests fully monkeypatch
+        # sync_playwright with fake objects (see tests/test_upstream_portal*.py) --
+        # no real browser binary is needed to run this suite.
+
+      - name: Run test suite
+        run: python -m pytest tests/ -q
+        # No env vars needed here: tests/conftest.py sets JWT_SECRET_KEY,
+        # DATABASE_PATH=:memory:, and RUN_SCHEDULER=0 itself at import time.

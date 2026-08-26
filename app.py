@@ -59,6 +59,20 @@ from config import Config
 app.config.from_object(Config)
 CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
 
+# Error tracking (Phase 2). Dormant/no-op if SENTRY_DSN is unset -- same optional-
+# feature pattern as Stripe/FERNET_KEY elsewhere in this file. Import is inside the
+# `if` so a dev environment without the package installed doesn't need it either.
+if Config.SENTRY_DSN:
+    import sentry_sdk
+    from sentry_sdk.integrations.flask import FlaskIntegration
+    sentry_sdk.init(
+        dsn=Config.SENTRY_DSN,
+        environment=Config.SENTRY_ENVIRONMENT,
+        integrations=[FlaskIntegration()],
+        traces_sample_rate=0.0,  # error tracking only for now, no perf tracing spend
+        send_default_pii=False,  # this app handles tenant billing/PII -- opt-in only
+    )
+
 # Served from frontend/public/serviceBillsLogo.png (build/ in prod). Used whenever
 # a tenant hasn't uploaded their own logo via /api/business-settings.
 DEFAULT_LOGO_URL = '/serviceBillsLogo.png'
@@ -110,6 +124,31 @@ from werkzeug.exceptions import Unauthorized
 @app.errorhandler(Unauthorized)
 def _unauthorized(e):
     return jsonify(msg=getattr(e, "description", "Unauthorized")), 401
+
+
+# Phase 2: a real liveness/readiness check, replacing a static-file check that
+# proved nothing about the app itself. Unauthenticated by design (load balancers/
+# uptime monitors don't carry a JWT); reveals no tenant data, only DB reachability.
+@app.route('/api/health')
+def health_check():
+    db_ok = True
+    db_error = None
+    try:
+        db.session.execute(db.text('SELECT 1'))
+    except Exception as e:
+        db_ok = False
+        db_error = str(e)
+
+    # Informational only -- RUN_SCHEDULER=0 is a valid, intentional config on a
+    # scaled-out web worker (see DEPLOY.md), so scheduler-off must never fail health.
+    payload = {
+        'status': 'ok' if db_ok else 'unhealthy',
+        'database': 'ok' if db_ok else 'error',
+        'scheduler_running': scheduler.running if 'scheduler' in globals() else None,
+    }
+    if db_error:
+        payload['database_error'] = db_error
+    return jsonify(payload), 200 if db_ok else 503
 
 
 # Database Models (unchanged)
