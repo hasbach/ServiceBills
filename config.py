@@ -40,6 +40,12 @@ class Config:
     APP_BASE_URL = os.environ.get("APP_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:3000"
     STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
     STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+    # Whish (Lebanon payment gateway) -- see
+    # docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md.
+    # Not yet issued as of 2026-08-26; whish_enabled in /api/billing/config
+    # stays False (hiding the self-serve button) until both are set.
+    WHISH_CHANNEL = os.environ.get("WHISH_CHANNEL")
+    WHISH_SECRET = os.environ.get("WHISH_SECRET")
     # Email: "console" (dev/CI, records in-memory), "smtp", or "sendgrid" (recommended
     # in prod -- rides over HTTPS, unlike raw SMTP ports many hosts block outbound).
     MAIL_BACKEND = os.environ.get("MAIL_BACKEND", "console")

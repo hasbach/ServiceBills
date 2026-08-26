@@ -5,9 +5,11 @@ import hashlib
 import math
 import time
 import threading
+import uuid
+import secrets
 import requests
 import traceback
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from datetime import datetime, timedelta, timezone
@@ -162,11 +164,23 @@ class Tenant(db.Model):
     plan = db.Column(db.String(20), nullable=False, default="free")      # free, pro, ...
     stripe_customer_id = db.Column(db.String(120), nullable=True)
     stripe_subscription_id = db.Column(db.String(120), nullable=True)
+    # Self-serve Pro via Whish (see docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md):
+    # null for Free; the paid-through timestamp for Pro. Whish has no
+    # recurring-billing concept, so this is advanced manually on each
+    # successful checkout, not by any webhook/subscription-lifecycle event.
+    plan_expires_at = db.Column(db.DateTime, nullable=True)
+    # Set once the pre-expiry reminder email has gone out, so the daily
+    # scheduler job sends it once per expiry cycle, not once per tick.
+    plan_expiry_reminder_sent_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "slug": self.slug,
-                "status": self.status, "plan": self.plan}
+                "status": self.status, "plan": self.plan,
+                # ISO-8601 with an explicit UTC 'Z' marker -- naive '%Y-%m-%d %H:%M:%S'
+                # was silently parsed as browser-LOCAL time by `new Date(...)` on the
+                # frontend, skewing the expiry countdown by the viewer's UTC offset.
+                "plan_expires_at": self.plan_expires_at.strftime('%Y-%m-%dT%H:%M:%SZ') if self.plan_expires_at else None}
 
 
 class User(db.Model):
@@ -903,6 +917,24 @@ class UpgradeRequest(db.Model):
         }
 
 
+class BillingPaymentAttempt(db.Model):
+    """One Whish checkout attempt for a Pro-plan payment. Whish's API has no
+    subscription/order object to query later -- this table is our own record
+    of what a payment was for, looked up by whish_external_id when Whish's
+    success/failure callback lands. See
+    docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    billing_cycle = db.Column(db.String(10), nullable=False)  # 'monthly' or 'yearly'
+    amount = db.Column(db.Float, nullable=False)
+    currency = db.Column(db.String(3), nullable=False, default='USD')
+    whish_external_id = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    callback_token = db.Column(db.String(64), nullable=False)
+    status = db.Column(db.String(10), nullable=False, default='pending')  # pending, succeeded, failed, expired
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+
+
 # --- Tenant write scoping (defense in depth) ---------------------------------
 # Every tenant-owned model. New rows of these get tenant_id stamped from the
 # request's JWT tenant automatically at flush time, so a bare `Model(...)` create
@@ -914,7 +946,7 @@ TENANT_OWNED_MODELS = (
     SupplierPayment, ExpenseCategory, Expense, Payment, GeneratedReceipt,
     AddonPurchase, BusinessSettings, WhatsAppSettings,
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
-    CustomerFeedback, PaymentReminder, UpgradeRequest,
+    CustomerFeedback, PaymentReminder, UpgradeRequest, BillingPaymentAttempt,
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
@@ -1227,6 +1259,107 @@ def billing_portal():
     return jsonify({"url": url}), 200
 
 
+import whish_billing
+
+
+@app.route('/api/billing/whish/checkout', methods=['POST'])
+@jwt_required()
+@admin_required()
+def billing_whish_checkout():
+    data = request.json or {}
+    cycle = data.get('cycle')
+    if cycle not in ('monthly', 'yearly'):
+        return jsonify({"msg": "cycle must be 'monthly' or 'yearly'"}), 400
+
+    amount = plans.whish_price('pro', cycle)
+    if amount is None:
+        return jsonify({"msg": "Pro plan is not purchasable via Whish"}), 400
+
+    tenant = current_tenant()
+    settings = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+
+    external_id = uuid.uuid4().hex
+    callback_token = uuid.uuid4().hex
+    attempt = new_for_tenant(
+        BillingPaymentAttempt,
+        billing_cycle=cycle, amount=amount, currency='USD',
+        whish_external_id=external_id, callback_token=callback_token, status='pending',
+    )
+    db.session.add(attempt)
+    db.session.commit()
+
+    try:
+        redirect_url = whish_billing.create_payment(
+            external_id=external_id, amount=amount, currency='USD', callback_token=callback_token,
+            requestee=(settings.business_name if settings else tenant.name),
+            target=(settings.mobile if settings else ''),
+            email=(settings.email if settings else ''),
+            invoice='ServiceBills Pro subscription',
+        )
+    except whish_billing.WhishAPIError as e:
+        logging.error(f"Whish checkout failed for tenant {tenant.id}: {e}")
+        attempt.status = 'failed'
+        db.session.commit()
+        return jsonify({"msg": "Could not start Whish checkout"}), 502
+
+    return jsonify({"redirect": redirect_url}), 200
+
+
+_WHISH_ATTEMPT_MAX_AGE = timedelta(hours=24)
+
+
+def _apply_whish_payment_success(attempt):
+    """Advance the paying tenant's plan/expiry. Extends from the current
+    plan_expires_at if it's still in the future (an early renewal), else
+    from now() -- matches the design spec's renewal semantics."""
+    tenant = db.session.get(Tenant, attempt.tenant_id)
+    now = datetime.utcnow()
+    base = tenant.plan_expires_at if (tenant.plan_expires_at and tenant.plan_expires_at > now) else now
+    delta = relativedelta(years=1) if attempt.billing_cycle == 'yearly' else relativedelta(months=1)
+    tenant.plan = 'pro'
+    tenant.plan_expires_at = base + delta
+    tenant.plan_expiry_reminder_sent_at = None
+    # Matches the Stripe checkout-completion path in billing.py: a successful
+    # payment must reactivate a suspended tenant, since _SUSPEND_EXEMPT_PREFIXES
+    # deliberately leaves billing/auth reachable while suspended specifically so
+    # a delinquent tenant can log in and pay its way back to active.
+    tenant.status = 'active'
+    attempt.status = 'succeeded'
+    attempt.completed_at = now
+    db.session.commit()
+
+
+@app.route('/api/billing/whish/success', methods=['GET'])
+def billing_whish_success():
+    # Public: Whish redirects the customer's browser here after payment (see
+    # the design spec for why this is a token-match model, not a signed
+    # webhook). Never raises on a bad/missing/replayed order+token -- always
+    # redirects somewhere sane.
+    external_id = request.args.get('order')
+    token = request.args.get('token')
+    attempt = BillingPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+
+    if (not attempt or attempt.status != 'pending' or not token
+            or not secrets.compare_digest(attempt.callback_token.encode(), token.encode())
+            or attempt.created_at < datetime.utcnow() - _WHISH_ATTEMPT_MAX_AGE):
+        logging.warning(f"Whish success callback rejected: order={external_id}")
+        return redirect(f"{Config.APP_BASE_URL}/billing?status=error")
+
+    _apply_whish_payment_success(attempt)
+    return redirect(f"{Config.APP_BASE_URL}/billing?status=success")
+
+
+@app.route('/api/billing/whish/failure', methods=['GET'])
+def billing_whish_failure():
+    external_id = request.args.get('order')
+    token = request.args.get('token')
+    attempt = BillingPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+    if attempt and attempt.status == 'pending' and token and secrets.compare_digest(attempt.callback_token.encode(), token.encode()):
+        attempt.status = 'failed'
+        db.session.commit()
+    return redirect(f"{Config.APP_BASE_URL}/billing?status=failed")
+
+
 @app.route('/api/tenant/me', methods=['GET'])
 @jwt_required()
 def tenant_me():
@@ -1250,9 +1383,12 @@ def list_plans():
 @jwt_required()
 def billing_config():
     # Tells the UI which upgrade paths to show. Contact-to-upgrade is always on;
-    # Stripe checkout appears only once keys + a Pro price are configured.
+    # Stripe checkout appears only once keys + a Pro price are configured (kept
+    # dormant, not removed -- see the Whish design spec for why); Whish appears
+    # only once real channel/secret credentials have been issued.
     stripe_enabled = bool(Config.STRIPE_SECRET_KEY and plans.PLANS.get('pro', {}).get('stripe_price'))
-    return jsonify({"stripe_enabled": stripe_enabled, "contact_enabled": True}), 200
+    whish_enabled = bool(Config.WHISH_CHANNEL and Config.WHISH_SECRET)
+    return jsonify({"stripe_enabled": stripe_enabled, "whish_enabled": whish_enabled, "contact_enabled": True}), 200
 
 
 @app.route('/api/billing/contact', methods=['POST'])
@@ -1409,9 +1545,22 @@ def _block_suspended_tenants():
             return jsonify({"msg": "Subscription inactive. Update billing to continue."}), 402
 
 
+# Columns withheld from /api/tenant/export per model. callback_token is the
+# bearer secret that gates billing_whish_success (see that route) -- a tenant
+# reading it back via their own export could self-grant Pro without paying.
+# whish_external_id is redacted alongside it since it's the paired lookup key
+# and a tenant has no legitimate need for either back via a data export.
+_EXPORT_COLUMN_DENYLIST = {
+    BillingPaymentAttempt: {"callback_token", "whish_external_id"},
+}
+
+
 def _row_to_dict(row):
+    denylist = _EXPORT_COLUMN_DENYLIST.get(type(row), ())
     out = {}
     for c in row.__table__.columns:
+        if c.name in denylist:
+            continue
         v = getattr(row, c.name)
         out[c.name] = v.isoformat() if isinstance(v, datetime) else v
     return out
@@ -1432,7 +1581,7 @@ def tenant_export():
 
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
-    UpgradeRequest, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
+    UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
     CustomerFeedback, ServiceStatus, Payment, ResellerPayment, SupplierPayment,
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
     WhatsAppSettings, ExpenseCategory, Sector,
@@ -1952,6 +2101,65 @@ def auto_sync_upstream_status_with_context():
         for t in Tenant.query.filter_by(status="active").all():
             auto_sync_upstream_status_for_tenant(t.id)
 
+
+# --- Self-serve Pro plan via Whish: renewal reminder + grace-period revert.
+# See docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md.
+# Whish has no auto-renew -- this is what keeps a lapsed Pro plan from
+# silently staying Pro forever, and what nudges a tenant to pay again before
+# that happens. Defined here, not near the checkout/callback routes further
+# down, for the exact same reason every other scheduler-registered function
+# in this file lives here: scheduler.add_job(func=...) below evaluates its
+# func argument at import time, so it must already be defined by the time
+# that line runs -- getting this wrong crashed production earlier today.
+_PRO_PLAN_REMINDER_WINDOW = timedelta(days=5)
+_PRO_PLAN_GRACE_PERIOD = timedelta(days=3)
+
+
+def check_pro_plan_expirations_for_tenant(tenant_id):
+    """Send the once-per-cycle reminder email inside the reminder window, and
+    revert plan='free' once the grace period has fully elapsed. Per-tenant
+    exceptions are caught and isolated by the caller
+    (check_pro_plan_expirations_with_context), not by this function itself
+    -- so one tenant's email/DB failure doesn't stop the rest of the daily
+    job, matching this file's established pattern for every other daily job."""
+    tenant = db.session.get(Tenant, tenant_id)
+    if not tenant or tenant.plan != 'pro' or not tenant.plan_expires_at:
+        return
+    now = datetime.utcnow()
+
+    if now > tenant.plan_expires_at + _PRO_PLAN_GRACE_PERIOD:
+        tenant.plan = 'free'
+        tenant.plan_expires_at = None
+        tenant.plan_expiry_reminder_sent_at = None
+        db.session.commit()
+        return
+
+    if now >= tenant.plan_expires_at - _PRO_PLAN_REMINDER_WINDOW and not tenant.plan_expiry_reminder_sent_at:
+        settings = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+        to_email = settings.email if settings and settings.email else None
+        if to_email:
+            try:
+                email_util.send(
+                    to_email, "servicesBills: your Pro plan is expiring soon",
+                    f"Your ServiceBills Pro plan expires on {tenant.plan_expires_at.strftime('%Y-%m-%d')}. "
+                    f"Renew from the Billing page to keep uninterrupted access.",
+                )
+            except Exception as e:
+                logging.warning(f"Pro-plan renewal reminder email failed for tenant {tenant_id}: {e}")
+        tenant.plan_expiry_reminder_sent_at = now
+        db.session.commit()
+
+
+def check_pro_plan_expirations_with_context():
+    with app.app_context():
+        for t in Tenant.query.filter_by(plan='pro').all():
+            try:
+                check_pro_plan_expirations_for_tenant(t.id)
+            except Exception as e:
+                db.session.rollback()
+                logging.error(f"Pro-plan expiration check failed for tenant {t.id}: {e}")
+
+
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
@@ -1985,6 +2193,7 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     # restarts (and re-fires next_run_time=now()) more than once a day --
     # not a change to this "fire immediately" pattern itself.
     scheduler.add_job(func=auto_sync_upstream_status_with_context, trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=check_pro_plan_expirations_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.start()
  
     

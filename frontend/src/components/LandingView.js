@@ -14,7 +14,7 @@ const FEATURES = [
 
 const PLANS = [
     { name: 'Free', price: '$0', features: ['Up to 50 customers', 'Manual WhatsApp (deep-link)', 'Core billing & receipts'] },
-    { name: 'Pro', price: 'Contact', highlighted: true, features: ['Unlimited customers', 'WhatsApp Cloud API (auto-send)', 'All features'] },
+    { name: 'Pro', price: '$120/mo', note: 'or $1000/yr — save ~30%', highlighted: true, features: ['Unlimited customers', 'WhatsApp Cloud API (auto-send)', 'All features'] },
 ];
 
 const LandingView = () => (
@@ -74,7 +74,8 @@ const LandingView = () => (
                                     <Typography variant="h5" sx={{ fontWeight: 800 }}>{p.name}</Typography>
                                     {p.highlighted && <Chip size="small" color="primary" label="Popular" />}
                                 </Box>
-                                <Typography variant="h4" sx={{ fontWeight: 800, mb: 2 }}>{p.price}</Typography>
+                                <Typography variant="h4" sx={{ fontWeight: 800, mb: p.note ? 0.5 : 2 }}>{p.price}</Typography>
+                                {p.note && <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>{p.note}</Typography>}
                                 <Stack spacing={1} sx={{ mb: 3 }}>
                                     {p.features.map((f) => (
                                         <Box key={f} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
