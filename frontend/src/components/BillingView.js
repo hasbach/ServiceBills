@@ -14,7 +14,7 @@ const WHISH_PRICES = { monthly: '$120/mo', yearly: '$1000/yr (save ~30%)' };
 
 function planExpiryBanner(tenant) {
     if (!tenant || tenant.plan !== 'pro' || !tenant.plan_expires_at) return null;
-    const expiresAt = new Date(tenant.plan_expires_at.replace(' ', 'T'));
+    const expiresAt = new Date(tenant.plan_expires_at);
     const daysLeft = Math.ceil((expiresAt - new Date()) / (1000 * 60 * 60 * 24));
     if (daysLeft > 5) return null;
     if (daysLeft >= 0) {

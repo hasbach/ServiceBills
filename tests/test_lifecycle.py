@@ -32,6 +32,34 @@ def test_export_contains_tenant_data(client):
     assert len(export["subscription_plan"]) == 1
 
 
+def test_export_redacts_whish_callback_token(app, client):
+    # A tenant must never be able to read back its own BillingPaymentAttempt
+    # callback_token via /api/tenant/export -- that token is what gates
+    # billing_whish_success, so leaking it lets a tenant self-grant Pro
+    # without paying (see billing_whish_checkout / _apply_whish_payment_success).
+    hdr = make_tenant(client, "Biz Whish Export", "whish_export_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(slug="biz-whish-export").first()
+        attempt = appmod.BillingPaymentAttempt(
+            tenant_id=tenant.id, billing_cycle="monthly", amount=120.0, currency="USD",
+            whish_external_id="secret-ext-id", callback_token="super-secret-token",
+            status="pending",
+        )
+        appmod.db.session.add(attempt)
+        appmod.db.session.commit()
+
+    export = client.get("/api/tenant/export", headers=hdr).get_json()
+    rows = export["billing_payment_attempt"]
+    assert len(rows) == 1
+    assert "callback_token" not in rows[0]
+    assert "whish_external_id" not in rows[0]
+    # The response body as a whole must not leak the secret values either.
+    import json as _json
+    body = _json.dumps(export)
+    assert "super-secret-token" not in body
+    assert "secret-ext-id" not in body
+
+
 def test_superadmin_delete_removes_only_that_tenant(app, client):
     a = make_tenant(client, "Biz A", "a_admin")
     make_tenant(client, "Biz B", "b_admin")

@@ -6,6 +6,7 @@ import math
 import time
 import threading
 import uuid
+import secrets
 import requests
 import traceback
 from flask import Flask, jsonify, request, redirect
@@ -176,7 +177,10 @@ class Tenant(db.Model):
     def to_dict(self):
         return {"id": self.id, "name": self.name, "slug": self.slug,
                 "status": self.status, "plan": self.plan,
-                "plan_expires_at": self.plan_expires_at.strftime('%Y-%m-%d %H:%M:%S') if self.plan_expires_at else None}
+                # ISO-8601 with an explicit UTC 'Z' marker -- naive '%Y-%m-%d %H:%M:%S'
+                # was silently parsed as browser-LOCAL time by `new Date(...)` on the
+                # frontend, skewing the expiry countdown by the viewer's UTC offset.
+                "plan_expires_at": self.plan_expires_at.strftime('%Y-%m-%dT%H:%M:%SZ') if self.plan_expires_at else None}
 
 
 class User(db.Model):
@@ -1315,6 +1319,11 @@ def _apply_whish_payment_success(attempt):
     tenant.plan = 'pro'
     tenant.plan_expires_at = base + delta
     tenant.plan_expiry_reminder_sent_at = None
+    # Matches the Stripe checkout-completion path in billing.py: a successful
+    # payment must reactivate a suspended tenant, since _SUSPEND_EXEMPT_PREFIXES
+    # deliberately leaves billing/auth reachable while suspended specifically so
+    # a delinquent tenant can log in and pay its way back to active.
+    tenant.status = 'active'
     attempt.status = 'succeeded'
     attempt.completed_at = now
     db.session.commit()
@@ -1330,7 +1339,8 @@ def billing_whish_success():
     token = request.args.get('token')
     attempt = BillingPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
 
-    if (not attempt or attempt.status != 'pending' or attempt.callback_token != token
+    if (not attempt or attempt.status != 'pending' or not token
+            or not secrets.compare_digest(attempt.callback_token, token)
             or attempt.created_at < datetime.utcnow() - _WHISH_ATTEMPT_MAX_AGE):
         logging.warning(f"Whish success callback rejected: order={external_id}")
         return redirect(f"{Config.APP_BASE_URL}/billing?status=error")
@@ -1344,7 +1354,7 @@ def billing_whish_failure():
     external_id = request.args.get('order')
     token = request.args.get('token')
     attempt = BillingPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
-    if attempt and attempt.status == 'pending' and attempt.callback_token == token:
+    if attempt and attempt.status == 'pending' and token and secrets.compare_digest(attempt.callback_token, token):
         attempt.status = 'failed'
         db.session.commit()
     return redirect(f"{Config.APP_BASE_URL}/billing?status=failed")
@@ -1535,9 +1545,22 @@ def _block_suspended_tenants():
             return jsonify({"msg": "Subscription inactive. Update billing to continue."}), 402
 
 
+# Columns withheld from /api/tenant/export per model. callback_token is the
+# bearer secret that gates billing_whish_success (see that route) -- a tenant
+# reading it back via their own export could self-grant Pro without paying.
+# whish_external_id is redacted alongside it since it's the paired lookup key
+# and a tenant has no legitimate need for either back via a data export.
+_EXPORT_COLUMN_DENYLIST = {
+    BillingPaymentAttempt: {"callback_token", "whish_external_id"},
+}
+
+
 def _row_to_dict(row):
+    denylist = _EXPORT_COLUMN_DENYLIST.get(type(row), ())
     out = {}
     for c in row.__table__.columns:
+        if c.name in denylist:
+            continue
         v = getattr(row, c.name)
         out[c.name] = v.isoformat() if isinstance(v, datetime) else v
     return out
@@ -2094,10 +2117,11 @@ _PRO_PLAN_GRACE_PERIOD = timedelta(days=3)
 
 def check_pro_plan_expirations_for_tenant(tenant_id):
     """Send the once-per-cycle reminder email inside the reminder window, and
-    revert plan='free' once the grace period has fully elapsed. Never raises
-    -- one tenant's email failure must not stop the rest of the daily job
-    (see the _with_context wrapper below), matching this file's established
-    pattern for every other daily job."""
+    revert plan='free' once the grace period has fully elapsed. Per-tenant
+    exceptions are caught and isolated by the caller
+    (check_pro_plan_expirations_with_context), not by this function itself
+    -- so one tenant's email/DB failure doesn't stop the rest of the daily
+    job, matching this file's established pattern for every other daily job."""
     tenant = db.session.get(Tenant, tenant_id)
     if not tenant or tenant.plan != 'pro' or not tenant.plan_expires_at:
         return

@@ -203,6 +203,24 @@ def test_whish_success_callback_upgrades_tenant_to_pro(app, client):
         assert attempt.completed_at is not None
 
 
+def test_whish_success_callback_reactivates_suspended_tenant(app, client):
+    make_tenant(client, "Biz Reactivate", "reactivate_admin")
+    tenant_id, ext_id = _make_pending_attempt(app, "Biz Reactivate")
+    with app.app_context():
+        tenant = appmod.db.session.get(appmod.Tenant, tenant_id)
+        tenant.status = "suspended"
+        appmod.db.session.commit()
+
+    r = client.get(f"/api/billing/whish/success?order={ext_id}&token=valid-token", follow_redirects=False)
+    assert r.status_code == 302
+    assert "status=success" in r.headers["Location"]
+
+    with app.app_context():
+        tenant = appmod.db.session.get(appmod.Tenant, tenant_id)
+        assert tenant.status == "active"
+        assert tenant.plan == "pro"
+
+
 def test_whish_success_callback_yearly_extends_by_a_year(app, client):
     make_tenant(client, "Biz Yearly", "yearly_admin")
     tenant_id, ext_id = _make_pending_attempt(app, "Biz Yearly", cycle="yearly", amount=1000.0)
