@@ -131,8 +131,11 @@ const BillingView = () => {
                                 <Box component="ul" sx={{ pl: 2, mb: 2, color: 'text.secondary' }}>
                                     {(FEATURES[name] || []).map((f, i) => <li key={i}>{f}</li>)}
                                 </Box>
-                                {name === 'pro' && (
-                                    <Stack spacing={1.5}>
+                                {tenant.plan === name && (
+                                    <Chip label="Current plan" size="small" sx={{ mb: name === 'pro' && whishEnabled ? 1.5 : 0 }} />
+                                )}
+                                {name === 'pro' && (tenant.plan !== 'pro' || whishEnabled) && (
+                                    <Stack spacing={1.5} sx={{ mt: tenant.plan === 'pro' ? 1.5 : 0 }}>
                                         {whishEnabled && (
                                             <>
                                                 <ToggleButtonGroup size="small" value={cycle} exclusive
@@ -145,7 +148,7 @@ const BillingView = () => {
                                                 </Button>
                                             </>
                                         )}
-                                        {stripeEnabled && (
+                                        {tenant.plan !== 'pro' && stripeEnabled && (
                                             <Button variant="outlined" disabled={busy} onClick={upgradeStripe}>
                                                 Upgrade to Pro (Stripe)
                                             </Button>
