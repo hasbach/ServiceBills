@@ -1845,6 +1845,113 @@ def send_daily_whatsapp_keepalive_with_context():
         for t in Tenant.query.filter_by(status="active").all():
             send_daily_whatsapp_keepalive(t.id)
 
+# --- Read-only status sync against a customer's upstream portal account.
+# Dispatches by UpstreamProvider.product: PROradius (Terra, Northern -- see
+# docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md) or
+# Krypton (MyISP, Smart Networks, Wise-ISP -- see
+# docs/superpowers/specs/2026-08-23-krypton-upstream-status-sync-design.md).
+# Never clicks anything on the portal. Two callers as of Phase 3: the
+# staff-triggered manual route (sync_customer_upstream_status below), and the
+# opt-in scheduled automation job (auto_sync_upstream_status_for_tenant) --
+# both route through _sync_customer_upstream_status_core so the concurrency
+# limit applies no matter which one is calling.
+#
+# Phase 3: caps concurrent Playwright/Chromium sessions -- previously
+# unlimited, which a prior audit flagged as a real memory-exhaustion risk
+# on a shared instance (each headless Chromium is ~150-300MB RSS). Serialized
+# to 1 by default (never more than one running at once); raise only after
+# confirming real memory headroom on the actual host. Process-local only --
+# a threading.Semaphore doesn't coordinate across gunicorn worker PROCESSES,
+# but that's fully sufficient for the current single-worker default
+# deployment (see DEPLOY.md); scaling to multiple workers later would need
+# a cross-process mechanism (e.g. a Postgres advisory lock) instead of this.
+#
+# Defined here (alongside the other scheduler jobs), not next to the manual
+# route further down, because scheduler.add_job(func=...) below evaluates
+# its func argument at import time -- it must already be defined by the time
+# that line runs, not merely by the time the app finishes loading.
+_UPSTREAM_SYNC_CONCURRENCY_LIMIT = 1
+_upstream_sync_semaphore = threading.Semaphore(_UPSTREAM_SYNC_CONCURRENCY_LIMIT)
+# A human waiting on the manual-trigger button shouldn't hang indefinitely
+# behind other syncs -- fail fast with a clear, retryable message well
+# inside gunicorn's 120s request timeout. The scheduled job (no HTTP client
+# waiting) blocks with no timeout instead -- see block=True below.
+_UPSTREAM_SYNC_ACQUIRE_TIMEOUT_SECONDS = 30
+
+
+def _sync_customer_upstream_status_core(customer, provider, block=True, timeout=None):
+    """The actual portal check, gated by the concurrency semaphore above.
+    Returns (ok, result) in the same shape as
+    upstream_portal[_krypton].get_subscriber_status."""
+    acquired = _upstream_sync_semaphore.acquire(blocking=block, timeout=timeout)
+    if not acquired:
+        return False, 'Too many upstream syncs already in progress -- try again shortly.'
+    try:
+        if provider.product == 'krypton':
+            return upstream_portal_krypton.get_subscriber_status(provider, customer.upstream_username)
+        return upstream_portal.get_subscriber_status(provider, customer.upstream_username)
+    finally:
+        _upstream_sync_semaphore.release()
+
+
+# --- Phase 3: opt-in scheduled automation for the sync above. Off by default
+# per tenant (BusinessSettings.upstream_sync_automation_enabled) -- a
+# deliberate beta/opt-in rollout, not default-on for everyone, given the
+# upstream-portal scrapers' documented fragility. Read-only, same as the
+# manual route: never suspends/unsuspends anything, only refreshes
+# upstream_last_status/upstream_actual_expiry.
+_UPSTREAM_AUTO_SYNC_MIN_INTERVAL = timedelta(hours=20)
+
+
+def auto_sync_upstream_status_for_tenant(tenant_id):
+    """Skips any customer synced within the last _UPSTREAM_AUTO_SYNC_MIN_INTERVAL
+    so repeated scheduler fires -- this host restarts often and re-fires all
+    daily jobs immediately on every restart, see the scheduler registration
+    comment below -- don't re-sync the same customer many times in one day.
+    Routes every real portal call through _sync_customer_upstream_status_core,
+    so the Playwright concurrency limit applies here exactly as it does for
+    the manual button. Never raises -- one customer's failure (portal down,
+    timeout) doesn't stop the rest of this tenant's customers, and one
+    tenant's failure doesn't stop the next tenant (see the _with_context
+    wrapper below)."""
+    settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).first()
+    if not settings or not settings.upstream_sync_automation_enabled:
+        return
+    cutoff = datetime.utcnow() - _UPSTREAM_AUTO_SYNC_MIN_INTERVAL
+    customers = Customer.query.filter(
+        Customer.tenant_id == tenant_id,
+        Customer.upstream_provider_id.isnot(None),
+        Customer.upstream_username.isnot(None),
+    ).filter(
+        db.or_(Customer.upstream_last_synced_at.is_(None), Customer.upstream_last_synced_at < cutoff)
+    ).all()
+    for customer in customers:
+        try:
+            provider = UpstreamProvider.query.filter_by(
+                id=customer.upstream_provider_id, tenant_id=tenant_id).first()
+            if not provider:
+                continue
+            # block=True, timeout=None: no HTTP client is waiting on this,
+            # so just wait for the semaphore rather than failing fast.
+            ok, result = _sync_customer_upstream_status_core(customer, provider, block=True, timeout=None)
+            if not ok:
+                logging.warning(f"Auto-sync failed for customer {customer.id} (tenant {tenant_id}): {result}")
+                continue
+            customer.upstream_last_status = result['status']
+            if result['expiry'] is not None:
+                customer.upstream_actual_expiry = result['expiry']
+            customer.upstream_last_synced_at = datetime.utcnow()
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logging.error(f"Auto-sync error for customer {customer.id} (tenant {tenant_id}): {e}")
+
+
+def auto_sync_upstream_status_with_context():
+    with app.app_context():
+        for t in Tenant.query.filter_by(status="active").all():
+            auto_sync_upstream_status_for_tenant(t.id)
+
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
@@ -6763,45 +6870,9 @@ def record_upstream_renewal_cost(provider_id):
 # docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md) or
 # Krypton (MyISP, Smart Networks, Wise-ISP -- see
 # docs/superpowers/specs/2026-08-23-krypton-upstream-status-sync-design.md).
-# Never clicks anything on the portal. Two callers as of Phase 3: the
-# staff-triggered manual route below, and the opt-in scheduled automation
-# job (auto_sync_upstream_status_for_tenant) -- both route through
-# _sync_customer_upstream_status_core so the concurrency limit applies no
-# matter which one is calling.
-#
-# Phase 3: caps concurrent Playwright/Chromium sessions -- previously
-# unlimited, which a prior audit flagged as a real memory-exhaustion risk
-# on a shared instance (each headless Chromium is ~150-300MB RSS). Serialized
-# to 1 by default (never more than one running at once); raise only after
-# confirming real memory headroom on the actual host. Process-local only --
-# a threading.Semaphore doesn't coordinate across gunicorn worker PROCESSES,
-# but that's fully sufficient for the current single-worker default
-# deployment (see DEPLOY.md); scaling to multiple workers later would need
-# a cross-process mechanism (e.g. a Postgres advisory lock) instead of this.
-_UPSTREAM_SYNC_CONCURRENCY_LIMIT = 1
-_upstream_sync_semaphore = threading.Semaphore(_UPSTREAM_SYNC_CONCURRENCY_LIMIT)
-# A human waiting on the manual-trigger button shouldn't hang indefinitely
-# behind other syncs -- fail fast with a clear, retryable message well
-# inside gunicorn's 120s request timeout. The scheduled job (no HTTP client
-# waiting) blocks with no timeout instead -- see block=True below.
-_UPSTREAM_SYNC_ACQUIRE_TIMEOUT_SECONDS = 30
-
-
-def _sync_customer_upstream_status_core(customer, provider, block=True, timeout=None):
-    """The actual portal check, gated by the concurrency semaphore above.
-    Returns (ok, result) in the same shape as
-    upstream_portal[_krypton].get_subscriber_status."""
-    acquired = _upstream_sync_semaphore.acquire(blocking=block, timeout=timeout)
-    if not acquired:
-        return False, 'Too many upstream syncs already in progress -- try again shortly.'
-    try:
-        if provider.product == 'krypton':
-            return upstream_portal_krypton.get_subscriber_status(provider, customer.upstream_username)
-        return upstream_portal.get_subscriber_status(provider, customer.upstream_username)
-    finally:
-        _upstream_sync_semaphore.release()
-
-
+# Never clicks anything on the portal. _sync_customer_upstream_status_core
+# and the semaphore it uses are defined earlier in this file, alongside the
+# other scheduler jobs -- see the comment there for why.
 @app.route('/api/customers/<int:customer_id>/upstream-status-sync', methods=['POST'])
 @jwt_required()
 def sync_customer_upstream_status(customer_id):
@@ -6836,65 +6907,6 @@ def sync_customer_upstream_status(customer_id):
         'upstream_last_synced_at': customer.upstream_last_synced_at.strftime('%Y-%m-%d %H:%M:%S'),
         'upstream_drift': _compute_upstream_drift(customer),
     }), 200
-
-
-# --- Phase 3: opt-in scheduled automation for the sync above. Off by default
-# per tenant (BusinessSettings.upstream_sync_automation_enabled) -- a
-# deliberate beta/opt-in rollout, not default-on for everyone, given the
-# upstream-portal scrapers' documented fragility. Read-only, same as the
-# manual route: never suspends/unsuspends anything, only refreshes
-# upstream_last_status/upstream_actual_expiry.
-_UPSTREAM_AUTO_SYNC_MIN_INTERVAL = timedelta(hours=20)
-
-
-def auto_sync_upstream_status_for_tenant(tenant_id):
-    """Skips any customer synced within the last _UPSTREAM_AUTO_SYNC_MIN_INTERVAL
-    so repeated scheduler fires -- this host restarts often and re-fires all
-    daily jobs immediately on every restart, see the scheduler registration
-    comment below -- don't re-sync the same customer many times in one day.
-    Routes every real portal call through _sync_customer_upstream_status_core,
-    so the Playwright concurrency limit applies here exactly as it does for
-    the manual button. Never raises -- one customer's failure (portal down,
-    timeout) doesn't stop the rest of this tenant's customers, and one
-    tenant's failure doesn't stop the next tenant (see the _with_context
-    wrapper below)."""
-    settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).first()
-    if not settings or not settings.upstream_sync_automation_enabled:
-        return
-    cutoff = datetime.utcnow() - _UPSTREAM_AUTO_SYNC_MIN_INTERVAL
-    customers = Customer.query.filter(
-        Customer.tenant_id == tenant_id,
-        Customer.upstream_provider_id.isnot(None),
-        Customer.upstream_username.isnot(None),
-    ).filter(
-        db.or_(Customer.upstream_last_synced_at.is_(None), Customer.upstream_last_synced_at < cutoff)
-    ).all()
-    for customer in customers:
-        try:
-            provider = UpstreamProvider.query.filter_by(
-                id=customer.upstream_provider_id, tenant_id=tenant_id).first()
-            if not provider:
-                continue
-            # block=True, timeout=None: no HTTP client is waiting on this,
-            # so just wait for the semaphore rather than failing fast.
-            ok, result = _sync_customer_upstream_status_core(customer, provider, block=True, timeout=None)
-            if not ok:
-                logging.warning(f"Auto-sync failed for customer {customer.id} (tenant {tenant_id}): {result}")
-                continue
-            customer.upstream_last_status = result['status']
-            if result['expiry'] is not None:
-                customer.upstream_actual_expiry = result['expiry']
-            customer.upstream_last_synced_at = datetime.utcnow()
-            db.session.commit()
-        except Exception as e:
-            db.session.rollback()
-            logging.error(f"Auto-sync error for customer {customer.id} (tenant {tenant_id}): {e}")
-
-
-def auto_sync_upstream_status_with_context():
-    with app.app_context():
-        for t in Tenant.query.filter_by(status="active").all():
-            auto_sync_upstream_status_for_tenant(t.id)
 
 
 @app.route('/api/mikrotik-servers', methods=['GET'])
