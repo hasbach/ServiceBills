@@ -38,3 +38,70 @@ import plans as plansmod
 def test_pro_plan_has_whish_prices():
     assert plansmod.PLANS['pro']['whish_price_monthly'] == 120.0
     assert plansmod.PLANS['pro']['whish_price_yearly'] == 1000.0
+
+
+import pytest
+import whish_billing
+
+
+class _FakeResponse:
+    def __init__(self, json_body, status_code=200):
+        self._json = json_body
+        self.status_code = status_code
+
+    def json(self):
+        return self._json
+
+
+def test_create_payment_returns_collect_url_on_success(monkeypatch):
+    monkeypatch.setattr(whish_billing.Config, "WHISH_CHANNEL", "chan1")
+    monkeypatch.setattr(whish_billing.Config, "WHISH_SECRET", "sec1")
+
+    captured = {}
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        return _FakeResponse({"status": True, "data": {"collectUrl": "https://whish.money/pay/abc"}})
+    monkeypatch.setattr(whish_billing.requests, "post", fake_post)
+
+    url = whish_billing.create_payment(
+        external_id="ext-1", amount=120.0, currency="USD", callback_token="tok-1",
+        requestee="Biz Name", target="+96170000000", email="biz@example.com",
+        invoice="ServiceBills Pro subscription",
+    )
+    assert url == "https://whish.money/pay/abc"
+    assert captured["url"] == whish_billing.WHISH_CREATE_URL
+    assert captured["headers"]["channel"] == "chan1"
+    assert captured["headers"]["secret"] == "sec1"
+    assert captured["json"]["externalId"] == "ext-1"
+    assert captured["json"]["amount"] == 120.0
+    assert captured["json"]["currency"] == "USD"
+    assert "token=tok-1" in captured["json"]["successCallbackUrl"]
+
+
+def test_create_payment_raises_on_failure_status(monkeypatch):
+    monkeypatch.setattr(whish_billing.Config, "WHISH_CHANNEL", "chan1")
+    monkeypatch.setattr(whish_billing.Config, "WHISH_SECRET", "sec1")
+    monkeypatch.setattr(
+        whish_billing.requests, "post",
+        lambda *a, **k: _FakeResponse({"status": False, "code": "currency.not_supported"}),
+    )
+    with pytest.raises(whish_billing.WhishAPIError):
+        whish_billing.create_payment(
+            external_id="ext-2", amount=120.0, currency="USD", callback_token="tok-2",
+            requestee="Biz", target="+961700", email="a@b.com", invoice="inv",
+        )
+
+
+def test_create_payment_raises_on_http_error(monkeypatch):
+    monkeypatch.setattr(whish_billing.Config, "WHISH_CHANNEL", "chan1")
+    monkeypatch.setattr(whish_billing.Config, "WHISH_SECRET", "sec1")
+    def raise_post(*a, **k):
+        raise whish_billing.requests.exceptions.ConnectionError("timeout")
+    monkeypatch.setattr(whish_billing.requests, "post", raise_post)
+    with pytest.raises(whish_billing.WhishAPIError):
+        whish_billing.create_payment(
+            external_id="ext-3", amount=120.0, currency="USD", callback_token="tok-3",
+            requestee="Biz", target="+961700", email="a@b.com", invoice="inv",
+        )
