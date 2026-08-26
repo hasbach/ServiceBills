@@ -1,5 +1,20 @@
+import hashlib
+import hmac
+import json
+
 import app as appmod
 from tests.conftest import make_tenant
+
+
+def _signed_post(client, payload, app_secret):
+    body = json.dumps(payload).encode("utf-8")
+    sig = hmac.new(app_secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return client.post(
+        "/api/whatsapp/webhook",
+        data=body,
+        content_type="application/json",
+        headers={"X-Hub-Signature-256": f"sha256={sig}"},
+    )
 
 
 def _seed_customer(client, hdr, phone):
@@ -17,12 +32,14 @@ def test_webhook_resolves_tenant_by_phone_number_id(app, client):
     _seed_customer(client, a, "70123456")
     _seed_customer(client, b, "70999999")
 
+    app_secret = "shh-tenant-a-secret"
     with app.app_context():
         a_tid = appmod.Tenant.query.filter_by(slug="biz-a").first().id
         b_tid = appmod.Tenant.query.filter_by(slug="biz-b").first().id
         # Tenant A owns business phone number "PNID_A" (no creds -> no outbound network calls).
         appmod.db.session.add(appmod.WhatsAppSettings(
-            tenant_id=a_tid, phone_number_id="PNID_A", enabled=True, mode="api"))
+            tenant_id=a_tid, phone_number_id="PNID_A", enabled=True, mode="api",
+            app_secret=app_secret))
         appmod.db.session.commit()
 
     payload = {"entry": [{"changes": [{"value": {
@@ -31,14 +48,61 @@ def test_webhook_resolves_tenant_by_phone_number_id(app, client):
         "messages": [{"from": "96170123456", "type": "text", "text": {"body": "hello"}}],
     }}]}]}
 
-    # Public endpoint (no auth). Meta delivers a message for tenant A's number.
-    r = client.post("/api/whatsapp/webhook", json=payload)
+    # Public endpoint (no auth). Meta delivers a message for tenant A's number,
+    # correctly signed with tenant A's app_secret.
+    r = _signed_post(client, payload, app_secret)
     assert r.status_code == 200
 
     with app.app_context():
         # The incoming reply became a support ticket for tenant A only.
         assert appmod.SupportTicket.query.filter_by(tenant_id=a_tid).count() == 1
         assert appmod.SupportTicket.query.filter_by(tenant_id=b_tid).count() == 0
+
+
+def test_webhook_rejects_missing_signature(app, client):
+    a = make_tenant(client, "Biz C", "c_admin")
+    with app.app_context():
+        a_tid = appmod.Tenant.query.filter_by(slug="biz-c").first().id
+        appmod.db.session.add(appmod.WhatsAppSettings(
+            tenant_id=a_tid, phone_number_id="PNID_C", enabled=True, mode="api",
+            app_secret="shh-tenant-c-secret"))
+        appmod.db.session.commit()
+
+    payload = {"entry": [{"changes": [{"value": {
+        "metadata": {"phone_number_id": "PNID_C"},
+        "contacts": [{"profile": {"name": "Cust C"}}],
+        "messages": [{"from": "96170000000", "type": "text", "text": {"body": "hello"}}],
+    }}]}]}
+
+    # No X-Hub-Signature-256 header at all.
+    r = client.post("/api/whatsapp/webhook", json=payload)
+    assert r.status_code == 401
+
+    with app.app_context():
+        assert appmod.SupportTicket.query.filter_by(tenant_id=a_tid).count() == 0
+
+
+def test_webhook_rejects_invalid_signature(app, client):
+    a = make_tenant(client, "Biz D", "d_admin")
+    with app.app_context():
+        a_tid = appmod.Tenant.query.filter_by(slug="biz-d").first().id
+        appmod.db.session.add(appmod.WhatsAppSettings(
+            tenant_id=a_tid, phone_number_id="PNID_D", enabled=True, mode="api",
+            app_secret="shh-tenant-d-secret"))
+        appmod.db.session.commit()
+
+    payload = {"entry": [{"changes": [{"value": {
+        "metadata": {"phone_number_id": "PNID_D"},
+        "contacts": [{"profile": {"name": "Cust D"}}],
+        "messages": [{"from": "96170000001", "type": "text", "text": {"body": "hello"}}],
+    }}]}]}
+
+    # Signed with the WRONG secret.
+    r = _signed_post(client, payload, "not-the-real-secret")
+    assert r.status_code == 401
+
+    with app.app_context():
+        assert appmod.SupportTicket.query.filter_by(tenant_id=a_tid).count() == 0
 
 
 def test_webhook_verifies_token_against_any_tenant(app, client):

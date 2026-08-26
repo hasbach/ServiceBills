@@ -1,5 +1,8 @@
 import os
 import re
+import hmac
+import hashlib
+import math
 import time
 import requests
 import traceback
@@ -589,11 +592,16 @@ class Payment(db.Model):
     reverted_at = db.Column(db.DateTime, nullable=True)
     reverted_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     revert_reason = db.Column(db.Text, nullable=True)
+    is_refund = db.Column(db.Boolean, nullable=False, default=False)
+    refund_reason = db.Column(db.Text, nullable=True)
+    refunded_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    refunded_at = db.Column(db.DateTime, nullable=True)
     addon_purchases = db.relationship('AddonPurchase', backref='payment', lazy=True)
 
     collected_by = db.relationship('User', foreign_keys=[collected_by_id])
     received_by = db.relationship('User', foreign_keys=[received_by_id])
     reverted_by = db.relationship('User', foreign_keys=[reverted_by_id])
+    refunded_by = db.relationship('User', foreign_keys=[refunded_by_id])
 
 
 class GeneratedReceipt(db.Model):
@@ -1927,9 +1935,22 @@ def add_customer():
         if not subscription_plan:
             return jsonify({'message': 'Subscription plan not found!'}), 404
 
-        discount = float(data.get('discount', 0.0))
+        try:
+            discount = float(data.get('discount', 0.0))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'discount must be a valid number.'}), 400
+        if not math.isfinite(discount) or discount < 0:
+            return jsonify({'error': 'discount cannot be negative.'}), 400
         raw_cost_override = data.get('cost_override')
-        cost_override = float(raw_cost_override) if raw_cost_override not in (None, '') else None
+        if raw_cost_override not in (None, ''):
+            try:
+                cost_override = float(raw_cost_override)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'cost_override must be a valid number.'}), 400
+            if not math.isfinite(cost_override) or cost_override < 0:
+                return jsonify({'error': 'cost_override cannot be negative.'}), 400
+        else:
+            cost_override = None
 
         conflict_error = _check_network_link_conflict(
             None,
@@ -2079,9 +2100,24 @@ def update_customer(customer_id):
         if 'sector' in data:
             customer.sector = data['sector']
         if 'discount' in data:
-            customer.discount = float(data['discount'])
+            try:
+                new_discount = float(data['discount'])
+            except (TypeError, ValueError):
+                return jsonify({'error': 'discount must be a valid number.'}), 400
+            if not math.isfinite(new_discount) or new_discount < 0:
+                return jsonify({'error': 'discount cannot be negative.'}), 400
+            customer.discount = new_discount
         if 'cost_override' in data:
-            customer.cost_override = float(data['cost_override']) if data['cost_override'] not in (None, '') else None
+            if data['cost_override'] not in (None, ''):
+                try:
+                    new_cost_override = float(data['cost_override'])
+                except (TypeError, ValueError):
+                    return jsonify({'error': 'cost_override must be a valid number.'}), 400
+                if not math.isfinite(new_cost_override) or new_cost_override < 0:
+                    return jsonify({'error': 'cost_override cannot be negative.'}), 400
+                customer.cost_override = new_cost_override
+            else:
+                customer.cost_override = None
         if 'balance' in data:
             customer.balance = float(data['balance'])
         if 'reseller_id' in data:
@@ -2313,6 +2349,7 @@ def bulk_delete_customers():
 
 @app.route('/api/payments/generate_future', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def generate_future_payments():
     try:
         data = request.json
@@ -2474,12 +2511,14 @@ def generate_future_payments():
         
 @app.route('/api/subscription_plans', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_subscription_plans():
     subscription_plans = tenant_query(SubscriptionPlan).all()
     return jsonify([plan.to_dict() for plan in subscription_plans]) # Use to_dict() for consistency
 
 @app.route('/api/subscription_plans', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def add_subscription_plan():
     try:
         data = request.json
@@ -2528,6 +2567,7 @@ def add_subscription_plan():
 
 @app.route('/api/subscription_plans/<int:plan_id>', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def update_subscription_plan(plan_id):
     try:
         plan = tenant_query(SubscriptionPlan).filter_by(id=plan_id).first()
@@ -2551,6 +2591,7 @@ def update_subscription_plan(plan_id):
 
 @app.route('/api/subscription_plans/<int:plan_id>', methods=['DELETE'])
 @jwt_required()
+@admin_or_finance_required()
 def delete_subscription_plan(plan_id):
     try:
         plan = tenant_query(SubscriptionPlan).filter_by(id=plan_id).first()
@@ -2566,8 +2607,27 @@ def delete_subscription_plan(plan_id):
         return jsonify({'error': str(e)}), 400
 
 
+def _parse_positive_amount(raw, field_name='amount'):
+    """Coerce a payment-amount-like field to a strictly positive float, raising
+    ValueError with a user-facing message if it's missing, non-numeric, zero,
+    or negative. Shared by every endpoint that mutates a payment/discount/
+    cost_override amount so a negative value can't silently become an
+    unbounded credit or surcharge. Refunds/adjustments are NOT made through
+    these fields -- they go through the dedicated refund endpoint instead."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f'{field_name} must be a valid number.')
+    if not math.isfinite(value):
+        raise ValueError(f'{field_name} must be a valid number.')
+    if value <= 0:
+        raise ValueError(f'{field_name} must be greater than zero.')
+    return value
+
+
 @app.route('/api/payments', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def add_payment():
     data = request.json
 
@@ -2588,7 +2648,10 @@ def add_payment():
         return jsonify({'error': 'Customer not found!'}), 404
 
     try:
-        payment_amount = float(data['amount'])
+        try:
+            payment_amount = _parse_positive_amount(data['amount'])
+        except ValueError as ve:
+            return jsonify({'error': str(ve)}), 400
         is_pre_payment = data.get('pre_payment', False)
         # A pre-payment is paid, a non-pre-payment (manual charge) is unpaid
         is_paid = is_pre_payment 
@@ -2738,6 +2801,7 @@ def _detach_payment_dependents(payment):
 
 @app.route('/api/payments/<int:payment_id>', methods=['DELETE'])
 @jwt_required()
+@admin_or_finance_required()
 def delete_payment(payment_id):
     try:
         payment = tenant_query(Payment).filter_by(id=payment_id).first()
@@ -2795,7 +2859,8 @@ def get_total_sales():
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.is_gratis == False,
-        Payment.pre_payment == False
+        Payment.pre_payment == False,
+        Payment.is_refund == False
     ).group_by('month').all()
 
     return jsonify([{
@@ -2929,7 +2994,10 @@ def mark_payment_as_paid(payment_id):
             # Save the collected amount
             partial_payment_flag = data.get('partial_payment', False)
             if partial_payment_flag:
-                payment.collected_amount = float(data.get('partial_amount', payment.amount))
+                try:
+                    payment.collected_amount = _parse_positive_amount(data.get('partial_amount', payment.amount))
+                except ValueError as ve:
+                    return jsonify({'message': str(ve)}), 400
             else:
                 payment.collected_amount = payment.amount
             
@@ -2971,16 +3039,19 @@ def mark_payment_as_paid(payment_id):
             return jsonify({'message': 'Unauthorized to mark payments as fully paid. Only finance or admin can do this.'}), 403
 
         partial_payment_flag = data.get('partial_payment', False)
-        partial_amount_received = float(data.get('partial_amount', 0)) if partial_payment_flag else 0.0
-        
+        if partial_payment_flag:
+            try:
+                partial_amount_received = _parse_positive_amount(data.get('partial_amount', 0), 'partial_amount')
+            except ValueError as ve:
+                return jsonify({'message': str(ve)}), 400
+        else:
+            partial_amount_received = 0.0
+
         # Store the original amount before any modifications
         original_payment_amount = payment.amount
         amount_received_in_this_transaction = 0.0
 
         if partial_payment_flag:
-            if partial_amount_received <= 0:
-                return jsonify({'message': 'Partial payment amount must be positive!'}), 400
-            
             if partial_amount_received >= payment.amount:
                 # Full payment via partial amount input
                 amount_received_in_this_transaction = payment.amount
@@ -3144,6 +3215,83 @@ def revert_payment(payment_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/payments/<int:payment_id>/refund', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def refund_payment(payment_id):
+    """The ONLY sanctioned path for a negative/refund-style balance
+    adjustment. General payment endpoints (add_payment, mark_paid, etc.)
+    reject non-positive amounts outright -- a refund is never expressed as a
+    negative amount on those. Instead this creates a new, distinct Payment
+    row (is_refund=True) recording money paid back to the customer, and
+    debits their balance by the refunded amount. Modeled on revert_payment:
+    requires admin/finance and a mandatory, non-empty reason for audit."""
+    current_username = get_jwt_identity()
+    current_user = User.query.filter_by(username=current_username).first()
+
+    payment = tenant_query(Payment).filter_by(id=payment_id).first()
+    if not payment:
+        return jsonify({'message': 'Payment not found!'}), 404
+
+    if not payment.paid:
+        return jsonify({'message': 'Only a paid payment can be refunded.'}), 400
+
+    data = request.json or {}
+    reason = (data.get('reason') or '').strip()
+    if not reason:
+        return jsonify({'message': 'A reason is required to issue a refund.'}), 400
+
+    try:
+        refund_amount = _parse_positive_amount(data.get('amount', payment.amount))
+    except ValueError as ve:
+        return jsonify({'message': str(ve)}), 400
+
+    if refund_amount > payment.amount:
+        return jsonify({'message': 'Refund amount cannot exceed the original payment amount.'}), 400
+
+    customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
+    if not customer:
+        return jsonify({'message': 'Customer not found for this payment!'}), 404
+
+    try:
+        now = datetime.utcnow()
+        refund = new_for_tenant(
+            Payment,
+            customer_id=customer.id,
+            amount=refund_amount,
+            reason=f'Refund for payment #{payment.id}',
+            date=now,
+            paid=True,
+            paid_at=now,
+            pre_payment=False,
+            is_refund=True,
+            refund_reason=reason,
+            refunded_by_id=current_user.id,
+            refunded_at=now,
+        )
+        db.session.add(refund)
+
+        # A refund gives money back, reducing what the customer has
+        # effectively paid -- the mirror image of a payment being marked
+        # paid (which credits the balance).
+        customer.balance -= refund_amount
+
+        db.session.commit()
+
+        return jsonify({
+            'message': 'Refund issued.',
+            'refund_payment_id': refund.id,
+            'original_payment_id': payment.id,
+            'amount': float(refund_amount),
+            'reason': reason,
+            'customer_new_balance': float(customer.balance)
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/payments/bulk_mark_paid', methods=['POST'])
 @jwt_required()
 def bulk_mark_payments_paid():
@@ -3197,6 +3345,7 @@ def bulk_mark_payments_paid():
 
 @app.route('/api/payments/bulk_delete', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def bulk_delete_payments():
     """Delete a batch of payments in a single request (see bulk_mark_payments_paid)."""
     payment_ids = request.json.get('payment_ids', []) if request.json else []
@@ -3667,7 +3816,8 @@ def get_monthly_revenue():
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.is_gratis == False,
-        Payment.pre_payment == False
+        Payment.pre_payment == False,
+        Payment.is_refund == False
     ).group_by('month').all()
 
     # Get expenses (exclude credit purchases)
@@ -3774,6 +3924,7 @@ def get_business_settings():
 
 @app.route('/api/whatsapp-settings', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_whatsapp_settings():
     settings = tenant_query(WhatsAppSettings).first()
     if settings:
@@ -3805,6 +3956,7 @@ def get_whatsapp_settings():
 
 @app.route('/api/whatsapp-settings', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def save_whatsapp_settings():
     data = request.json
     try:
@@ -4368,8 +4520,12 @@ def get_service_status(customer_id):
 @app.route('/api/service-status/<int:customer_id>', methods=['POST'])
 @jwt_required()
 def update_service_status(customer_id):
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
+    if not customer:
+        return jsonify({'message': 'Customer not found!'}), 404
     data = request.json
-    status = ServiceStatus(
+    status = new_for_tenant(
+        ServiceStatus,
         customer_id=customer_id,
         status=data['status'],
         notes=data.get('notes', '')
@@ -4672,10 +4828,15 @@ def update_service_status_by_id(status_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/customer-feedback', methods=['POST'])
+@jwt_required()
 def submit_feedback():
     data = request.json
-    feedback = CustomerFeedback(
-        customer_id=data['customer_id'],
+    customer = tenant_query(Customer).filter_by(id=data['customer_id']).first()
+    if not customer:
+        return jsonify({'message': 'Customer not found!'}), 404
+    feedback = new_for_tenant(
+        CustomerFeedback,
+        customer_id=customer.id,
         rating=data['rating'],
         comment=data.get('comment', ''),
         category=data['category']
@@ -4926,13 +5087,19 @@ def whatsapp_webhook():
         mode = request.args.get('hub.mode')
         token = request.args.get('hub.verify_token')
         challenge = request.args.get('hub.challenge')
+        # Only a tenant's real, configured webhook_verify_token is accepted --
+        # no universal hardcoded fallback. (Any tenant that never customized
+        # this still has a per-tenant value in the DB via the column default;
+        # there is no code-level bypass string anymore.)
         token_match = WhatsAppSettings.query.filter_by(webhook_verify_token=token).first() if token else None
-        if mode == 'subscribe' and (token_match or token == 'delta_net_whatsapp_secret'):
+        if mode == 'subscribe' and token_match:
             logging.info("WhatsApp Webhook verified successfully by Meta!")
             return challenge, 200
         return 'Verification failed', 403
 
     if request.method == 'POST':
+        raw_body = request.get_data()  # cached by Flask -- request.json below still works
+        signature_header = request.headers.get('X-Hub-Signature-256', '')
         data = request.json or {}
         try:
             for entry in data.get('entry', []):
@@ -4948,6 +5115,23 @@ def whatsapp_webhook():
                     if not settings:
                         logging.warning(f"WhatsApp webhook: no tenant for phone_number_id={incoming_pnid}; skipping.")
                         continue
+
+                    # Verify this specific tenant's HMAC-SHA256 signature over the raw
+                    # body BEFORE acting on anything in this change (ticket creation,
+                    # message forwarding, auto-reply). Never trust the payload just
+                    # because a phone_number_id happened to match a tenant -- reject
+                    # the whole request rather than silently skipping this change.
+                    if not settings.app_secret or not signature_header.startswith('sha256='):
+                        logging.warning(f"WhatsApp webhook: missing app_secret or signature header for tenant_id={settings.tenant_id}; rejecting.")
+                        return jsonify({'error': 'Invalid signature'}), 401
+                    expected_sig = hmac.new(
+                        settings.app_secret.encode('utf-8'), raw_body, hashlib.sha256
+                    ).hexdigest()
+                    provided_sig = signature_header[len('sha256='):]
+                    if not hmac.compare_digest(expected_sig, provided_sig):
+                        logging.warning(f"WhatsApp webhook: signature mismatch for tenant_id={settings.tenant_id}; rejecting.")
+                        return jsonify({'error': 'Invalid signature'}), 401
+
                     if len(matches) > 1:
                         logging.warning(f"WhatsApp webhook: {len(matches)} settings rows share phone_number_id={incoming_pnid} "
                                          f"(tenant_ids={[m.tenant_id for m in matches]}); using settings.id={settings.id} tenant_id={settings.tenant_id}.")
@@ -5159,7 +5343,7 @@ def get_revenue_report():
         end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if end_date_str else None
 
         # Revenue = when the payment was actually paid, not when it was billed/due.
-        query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False).options(
+        query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False, Payment.is_refund == False).options(
             db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
         )
         if start_date:
@@ -5491,6 +5675,7 @@ def delete_expense_category(category_id):
 
 @app.route('/api/expenses', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_expenses():
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
@@ -5561,6 +5746,7 @@ def get_expenses():
 
 @app.route('/api/expenses', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def add_expense():
     try:
         data = request.json
@@ -5617,6 +5803,7 @@ def add_expense():
 
 @app.route('/api/expenses/<int:expense_id>', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def update_expense(expense_id):
     try:
         data = request.json
@@ -5678,6 +5865,7 @@ def update_expense(expense_id):
 
 @app.route('/api/expenses/<int:expense_id>', methods=['DELETE'])
 @jwt_required()
+@admin_or_finance_required()
 def delete_expense(expense_id):
     try:
         expense = tenant_query(Expense).filter_by(id=expense_id).first()
@@ -5910,6 +6098,7 @@ def get_financial_report():
             Payment.tenant_id == current_tenant_id(),
             Payment.paid == True,
             Payment.is_gratis == False,
+            Payment.is_refund == False,
             func.coalesce(Payment.paid_at, Payment.date) >= start_date,
             func.coalesce(Payment.paid_at, Payment.date) <= end_date
         ).group_by('month').all()
@@ -6103,6 +6292,7 @@ def serve_manifest():
 
 @app.route('/api/resellers/<int:reseller_id>/history', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_reseller_history(reseller_id):
     reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
     if not reseller:
@@ -6114,6 +6304,7 @@ def get_reseller_history(reseller_id):
 
 @app.route('/api/resellers', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_resellers():
     resellers = tenant_query(Reseller).all()
     result = []
@@ -6125,6 +6316,7 @@ def get_resellers():
 
 @app.route('/api/resellers', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def create_reseller():
     data = request.json
     try:
@@ -6143,6 +6335,7 @@ def create_reseller():
 
 @app.route('/api/resellers/<int:reseller_id>', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def update_reseller(reseller_id):
     data = request.json
     reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
@@ -6162,6 +6355,7 @@ def update_reseller(reseller_id):
 
 @app.route('/api/resellers/<int:reseller_id>/add_credit', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def add_reseller_credit(reseller_id):
     data = request.json
     reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
@@ -6203,6 +6397,7 @@ def add_reseller_credit(reseller_id):
 
 @app.route('/api/resellers/<int:reseller_id>/apply_discount', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def apply_reseller_discount(reseller_id):
     data = request.json
     reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
@@ -6244,6 +6439,7 @@ def apply_reseller_discount(reseller_id):
 
 @app.route('/api/resellers/<int:reseller_id>/collect_payment', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def collect_reseller_payment(reseller_id):
     data = request.json
     reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
@@ -6297,6 +6493,7 @@ def collect_reseller_payment(reseller_id):
 
 @app.route('/api/upstream-providers', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_upstream_providers():
     providers = tenant_query(UpstreamProvider).order_by(UpstreamProvider.name).all()
     result = []
@@ -6308,6 +6505,7 @@ def get_upstream_providers():
 
 @app.route('/api/upstream-providers', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def create_upstream_provider():
     data = request.json
     try:
@@ -6329,6 +6527,7 @@ def create_upstream_provider():
 
 @app.route('/api/upstream-providers/<int:provider_id>', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def update_upstream_provider(provider_id):
     data = request.json
     provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
@@ -6357,6 +6556,7 @@ def update_upstream_provider(provider_id):
 
 @app.route('/api/upstream-providers/<int:provider_id>', methods=['DELETE'])
 @jwt_required()
+@admin_or_finance_required()
 def delete_upstream_provider(provider_id):
     try:
         provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
@@ -6377,6 +6577,7 @@ def delete_upstream_provider(provider_id):
 
 @app.route('/api/upstream-providers/<int:provider_id>/history', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_upstream_provider_history(provider_id):
     provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
     if not provider:
@@ -6387,6 +6588,7 @@ def get_upstream_provider_history(provider_id):
 
 @app.route('/api/upstream-providers/<int:provider_id>/topup', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def topup_upstream_provider(provider_id):
     """Manual prepaid-credit top-up -- decreases balance, the same direction the
     real portal's own balance figure moves when the tenant pays the upstream."""
@@ -6415,6 +6617,7 @@ def topup_upstream_provider(provider_id):
 
 @app.route('/api/upstream-providers/<int:provider_id>/renewal-cost', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def record_upstream_renewal_cost(provider_id):
     """Manual record of what a customer's renewal cost upstream -- how the
     tenant tracks real per-customer cost until portal automation exists."""
@@ -6498,6 +6701,7 @@ def sync_customer_upstream_status(customer_id):
 
 @app.route('/api/mikrotik-servers', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_mikrotik_servers():
     servers = tenant_query(MikrotikServer).order_by(MikrotikServer.name).all()
     result = []
@@ -6509,6 +6713,7 @@ def get_mikrotik_servers():
 
 @app.route('/api/mikrotik-servers', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def create_mikrotik_server():
     data = request.json
     try:
@@ -6533,6 +6738,7 @@ def create_mikrotik_server():
 
 @app.route('/api/mikrotik-servers/<int:server_id>', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def update_mikrotik_server(server_id):
     data = request.json
     server = tenant_query(MikrotikServer).filter_by(id=server_id).first()
@@ -6562,6 +6768,7 @@ def update_mikrotik_server(server_id):
 
 @app.route('/api/mikrotik-servers/<int:server_id>', methods=['DELETE'])
 @jwt_required()
+@admin_or_finance_required()
 def delete_mikrotik_server(server_id):
     try:
         server = tenant_query(MikrotikServer).filter_by(id=server_id).first()
@@ -6580,6 +6787,7 @@ def delete_mikrotik_server(server_id):
 
 @app.route('/api/mikrotik-servers/<int:server_id>/test-connection', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def test_mikrotik_connection(server_id):
     server = tenant_query(MikrotikServer).filter_by(id=server_id).first()
     if not server:
@@ -6648,12 +6856,14 @@ def unsuspend_customer_mikrotik(customer_id):
 
 @app.route('/api/suppliers', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_suppliers():
     suppliers = tenant_query(Supplier).order_by(Supplier.name).all()
     return jsonify([s.to_dict() for s in suppliers])
 
 @app.route('/api/suppliers', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def add_supplier():
     data = request.json
     try:
@@ -6672,6 +6882,7 @@ def add_supplier():
 
 @app.route('/api/suppliers/<int:supplier_id>', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def update_supplier(supplier_id):
     data = request.json
     supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
@@ -6690,6 +6901,7 @@ def update_supplier(supplier_id):
 
 @app.route('/api/suppliers/<int:supplier_id>', methods=['DELETE'])
 @jwt_required()
+@admin_or_finance_required()
 def delete_supplier(supplier_id):
     try:
         supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
@@ -6712,12 +6924,14 @@ def delete_supplier(supplier_id):
 
 @app.route('/api/suppliers/<int:supplier_id>/payments', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_supplier_payments(supplier_id):
     payments = tenant_query(SupplierPayment).filter_by(supplier_id=supplier_id).order_by(SupplierPayment.payment_date.desc()).all()
     return jsonify([p.to_dict() for p in payments])
 
 @app.route('/api/suppliers/<int:supplier_id>/payments', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def record_supplier_payment(supplier_id):
     data = request.json
     supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
@@ -6752,6 +6966,7 @@ def record_supplier_payment(supplier_id):
 
 @app.route('/api/suppliers/<int:supplier_id>/history', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_supplier_history(supplier_id):
     supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
     if not supplier:
@@ -6791,6 +7006,7 @@ def get_supplier_history(supplier_id):
 
 @app.route('/api/suppliers/<int:supplier_id>/fix-balance', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def fix_supplier_balance(supplier_id):
     data = request.json
     supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()

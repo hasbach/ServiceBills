@@ -15,6 +15,7 @@ import {
     Clear as ClearIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
+import { escapeHtml } from '../utils/escapeHtml.js';
 
 const ReceiptsView = () => {
     const { apiService, setSnackbar } = useAppContext();
@@ -281,21 +282,21 @@ const ReceiptsView = () => {
                 <div class="receipt-container">
                     <div class="main-part">
                         <div class="receipt-details">
-                            <span>الإسم: ${data.customer_name}</span>
-                            <span>العنوان: ${data.customer_address}</span>
-                            <span>الهاتف: ${data.customer_phone}</span>
-                            <span>تاريخ الإيصال: ${data.payment_date}</span>
-                            <span>الدفعة الشهرية: ${data.subscription_plan_details.price}$ - الخدمة: ${data.subscription_plan_details.name}</span>
+                            <span>الإسم: ${escapeHtml(data.customer_name)}</span>
+                            <span>العنوان: ${escapeHtml(data.customer_address)}</span>
+                            <span>الهاتف: ${escapeHtml(data.customer_phone)}</span>
+                            <span>تاريخ الإيصال: ${escapeHtml(data.payment_date)}</span>
+                            <span>الدفعة الشهرية: ${escapeHtml(data.subscription_plan_details.price)}$ - الخدمة: ${escapeHtml(data.subscription_plan_details.name)}</span>
                             <span>عن شهر: ${arabicMonthYear}</span>
                             <span>الرصيد الحالي: ${currentBalance}$ - الرصيد السابق: ${previousBalance}$</span>
                         </div>
                     </div>
                     <div class="mini-part">
                         <div class="receipt-details">
-                            <span>الإسم: ${data.customer_name}</span>
-                            <span>العنوان: ${data.customer_address}</span>
-                            <span>الهاتف: ${data.customer_phone}</span>
-                            <span>الدفعة الشهرية: ${data.subscription_plan_details.price}$</span>
+                            <span>الإسم: ${escapeHtml(data.customer_name)}</span>
+                            <span>العنوان: ${escapeHtml(data.customer_address)}</span>
+                            <span>الهاتف: ${escapeHtml(data.customer_phone)}</span>
+                            <span>الدفعة الشهرية: ${escapeHtml(data.subscription_plan_details.price)}$</span>
                             <span>عن شهر: ${arabicMonthYear}</span>
                             <span>الرصيد الحالي: ${currentBalance}$</span>
                             <span>الرصيد السابق: ${previousBalance}$</span>
