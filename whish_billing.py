@@ -68,6 +68,9 @@ def create_payment(external_id, amount, currency, callback_token, requestee, tar
     except requests.exceptions.RequestException as e:
         raise WhishAPIError(f"Whish request failed: {e}") from e
 
+    if not resp.ok:
+        raise WhishAPIError(f"Whish returned HTTP {resp.status_code}")
+
     try:
         body = resp.json()
     except ValueError as e:

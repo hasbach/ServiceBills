@@ -49,6 +49,10 @@ class _FakeResponse:
         self._json = json_body
         self.status_code = status_code
 
+    @property
+    def ok(self):
+        return self.status_code < 400
+
     def json(self):
         return self._json
 
@@ -105,3 +109,24 @@ def test_create_payment_raises_on_http_error(monkeypatch):
             external_id="ext-3", amount=120.0, currency="USD", callback_token="tok-3",
             requestee="Biz", target="+961700", email="a@b.com", invoice="inv",
         )
+
+
+def test_create_payment_raises_on_non_2xx_status_even_if_json_looks_successful(monkeypatch):
+    """Regression test: if a 5xx error returns a JSON body that looks like
+    {"status": true, "data": {"collectUrl": "..."}}, it should still raise
+    WhishAPIError, not silently treat it as success."""
+    monkeypatch.setattr(whish_billing.Config, "WHISH_CHANNEL", "chan1")
+    monkeypatch.setattr(whish_billing.Config, "WHISH_SECRET", "sec1")
+    monkeypatch.setattr(
+        whish_billing.requests, "post",
+        lambda *a, **k: _FakeResponse(
+            {"status": True, "data": {"collectUrl": "https://whish.money/pay/should-not-be-used"}},
+            status_code=500,
+        ),
+    )
+    with pytest.raises(whish_billing.WhishAPIError) as exc_info:
+        whish_billing.create_payment(
+            external_id="ext-4", amount=120.0, currency="USD", callback_token="tok-4",
+            requestee="Biz", target="+961700", email="a@b.com", invoice="inv",
+        )
+    assert "500" in str(exc_info.value)
