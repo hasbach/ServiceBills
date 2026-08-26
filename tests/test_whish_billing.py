@@ -243,6 +243,20 @@ def test_whish_success_callback_wrong_token_rejected(app, client):
         assert attempt.status == "pending"  # untouched
 
 
+def test_whish_success_callback_non_ascii_token_rejected_not_500(app, client):
+    """secrets.compare_digest raises TypeError on a non-ASCII str -- a stray
+    Unicode character in the token query param must still be handled as a
+    normal rejection (redirect to status=error), not an unhandled 500."""
+    make_tenant(client, "Biz NonAscii", "nonascii_admin")
+    tenant_id, ext_id = _make_pending_attempt(app, "Biz NonAscii")
+    r = client.get(f"/api/billing/whish/success?order={ext_id}&token=%C3%A9", follow_redirects=False)
+    assert r.status_code == 302
+    assert "status=error" in r.headers["Location"]
+    with app.app_context():
+        tenant = appmod.db.session.get(appmod.Tenant, tenant_id)
+        assert tenant.plan == "free"
+
+
 def test_whish_success_callback_is_single_use(app, client):
     make_tenant(client, "Biz Replay", "replay_admin")
     tenant_id, ext_id = _make_pending_attempt(app, "Biz Replay")

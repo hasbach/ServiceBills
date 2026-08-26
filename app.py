@@ -1340,7 +1340,7 @@ def billing_whish_success():
     attempt = BillingPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
 
     if (not attempt or attempt.status != 'pending' or not token
-            or not secrets.compare_digest(attempt.callback_token, token)
+            or not secrets.compare_digest(attempt.callback_token.encode(), token.encode())
             or attempt.created_at < datetime.utcnow() - _WHISH_ATTEMPT_MAX_AGE):
         logging.warning(f"Whish success callback rejected: order={external_id}")
         return redirect(f"{Config.APP_BASE_URL}/billing?status=error")
@@ -1354,7 +1354,7 @@ def billing_whish_failure():
     external_id = request.args.get('order')
     token = request.args.get('token')
     attempt = BillingPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
-    if attempt and attempt.status == 'pending' and token and secrets.compare_digest(attempt.callback_token, token):
+    if attempt and attempt.status == 'pending' and token and secrets.compare_digest(attempt.callback_token.encode(), token.encode()):
         attempt.status = 'failed'
         db.session.commit()
     return redirect(f"{Config.APP_BASE_URL}/billing?status=failed")
