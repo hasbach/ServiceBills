@@ -18,6 +18,12 @@ class Config:
     # Comma-separated allowlist; defaults to the local React dev server.
     CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
 
+    # --- Phase 2: operational visibility ---
+    # Optional: unset means error tracking is simply off (no hard requirement,
+    # unlike JWT_SECRET_KEY/FERNET_KEY, since this doesn't guard sensitive data).
+    SENTRY_DSN = os.environ.get("SENTRY_DSN")
+    SENTRY_ENVIRONMENT = os.environ.get("SENTRY_ENVIRONMENT", "production")
+
     # --- Phase 3: secrets encryption + object storage ---
     # Fernet key for encrypting per-tenant WhatsApp credentials (required in prod).
     FERNET_KEY = os.environ.get("FERNET_KEY")
