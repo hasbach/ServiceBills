@@ -1417,6 +1417,15 @@ _TENANT_DELETE_ORDER = [
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
     WhatsAppSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
+    # Phase 3 fix: MonthlyProfitEstimate was missing here entirely. SQLite
+    # doesn't enforce FK constraints, so a tenant delete silently orphaned
+    # these rows there; Postgres correctly rejects the DELETE FROM tenant
+    # with a ForeignKeyViolation instead, which is how this was actually
+    # found -- test_superadmin_delete_removes_only_that_tenant only fails
+    # against real Postgres, not SQLite. No child table references
+    # MonthlyProfitEstimate, so its position in this list doesn't matter
+    # beyond being before the tenant delete itself.
+    MonthlyProfitEstimate,
 ]
 
 
