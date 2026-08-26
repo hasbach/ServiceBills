@@ -97,6 +97,7 @@ const rawApiService = {
     billingCheckout: (plan) => api.post('/billing/checkout', { plan }),
     billingPortal: () => api.post('/billing/portal'),
     billingContact: (payload) => api.post('/billing/contact', payload),
+    billingWhishCheckout: (cycle) => api.post('/billing/whish/checkout', { cycle }),
     // Platform super-admin
     adminTenants: () => api.get('/admin/tenants'),
     adminSuspendTenant: (id) => api.post(`/admin/tenants/${id}/suspend`),

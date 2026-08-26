@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
     Box, Typography, Card, CardContent, Button, Chip, Grid, CircularProgress, Alert,
-    Dialog, DialogTitle, DialogContent, DialogActions, TextField, Stack,
+    Dialog, DialogTitle, DialogContent, DialogActions, TextField, Stack, ToggleButtonGroup, ToggleButton,
 } from '@mui/material';
 import { useAppContext } from '../context/AppContext.js';
 
@@ -10,11 +10,30 @@ const FEATURES = {
     pro: ['Unlimited customers', 'WhatsApp Cloud API (auto-send)', 'All servicesBills features'],
 };
 
+const WHISH_PRICES = { monthly: '$120/mo', yearly: '$1000/yr (save ~30%)' };
+
+function planExpiryBanner(tenant) {
+    if (!tenant || tenant.plan !== 'pro' || !tenant.plan_expires_at) return null;
+    const expiresAt = new Date(tenant.plan_expires_at.replace(' ', 'T'));
+    const daysLeft = Math.ceil((expiresAt - new Date()) / (1000 * 60 * 60 * 24));
+    if (daysLeft > 5) return null;
+    if (daysLeft >= 0) {
+        return { severity: 'warning', message: `Pro expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'} — renew now to avoid interruption.` };
+    }
+    const graceDaysLeft = 3 + daysLeft;
+    if (graceDaysLeft > 0) {
+        return { severity: 'error', message: `Pro expired — renew within ${graceDaysLeft} day${graceDaysLeft === 1 ? '' : 's'} to avoid losing access.` };
+    }
+    return null;
+}
+
 const BillingView = () => {
     const { apiService, setSnackbar, user } = useAppContext();
     const [tenant, setTenant] = useState(null);
     const [plans, setPlans] = useState({});
     const [stripeEnabled, setStripeEnabled] = useState(false);
+    const [whishEnabled, setWhishEnabled] = useState(false);
+    const [cycle, setCycle] = useState('monthly');
     const [busy, setBusy] = useState(false);
     const [contactOpen, setContactOpen] = useState(false);
     const [contact, setContact] = useState({ name: '', email: user?.email || '', phone: '', message: '' });
@@ -22,9 +41,14 @@ const BillingView = () => {
     useEffect(() => {
         apiService.tenantMe().then((r) => setTenant(r.data)).catch(() => setTenant({ plan: 'free', status: 'active' }));
         apiService.listPlans().then((r) => setPlans(r.data)).catch(() => setPlans({}));
-        apiService.billingConfig().then((r) => setStripeEnabled(!!r.data.stripe_enabled)).catch(() => setStripeEnabled(false));
+        apiService.billingConfig().then((r) => {
+            setStripeEnabled(!!r.data.stripe_enabled);
+            setWhishEnabled(!!r.data.whish_enabled);
+        }).catch(() => { setStripeEnabled(false); setWhishEnabled(false); });
         const status = new URLSearchParams(window.location.search).get('status');
-        if (status === 'success') setSnackbar({ open: true, message: 'Payment received — your plan will update shortly.', severity: 'success' });
+        if (status === 'success') setSnackbar({ open: true, message: 'Payment received — your plan has been updated.', severity: 'success' });
+        if (status === 'failed') setSnackbar({ open: true, message: 'Payment failed or was canceled.', severity: 'error' });
+        if (status === 'error') setSnackbar({ open: true, message: 'Could not verify that payment. Contact support if you were charged.', severity: 'error' });
         if (status === 'cancel') setSnackbar({ open: true, message: 'Checkout canceled.', severity: 'info' });
     }, [apiService, setSnackbar]);
 
@@ -33,6 +57,17 @@ const BillingView = () => {
         try {
             const r = await apiService.billingCheckout('pro');
             window.location.href = r.data.url;
+        } catch (e) {
+            setSnackbar({ open: true, message: e.response?.data?.msg || 'Checkout failed.', severity: 'error' });
+            setBusy(false);
+        }
+    };
+
+    const upgradeWhish = async () => {
+        setBusy(true);
+        try {
+            const r = await apiService.billingWhishCheckout(cycle);
+            window.location.href = r.data.redirect;
         } catch (e) {
             setSnackbar({ open: true, message: e.response?.data?.msg || 'Checkout failed.', severity: 'error' });
             setBusy(false);
@@ -65,6 +100,8 @@ const BillingView = () => {
 
     if (!tenant) return <Box sx={{ p: 4, textAlign: 'center' }}><CircularProgress /></Box>;
 
+    const banner = planExpiryBanner(tenant);
+
     return (
         <Box sx={{ p: { xs: 2, md: 3 } }}>
             <Typography variant="h5" sx={{ mb: 2 }}>Billing &amp; Plan</Typography>
@@ -72,12 +109,16 @@ const BillingView = () => {
                 <Typography>Current plan:</Typography>
                 <Chip label={(tenant.plan || 'free').toUpperCase()} color="primary" />
                 <Chip label={tenant.status} color={tenant.status === 'active' ? 'success' : 'warning'} variant="outlined" />
+                {tenant.plan === 'pro' && tenant.plan_expires_at && (
+                    <Typography variant="body2" color="text.secondary">expires {tenant.plan_expires_at}</Typography>
+                )}
             </Box>
             {tenant.status !== 'active' && (
                 <Alert severity="warning" sx={{ mb: 2 }}>
                     Your subscription is inactive. Upgrade or contact us to restore full access.
                 </Alert>
             )}
+            {banner && <Alert severity={banner.severity} sx={{ mb: 2 }}>{banner.message}</Alert>}
             <Grid container spacing={2}>
                 {Object.keys(plans).map((name) => (
                     <Grid item xs={12} md={6} key={name}>
@@ -90,22 +131,33 @@ const BillingView = () => {
                                 <Box component="ul" sx={{ pl: 2, mb: 2, color: 'text.secondary' }}>
                                     {(FEATURES[name] || []).map((f, i) => <li key={i}>{f}</li>)}
                                 </Box>
-                                {tenant.plan === name ? (
-                                    <Chip label="Current plan" size="small" />
-                                ) : (name === 'pro' && (
-                                    <Stack direction="row" spacing={1} flexWrap="wrap">
+                                {name === 'pro' && (
+                                    <Stack spacing={1.5}>
+                                        {whishEnabled && (
+                                            <>
+                                                <ToggleButtonGroup size="small" value={cycle} exclusive
+                                                    onChange={(e, v) => v && setCycle(v)}>
+                                                    <ToggleButton value="monthly">{WHISH_PRICES.monthly}</ToggleButton>
+                                                    <ToggleButton value="yearly">{WHISH_PRICES.yearly}</ToggleButton>
+                                                </ToggleButtonGroup>
+                                                <Button variant="contained" disabled={busy} onClick={upgradeWhish}>
+                                                    {tenant.plan === 'pro' ? 'Renew via Whish' : 'Upgrade via Whish'}
+                                                </Button>
+                                            </>
+                                        )}
                                         {stripeEnabled && (
-                                            <Button variant="contained" disabled={busy} onClick={upgradeStripe}>
-                                                Upgrade to Pro
+                                            <Button variant="outlined" disabled={busy} onClick={upgradeStripe}>
+                                                Upgrade to Pro (Stripe)
                                             </Button>
                                         )}
-                                        {/* Manual/offline path — always available (e.g. before Stripe is live) */}
-                                        <Button variant={stripeEnabled ? 'outlined' : 'contained'} disabled={busy}
-                                                onClick={() => setContactOpen(true)}>
-                                            Contact us to upgrade
-                                        </Button>
+                                        {tenant.plan !== 'pro' && (
+                                            <Button variant={whishEnabled || stripeEnabled ? 'text' : 'contained'} disabled={busy}
+                                                    onClick={() => setContactOpen(true)}>
+                                                Contact us to upgrade
+                                            </Button>
+                                        )}
                                     </Stack>
-                                ))}
+                                )}
                             </CardContent>
                         </Card>
                     </Grid>
