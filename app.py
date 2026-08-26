@@ -1373,9 +1373,12 @@ def list_plans():
 @jwt_required()
 def billing_config():
     # Tells the UI which upgrade paths to show. Contact-to-upgrade is always on;
-    # Stripe checkout appears only once keys + a Pro price are configured.
+    # Stripe checkout appears only once keys + a Pro price are configured (kept
+    # dormant, not removed -- see the Whish design spec for why); Whish appears
+    # only once real channel/secret credentials have been issued.
     stripe_enabled = bool(Config.STRIPE_SECRET_KEY and plans.PLANS.get('pro', {}).get('stripe_price'))
-    return jsonify({"stripe_enabled": stripe_enabled, "contact_enabled": True}), 200
+    whish_enabled = bool(Config.WHISH_CHANNEL and Config.WHISH_SECRET)
+    return jsonify({"stripe_enabled": stripe_enabled, "whish_enabled": whish_enabled, "contact_enabled": True}), 200
 
 
 @app.route('/api/billing/contact', methods=['POST'])

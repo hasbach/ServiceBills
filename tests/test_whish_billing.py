@@ -267,3 +267,25 @@ def test_whish_success_callback_unknown_order_is_safe(client):
     r = client.get("/api/billing/whish/success?order=does-not-exist&token=x", follow_redirects=False)
     assert r.status_code == 302
     assert "status=error" in r.headers["Location"]
+
+
+def test_billing_config_reports_whish_disabled_without_credentials(client, monkeypatch):
+    monkeypatch.setattr(appmod.Config, "WHISH_CHANNEL", None)
+    monkeypatch.setattr(appmod.Config, "WHISH_SECRET", None)
+    hdr = make_tenant(client, "Biz NoWhish", "nowhish_admin")
+    r = client.get("/api/billing/config", headers=hdr)
+    assert r.get_json()["whish_enabled"] is False
+
+
+def test_billing_config_reports_whish_enabled_with_credentials(client, monkeypatch):
+    monkeypatch.setattr(appmod.Config, "WHISH_CHANNEL", "chan1")
+    monkeypatch.setattr(appmod.Config, "WHISH_SECRET", "sec1")
+    hdr = make_tenant(client, "Biz Whish", "whish_admin")
+    r = client.get("/api/billing/config", headers=hdr)
+    assert r.get_json()["whish_enabled"] is True
+
+
+def test_tenant_me_reports_plan_expiry(client):
+    hdr = make_tenant(client, "Biz TenantMe", "tenantme_admin")
+    r = client.get("/api/tenant/me", headers=hdr)
+    assert r.get_json()["plan_expires_at"] is None
