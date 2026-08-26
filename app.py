@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import math
 import time
+import threading
 import requests
 import traceback
 from flask import Flask, jsonify, request
@@ -695,6 +696,14 @@ class BusinessSettings(db.Model):
     # of an upstream's RADIUS portal -- see UpstreamProvider), or
     # 'local_mikrotik' (tenant owns the edge -- see MikrotikServer).
     network_mode = db.Column(db.String(20), nullable=False, default='none')
+    # Phase 3: per-tenant opt-in for automated (scheduled) upstream RADIUS
+    # status sync, instead of the staff-only manual "Refresh" button. Off by
+    # default -- deliberately opt-in/beta per the product decision to roll
+    # this out per-tenant rather than making it default-on for everyone,
+    # given the upstream-portal scrapers' documented fragility. Read-only:
+    # this flag only controls whether upstream_last_status/expiry get
+    # refreshed automatically; it never triggers a suspend/unsuspend action.
+    upstream_sync_automation_enabled = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -714,6 +723,7 @@ class BusinessSettings(db.Model):
             'email': self.email,
             'website': self.website,
             'network_mode': self.network_mode or 'none',
+            'upstream_sync_automation_enabled': bool(self.upstream_sync_automation_enabled),
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -970,6 +980,16 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def _parse_bool_form_field(raw, default=False):
+    """multipart/form-data has no native boolean type -- values arrive as
+    strings (or the field is simply absent). Accepts the common truthy
+    spellings a frontend checkbox is likely to send; anything else (or a
+    missing/None value) falls back to `default`."""
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ('true', '1', 'on', 'yes')
 
 if not os.path.exists(app.config['UPLOAD_FOLDER']):
     os.makedirs(app.config['UPLOAD_FOLDER'])
@@ -1850,6 +1870,14 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     scheduler.add_job(func=generate_missing_salary_charges_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.add_job(func=recalculate_all_estimated_profits_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.add_job(func=send_daily_whatsapp_keepalive_with_context, trigger="interval", days=1, next_run_time=datetime.now())
+    # Phase 3: opt-in only (BusinessSettings.upstream_sync_automation_enabled),
+    # so this fires for every active tenant same as the jobs above but is a
+    # genuine no-op for any tenant that hasn't turned it on. The per-customer
+    # 20h freshness check in auto_sync_upstream_status_for_tenant is what
+    # actually protects against over-syncing on a spin-down-prone host that
+    # restarts (and re-fires next_run_time=now()) more than once a day --
+    # not a change to this "fire immediately" pattern itself.
+    scheduler.add_job(func=auto_sync_upstream_status_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.start()
  
     
@@ -3941,7 +3969,9 @@ def save_business_settings():
                 mobile=request.form.get('mobile', ""),
                 email=request.form.get('email', ""),
                 website=request.form.get('website', ""),
-                network_mode=request.form.get('network_mode', "none")
+                network_mode=request.form.get('network_mode', "none"),
+                upstream_sync_automation_enabled=_parse_bool_form_field(
+                    request.form.get('upstream_sync_automation_enabled'), default=False),
             )
             db.session.add(settings)
 
@@ -3959,6 +3989,9 @@ def save_business_settings():
         settings.email = request.form.get('email', settings.email)
         settings.website = request.form.get('website', settings.website)
         settings.network_mode = request.form.get('network_mode', settings.network_mode)
+        if 'upstream_sync_automation_enabled' in request.form:
+            settings.upstream_sync_automation_enabled = _parse_bool_form_field(
+                request.form.get('upstream_sync_automation_enabled'), default=settings.upstream_sync_automation_enabled)
 
         # Only update logo_url if a new file was uploaded
         if logo_url:
@@ -3989,7 +4022,8 @@ def get_business_settings():
                 'mobile': "",
                 'email': "",
                 'website': "",
-                'network_mode': "none"
+                'network_mode': "none",
+                'upstream_sync_automation_enabled': False
             }
         }), 200
 
@@ -6729,8 +6763,44 @@ def record_upstream_renewal_cost(provider_id):
 # docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md) or
 # Krypton (MyISP, Smart Networks, Wise-ISP -- see
 # docs/superpowers/specs/2026-08-23-krypton-upstream-status-sync-design.md).
-# Never clicks anything on the portal, staff-triggered only, one customer
-# at a time -- no scheduler calls this.
+# Never clicks anything on the portal. Two callers as of Phase 3: the
+# staff-triggered manual route below, and the opt-in scheduled automation
+# job (auto_sync_upstream_status_for_tenant) -- both route through
+# _sync_customer_upstream_status_core so the concurrency limit applies no
+# matter which one is calling.
+#
+# Phase 3: caps concurrent Playwright/Chromium sessions -- previously
+# unlimited, which a prior audit flagged as a real memory-exhaustion risk
+# on a shared instance (each headless Chromium is ~150-300MB RSS). Serialized
+# to 1 by default (never more than one running at once); raise only after
+# confirming real memory headroom on the actual host. Process-local only --
+# a threading.Semaphore doesn't coordinate across gunicorn worker PROCESSES,
+# but that's fully sufficient for the current single-worker default
+# deployment (see DEPLOY.md); scaling to multiple workers later would need
+# a cross-process mechanism (e.g. a Postgres advisory lock) instead of this.
+_UPSTREAM_SYNC_CONCURRENCY_LIMIT = 1
+_upstream_sync_semaphore = threading.Semaphore(_UPSTREAM_SYNC_CONCURRENCY_LIMIT)
+# A human waiting on the manual-trigger button shouldn't hang indefinitely
+# behind other syncs -- fail fast with a clear, retryable message well
+# inside gunicorn's 120s request timeout. The scheduled job (no HTTP client
+# waiting) blocks with no timeout instead -- see block=True below.
+_UPSTREAM_SYNC_ACQUIRE_TIMEOUT_SECONDS = 30
+
+
+def _sync_customer_upstream_status_core(customer, provider, block=True, timeout=None):
+    """The actual portal check, gated by the concurrency semaphore above.
+    Returns (ok, result) in the same shape as
+    upstream_portal[_krypton].get_subscriber_status."""
+    acquired = _upstream_sync_semaphore.acquire(blocking=block, timeout=timeout)
+    if not acquired:
+        return False, 'Too many upstream syncs already in progress -- try again shortly.'
+    try:
+        if provider.product == 'krypton':
+            return upstream_portal_krypton.get_subscriber_status(provider, customer.upstream_username)
+        return upstream_portal.get_subscriber_status(provider, customer.upstream_username)
+    finally:
+        _upstream_sync_semaphore.release()
+
 
 @app.route('/api/customers/<int:customer_id>/upstream-status-sync', methods=['POST'])
 @jwt_required()
@@ -6744,10 +6814,8 @@ def sync_customer_upstream_status(customer_id):
     if not provider:
         return jsonify({'error': 'Linked Upstream Provider not found.'}), 404
 
-    if provider.product == 'krypton':
-        ok, result = upstream_portal_krypton.get_subscriber_status(provider, customer.upstream_username)
-    else:
-        ok, result = upstream_portal.get_subscriber_status(provider, customer.upstream_username)
+    ok, result = _sync_customer_upstream_status_core(
+        customer, provider, block=True, timeout=_UPSTREAM_SYNC_ACQUIRE_TIMEOUT_SECONDS)
     if not ok:
         return jsonify({'ok': False, 'error': result}), 502
 
@@ -6768,6 +6836,65 @@ def sync_customer_upstream_status(customer_id):
         'upstream_last_synced_at': customer.upstream_last_synced_at.strftime('%Y-%m-%d %H:%M:%S'),
         'upstream_drift': _compute_upstream_drift(customer),
     }), 200
+
+
+# --- Phase 3: opt-in scheduled automation for the sync above. Off by default
+# per tenant (BusinessSettings.upstream_sync_automation_enabled) -- a
+# deliberate beta/opt-in rollout, not default-on for everyone, given the
+# upstream-portal scrapers' documented fragility. Read-only, same as the
+# manual route: never suspends/unsuspends anything, only refreshes
+# upstream_last_status/upstream_actual_expiry.
+_UPSTREAM_AUTO_SYNC_MIN_INTERVAL = timedelta(hours=20)
+
+
+def auto_sync_upstream_status_for_tenant(tenant_id):
+    """Skips any customer synced within the last _UPSTREAM_AUTO_SYNC_MIN_INTERVAL
+    so repeated scheduler fires -- this host restarts often and re-fires all
+    daily jobs immediately on every restart, see the scheduler registration
+    comment below -- don't re-sync the same customer many times in one day.
+    Routes every real portal call through _sync_customer_upstream_status_core,
+    so the Playwright concurrency limit applies here exactly as it does for
+    the manual button. Never raises -- one customer's failure (portal down,
+    timeout) doesn't stop the rest of this tenant's customers, and one
+    tenant's failure doesn't stop the next tenant (see the _with_context
+    wrapper below)."""
+    settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).first()
+    if not settings or not settings.upstream_sync_automation_enabled:
+        return
+    cutoff = datetime.utcnow() - _UPSTREAM_AUTO_SYNC_MIN_INTERVAL
+    customers = Customer.query.filter(
+        Customer.tenant_id == tenant_id,
+        Customer.upstream_provider_id.isnot(None),
+        Customer.upstream_username.isnot(None),
+    ).filter(
+        db.or_(Customer.upstream_last_synced_at.is_(None), Customer.upstream_last_synced_at < cutoff)
+    ).all()
+    for customer in customers:
+        try:
+            provider = UpstreamProvider.query.filter_by(
+                id=customer.upstream_provider_id, tenant_id=tenant_id).first()
+            if not provider:
+                continue
+            # block=True, timeout=None: no HTTP client is waiting on this,
+            # so just wait for the semaphore rather than failing fast.
+            ok, result = _sync_customer_upstream_status_core(customer, provider, block=True, timeout=None)
+            if not ok:
+                logging.warning(f"Auto-sync failed for customer {customer.id} (tenant {tenant_id}): {result}")
+                continue
+            customer.upstream_last_status = result['status']
+            if result['expiry'] is not None:
+                customer.upstream_actual_expiry = result['expiry']
+            customer.upstream_last_synced_at = datetime.utcnow()
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logging.error(f"Auto-sync error for customer {customer.id} (tenant {tenant_id}): {e}")
+
+
+def auto_sync_upstream_status_with_context():
+    with app.app_context():
+        for t in Tenant.query.filter_by(status="active").all():
+            auto_sync_upstream_status_for_tenant(t.id)
 
 
 @app.route('/api/mikrotik-servers', methods=['GET'])
