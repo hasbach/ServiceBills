@@ -1459,7 +1459,7 @@ def tenant_export():
 
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
-    UpgradeRequest, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
+    UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
     CustomerFeedback, ServiceStatus, Payment, ResellerPayment, SupplierPayment,
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
     WhatsAppSettings, ExpenseCategory, Sector,
