@@ -2078,6 +2078,64 @@ def auto_sync_upstream_status_with_context():
         for t in Tenant.query.filter_by(status="active").all():
             auto_sync_upstream_status_for_tenant(t.id)
 
+
+# --- Self-serve Pro plan via Whish: renewal reminder + grace-period revert.
+# See docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md.
+# Whish has no auto-renew -- this is what keeps a lapsed Pro plan from
+# silently staying Pro forever, and what nudges a tenant to pay again before
+# that happens. Defined here, not near the checkout/callback routes further
+# down, for the exact same reason every other scheduler-registered function
+# in this file lives here: scheduler.add_job(func=...) below evaluates its
+# func argument at import time, so it must already be defined by the time
+# that line runs -- getting this wrong crashed production earlier today.
+_PRO_PLAN_REMINDER_WINDOW = timedelta(days=5)
+_PRO_PLAN_GRACE_PERIOD = timedelta(days=3)
+
+
+def check_pro_plan_expirations_for_tenant(tenant_id):
+    """Send the once-per-cycle reminder email inside the reminder window, and
+    revert plan='free' once the grace period has fully elapsed. Never raises
+    -- one tenant's email failure must not stop the rest of the daily job
+    (see the _with_context wrapper below), matching this file's established
+    pattern for every other daily job."""
+    tenant = db.session.get(Tenant, tenant_id)
+    if not tenant or tenant.plan != 'pro' or not tenant.plan_expires_at:
+        return
+    now = datetime.utcnow()
+
+    if now > tenant.plan_expires_at + _PRO_PLAN_GRACE_PERIOD:
+        tenant.plan = 'free'
+        tenant.plan_expires_at = None
+        tenant.plan_expiry_reminder_sent_at = None
+        db.session.commit()
+        return
+
+    if now >= tenant.plan_expires_at - _PRO_PLAN_REMINDER_WINDOW and not tenant.plan_expiry_reminder_sent_at:
+        settings = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+        to_email = settings.email if settings and settings.email else None
+        if to_email:
+            try:
+                email_util.send(
+                    to_email, "servicesBills: your Pro plan is expiring soon",
+                    f"Your ServiceBills Pro plan expires on {tenant.plan_expires_at.strftime('%Y-%m-%d')}. "
+                    f"Renew from the Billing page to keep uninterrupted access.",
+                )
+            except Exception as e:
+                logging.warning(f"Pro-plan renewal reminder email failed for tenant {tenant_id}: {e}")
+        tenant.plan_expiry_reminder_sent_at = now
+        db.session.commit()
+
+
+def check_pro_plan_expirations_with_context():
+    with app.app_context():
+        for t in Tenant.query.filter_by(plan='pro').all():
+            try:
+                check_pro_plan_expirations_for_tenant(t.id)
+            except Exception as e:
+                db.session.rollback()
+                logging.error(f"Pro-plan expiration check failed for tenant {t.id}: {e}")
+
+
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
@@ -2111,6 +2169,7 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     # restarts (and re-fires next_run_time=now()) more than once a day --
     # not a change to this "fire immediately" pattern itself.
     scheduler.add_job(func=auto_sync_upstream_status_with_context, trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=check_pro_plan_expirations_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.start()
  
     

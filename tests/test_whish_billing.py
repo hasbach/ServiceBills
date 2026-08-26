@@ -289,3 +289,83 @@ def test_tenant_me_reports_plan_expiry(client):
     hdr = make_tenant(client, "Biz TenantMe", "tenantme_admin")
     r = client.get("/api/tenant/me", headers=hdr)
     assert r.get_json()["plan_expires_at"] is None
+
+
+def test_reminder_sent_once_within_window_not_sent_again(app, client):
+    make_tenant(client, "Biz Reminder", "reminder_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Reminder").first()
+        tenant.plan = 'pro'
+        tenant.plan_expires_at = datetime.utcnow() + timedelta(days=3)  # inside the 5-day window
+        # The reminder is sent to BusinessSettings.email, which -- unlike
+        # Tenant/User -- registration doesn't populate; a row only exists once
+        # a tenant has saved their business settings at least once (see
+        # test_phase3_network_automation.py's _enable_automation for the same
+        # pattern). Without this the reminder has no recipient and is a no-op.
+        appmod.db.session.add(appmod.BusinessSettings(
+            tenant_id=tenant.id, business_name="Biz Reminder", address="a",
+            mobile="1", email="reminder@example.com"))
+        appmod.db.session.commit()
+
+        appmod.email_util.SENT.clear()
+        appmod.check_pro_plan_expirations_for_tenant(tenant.id)
+        assert len(appmod.email_util.SENT) == 1
+
+        # A second run within the same cycle must not send it again.
+        appmod.check_pro_plan_expirations_for_tenant(tenant.id)
+        assert len(appmod.email_util.SENT) == 1
+
+        tenant = appmod.db.session.get(appmod.Tenant, tenant.id)
+        assert tenant.plan_expiry_reminder_sent_at is not None
+
+
+def test_no_reminder_outside_the_window(app, client):
+    make_tenant(client, "Biz NoReminder", "noreminder_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz NoReminder").first()
+        tenant.plan = 'pro'
+        tenant.plan_expires_at = datetime.utcnow() + timedelta(days=20)  # well outside the 5-day window
+        appmod.db.session.commit()
+
+        appmod.email_util.SENT.clear()
+        appmod.check_pro_plan_expirations_for_tenant(tenant.id)
+        assert len(appmod.email_util.SENT) == 0
+
+
+def test_plan_stays_pro_within_grace_period(app, client):
+    make_tenant(client, "Biz Grace", "grace_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Grace").first()
+        tenant.plan = 'pro'
+        tenant.plan_expires_at = datetime.utcnow() - timedelta(days=1)  # expired 1 day ago, inside 3-day grace
+        appmod.db.session.commit()
+
+        appmod.check_pro_plan_expirations_for_tenant(tenant.id)
+        tenant = appmod.db.session.get(appmod.Tenant, tenant.id)
+        assert tenant.plan == 'pro'
+
+
+def test_plan_reverts_to_free_after_grace_period(app, client):
+    make_tenant(client, "Biz Revert", "revert_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Revert").first()
+        tenant.plan = 'pro'
+        tenant.plan_expires_at = datetime.utcnow() - timedelta(days=4)  # past the 3-day grace
+        tenant.plan_expiry_reminder_sent_at = datetime.utcnow() - timedelta(days=9)
+        appmod.db.session.commit()
+
+        appmod.check_pro_plan_expirations_for_tenant(tenant.id)
+        tenant = appmod.db.session.get(appmod.Tenant, tenant.id)
+        assert tenant.plan == 'free'
+        assert tenant.plan_expires_at is None
+        assert tenant.plan_expiry_reminder_sent_at is None
+
+
+def test_free_plan_tenant_is_a_noop(app, client):
+    make_tenant(client, "Biz FreeNoop", "freenoop_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz FreeNoop").first()
+        appmod.email_util.SENT.clear()
+        appmod.check_pro_plan_expirations_for_tenant(tenant.id)
+        assert len(appmod.email_util.SENT) == 0
+        assert appmod.db.session.get(appmod.Tenant, tenant.id).plan == 'free'
