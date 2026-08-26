@@ -54,11 +54,24 @@ Validates the Postgres migration chain, the full app boot, and the SaaS flows.
    Create a **webhook endpoint** → `https://<your-app>/api/stripe/webhook`, subscribe to
    `checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`
    (copy the `whsec_...` signing secret).
-4. **Email — SendGrid** (recommended; Render blocks outbound SMTP, confirmed live): create a
+4. **Whish (Lebanon self-serve Pro plan)** — Set `WHISH_CHANNEL` and `WHISH_SECRET` once
+   Whish support issues them for this business's merchant account (not Stripe -- Stripe is
+   not used for this market, see docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md).
+   Until both are set, the self-serve Whish checkout button stays hidden and
+   `/api/billing/whish/checkout` is simply unused -- no code change needed when credentials
+   do arrive, just set the two env vars and redeploy.
+   
+   **`APP_BASE_URL` must be the real, working public domain** -- `https://servicebills.salloumservices.com`,
+   not the `onrender.com` hostname (confirmed broken/unreachable as this app's primary URL -- see the
+   `project-security-hotfix-roadmap` memory's note on this). Whish's payment callback is a browser
+   redirect to `{APP_BASE_URL}/api/billing/whish/success`; a wrong `APP_BASE_URL` means paying customers
+   land on a broken URL after paying. Verify this in the Render dashboard's environment settings before
+   Whish credentials are added -- do not assume `RENDER_EXTERNAL_URL`'s fallback value is correct.
+5. **Email — SendGrid** (recommended; Render blocks outbound SMTP, confirmed live): create a
    SendGrid account, verify a sender/domain, create an API key (Mail Send scope) →
    `SENDGRID_API_KEY`. Direct SMTP (`MAIL_BACKEND=smtp`) is still available for hosts that
    allow it, but won't work on Render's free tier.
-5. **Secrets** — generate:
+6. **Secrets** — generate:
    ```
    python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"   # FERNET_KEY
    python -c "import secrets;print(secrets.token_hex(32))"                                     # JWT_SECRET_KEY (or let Render generate)
