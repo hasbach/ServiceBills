@@ -8,7 +8,7 @@ import threading
 import uuid
 import requests
 import traceback
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from datetime import datetime, timedelta, timezone
@@ -1299,6 +1299,55 @@ def billing_whish_checkout():
         return jsonify({"msg": "Could not start Whish checkout"}), 502
 
     return jsonify({"redirect": redirect_url}), 200
+
+
+_WHISH_ATTEMPT_MAX_AGE = timedelta(hours=24)
+
+
+def _apply_whish_payment_success(attempt):
+    """Advance the paying tenant's plan/expiry. Extends from the current
+    plan_expires_at if it's still in the future (an early renewal), else
+    from now() -- matches the design spec's renewal semantics."""
+    tenant = db.session.get(Tenant, attempt.tenant_id)
+    now = datetime.utcnow()
+    base = tenant.plan_expires_at if (tenant.plan_expires_at and tenant.plan_expires_at > now) else now
+    delta = relativedelta(years=1) if attempt.billing_cycle == 'yearly' else relativedelta(months=1)
+    tenant.plan = 'pro'
+    tenant.plan_expires_at = base + delta
+    tenant.plan_expiry_reminder_sent_at = None
+    attempt.status = 'succeeded'
+    attempt.completed_at = now
+    db.session.commit()
+
+
+@app.route('/api/billing/whish/success', methods=['GET'])
+def billing_whish_success():
+    # Public: Whish redirects the customer's browser here after payment (see
+    # the design spec for why this is a token-match model, not a signed
+    # webhook). Never raises on a bad/missing/replayed order+token -- always
+    # redirects somewhere sane.
+    external_id = request.args.get('order')
+    token = request.args.get('token')
+    attempt = BillingPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+
+    if (not attempt or attempt.status != 'pending' or attempt.callback_token != token
+            or attempt.created_at < datetime.utcnow() - _WHISH_ATTEMPT_MAX_AGE):
+        logging.warning(f"Whish success callback rejected: order={external_id}")
+        return redirect(f"{Config.APP_BASE_URL}/billing?status=error")
+
+    _apply_whish_payment_success(attempt)
+    return redirect(f"{Config.APP_BASE_URL}/billing?status=success")
+
+
+@app.route('/api/billing/whish/failure', methods=['GET'])
+def billing_whish_failure():
+    external_id = request.args.get('order')
+    token = request.args.get('token')
+    attempt = BillingPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+    if attempt and attempt.status == 'pending' and attempt.callback_token == token:
+        attempt.status = 'failed'
+        db.session.commit()
+    return redirect(f"{Config.APP_BASE_URL}/billing?status=failed")
 
 
 @app.route('/api/tenant/me', methods=['GET'])

@@ -167,3 +167,103 @@ def test_whish_checkout_returns_502_when_whish_fails(app, client, monkeypatch):
     monkeypatch.setattr(appmod.whish_billing, "create_payment", raise_error)
     r = client.post("/api/billing/whish/checkout", headers=hdr, json={"cycle": "yearly"})
     assert r.status_code == 502
+
+
+from datetime import datetime, timedelta
+
+
+def _make_pending_attempt(app, tenant_name, cycle="monthly", amount=120.0, created_at=None):
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name=tenant_name).first()
+        attempt = appmod.BillingPaymentAttempt(
+            tenant_id=tenant.id, billing_cycle=cycle, amount=amount, currency="USD",
+            whish_external_id=f"ext-{tenant.id}", callback_token="valid-token",
+            status="pending", created_at=created_at or datetime.utcnow(),
+        )
+        appmod.db.session.add(attempt)
+        appmod.db.session.commit()
+        return tenant.id, attempt.whish_external_id
+
+
+def test_whish_success_callback_upgrades_tenant_to_pro(app, client):
+    make_tenant(client, "Biz Success", "success_admin")
+    tenant_id, ext_id = _make_pending_attempt(app, "Biz Success")
+
+    r = client.get(f"/api/billing/whish/success?order={ext_id}&token=valid-token", follow_redirects=False)
+    assert r.status_code == 302
+    assert "status=success" in r.headers["Location"]
+
+    with app.app_context():
+        tenant = appmod.db.session.get(appmod.Tenant, tenant_id)
+        assert tenant.plan == "pro"
+        assert tenant.plan_expires_at is not None
+        assert tenant.plan_expires_at > datetime.utcnow() + timedelta(days=25)
+        attempt = appmod.BillingPaymentAttempt.query.filter_by(whish_external_id=ext_id).first()
+        assert attempt.status == "succeeded"
+        assert attempt.completed_at is not None
+
+
+def test_whish_success_callback_yearly_extends_by_a_year(app, client):
+    make_tenant(client, "Biz Yearly", "yearly_admin")
+    tenant_id, ext_id = _make_pending_attempt(app, "Biz Yearly", cycle="yearly", amount=1000.0)
+    client.get(f"/api/billing/whish/success?order={ext_id}&token=valid-token")
+    with app.app_context():
+        tenant = appmod.db.session.get(appmod.Tenant, tenant_id)
+        assert tenant.plan_expires_at > datetime.utcnow() + timedelta(days=360)
+
+
+def test_whish_success_callback_wrong_token_rejected(app, client):
+    make_tenant(client, "Biz Wrong", "wrong_admin")
+    tenant_id, ext_id = _make_pending_attempt(app, "Biz Wrong")
+    r = client.get(f"/api/billing/whish/success?order={ext_id}&token=not-the-right-token", follow_redirects=False)
+    assert r.status_code == 302
+    assert "status=error" in r.headers["Location"]
+    with app.app_context():
+        tenant = appmod.db.session.get(appmod.Tenant, tenant_id)
+        assert tenant.plan == "free"
+        attempt = appmod.BillingPaymentAttempt.query.filter_by(whish_external_id=ext_id).first()
+        assert attempt.status == "pending"  # untouched
+
+
+def test_whish_success_callback_is_single_use(app, client):
+    make_tenant(client, "Biz Replay", "replay_admin")
+    tenant_id, ext_id = _make_pending_attempt(app, "Biz Replay")
+    client.get(f"/api/billing/whish/success?order={ext_id}&token=valid-token")
+    with app.app_context():
+        first_expiry = appmod.db.session.get(appmod.Tenant, tenant_id).plan_expires_at
+
+    # Replay the exact same callback -- must not extend the expiry a second time.
+    r = client.get(f"/api/billing/whish/success?order={ext_id}&token=valid-token", follow_redirects=False)
+    assert "status=error" in r.headers["Location"]
+    with app.app_context():
+        second_expiry = appmod.db.session.get(appmod.Tenant, tenant_id).plan_expires_at
+        assert second_expiry == first_expiry
+
+
+def test_whish_success_callback_rejects_expired_attempt(app, client):
+    make_tenant(client, "Biz Stale", "stale_billing_admin")
+    tenant_id, ext_id = _make_pending_attempt(
+        app, "Biz Stale", created_at=datetime.utcnow() - timedelta(hours=25))
+    r = client.get(f"/api/billing/whish/success?order={ext_id}&token=valid-token", follow_redirects=False)
+    assert "status=error" in r.headers["Location"]
+    with app.app_context():
+        tenant = appmod.db.session.get(appmod.Tenant, tenant_id)
+        assert tenant.plan == "free"
+
+
+def test_whish_failure_callback_marks_attempt_failed(app, client):
+    make_tenant(client, "Biz Failure", "failure_admin")
+    tenant_id, ext_id = _make_pending_attempt(app, "Biz Failure")
+    r = client.get(f"/api/billing/whish/failure?order={ext_id}&token=valid-token", follow_redirects=False)
+    assert "status=failed" in r.headers["Location"]
+    with app.app_context():
+        attempt = appmod.BillingPaymentAttempt.query.filter_by(whish_external_id=ext_id).first()
+        assert attempt.status == "failed"
+        tenant = appmod.db.session.get(appmod.Tenant, tenant_id)
+        assert tenant.plan == "free"
+
+
+def test_whish_success_callback_unknown_order_is_safe(client):
+    r = client.get("/api/billing/whish/success?order=does-not-exist&token=x", follow_redirects=False)
+    assert r.status_code == 302
+    assert "status=error" in r.headers["Location"]
