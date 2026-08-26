@@ -328,7 +328,7 @@ class Customer(db.Model):
     sector = db.Column(db.String(100), nullable=True)
     subscription_plan_id = db.Column(db.Integer, db.ForeignKey('subscription_plan.id'), nullable=False)
     subscription_start_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    subscription_expiry_date = db.Column(db.DateTime, nullable=False)
+    subscription_expiry_date = db.Column(db.DateTime, nullable=False, index=True)
     is_subscription_active = db.Column(db.Boolean, default=True)
     balance = db.Column(db.Float, default=0.0)
     discount = db.Column(db.Float, default=0.0)
@@ -614,12 +614,24 @@ class MonthlyProfitEstimate(db.Model):
 class Payment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
-    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False, index=True)
     amount = db.Column(db.Float, nullable=False)
     reason = db.Column(db.String(255), nullable=True)
-    paid = db.Column(db.Boolean, default=False)
+    # `collected` and `paid` are two independent, sequential booleans, not
+    # synonyms -- a payment goes uncollected -> collected -> paid, and only
+    # `paid` moves money against `customer.balance`. `collected` means a
+    # field agent has physically received cash but it is NOT YET CONFIRMED;
+    # it deliberately does not touch the customer's balance and is excluded
+    # from "amount owed" totals (see the collect branch of mark_paid). `paid`
+    # means admin/finance has confirmed the collection (or collected it
+    # directly themselves) -- this is the only state that credits the
+    # customer's balance. Both can independently be True (normal end state)
+    # or `collected=True, paid=False` (the normal in-flight state);
+    # `paid=True, collected=False` also happens when admin/finance collects
+    # and confirms in one step, bypassing a separate field-agent handoff.
+    paid = db.Column(db.Boolean, default=False, index=True)
     paid_at = db.Column(db.DateTime, nullable=True)
-    collected = db.Column(db.Boolean, default=False)
+    collected = db.Column(db.Boolean, default=False, index=True)
     collected_at = db.Column(db.DateTime, nullable=True)
     collected_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     collected_amount = db.Column(db.Float, nullable=True)
@@ -1405,6 +1417,15 @@ _TENANT_DELETE_ORDER = [
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
     WhatsAppSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
+    # Phase 3 fix: MonthlyProfitEstimate was missing here entirely. SQLite
+    # doesn't enforce FK constraints, so a tenant delete silently orphaned
+    # these rows there; Postgres correctly rejects the DELETE FROM tenant
+    # with a ForeignKeyViolation instead, which is how this was actually
+    # found -- test_superadmin_delete_removes_only_that_tenant only fails
+    # against real Postgres, not SQLite. No child table references
+    # MonthlyProfitEstimate, so its position in this list doesn't matter
+    # beyond being before the tenant delete itself.
+    MonthlyProfitEstimate,
 ]
 
 
@@ -3091,36 +3112,47 @@ def mark_payment_as_paid(payment_id):
         amount_received_in_this_transaction = 0.0
 
         if partial_payment_flag:
-            if partial_amount_received >= payment.amount:
-                # Full payment via partial amount input
-                amount_received_in_this_transaction = payment.amount
-                customer.balance += payment.amount
-                payment.paid = True
-                payment.paid_at = datetime.utcnow()
-                payment.received_by_id = current_user.id
-                # DON'T set amount to 0 - keep original amount for revenue tracking
-            else:
-                # Actual partial payment
-                amount_received_in_this_transaction = partial_amount_received
-                customer.balance += partial_amount_received
-                # Create a new payment record for the remaining amount
-                remaining_amount = payment.amount - partial_amount_received
-                
-                # Mark original as paid (keeping original amount)
-                payment.paid = True
-                payment.paid_at = datetime.utcnow()
-                payment.received_by_id = current_user.id
-                
-                # Create new payment record for remaining balance if greater than 0
-                if remaining_amount > 0:
-                    remaining_payment = Payment(
-                        customer_id=payment.customer_id,
-                        amount=remaining_amount,
-                        paid=False,
-                        date=payment.date,
-                        pre_payment=payment.pre_payment
-                    )
-                    db.session.add(remaining_payment)
+            # Phase 3 fix: this branch used to mutate unconditionally, unlike
+            # the full-payment branch below (which already guarded on
+            # `not payment.paid`). Two near-simultaneous partial-payment
+            # requests for the same payment could both read `paid=False`
+            # before either committed, and both credit customer.balance and
+            # create a "remaining amount" row -- a real double-submission
+            # bug (double-click, retried request), not just a race under
+            # adversarial timing. Guarding here makes a repeated request on
+            # an already-paid payment a safe no-op, matching the full-payment
+            # branch's existing contract.
+            if not payment.paid:
+                if partial_amount_received >= payment.amount:
+                    # Full payment via partial amount input
+                    amount_received_in_this_transaction = payment.amount
+                    customer.balance += payment.amount
+                    payment.paid = True
+                    payment.paid_at = datetime.utcnow()
+                    payment.received_by_id = current_user.id
+                    # DON'T set amount to 0 - keep original amount for revenue tracking
+                else:
+                    # Actual partial payment
+                    amount_received_in_this_transaction = partial_amount_received
+                    customer.balance += partial_amount_received
+                    # Create a new payment record for the remaining amount
+                    remaining_amount = payment.amount - partial_amount_received
+
+                    # Mark original as paid (keeping original amount)
+                    payment.paid = True
+                    payment.paid_at = datetime.utcnow()
+                    payment.received_by_id = current_user.id
+
+                    # Create new payment record for remaining balance if greater than 0
+                    if remaining_amount > 0:
+                        remaining_payment = Payment(
+                            customer_id=payment.customer_id,
+                            amount=remaining_amount,
+                            paid=False,
+                            date=payment.date,
+                            pre_payment=payment.pre_payment
+                        )
+                        db.session.add(remaining_payment)
 
         else: # Full payment
             if not payment.paid:
