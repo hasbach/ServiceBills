@@ -1938,9 +1938,9 @@ def tenant_export():
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
     UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
-    CustomerFeedback, ServiceStatus, Payment, ResellerPayment, SupplierPayment,
+    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment,
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
-    WhatsAppSettings, ExpenseCategory, Sector,
+    WhatsAppSettings, TenantWhishSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
     # Phase 3 fix: MonthlyProfitEstimate was missing here entirely. SQLite
     # doesn't enforce FK constraints, so a tenant delete silently orphaned
