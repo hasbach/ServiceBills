@@ -16,6 +16,13 @@ def app():
     flask_app.config.update(TESTING=True, SQLALCHEMY_DATABASE_URI="sqlite:///:memory:")
     with flask_app.app_context():
         db.create_all()
+        # Currency is a small reference table normally seeded by its Alembic
+        # migration (see migrations/versions/*_add_currency_and_exchange_rate.py);
+        # tests build schema via create_all(), not migrations, so seed it here too.
+        from app import Currency
+        db.session.add(Currency(code='USD', name='US Dollar', decimal_places=2))
+        db.session.add(Currency(code='LBP', name='Lebanese Pound', decimal_places=0))
+        db.session.commit()
         yield flask_app
         db.session.remove()
         db.drop_all()

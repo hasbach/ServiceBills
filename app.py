@@ -108,6 +108,7 @@ import email_util
 import mikrotik
 import upstream_portal
 import upstream_portal_krypton
+import fx
 from itsdangerous import URLSafeTimedSerializer, BadData
 
 
@@ -205,7 +206,7 @@ class Reseller(db.Model):
     name = db.Column(db.String(100), nullable=False)
     phone = db.Column(db.String(20), nullable=False)
     type = db.Column(db.String(20), nullable=False) # 'type1' or 'type2'
-    balance = db.Column(db.Float, default=0.0)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
     customers = db.relationship('Customer', backref='reseller', lazy=True)
     payments = db.relationship('ResellerPayment', backref='reseller', lazy=True, cascade="all, delete-orphan")
 
@@ -225,7 +226,7 @@ class ResellerPayment(db.Model):
     # Set for per-customer billing entries (credit_added charges); null for reseller-level
     # entries not tied to one customer (manual add_credit/apply_discount/collect_payment).
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True, index=True)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     type = db.Column(db.String(50), nullable=False) # 'credit_added', 'payment_received', 'discount_applied'
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     description = db.Column(db.String(200))
@@ -252,7 +253,7 @@ class UpstreamProvider(db.Model):
     portal_url = db.Column(db.String(300), nullable=True)
     portal_username = db.Column(db.String(100), nullable=True)
     portal_password = db.Column(EncryptedString, nullable=True)  # encrypted at rest; unused until portal automation ships
-    balance = db.Column(db.Float, default=0.0)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
     status = db.Column(db.String(20), default='active')
     customers = db.relationship('Customer', backref='upstream_provider', lazy=True)
     payments = db.relationship('UpstreamProviderPayment', backref='upstream_provider', lazy=True, cascade="all, delete-orphan")
@@ -274,7 +275,7 @@ class UpstreamProviderPayment(db.Model):
     upstream_provider_id = db.Column(db.Integer, db.ForeignKey('upstream_provider.id'), nullable=False)
     # Set for a specific customer's renewal cost; null for provider-level manual top-ups.
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True, index=True)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     type = db.Column(db.String(50), nullable=False)  # 'balance_topup', 'renewal_cost', 'manual_adjustment'
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     description = db.Column(db.String(200))
@@ -345,9 +346,9 @@ class Customer(db.Model):
     subscription_start_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     subscription_expiry_date = db.Column(db.DateTime, nullable=False, index=True)
     is_subscription_active = db.Column(db.Boolean, default=True)
-    balance = db.Column(db.Float, default=0.0)
-    discount = db.Column(db.Float, default=0.0)
-    cost_override = db.Column(db.Float, nullable=True)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
+    discount = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
+    cost_override = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
     reseller_id = db.Column(db.Integer, db.ForeignKey('reseller.id'), nullable=True)
     # Populated only when the tenant's BusinessSettings.network_mode is
     # 'upstream_bridge' -- the upstream RADIUS operator and this customer's
@@ -388,10 +389,14 @@ class SubscriptionPlan(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
-    price = db.Column(db.Float, nullable=False)
-    cost = db.Column(db.Float, nullable=False, default=0.0)
+    price = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    cost = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
     billing_cycle = db.Column(db.String(20), nullable=False)
     status = db.Column(db.String(50), default='active') # active, inactive
+    # Multi-currency (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md):
+    # a Customer inherits its price/currency from its plan, the same way it
+    # already inherits price/billing_cycle -- no separate per-customer override.
+    currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
 
     customers = db.relationship('Customer', backref='subscription_plan', lazy=True)
 
@@ -402,7 +407,8 @@ class SubscriptionPlan(db.Model):
             'price': float(self.price),
             'cost': float(self.cost),
             'billing_cycle': self.billing_cycle,
-            'status': self.status
+            'status': self.status,
+            'currency': self.currency or 'USD'
         }
 
 class Sector(db.Model):
@@ -420,7 +426,7 @@ class Supplier(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
     phone = db.Column(db.String(20), nullable=True)
-    balance = db.Column(db.Float, default=0.0)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
     address = db.Column(db.String(200), nullable=True)
     notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -440,7 +446,7 @@ class SupplierPayment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     supplier_id = db.Column(db.Integer, db.ForeignKey('supplier.id'), nullable=False)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     payment_date = db.Column(db.DateTime, default=datetime.utcnow)
     payment_method = db.Column(db.String(50), nullable=True)
     reference_note = db.Column(db.Text, nullable=True)
@@ -504,7 +510,7 @@ class Expense(db.Model):
     # purposes, independent of whatever the category happens to be named.
     employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=True)
     is_credit = db.Column(db.Boolean, default=False)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     description = db.Column(db.String(200), nullable=False)
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
@@ -533,11 +539,11 @@ class Employee(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
-    monthly_salary = db.Column(db.Float, nullable=False, default=0.0)
+    monthly_salary = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
     hire_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     active = db.Column(db.Boolean, default=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
-    balance = db.Column(db.Float, default=0.0)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
     notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -561,7 +567,7 @@ class SalaryCharge(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=False)
     type = db.Column(db.String(20), nullable=False)  # 'salary' | 'bonus' | 'deduction'
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     period = db.Column(db.String(7), nullable=False)  # 'YYYY-MM'
     date = db.Column(db.DateTime, default=datetime.utcnow)
     reason = db.Column(db.String(200), nullable=True)
@@ -583,7 +589,7 @@ class SalaryPayment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=False)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     payment_date = db.Column(db.DateTime, default=datetime.utcnow)
     method = db.Column(db.String(50), nullable=True)
     is_advance = db.Column(db.Boolean, default=False)
@@ -610,9 +616,9 @@ class MonthlyProfitEstimate(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     month = db.Column(db.String(7), nullable=False)  # 'YYYY-MM'
-    estimated_income = db.Column(db.Float, nullable=False, default=0.0)
-    estimated_cost = db.Column(db.Float, nullable=False, default=0.0)
-    estimated_profit = db.Column(db.Float, nullable=False, default=0.0)  # denormalized: income - cost
+    estimated_income = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
+    estimated_cost = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
+    estimated_profit = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)  # denormalized: income - cost
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (db.UniqueConstraint('tenant_id', 'month', name='uq_monthly_profit_estimate_tenant_month'),)
 
@@ -630,7 +636,20 @@ class Payment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False, index=True)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    # Multi-currency (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
+    # `currency` is the currency `amount` is denominated in (inherited from the
+    # customer's subscription_plan.currency at the moment this payment was
+    # created). `fx_rate_to_reporting` is the rate used to convert `amount`
+    # into the tenant's reporting_currency AT THAT MOMENT -- frozen forever,
+    # never recomputed when new ExchangeRate rows are added later. This is the
+    # actual historical rate-locking mechanism. NOTE: as of this PR, only the
+    # explicit POST /api/payments (add_payment) path locks these correctly --
+    # other Payment-creation call sites (recurring/backdated billing,
+    # renewals, partial-payment splits) still use the plain defaults below;
+    # see the spec's Non-goals for why, and for the follow-up needed.
+    currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
+    fx_rate_to_reporting = db.Column(db.Numeric(18, 8), nullable=False, default=1)
     reason = db.Column(db.String(255), nullable=True)
     # `collected` and `paid` are two independent, sequential booleans, not
     # synonyms -- a payment goes uncollected -> collected -> paid, and only
@@ -649,7 +668,7 @@ class Payment(db.Model):
     collected = db.Column(db.Boolean, default=False, index=True)
     collected_at = db.Column(db.DateTime, nullable=True)
     collected_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
-    collected_amount = db.Column(db.Float, nullable=True)
+    collected_amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
     received_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     pre_payment = db.Column(db.Boolean, default=False)
@@ -689,7 +708,7 @@ class AddonPurchase(db.Model):
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     description = db.Column(db.String(200))
     purchase_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     paid = db.Column(db.Boolean, default=False)
     payment_id = db.Column(db.Integer, db.ForeignKey('payment.id'), nullable=True)
     notes = db.Column(db.String(200))
@@ -718,6 +737,15 @@ class BusinessSettings(db.Model):
     # this flag only controls whether upstream_last_status/expiry get
     # refreshed automatically; it never triggers a suspend/unsuspend action.
     upstream_sync_automation_enabled = db.Column(db.Boolean, nullable=False, default=False)
+    # Multi-currency accounting for THIS tenant's own customer billing (see
+    # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
+    # Off by default, same opt-in precedent as upstream_sync_automation_enabled
+    # above -- an opted-out tenant sees zero behavior change. reporting_currency
+    # exists regardless of the flag: it is "this tenant's one currency" for a
+    # single-currency tenant too, so report-aggregation code has exactly one
+    # path (always convert-and-sum) rather than a flag-gated branch.
+    multi_currency_enabled = db.Column(db.Boolean, nullable=False, default=False)
+    reporting_currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -738,6 +766,8 @@ class BusinessSettings(db.Model):
             'website': self.website,
             'network_mode': self.network_mode or 'none',
             'upstream_sync_automation_enabled': bool(self.upstream_sync_automation_enabled),
+            'multi_currency_enabled': bool(self.multi_currency_enabled),
+            'reporting_currency': self.reporting_currency or 'USD',
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -926,13 +956,57 @@ class BillingPaymentAttempt(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     billing_cycle = db.Column(db.String(10), nullable=False)  # 'monthly' or 'yearly'
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     currency = db.Column(db.String(3), nullable=False, default='USD')
     whish_external_id = db.Column(db.String(64), unique=True, nullable=False, index=True)
     callback_token = db.Column(db.String(64), nullable=False)
     status = db.Column(db.String(10), nullable=False, default='pending')  # pending, succeeded, failed, expired
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     completed_at = db.Column(db.DateTime, nullable=True)
+
+
+class Currency(db.Model):
+    """Reference table of currencies this deployment knows about -- NOT
+    tenant-scoped (shared, like plans.PLANS). Seeded with USD/LBP by the
+    migration; adding a third currency is a data insert, not a schema
+    change. See docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md."""
+    code = db.Column(db.String(3), primary_key=True)  # ISO 4217
+    name = db.Column(db.String(50), nullable=False)
+    decimal_places = db.Column(db.Integer, nullable=False, default=2)
+    active = db.Column(db.Boolean, nullable=False, default=True)
+
+    def to_dict(self):
+        return {'code': self.code, 'name': self.name,
+                'decimal_places': self.decimal_places, 'active': self.active}
+
+
+class ExchangeRate(db.Model):
+    """A tenant-entered FX rate, effective from a point in time until superseded
+    by a later one. Historical Payment rows never re-read this table after
+    creation (see Payment.fx_rate_to_reporting) -- this table is consulted only
+    at payment-creation time (to pick the rate to lock) and for live (not
+    historical) conversions. See
+    docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    from_currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False)
+    to_currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False)
+    rate = db.Column(db.Numeric(18, 8), nullable=False)  # 1 unit of from_currency = `rate` units of to_currency
+    effective_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    source = db.Column(db.String(20), nullable=False, default='manual')  # 'manual' today; reserved for a future API source
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.Index('ix_exchange_rate_tenant_pair_effective', 'tenant_id', 'from_currency', 'to_currency', 'effective_at'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'from_currency': self.from_currency, 'to_currency': self.to_currency,
+            'rate': float(self.rate), 'effective_at': self.effective_at.strftime('%Y-%m-%d %H:%M:%S'),
+            'source': self.source, 'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        }
 
 
 # --- Tenant write scoping (defense in depth) ---------------------------------
@@ -950,6 +1024,7 @@ TENANT_OWNED_MODELS = (
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
+    ExchangeRate,
 )
 
 from sqlalchemy import event as _sa_event
@@ -2681,7 +2756,20 @@ def update_customer(customer_id):
             new_plan = tenant_query(SubscriptionPlan).filter_by(id=data['subscription_plan_id']).first()
             if not new_plan:
                 return jsonify({'message': 'Subscription plan not found!'}), 404
-            
+
+            # Multi-currency (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md):
+            # a customer's balance is denominated in their current plan's
+            # currency. Changing to a plan in a different currency while a
+            # non-zero balance exists would silently re-value that balance --
+            # block it and require settling to zero first, rather than
+            # guessing at a conversion.
+            old_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
+            if old_plan and new_plan.currency != old_plan.currency and float(customer.balance or 0) != 0.0:
+                return jsonify({'error': (
+                    f"Cannot change this customer's plan from {old_plan.currency} to {new_plan.currency} "
+                    f"while they have a non-zero balance ({float(customer.balance):.2f} {old_plan.currency}). "
+                    f"Settle their balance to zero first, then change the plan.")}), 400
+
             old_plan_id = customer.subscription_plan_id
             customer.subscription_plan_id = data['subscription_plan_id']
             
@@ -2998,12 +3086,17 @@ def add_subscription_plan():
         if data['billing_cycle'] not in ['monthly', 'yearly']:
             return jsonify({'error': "Billing cycle must be 'monthly' or 'yearly'."}), 400
 
+        currency = data.get('currency', 'USD')
+        if not Currency.query.filter_by(code=currency, active=True).first():
+            return jsonify({'error': f"Unknown or inactive currency code '{currency}'."}), 400
+
         new_plan = SubscriptionPlan(
             name=data['name'],
             price=price,
             cost=cost,
             billing_cycle=data['billing_cycle'],
-            status=data.get('status', 'active')
+            status=data.get('status', 'active'),
+            currency=currency
         )
         db.session.add(new_plan)
         db.session.commit()
@@ -3034,6 +3127,11 @@ def update_subscription_plan(plan_id):
         plan.cost = float(data.get('cost', plan.cost))
         plan.billing_cycle = data.get('billing_cycle', plan.billing_cycle)
         plan.status = data.get('status', plan.status)
+        if 'currency' in data:
+            new_currency = data['currency']
+            if not Currency.query.filter_by(code=new_currency, active=True).first():
+                return jsonify({'error': f"Unknown or inactive currency code '{new_currency}'."}), 400
+            plan.currency = new_currency
 
         db.session.commit()
         recalculate_estimated_profit(plan.tenant_id)
@@ -3108,12 +3206,30 @@ def add_payment():
             return jsonify({'error': str(ve)}), 400
         is_pre_payment = data.get('pre_payment', False)
         # A pre-payment is paid, a non-pre-payment (manual charge) is unpaid
-        is_paid = is_pre_payment 
+        is_paid = is_pre_payment
+
+        # Multi-currency: lock the FX rate at creation time (see
+        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
+        # payment_date may be tz-aware (datetime.now(timezone.utc), the no-date
+        # default above) while ExchangeRate.effective_at is naive -- normalize
+        # before comparing.
+        settings = get_tenant_settings(BusinessSettings, business_name="Default Business", address="", mobile="")
+        subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
+        payment_currency = subscription_plan.currency if subscription_plan else 'USD'
+        fx_as_of = payment_date.replace(tzinfo=None) if payment_date.tzinfo else payment_date
+        try:
+            locked_rate = fx.get_rate(current_tenant_id(), payment_currency, settings.reporting_currency, as_of=fx_as_of)
+        except fx.FxRateMissingError:
+            return jsonify({'error': (
+                f"No exchange rate on file for {payment_currency}->{settings.reporting_currency} "
+                f"as of this payment's date; enter one under Settings -> Exchange Rates first.")}), 400
 
         # Create a new payment
         new_payment = Payment(
             customer_id=customer.id,
             amount=payment_amount,
+            currency=payment_currency,
+            fx_rate_to_reporting=locked_rate,
             reason=data['reason'],
             date=payment_date,
             pre_payment=is_pre_payment,
@@ -3306,9 +3422,12 @@ def month_key(column):
 @app.route('/api/reports/total-sales', methods=['GET'])
 @jwt_required()
 def get_total_sales():
+    # Converted into the tenant's reporting_currency using each payment's own
+    # LOCKED rate (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md)
+    # -- a no-op multiply-by-1 for an opted-out (single-currency) tenant.
     total_sales = db.session.query(
         month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(Payment.amount).label('total_sales')
+        func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_sales')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
@@ -3327,7 +3446,7 @@ def get_total_sales():
 def get_unpaid_payments():
     unpaid_payments = db.session.query(
         month_key(Payment.date).label('month'),
-        func.sum(Payment.amount).label('unpaid')
+        func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('unpaid')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == False
@@ -4273,10 +4392,12 @@ def get_expenses_total():
 @app.route('/api/reports/monthly-revenue', methods=['GET'])
 @jwt_required()
 def get_monthly_revenue():
-    # Get total sales (paid only)
+    # Get total sales (paid only). Converted into the tenant's reporting_currency
+    # using each payment's own locked rate (no-op for an opted-out tenant) -- see
+    # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
     sales_query = db.session.query(
         month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(Payment.amount).label('total_sales')
+        func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_sales')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
@@ -4326,6 +4447,11 @@ def get_monthly_revenue():
 @jwt_required()
 def save_business_settings():
     try:
+        if 'reporting_currency' in request.form:
+            _requested_reporting_currency = request.form.get('reporting_currency')
+            if not Currency.query.filter_by(code=_requested_reporting_currency, active=True).first():
+                return jsonify({'error': f"Unknown or inactive currency code '{_requested_reporting_currency}'."}), 400
+
         # Fetch existing settings or create new
         settings = tenant_query(BusinessSettings).first()
         if not settings:
@@ -4338,6 +4464,9 @@ def save_business_settings():
                 network_mode=request.form.get('network_mode', "none"),
                 upstream_sync_automation_enabled=_parse_bool_form_field(
                     request.form.get('upstream_sync_automation_enabled'), default=False),
+                multi_currency_enabled=_parse_bool_form_field(
+                    request.form.get('multi_currency_enabled'), default=False),
+                reporting_currency=request.form.get('reporting_currency', 'USD'),
             )
             db.session.add(settings)
 
@@ -4358,6 +4487,12 @@ def save_business_settings():
         if 'upstream_sync_automation_enabled' in request.form:
             settings.upstream_sync_automation_enabled = _parse_bool_form_field(
                 request.form.get('upstream_sync_automation_enabled'), default=settings.upstream_sync_automation_enabled)
+        if 'multi_currency_enabled' in request.form:
+            settings.multi_currency_enabled = _parse_bool_form_field(
+                request.form.get('multi_currency_enabled'), default=settings.multi_currency_enabled)
+        if 'reporting_currency' in request.form:
+            # Already validated above (before the create/update branch).
+            settings.reporting_currency = request.form.get('reporting_currency')
 
         # Only update logo_url if a new file was uploaded
         if logo_url:
@@ -4389,9 +4524,63 @@ def get_business_settings():
                 'email': "",
                 'website': "",
                 'network_mode': "none",
-                'upstream_sync_automation_enabled': False
+                'upstream_sync_automation_enabled': False,
+                'multi_currency_enabled': False,
+                'reporting_currency': 'USD'
             }
         }), 200
+
+
+@app.route('/api/exchange-rates', methods=['POST'])
+@jwt_required()
+@admin_required()
+def create_exchange_rate():
+    """Manual FX-rate entry (see
+    docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
+    Rejected outright when multi_currency_enabled is off -- no point letting a
+    tenant populate a table their own payment flow will never consult."""
+    settings = tenant_query(BusinessSettings).first()
+    if not settings or not settings.multi_currency_enabled:
+        return jsonify({'error': 'Multi-currency accounting is not enabled for this business.'}), 400
+
+    data = request.json or {}
+    from_currency = data.get('from_currency')
+    to_currency = data.get('to_currency')
+    if not Currency.query.filter_by(code=from_currency, active=True).first():
+        return jsonify({'error': f"Unknown or inactive currency code '{from_currency}'."}), 400
+    if not Currency.query.filter_by(code=to_currency, active=True).first():
+        return jsonify({'error': f"Unknown or inactive currency code '{to_currency}'."}), 400
+    try:
+        rate = float(data.get('rate'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'rate must be a valid number.'}), 400
+    if not math.isfinite(rate) or rate <= 0:
+        return jsonify({'error': 'rate must be greater than zero.'}), 400
+
+    effective_at = datetime.utcnow()
+    if data.get('effective_at'):
+        try:
+            effective_at = datetime.fromisoformat(data['effective_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+        except ValueError:
+            return jsonify({'error': 'effective_at must be a valid ISO-8601 datetime.'}), 400
+
+    current_username = get_jwt_identity()
+    current_user = User.query.filter_by(username=current_username).first()
+    row = new_for_tenant(
+        ExchangeRate, from_currency=from_currency, to_currency=to_currency, rate=rate,
+        effective_at=effective_at, created_by_id=current_user.id if current_user else None,
+    )
+    db.session.add(row)
+    db.session.commit()
+    return jsonify({'message': 'Exchange rate added.', 'exchange_rate': row.to_dict()}), 201
+
+
+@app.route('/api/exchange-rates', methods=['GET'])
+@jwt_required()
+def list_exchange_rates():
+    rows = tenant_query(ExchangeRate).order_by(ExchangeRate.effective_at.desc()).all()
+    return jsonify({'exchange_rates': [r.to_dict() for r in rows]}), 200
+
 
 @app.route('/api/whatsapp-settings', methods=['GET'])
 @jwt_required()
@@ -6518,9 +6707,12 @@ def get_collector_progress():
         end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
         end_date = end_date.replace(hour=23, minute=59, second=59)
 
+        # Converted into the tenant's reporting_currency using each payment's own
+        # locked rate (no-op for an opted-out tenant) -- see
+        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
         collector_query = db.session.query(
             User.username,
-            func.sum(Payment.amount).label('total_amount'),
+            func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_amount'),
             func.count(Payment.id).label('total_payments')
         ).join(Payment, Payment.collected_by_id == User.id)\
          .filter(
@@ -6562,9 +6754,16 @@ def get_financial_report():
         end_date = end_date.replace(hour=23, minute=59, second=59)
 
         # 1. Income: Payments marked as paid. Fall back to date if paid_at is null.
+        # Converted into the tenant's reporting_currency using each payment's own
+        # LOCKED rate (fx_rate_to_reporting) -- not a live/current rate -- so a
+        # report over a date range spanning an FX-rate update always reflects
+        # what those payments were actually worth when they happened. For an
+        # opted-out (single-currency) tenant, fx_rate_to_reporting is always
+        # exactly 1, so this is a no-op multiply-by-1. See
+        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
         income_query = db.session.query(
             month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-            func.sum(Payment.amount).label('total')
+            func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total')
         ).filter(
             Payment.tenant_id == current_tenant_id(),
             Payment.paid == True,
@@ -6703,9 +6902,13 @@ def get_financial_report():
                 total_variance += data['variance']
 
         total_profit = total_income - total_expenses
+        _reporting_settings = tenant_query(BusinessSettings).first()
 
         return jsonify({
             'monthly_data': monthly_data,
+            # See docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md
+            # -- all totals above are already converted into this currency.
+            'currency': (_reporting_settings.reporting_currency if _reporting_settings else 'USD'),
             'totals': {
                 'income': total_income,
                 'expenses': total_expenses,
