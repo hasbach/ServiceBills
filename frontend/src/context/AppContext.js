@@ -205,6 +205,8 @@ const rawApiService = {
     fetchWhatsAppSettings: () => api.get('/whatsapp-settings'),
     saveWhatsAppSettings: (data) => api.post('/whatsapp-settings', data),
     subscribeWaba: () => api.post('/whatsapp/subscribe-waba'),
+    tenantWhishSettings: () => api.get('/tenant-whish-settings'),
+    saveTenantWhishSettings: (payload) => api.post('/tenant-whish-settings', payload),
     sendWhatsappReminder: (customerId, templateType = 'payment_reminder') => api.post(`/customers/${customerId}/send-whatsapp-reminder`, { template_type: templateType }),
     fetchReceipt: (paymentId) => api.get(`/receipt/${paymentId}`),
     addCustomerPayment: (paymentData) => api.post(`/payments`, paymentData),
