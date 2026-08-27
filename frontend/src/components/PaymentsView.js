@@ -57,7 +57,10 @@ import {
     LocationOn as LocationIcon,
     CardGiftcard as CardGiftcardIcon,
     Phone as PhoneIcon,
-    Undo as UndoIcon
+    Undo as UndoIcon,
+    ContentCopy as ContentCopyIcon,
+    Link as LinkIcon,
+    Email as EmailIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import { escapeHtml } from '../utils/escapeHtml.js';
@@ -264,6 +267,7 @@ const PaymentCardItem = React.memo(({
     getStatusColor, getPaymentTypeColor,
     openMarkPaidDialog, openMarkGratisDialog, openRevertDialog, handlePrepareReceipt, handleDeletePayment,
     buildWhatsAppLink, waSettings, userRoles,
+    twsEnabled, handleSendPaymentLink, sendLinkLoading,
 }) => {
     const isCollector = userRoles.includes('collector') || userRoles.includes('admin') || userRoles.includes('finance');
     const isAdminOrFinance = userRoles.includes('admin') || userRoles.includes('finance');
@@ -348,9 +352,11 @@ const PaymentCardItem = React.memo(({
                                     by {payment.collected_by} {payment.collected_amount ? `($${payment.collected_amount.toFixed(2)})` : ''}
                                 </Typography>
                             )}
-                            {payment.paid && payment.received_by && (
+                            {payment.paid && (payment.received_by || payment.collected_via === 'whish') && (
                                 <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
-                                    rcvd by {payment.received_by}
+                                    {payment.received_by
+                                        ? `rcvd by ${payment.received_by}`
+                                        : `via Whish${payment.whish_transaction_number ? ` (#${payment.whish_transaction_number})` : ''}`}
                                 </Typography>
                             )}
                         </Box>
@@ -372,6 +378,13 @@ const PaymentCardItem = React.memo(({
                                 {isAdminOrFinance && (
                                     <Button size="small" variant="outlined" startIcon={<PrintIcon />} onClick={() => handlePrepareReceipt(payment.id)} sx={{ borderColor: alpha(theme.palette.primary.main, 0.3), '&:hover': { borderColor: theme.palette.primary.main, backgroundColor: alpha(theme.palette.primary.main, 0.05) } }}>
                                         Print Receipt
+                                    </Button>
+                                )}
+                                {isAdminOrFinance && twsEnabled && (
+                                    <Button size="small" variant="outlined" startIcon={<LinkIcon />} disabled={sendLinkLoading}
+                                        onClick={() => handleSendPaymentLink(payment)}
+                                        sx={{ borderColor: alpha(theme.palette.primary.main, 0.3), '&:hover': { borderColor: theme.palette.primary.main, backgroundColor: alpha(theme.palette.primary.main, 0.05) } }}>
+                                        Send Payment Link
                                     </Button>
                                 )}
                             </>
@@ -432,7 +445,8 @@ const PaymentsView = () => {
     const [revertDialog, setRevertDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
     const [revertReason, setRevertReason] = useState('');
     const [revertSubmitting, setRevertSubmitting] = useState(false);
-    const [waSettings, setWaSettings] = useState({ enabled: false, mode: 'deeplink', deeplink_msg_payment: 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!' });
+    const [waSettings, setWaSettings] = useState({ enabled: false, mode: 'deeplink', deeplink_msg_payment: 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!', deeplink_msg_payment_link: 'Hi {customer_name}, here is your payment link: {pay_url}' });
+    const [twsEnabled, setTwsEnabled] = useState(false);
 
     // Fetch WhatsApp settings once
     useEffect(() => {
@@ -440,6 +454,71 @@ const PaymentsView = () => {
             if (res.data?.settings) setWaSettings(res.data.settings);
         }).catch(() => {});
     }, [apiService]);
+
+    // Fetch tenant-Whish (customer payments) settings once -- gates the
+    // "Send payment link" button below.
+    useEffect(() => {
+        apiService.tenantWhishSettings().then(res => {
+            setTwsEnabled(!!res.data?.settings?.enabled);
+        }).catch(() => {});
+    }, [apiService]);
+
+    // Send-payment-link dialog: shown after a successful resend, offering
+    // WhatsApp / copy-link / email delivery for the fresh link.
+    const [sendLinkDialog, setSendLinkDialog] = useState({ open: false, payment: null, payUrl: '', viewToken: '' });
+    const [sendLinkLoading, setSendLinkLoading] = useState(false);
+    const [emailAddress, setEmailAddress] = useState('');
+    const [emailSending, setEmailSending] = useState(false);
+
+    const handleSendPaymentLink = async (payment) => {
+        setSendLinkLoading(true);
+        try {
+            const res = await apiService.resendWhishPaymentLink(payment.customer_id, payment.id);
+            setSendLinkDialog({ open: true, payment, payUrl: res.data.pay_url, viewToken: res.data.view_token });
+            setEmailAddress('');
+        } catch (err) {
+            const detail = err?.response?.data?.msg || 'Could not create a payment link.';
+            setSnackbar({ open: true, message: detail, severity: 'error' });
+        } finally {
+            setSendLinkLoading(false);
+        }
+    };
+
+    const closeSendLinkDialog = () => setSendLinkDialog({ open: false, payment: null, payUrl: '', viewToken: '' });
+
+    const sendLinkWhatsAppUrl = () => {
+        const { payment, payUrl } = sendLinkDialog;
+        const phone = (payment?.customer_phone || '').replace(/\D/g, '');
+        if (!phone) return null;
+        const msg = (waSettings.deeplink_msg_payment_link || 'Hi {customer_name}, here is your payment link: {pay_url}')
+            .replace('{customer_name}', payment?.customer_name || '')
+            .replace('{pay_url}', payUrl);
+        return `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+    };
+
+    const copyPaymentLink = async () => {
+        try {
+            await navigator.clipboard.writeText(sendLinkDialog.payUrl);
+            setSnackbar({ open: true, message: 'Link copied!', severity: 'success' });
+        } catch {
+            setSnackbar({ open: true, message: 'Could not copy link.', severity: 'error' });
+        }
+    };
+
+    const emailPaymentLink = async () => {
+        if (!emailAddress.trim()) return;
+        setEmailSending(true);
+        try {
+            const { payment, payUrl } = sendLinkDialog;
+            await apiService.emailWhishPaymentLink(payment.customer_id, payment.id, emailAddress.trim(), payUrl);
+            setSnackbar({ open: true, message: 'Email sent!', severity: 'success' });
+        } catch (err) {
+            const detail = err?.response?.data?.msg || 'Could not send the email.';
+            setSnackbar({ open: true, message: detail, severity: 'error' });
+        } finally {
+            setEmailSending(false);
+        }
+    };
 
     // Build wa.me deep-link for a paid payment
     const buildWhatsAppLink = (payment) => {
@@ -1067,8 +1146,11 @@ const handlePrint = () => {
         buildWhatsAppLink,
         waSettings,
         userRoles,
+        twsEnabled,
+        handleSendPaymentLink,
+        sendLinkLoading,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }), [waSettings, userRoles.join(',')]);
+    }), [waSettings, userRoles.join(','), twsEnabled, sendLinkLoading]);
 
     const PaymentCard = React.useCallback(
         ({ payment }) => <PaymentCardItem payment={payment} {...cardHandlers} />,
@@ -1724,6 +1806,54 @@ const handlePrint = () => {
                     >
                         Confirm Revert
                     </Button>
+                </DialogActions>
+            </Dialog>
+
+            {/* Send Payment Link dialog -- WhatsApp / copy-link / email delivery */}
+            <Dialog open={sendLinkDialog.open} onClose={closeSendLinkDialog} maxWidth="xs" fullWidth>
+                <DialogTitle sx={{ fontWeight: 700 }}>Send Payment Link</DialogTitle>
+                <DialogContent>
+                    <Typography variant="body2" sx={{ mb: 2, color: 'text.secondary' }}>
+                        A fresh payment link was created for <strong>{sendLinkDialog.payment?.customer_name}</strong>.
+                    </Typography>
+                    <TextField
+                        fullWidth
+                        label="Payment link"
+                        value={sendLinkDialog.payUrl}
+                        InputProps={{ readOnly: true }}
+                        sx={{ mb: 2 }}
+                    />
+                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mb: 3 }}>
+                        {sendLinkWhatsAppUrl() && (
+                            <Button variant="outlined" startIcon={<WhatsAppIcon />} component="a"
+                                href={sendLinkWhatsAppUrl()} target="_blank" rel="noopener noreferrer"
+                                sx={{ borderColor: alpha('#25D366', 0.4), color: '#25D366' }}>
+                                WhatsApp
+                            </Button>
+                        )}
+                        <Button variant="outlined" startIcon={<ContentCopyIcon />} onClick={copyPaymentLink}>
+                            Copy Link
+                        </Button>
+                    </Box>
+                    <Divider sx={{ mb: 2 }} />
+                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Or send by email</Typography>
+                    <Box sx={{ display: 'flex', gap: 1 }}>
+                        <TextField
+                            fullWidth
+                            size="small"
+                            type="email"
+                            placeholder="customer@example.com"
+                            value={emailAddress}
+                            onChange={(e) => setEmailAddress(e.target.value)}
+                            InputProps={{ startAdornment: <InputAdornment position="start"><EmailIcon fontSize="small" /></InputAdornment> }}
+                        />
+                        <Button variant="contained" onClick={emailPaymentLink} disabled={emailSending || !emailAddress.trim()}>
+                            {emailSending ? <CircularProgress size={18} color="inherit" /> : 'Send'}
+                        </Button>
+                    </Box>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={closeSendLinkDialog}>Close</Button>
                 </DialogActions>
             </Dialog>
 

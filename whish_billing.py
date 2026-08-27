@@ -39,13 +39,25 @@ def _headers():
     }
 
 
-def create_payment(external_id, amount, currency, callback_token, requestee, target, email, invoice):
+def create_payment(external_id, amount, currency, callback_token, requestee, target, email, invoice,
+                    success_path='/api/billing/whish/success', failure_path='/api/billing/whish/failure'):
     """Create a one-time Whish payment and return the collectUrl to redirect
     the customer's browser to. Raises WhishAPIError on any failure -- never
     returns a falsy/partial result, matching billing.py's raise-based
-    convention for the Stripe client this sits alongside."""
-    success_url = f"{Config.APP_BASE_URL}/api/billing/whish/success?order={external_id}&token={callback_token}"
-    failure_url = f"{Config.APP_BASE_URL}/api/billing/whish/failure?order={external_id}&token={callback_token}"
+    convention for the Stripe client this sits alongside.
+
+    success_path/failure_path default to platform billing's own callback
+    routes (this function's original, only caller) -- additive optional
+    params, not a signature break, so that call keeps working unchanged.
+    The tenant-facing customer-payments feature (see
+    docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md)
+    passes its own routes here instead: this function has no way to tell
+    those two flows apart otherwise, since Whish redirects the browser to
+    whatever URL it was given verbatim, and a payment meant for a tenant's
+    customer must never redirect through platform billing's success handler
+    (or vice versa)."""
+    success_url = f"{Config.APP_BASE_URL}{success_path}?order={external_id}&token={callback_token}"
+    failure_url = f"{Config.APP_BASE_URL}{failure_path}?order={external_id}&token={callback_token}"
     payload = {
         "externalId": external_id,
         "successCallbackUrl": success_url,

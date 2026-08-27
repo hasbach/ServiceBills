@@ -269,6 +269,48 @@ const EnhancedReportsView = () => {
     );
   };
 
+  const renderCustomerWhishPaymentsTable = () => {
+    const rows = (reportData && Array.isArray(reportData.links)) ? reportData.links : [];
+
+    return (
+      <TableContainer component={Paper}>
+        <Table>
+          <TableHead>
+            <TableRow>
+              <TableCell>Customer</TableCell>
+              <TableCell>Phone</TableCell>
+              <TableCell align="right">Amount</TableCell>
+              <TableCell>Currency</TableCell>
+              <TableCell>Status</TableCell>
+              <TableCell>Whish Transaction #</TableCell>
+              <TableCell>Created</TableCell>
+              <TableCell>Completed</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {rows.map((link) => (
+              <TableRow key={link.id}>
+                <TableCell>{link.customer_name}</TableCell>
+                <TableCell>{link.customer_phone}</TableCell>
+                <TableCell align="right">{link.amount}</TableCell>
+                <TableCell>{link.currency}</TableCell>
+                <TableCell>{link.status}</TableCell>
+                <TableCell>{link.whish_transaction_number || '-'}</TableCell>
+                <TableCell>{link.created_at}</TableCell>
+                <TableCell>{link.completed_at || '-'}</TableCell>
+              </TableRow>
+            ))}
+            {rows.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={8} align="center" sx={{ py: 3, color: 'text.secondary' }}>No Whish payment links found for this period.</TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </TableContainer>
+    );
+  };
+
   const renderCustomerMetrics = () => {
     if (!customerMetrics) return null;
 
@@ -333,6 +375,7 @@ const EnhancedReportsView = () => {
                     <MenuItem value="customers">Customer Report</MenuItem>
                     <MenuItem value="payments">Payment Report</MenuItem>
                     <MenuItem value="collector-progress">Collector Progress Report</MenuItem>
+                    <MenuItem value="customer-whish-payments">Customer Whish Payments Report</MenuItem>
                   </Select>
                 </FormControl>
               </Grid>
@@ -414,6 +457,18 @@ const EnhancedReportsView = () => {
                 Collector Progress Report
               </Typography>
               {renderCollectorProgressTable()}
+            </Paper>
+          </Grid>
+        )}
+
+        {/* Customer Whish Payments Report */}
+        {reportType === 'customer-whish-payments' && (
+          <Grid item xs={12}>
+            <Paper sx={{ p: 2 }}>
+              <Typography variant="h6" gutterBottom>
+                Customer Whish Payments Report
+              </Typography>
+              {renderCustomerWhishPaymentsTable()}
             </Paper>
           </Grid>
         )}
