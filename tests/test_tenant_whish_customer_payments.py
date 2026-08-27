@@ -366,3 +366,79 @@ def test_generate_missing_payments_scheduler_job_creates_links(app, client):
         appmod.generate_missing_payments(tenant_id)
         links = appmod.CustomerPaymentLink.query.filter_by(customer_id=customer_id).all()
         assert len(links) >= 1
+
+
+def _make_link(app, tenant_name, status='pending', expires_delta=timedelta(days=7), currency='USD'):
+    # _enable_whish_for_tenant looks up an already-registered tenant by name --
+    # register it first (the plan's own snippet omitted this step).
+    make_tenant(app.test_client(), tenant_name, f"{tenant_name.lower().replace(' ', '_')}_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, tenant_name, currency=currency)
+    with app.app_context():
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        payment = appmod.Payment(tenant_id=tenant_id, customer_id=customer_id, amount=30.0,
+                                  currency=currency, paid=(status == 'succeeded'), date=appmod.datetime.utcnow())
+        appmod.db.session.add(payment)
+        appmod.db.session.commit()
+        link = appmod.CustomerPaymentLink(
+            tenant_id=tenant_id, customer_id=customer_id, payment_id=payment.id,
+            amount=30.0, currency=currency,
+            view_token=secrets.token_urlsafe(32), callback_token=secrets.token_urlsafe(32),
+            status=status, expires_at=appmod.datetime.utcnow() + expires_delta,
+        )
+        appmod.db.session.add(link)
+        appmod.db.session.commit()
+        return link.view_token, customer.name
+
+
+def test_public_pay_view_valid_pending_link(client, app):
+    token, customer_name = _make_link(app, "Biz PayView1")
+    r = client.get(f"/api/pay/{token}")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["valid"] is True
+    assert body["amount"] == 30.0
+    assert body["currency"] == "USD"
+    assert body["customer_name"] == customer_name
+    assert body["status"] == "pending"
+    # Minimal disclosure -- no phone/address/balance-history fields leaked.
+    assert "phone" not in body and "balance" not in body and "address" not in body
+
+
+def test_public_pay_view_already_succeeded_link_still_renders(client, app):
+    token, _ = _make_link(app, "Biz PayView2", status='succeeded')
+    r = client.get(f"/api/pay/{token}")
+    assert r.status_code == 200
+    assert r.get_json()["status"] == "succeeded"
+    assert r.get_json()["valid"] is True  # viewable, even though checkout (Task 8) will reject it
+
+
+def test_public_pay_view_unknown_token_returns_generic_invalid(client):
+    r = client.get("/api/pay/does-not-exist-token")
+    assert r.status_code == 200  # never a 404 -- see spec's no-enumeration-surface requirement
+    body = r.get_json()
+    assert body["valid"] is False
+    assert "message" in body
+
+
+def test_public_pay_view_expired_link_returns_generic_invalid_not_specific_reason(client, app):
+    token, _ = _make_link(app, "Biz PayView3", expires_delta=timedelta(days=-1))
+    r = client.get(f"/api/pay/{token}")
+    body = r.get_json()
+    assert body["valid"] is False
+
+
+def test_public_pay_view_stale_link_returns_generic_invalid(client, app):
+    token, _ = _make_link(app, "Biz PayView4", status='stale')
+    r = client.get(f"/api/pay/{token}")
+    assert r.get_json()["valid"] is False
+
+
+def test_public_pay_view_invalid_and_unknown_responses_are_shape_identical(client, app):
+    # No-enumeration-surface: an attacker probing tokens must not be able to
+    # distinguish "never existed" from "expired" from "already used" by
+    # response shape/status/timing-sensitive content.
+    expired_token, _ = _make_link(app, "Biz PayView5", expires_delta=timedelta(days=-1))
+    r1 = client.get(f"/api/pay/{expired_token}")
+    r2 = client.get("/api/pay/totally-made-up-token-xyz")
+    assert r1.status_code == r2.status_code
+    assert set(r1.get_json().keys()) == set(r2.get_json().keys())

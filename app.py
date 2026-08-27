@@ -4878,6 +4878,39 @@ def save_tenant_whish_settings():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/pay/<view_token>', methods=['GET'])
+@limiter.limit("30 per minute")
+def public_pay_view(view_token):
+    """Public, unauthenticated: a customer opens this from a WhatsApp/email
+    link, possibly days after it was sent. Never distinguishes *why* a token
+    is invalid (never-existed vs. expired vs. stale vs. wrong) -- same shape,
+    same status, regardless of reason. See the spec's Security model,
+    "No enumeration surface". Rate-limited (Task 1) since this is a public,
+    token-guessing-adjacent surface."""
+    link = CustomerPaymentLink.query.filter_by(view_token=view_token).first()
+    invalid_response = {
+        "valid": False,
+        "message": "This payment link is no longer valid. Please contact the business that sent it to you.",
+    }
+    if not link:
+        return jsonify(invalid_response), 200
+    if link.status == 'stale' or link.status == 'expired':
+        return jsonify(invalid_response), 200
+    if link.status == 'pending' and link.expires_at < datetime.utcnow():
+        link.status = 'expired'
+        db.session.commit()
+        return jsonify(invalid_response), 200
+    # 'pending', 'succeeded', 'failed' are all viewable -- see spec's Testing
+    # approach ("already-succeeded link's view page still renders").
+    return jsonify({
+        "valid": True,
+        "amount": float(link.amount),
+        "currency": link.currency,
+        "customer_name": link.customer.name,
+        "status": link.status,
+    }), 200
+
+
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
 @jwt_required()
 def subscribe_waba():
