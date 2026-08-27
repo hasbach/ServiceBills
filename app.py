@@ -1135,7 +1135,16 @@ def _stale_customer_payment_links_on_payment_mutation(session, flush_context, in
     ("Link invalidation on Payment mutation"). Only inspects session.dirty
     (updates), not session.deleted -- a Payment being deleted outright is
     handled by the ORM's normal FK behavior for existing links and by this
-    app's existing tenant-delete cascade, not by this listener."""
+    app's existing tenant-delete cascade, not by this listener.
+
+    Deliberately filters on link.status in Python, NOT `status='pending'` in
+    the SQL query: this listener runs mid-flush, before any pending UPDATE
+    (including one this same flush is about to make to the link itself, e.g.
+    Task 9's success callback setting link.status='succeeded' right before
+    its own commit) has reached the database -- a SQL-side filter would still
+    see the OLD, not-yet-flushed 'pending' value and wrongly clobber that
+    legitimate transition back to 'stale'. Reading link.status in Python
+    picks up any in-memory change already made earlier in this same flush."""
     watched_fields = ('amount', 'paid', 'is_refund', 'reverted_at')
     for obj in session.dirty:
         if not isinstance(obj, Payment):
@@ -1143,9 +1152,10 @@ def _stale_customer_payment_links_on_payment_mutation(session, flush_context, in
         state = db.inspect(obj)
         if not any(state.attrs[f].history.has_changes() for f in watched_fields):
             continue
-        pending_links = CustomerPaymentLink.query.filter_by(payment_id=obj.id, status='pending').all()
-        for link in pending_links:
-            link.status = 'stale'
+        links = CustomerPaymentLink.query.filter_by(payment_id=obj.id).all()
+        for link in links:
+            if link.status == 'pending':
+                link.status = 'stale'
 
 
 def _maybe_create_customer_payment_link(payment, customer):
@@ -3646,15 +3656,20 @@ def get_customer_numbers():
         'value': num.customers
     } for num in customer_numbers])
 
-def _mark_payment_fully_paid(payment, customer, current_user):
+def _mark_payment_fully_paid(payment, customer, current_user=None):
     """Mutate payment+customer to record a full (non-partial) payment. Caller
     commits. Returns the amount received in this transaction. Shared by the
-    single-item and bulk mark_paid endpoints so the logic lives in one place."""
+    single-item and bulk mark_paid endpoints so the logic lives in one place.
+    current_user is optional so a customer-initiated Whish callback (no staff
+    involved) can call this too -- see
+    docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, the
+    amendment note at the end of Task 9."""
     amount_received = payment.amount
     customer.balance += payment.amount
     payment.paid = True
     payment.paid_at = datetime.utcnow()
-    payment.received_by_id = current_user.id
+    if current_user:
+        payment.received_by_id = current_user.id
     # DON'T set amount to 0 - keep original amount
     return amount_received
 
@@ -4959,6 +4974,63 @@ def public_pay_checkout(view_token):
     link.whish_external_id = external_id
     db.session.commit()
     return jsonify({"redirect": collect_url}), 200
+
+
+@app.route('/api/customer-whish/success', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_success():
+    """Public: Whish redirects the customer's browser here after payment.
+    See the spec's Security model for why this is a token-match model (same
+    as platform billing) rather than a signed webhook, and why the stakes
+    are higher here (a forged callback here defrauds the TENANT's customer
+    relationship, not just the tenant's own account -- see Security model)."""
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    link = CustomerPaymentLink.query.filter_by(whish_external_id=external_id).first()
+
+    if (not link or link.status != 'pending'
+            or not secrets.compare_digest(link.callback_token, token)
+            or link.expires_at < datetime.utcnow()):
+        logging.warning(f"Customer-Whish success callback rejected: order={external_id}")
+        return redirect(f"{Config.APP_BASE_URL}/pay/{link.view_token if link else 'invalid'}?status=error")
+
+    payment = db.session.get(Payment, link.payment_id)
+    customer = db.session.get(Customer, link.customer_id)
+    # Reuses the exact same state transition the manual "mark paid" path
+    # already produces -- not a duplicated balance-adjustment implementation.
+    # current_user=None: no staff involved, the customer paid directly (see
+    # _mark_payment_fully_paid's own docstring for why that's a safe default).
+    _mark_payment_fully_paid(payment, customer, current_user=None)
+
+    link.status = 'succeeded'
+    link.completed_at = datetime.utcnow()
+    # TBD: exact query-param name Whish's real success callback uses for the
+    # transaction number -- unconfirmed, no real Whish credentials exist in
+    # any environment for this codebase today (same caveat the platform-
+    # billing callback already carries). Degrades safely: None here doesn't
+    # block payment.paid/balance from updating, it only leaves Task 13's
+    # report column empty until this is confirmed against a real payload.
+    link.whish_transaction_number = request.args.get('transactionNumber') or request.args.get('transaction_id')
+    db.session.commit()
+
+    try:
+        send_whatsapp_message(customer, 'payment_paid', context={'amount': float(payment.amount), 'balance': float(customer.balance)})
+    except Exception as e:
+        logging.warning(f"payment_paid WhatsApp notification failed after Whish success (link {link.id}): {e}")
+
+    return redirect(f"{Config.APP_BASE_URL}/pay/{link.view_token}?status=success")
+
+
+@app.route('/api/customer-whish/failure', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_failure():
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    link = CustomerPaymentLink.query.filter_by(whish_external_id=external_id).first()
+    if link and link.status == 'pending' and secrets.compare_digest(link.callback_token, token):
+        link.status = 'failed'
+        db.session.commit()
+    return redirect(f"{Config.APP_BASE_URL}/pay/{link.view_token if link else 'invalid'}?status=failed")
 
 
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])

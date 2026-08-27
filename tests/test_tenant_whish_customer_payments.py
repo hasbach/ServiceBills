@@ -512,3 +512,85 @@ def test_checkout_rejects_when_whish_api_fails(client, app, monkeypatch):
                          lambda **kw: (_ for _ in ()).throw(appmod.whish_billing.WhishAPIError("boom")))
     r = client.post(f"/api/pay/{token}/checkout")
     assert r.status_code == 502
+
+
+def _make_link_with_external_id(app, tenant_name):
+    token, _ = _make_link(app, tenant_name)
+    with app.app_context():
+        link = appmod.CustomerPaymentLink.query.filter_by(view_token=token).first()
+        link.whish_external_id = f"ext-{link.id}"
+        appmod.db.session.commit()
+        return link.whish_external_id, link.callback_token, link.payment_id, link.customer_id
+
+
+def test_success_callback_marks_link_and_payment_paid(client, app):
+    ext_id, cb_token, payment_id, customer_id = _make_link_with_external_id(app, "Biz Success1")
+    r = client.get(f"/api/customer-whish/success?order={ext_id}&token={cb_token}", follow_redirects=False)
+    assert r.status_code == 302
+    with app.app_context():
+        link = appmod.CustomerPaymentLink.query.filter_by(whish_external_id=ext_id).first()
+        assert link.status == 'succeeded'
+        assert link.completed_at is not None
+        payment = appmod.db.session.get(appmod.Payment, payment_id)
+        assert payment.paid is True
+        assert payment.paid_at is not None
+        assert payment.received_by_id is None  # customer-initiated, no staff involved
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        # Balance moved the same way the existing "mark paid" path already
+        # does it -- see the spec's Payment flow step 8 ("reusing that
+        # existing mutation path, not duplicating its balance-adjustment logic").
+        assert customer.balance == 30.0  # was 0, a 30.0 payment credited it
+
+
+def test_success_callback_wrong_token_rejected(client, app):
+    ext_id, cb_token, payment_id, _ = _make_link_with_external_id(app, "Biz Success2")
+    r = client.get(f"/api/customer-whish/success?order={ext_id}&token=totally-wrong", follow_redirects=False)
+    assert r.status_code == 302
+    with app.app_context():
+        link = appmod.CustomerPaymentLink.query.filter_by(whish_external_id=ext_id).first()
+        assert link.status == 'pending'  # untouched
+        payment = appmod.db.session.get(appmod.Payment, payment_id)
+        assert payment.paid is False
+
+
+def test_success_callback_is_single_use(client, app):
+    ext_id, cb_token, payment_id, _ = _make_link_with_external_id(app, "Biz Success3")
+    client.get(f"/api/customer-whish/success?order={ext_id}&token={cb_token}")
+    with app.app_context():
+        payment = appmod.db.session.get(appmod.Payment, payment_id)
+        first_balance = payment.customer.balance
+    r = client.get(f"/api/customer-whish/success?order={ext_id}&token={cb_token}", follow_redirects=False)
+    assert r.status_code == 302  # still redirects somewhere sane, never crashes
+    with app.app_context():
+        payment = appmod.db.session.get(appmod.Payment, payment_id)
+        assert payment.customer.balance == first_balance  # not double-credited
+
+
+def test_success_callback_unknown_order_is_safe(client):
+    r = client.get("/api/customer-whish/success?order=does-not-exist&token=x", follow_redirects=False)
+    assert r.status_code == 302
+
+
+def test_failure_callback_marks_link_failed(client, app):
+    ext_id, cb_token, payment_id, _ = _make_link_with_external_id(app, "Biz Failure1")
+    r = client.get(f"/api/customer-whish/failure?order={ext_id}&token={cb_token}", follow_redirects=False)
+    assert r.status_code == 302
+    with app.app_context():
+        link = appmod.CustomerPaymentLink.query.filter_by(whish_external_id=ext_id).first()
+        assert link.status == 'failed'
+        payment = appmod.db.session.get(appmod.Payment, payment_id)
+        assert payment.paid is False
+
+
+def test_failure_callback_view_token_still_valid_for_retry(client, app):
+    # A failed attempt does NOT consume view_token -- the customer can retry
+    # from the same page. See spec's Payment flow step 9.
+    view_token, _ = _make_link(app, "Biz Failure2")
+    with app.app_context():
+        link = appmod.CustomerPaymentLink.query.filter_by(view_token=view_token).first()
+        link.whish_external_id = f"ext-{link.id}"
+        appmod.db.session.commit()
+        ext_id, cb_token = link.whish_external_id, link.callback_token
+    client.get(f"/api/customer-whish/failure?order={ext_id}&token={cb_token}")
+    r = client.get(f"/api/pay/{view_token}")
+    assert r.get_json()["valid"] is True  # still viewable -- link itself is 'failed' but view_token isn't dead
