@@ -108,6 +108,7 @@ import email_util
 import mikrotik
 import upstream_portal
 import upstream_portal_krypton
+import fx
 from itsdangerous import URLSafeTimedSerializer, BadData
 
 
@@ -392,6 +393,10 @@ class SubscriptionPlan(db.Model):
     cost = db.Column(db.Float, nullable=False, default=0.0)
     billing_cycle = db.Column(db.String(20), nullable=False)
     status = db.Column(db.String(50), default='active') # active, inactive
+    # Multi-currency (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md):
+    # a Customer inherits its price/currency from its plan, the same way it
+    # already inherits price/billing_cycle -- no separate per-customer override.
+    currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
 
     customers = db.relationship('Customer', backref='subscription_plan', lazy=True)
 
@@ -402,7 +407,8 @@ class SubscriptionPlan(db.Model):
             'price': float(self.price),
             'cost': float(self.cost),
             'billing_cycle': self.billing_cycle,
-            'status': self.status
+            'status': self.status,
+            'currency': self.currency or 'USD'
         }
 
 class Sector(db.Model):
@@ -718,6 +724,15 @@ class BusinessSettings(db.Model):
     # this flag only controls whether upstream_last_status/expiry get
     # refreshed automatically; it never triggers a suspend/unsuspend action.
     upstream_sync_automation_enabled = db.Column(db.Boolean, nullable=False, default=False)
+    # Multi-currency accounting for THIS tenant's own customer billing (see
+    # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
+    # Off by default, same opt-in precedent as upstream_sync_automation_enabled
+    # above -- an opted-out tenant sees zero behavior change. reporting_currency
+    # exists regardless of the flag: it is "this tenant's one currency" for a
+    # single-currency tenant too, so report-aggregation code has exactly one
+    # path (always convert-and-sum) rather than a flag-gated branch.
+    multi_currency_enabled = db.Column(db.Boolean, nullable=False, default=False)
+    reporting_currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -738,6 +753,8 @@ class BusinessSettings(db.Model):
             'website': self.website,
             'network_mode': self.network_mode or 'none',
             'upstream_sync_automation_enabled': bool(self.upstream_sync_automation_enabled),
+            'multi_currency_enabled': bool(self.multi_currency_enabled),
+            'reporting_currency': self.reporting_currency or 'USD',
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -935,6 +952,50 @@ class BillingPaymentAttempt(db.Model):
     completed_at = db.Column(db.DateTime, nullable=True)
 
 
+class Currency(db.Model):
+    """Reference table of currencies this deployment knows about -- NOT
+    tenant-scoped (shared, like plans.PLANS). Seeded with USD/LBP by the
+    migration; adding a third currency is a data insert, not a schema
+    change. See docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md."""
+    code = db.Column(db.String(3), primary_key=True)  # ISO 4217
+    name = db.Column(db.String(50), nullable=False)
+    decimal_places = db.Column(db.Integer, nullable=False, default=2)
+    active = db.Column(db.Boolean, nullable=False, default=True)
+
+    def to_dict(self):
+        return {'code': self.code, 'name': self.name,
+                'decimal_places': self.decimal_places, 'active': self.active}
+
+
+class ExchangeRate(db.Model):
+    """A tenant-entered FX rate, effective from a point in time until superseded
+    by a later one. Historical Payment rows never re-read this table after
+    creation (see Payment.fx_rate_to_reporting) -- this table is consulted only
+    at payment-creation time (to pick the rate to lock) and for live (not
+    historical) conversions. See
+    docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    from_currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False)
+    to_currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False)
+    rate = db.Column(db.Numeric(18, 8), nullable=False)  # 1 unit of from_currency = `rate` units of to_currency
+    effective_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    source = db.Column(db.String(20), nullable=False, default='manual')  # 'manual' today; reserved for a future API source
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.Index('ix_exchange_rate_tenant_pair_effective', 'tenant_id', 'from_currency', 'to_currency', 'effective_at'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'from_currency': self.from_currency, 'to_currency': self.to_currency,
+            'rate': float(self.rate), 'effective_at': self.effective_at.strftime('%Y-%m-%d %H:%M:%S'),
+            'source': self.source, 'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        }
+
+
 # --- Tenant write scoping (defense in depth) ---------------------------------
 # Every tenant-owned model. New rows of these get tenant_id stamped from the
 # request's JWT tenant automatically at flush time, so a bare `Model(...)` create
@@ -950,6 +1011,7 @@ TENANT_OWNED_MODELS = (
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
+    ExchangeRate,
 )
 
 from sqlalchemy import event as _sa_event
@@ -2948,12 +3010,17 @@ def add_subscription_plan():
         if data['billing_cycle'] not in ['monthly', 'yearly']:
             return jsonify({'error': "Billing cycle must be 'monthly' or 'yearly'."}), 400
 
+        currency = data.get('currency', 'USD')
+        if not Currency.query.filter_by(code=currency, active=True).first():
+            return jsonify({'error': f"Unknown or inactive currency code '{currency}'."}), 400
+
         new_plan = SubscriptionPlan(
             name=data['name'],
             price=price,
             cost=cost,
             billing_cycle=data['billing_cycle'],
-            status=data.get('status', 'active')
+            status=data.get('status', 'active'),
+            currency=currency
         )
         db.session.add(new_plan)
         db.session.commit()
@@ -2984,6 +3051,11 @@ def update_subscription_plan(plan_id):
         plan.cost = float(data.get('cost', plan.cost))
         plan.billing_cycle = data.get('billing_cycle', plan.billing_cycle)
         plan.status = data.get('status', plan.status)
+        if 'currency' in data:
+            new_currency = data['currency']
+            if not Currency.query.filter_by(code=new_currency, active=True).first():
+                return jsonify({'error': f"Unknown or inactive currency code '{new_currency}'."}), 400
+            plan.currency = new_currency
 
         db.session.commit()
         recalculate_estimated_profit(plan.tenant_id)
@@ -4276,6 +4348,11 @@ def get_monthly_revenue():
 @jwt_required()
 def save_business_settings():
     try:
+        if 'reporting_currency' in request.form:
+            _requested_reporting_currency = request.form.get('reporting_currency')
+            if not Currency.query.filter_by(code=_requested_reporting_currency, active=True).first():
+                return jsonify({'error': f"Unknown or inactive currency code '{_requested_reporting_currency}'."}), 400
+
         # Fetch existing settings or create new
         settings = tenant_query(BusinessSettings).first()
         if not settings:
@@ -4288,6 +4365,9 @@ def save_business_settings():
                 network_mode=request.form.get('network_mode', "none"),
                 upstream_sync_automation_enabled=_parse_bool_form_field(
                     request.form.get('upstream_sync_automation_enabled'), default=False),
+                multi_currency_enabled=_parse_bool_form_field(
+                    request.form.get('multi_currency_enabled'), default=False),
+                reporting_currency=request.form.get('reporting_currency', 'USD'),
             )
             db.session.add(settings)
 
@@ -4308,6 +4388,12 @@ def save_business_settings():
         if 'upstream_sync_automation_enabled' in request.form:
             settings.upstream_sync_automation_enabled = _parse_bool_form_field(
                 request.form.get('upstream_sync_automation_enabled'), default=settings.upstream_sync_automation_enabled)
+        if 'multi_currency_enabled' in request.form:
+            settings.multi_currency_enabled = _parse_bool_form_field(
+                request.form.get('multi_currency_enabled'), default=settings.multi_currency_enabled)
+        if 'reporting_currency' in request.form:
+            # Already validated above (before the create/update branch).
+            settings.reporting_currency = request.form.get('reporting_currency')
 
         # Only update logo_url if a new file was uploaded
         if logo_url:
@@ -4339,7 +4425,9 @@ def get_business_settings():
                 'email': "",
                 'website': "",
                 'network_mode': "none",
-                'upstream_sync_automation_enabled': False
+                'upstream_sync_automation_enabled': False,
+                'multi_currency_enabled': False,
+                'reporting_currency': 'USD'
             }
         }), 200
 
