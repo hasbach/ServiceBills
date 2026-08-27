@@ -594,3 +594,73 @@ def test_failure_callback_view_token_still_valid_for_retry(client, app):
     client.get(f"/api/customer-whish/failure?order={ext_id}&token={cb_token}")
     r = client.get(f"/api/pay/{view_token}")
     assert r.get_json()["valid"] is True  # still viewable -- link itself is 'failed' but view_token isn't dead
+
+
+def test_payment_link_creation_triggers_whatsapp_send_in_api_mode(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz WaLink1", "walink1_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz WaLink1")
+    with app.app_context():
+        wa = appmod.WhatsAppSettings(tenant_id=tenant_id, mode='api', enabled=True,
+                                      phone_number_id='pnid', access_token='tok')
+        appmod.db.session.add(wa)
+        appmod.db.session.commit()
+
+    sent = {}
+    def fake_send(customer, event_type, context=None):
+        sent['event_type'] = event_type
+        sent['context'] = context
+        return {'success': True}
+    monkeypatch.setattr(appmod, "send_whatsapp_message", fake_send)
+
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    assert r.status_code == 201
+    assert sent.get('event_type') == 'payment_link'
+    assert 'view_token' in sent.get('context', {})
+
+
+def test_payment_link_creation_is_safe_when_whatsapp_not_configured(app, client):
+    # deeplink-mode / no WhatsApp settings at all -- send_whatsapp_message's
+    # own existing mode!='api' branch already returns a "Simulated / Manual"
+    # success without sending anything; confirm this doesn't raise or block
+    # link creation.
+    hdr = make_tenant(client, "Biz WaLink2", "walink2_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz WaLink2")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    assert r.status_code == 201
+    payment_id = r.get_json()['payment']['id']
+    with app.app_context():
+        assert appmod.CustomerPaymentLink.query.filter_by(payment_id=payment_id).first() is not None
+
+
+def test_build_meta_template_payload_fills_url_button_from_view_token():
+    # Confirms the ALREADY-EXISTING generic URL-button support (app.py's
+    # build_meta_template_payload) does the right thing for a template shaped
+    # like this feature needs -- BODY has zero {{n}} placeholders, BUTTONS has
+    # exactly one URL button with {{1}}.
+    fake_settings = type('S', (), {'template_language': 'en'})()
+
+    def fake_get_meta_template_definition(settings, template_name):
+        return {
+            'language': 'en',
+            'components': [
+                {'type': 'BODY', 'text': 'You have a new payment link.'},
+                {'type': 'BUTTONS', 'buttons': [{'type': 'URL', 'url': 'https://example.com/pay?token={{1}}'}]},
+            ],
+        }
+    import unittest.mock as mock
+    with mock.patch.object(appmod, 'get_meta_template_definition', fake_get_meta_template_definition):
+        result = appmod.build_meta_template_payload(
+            settings=fake_settings, template_name='payment_link', default_language='en',
+            user_body_params=['abc123view'], user_header_params=None,
+        )
+    button_components = [c for c in result.get('components', []) if c['type'] == 'button']
+    assert len(button_components) == 1
+    assert button_components[0]['parameters'][0]['text'] == 'abc123view'
+    body_components = [c for c in result.get('components', []) if c['type'] == 'body']
+    assert len(body_components) == 0  # confirms the "0 placeholders -> omit BODY" path, not a false-positive send

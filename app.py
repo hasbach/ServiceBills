@@ -850,6 +850,11 @@ class WhatsAppSettings(db.Model):
     template_bulk_maintenance = db.Column(db.String(200), nullable=True, default='maintenance_alert')
     template_bulk_feature = db.Column(db.String(200), nullable=True, default='feature_update')
     template_bulk_offer = db.Column(db.String(200), nullable=True, default='special_offer')
+    # Sent automatically when a CustomerPaymentLink is created (see
+    # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md,
+    # Task 11) -- BODY has zero {{n}} placeholders by design, a URL button's
+    # {{1}} is filled from the link's view_token instead.
+    template_payment_link = db.Column(db.String(200), nullable=True, default='payment_link')
     # Template language code
     template_language = db.Column(db.String(20), nullable=True, default='en')
     # Deep-link message templates (plain text for wa.me links)
@@ -893,6 +898,7 @@ class WhatsAppSettings(db.Model):
             'template_bulk_maintenance': self.template_bulk_maintenance or 'maintenance_alert',
             'template_bulk_feature': self.template_bulk_feature or 'feature_update',
             'template_bulk_offer': self.template_bulk_offer or 'special_offer',
+            'template_payment_link': self.template_payment_link or 'payment_link',
             'template_language': self.template_language or 'en',
             'deeplink_msg_payment': self.deeplink_msg_payment or 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
             'deeplink_msg_renewal': self.deeplink_msg_renewal or 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
@@ -1206,6 +1212,10 @@ def _maybe_create_customer_payment_link(payment, customer):
             expires_at=datetime.utcnow() + timedelta(days=7),
         )
         db.session.add(link)
+        try:
+            send_whatsapp_message(customer, 'payment_link', context={'view_token': link.view_token})
+        except Exception as wa_error:
+            logging.warning(f"payment_link WhatsApp auto-send failed for CustomerPaymentLink (tenant {customer.tenant_id}): {wa_error}")
         return link
     except Exception as e:
         # Never let link generation break the underlying Payment creation --
@@ -4795,6 +4805,7 @@ def get_whatsapp_settings():
         'template_bulk_maintenance': 'maintenance_alert',
         'template_bulk_feature': 'feature_update',
         'template_bulk_offer': 'special_offer',
+        'template_payment_link': 'payment_link',
         'template_language': 'en',
         'deeplink_msg_payment': 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
         'deeplink_msg_renewal': 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
@@ -4822,6 +4833,7 @@ def save_whatsapp_settings():
                   'app_secret','access_token','api_version','template_payment_paid',
                   'template_subscription_created', 'template_subscription_renewed','template_payment_reminder', 'template_current_balance',
                   'template_forward_alert', 'template_bulk_outage', 'template_bulk_maintenance', 'template_bulk_feature', 'template_bulk_offer',
+                  'template_payment_link',
                   'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message',
                   'template_forward_keepalive']
         for f in fields:
@@ -5348,6 +5360,8 @@ def send_whatsapp_message(customer, event_type, context=None):
             template_name = settings.template_payment_reminder or 'payment_reminder'
         elif event_type == 'current_balance':
             template_name = getattr(settings, 'template_current_balance', None) or 'current_balance'
+        elif event_type == 'payment_link':
+            template_name = getattr(settings, 'template_payment_link', None) or 'payment_link'
         elif event_type == 'reseller_credit_added':
             template_name = 'reseller_credit_added'
         elif event_type == 'reseller_discount_applied':
@@ -5387,6 +5401,13 @@ def send_whatsapp_message(customer, event_type, context=None):
             balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
             expiry_date = str(context.get('expiry_date', customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else 'N/A'))
             user_body_params = [customer.name, balance_str, expiry_date]
+        elif event_type == 'payment_link':
+            # Deliberately the link's view_token ALONE, no other params -- see
+            # this task's design note on why the payment_link template's BODY
+            # component must have zero {{n}} placeholders (so
+            # user_body_params[0] is free for the URL button's {{1}} without
+            # colliding with a body placeholder consuming the same value).
+            user_body_params = [context.get('view_token', '')]
         elif event_type == 'bulk_outage':
             user_body_params = [context.get('message', 'an outage occured from the isp , will be repaired soon')]
         elif event_type == 'bulk_maintenance':
