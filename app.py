@@ -4992,7 +4992,7 @@ def customer_whish_success():
             or not secrets.compare_digest(link.callback_token, token)
             or link.expires_at < datetime.utcnow()):
         logging.warning(f"Customer-Whish success callback rejected: order={external_id}")
-        return redirect(f"{Config.APP_BASE_URL}/pay/{link.view_token if link else 'invalid'}?status=error")
+        return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token if link else 'invalid'}&status=error")
 
     payment = db.session.get(Payment, link.payment_id)
     customer = db.session.get(Customer, link.customer_id)
@@ -5018,7 +5018,7 @@ def customer_whish_success():
     except Exception as e:
         logging.warning(f"payment_paid WhatsApp notification failed after Whish success (link {link.id}): {e}")
 
-    return redirect(f"{Config.APP_BASE_URL}/pay/{link.view_token}?status=success")
+    return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token}&status=success")
 
 
 @app.route('/api/customer-whish/failure', methods=['GET'])
@@ -5030,7 +5030,7 @@ def customer_whish_failure():
     if link and link.status == 'pending' and secrets.compare_digest(link.callback_token, token):
         link.status = 'failed'
         db.session.commit()
-    return redirect(f"{Config.APP_BASE_URL}/pay/{link.view_token if link else 'invalid'}?status=failed")
+    return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token if link else 'invalid'}&status=failed")
 
 
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])

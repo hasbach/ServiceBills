@@ -43,6 +43,7 @@ import LoginView from './components/LoginView.js';
 import RegisterView from './components/RegisterView.js';
 import VerifyEmailView from './components/VerifyEmailView.js';
 import ForgotPasswordView from './components/ForgotPasswordView.js';
+import PublicPaymentView from './components/PublicPaymentView.js';
 import ResetPasswordView from './components/ResetPasswordView.js';
 import BillingView from './components/BillingView.js';
 import SuperAdminView from './components/SuperAdminView.js';
@@ -480,6 +481,7 @@ const AppContent = () => {
     if (location.pathname === '/verify') return <VerifyEmailView />;
     if (location.pathname === '/reset-password') return <ResetPasswordView />;
     if (location.pathname === '/forgot-password') return <ForgotPasswordView />;
+    if (location.pathname === '/pay') return <PublicPaymentView />;
 
     if (!isAuthenticated) {
         if (location.pathname === '/register') return <RegisterView />;
