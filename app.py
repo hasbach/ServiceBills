@@ -1148,6 +1148,64 @@ def _stale_customer_payment_links_on_payment_mutation(session, flush_context, in
             link.status = 'stale'
 
 
+def _maybe_create_customer_payment_link(payment, customer):
+    """If the given (already-`db.session.add`ed, not-yet-committed, paid=False)
+    Payment's tenant has TenantWhishSettings.enabled (which already implies
+    Pro-plan, since Task 3 gates enabling it) and the Payment's currency is
+    Whish-supported, create a pending CustomerPaymentLink for it. Silently
+    no-ops (does NOT raise, does NOT block the caller's own commit) for every
+    other case -- generating a payment link is a value-add on top of Payment
+    creation, never a precondition for it. See
+    docs/superpowers/specs/2026-08-27-tenant-whish-customer-payments-design.md,
+    Payment flow step 1.
+
+    Call this AFTER db.session.add(payment) and BEFORE the caller's own
+    db.session.commit() -- payment.id is not required (SQLAlchemy resolves
+    the relationship via the pending object itself at flush time), but
+    payment.currency/amount must already be set. Deliberately reads
+    tenant_id from `customer`, NOT `payment` -- most call sites never set
+    Payment.tenant_id explicitly, relying on the _stamp_tenant_id before_flush
+    listener, which has not run yet at this point; `customer` is always
+    already a real, tenant-scoped object here (either an existing persisted
+    row, or freshly built via new_for_tenant(), which sets tenant_id eagerly
+    at construction) -- confirmed at every one of this task's 10 call sites,
+    not assumed."""
+    try:
+        whish_settings = TenantWhishSettings.query.filter_by(tenant_id=customer.tenant_id, enabled=True).first()
+        if not whish_settings:
+            return None
+        # Several call sites never set Payment.currency explicitly, relying on
+        # the column's Python-side default='USD' -- which SQLAlchemy applies
+        # during flush, not necessarily by the time this runs. Read the
+        # eventual effective value directly rather than depend on ORM
+        # flush-timing: 'USD' matches Payment.currency's own column default.
+        effective_currency = payment.currency or 'USD'
+        if effective_currency not in ('USD', 'LBP'):
+            logging.info(f"Skipping Whish customer-payment-link for payment (tenant {customer.tenant_id}): "
+                         f"currency {effective_currency} not Whish-supported.")
+            return None
+        link = CustomerPaymentLink(
+            tenant_id=customer.tenant_id,
+            customer_id=customer.id,
+            payment=payment,  # relationship assignment -- resolves payment_id at flush even pre-commit
+            amount=payment.amount,
+            currency=effective_currency,
+            view_token=secrets.token_urlsafe(32),
+            callback_token=secrets.token_urlsafe(32),
+            status='pending',
+            expires_at=datetime.utcnow() + timedelta(days=7),
+        )
+        db.session.add(link)
+        return link
+    except Exception as e:
+        # Never let link generation break the underlying Payment creation --
+        # matches this file's established pattern for send_whatsapp_message's
+        # own try/except (a notification/delivery side effect must not abort
+        # the primary financial transaction it's attached to).
+        logging.error(f"Failed to create CustomerPaymentLink for payment (tenant {customer.tenant_id}): {e}")
+        return None
+
+
 # Schema is owned by Alembic (flask db upgrade). No import-time create_all or
 # home-grown ALTERs. Tests build their own schema via tests/conftest.py.
 
@@ -1265,7 +1323,8 @@ def apply_customer_balance_to_unpaid_payments(customer):
                     pre_payment=payment.pre_payment
                 )
                 db.session.add(remaining_payment)
-            
+                _maybe_create_customer_payment_link(remaining_payment, customer)
+
             # Mark original payment as paid
             # (This is the established logic from mark_payment_as_paid)
             payment.paid = True
@@ -2039,6 +2098,7 @@ def generate_missing_payments(tenant_id):
                             pre_payment=False
                         )
                         db.session.add(new_payment)
+                        _maybe_create_customer_payment_link(new_payment, customer)
                         customer.balance -= amount_due
 
                 # Move to the next billing cycle
@@ -2656,6 +2716,7 @@ def add_customer():
                         pre_payment=False
                     )
                     db.session.add(new_payment)
+                    _maybe_create_customer_payment_link(new_payment, new_customer)
                     total_due += amount_due
 
             # Move to the next billing cycle
@@ -2680,6 +2741,7 @@ def add_customer():
                 pre_payment=False,
             )
             db.session.add(addon_payment)
+            _maybe_create_customer_payment_link(addon_payment, new_customer)
             new_customer.balance -= addon_amount
         # --- ADDED: Reconcile balance after creating customer and all initial charges ---
         apply_customer_balance_to_unpaid_payments(new_customer)
@@ -2820,11 +2882,13 @@ def update_customer(customer_id):
                     # Going to Independent: put debt back on customer
                     customer.balance -= net_debt
                     if net_debt > 0:
-                        db.session.add(Payment(
+                        debt_payment = Payment(
                             customer_id=customer.id, amount=net_debt, paid=False,
                             date=datetime.now(timezone.utc), pre_payment=False,
                             reason="Assumed accumulated debt from previous reseller"
-                        ))
+                        )
+                        db.session.add(debt_payment)
+                        _maybe_create_customer_payment_link(debt_payment, customer)
 
             customer.reseller_id = new_reseller_id
 
@@ -3135,6 +3199,7 @@ def generate_future_payments():
                         pre_payment=False
                     )
                     db.session.add(new_payment)
+                    _maybe_create_customer_payment_link(new_payment, customer)
                     customer.balance -= amount_due
                     payments_created_count += 1
 
@@ -3344,7 +3409,9 @@ def add_payment():
             paid_at=datetime.utcnow() if is_paid else None
         )
         db.session.add(new_payment)
-        
+        if not is_paid:
+            _maybe_create_customer_payment_link(new_payment, customer)
+
         # Update customer balance based on payment status
         if is_paid: # If payment is received, increase balance (less owed, or more credit)
             customer.balance += payment_amount
@@ -3773,6 +3840,7 @@ def mark_payment_as_paid(payment_id):
                             pre_payment=payment.pre_payment
                         )
                         db.session.add(remaining_payment)
+                        _maybe_create_customer_payment_link(remaining_payment, customer)
 
         else: # Full payment
             if not payment.paid:
@@ -4135,6 +4203,7 @@ def activate_subscription(customer_id):
                         pre_payment=False
                     )
                     db.session.add(new_payment)
+                    _maybe_create_customer_payment_link(new_payment, customer)
                     customer.balance -= amount_due
 
         db.session.commit()
@@ -6292,6 +6361,7 @@ def _renew_subscription_core(customer):
                 pre_payment=False
             )
             db.session.add(new_payment)
+            _maybe_create_customer_payment_link(new_payment, customer)
 
             customer.balance -= renewal_amount
             db.session.commit()

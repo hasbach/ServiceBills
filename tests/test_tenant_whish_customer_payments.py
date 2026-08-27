@@ -238,3 +238,131 @@ def test_customer_payment_link_unaffected_by_mutation_when_not_pending(app, clie
         appmod.db.session.commit()
         link = appmod.db.session.get(appmod.CustomerPaymentLink, link_id)
         assert link.status == 'succeeded'  # untouched
+
+
+def _enable_whish_for_tenant(app, tenant_name, currency='USD'):
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name=tenant_name).first()
+        tenant.plan = 'pro'
+        appmod.db.session.add(appmod.TenantWhishSettings(
+            tenant_id=tenant.id, enabled=True, whish_channel="c", whish_secret="s"))
+        plan = appmod.SubscriptionPlan(tenant_id=tenant.id, name="P", price=30.0,
+                                        billing_cycle="monthly", currency=currency)
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(tenant_id=tenant.id, name="Nadia", phone="+96170000099",
+                                    subscription_plan_id=plan.id, address="Beirut",
+                                    subscription_expiry_date=appmod.datetime.utcnow() + timedelta(days=30))
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        return tenant.id, customer.id
+
+
+def test_add_payment_creates_customer_payment_link_when_whish_enabled(app, client):
+    hdr = make_tenant(client, "Biz Hook1", "hook1_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Hook1")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    assert r.status_code == 201
+    payment_id = r.get_json()['payment']['id']
+    with app.app_context():
+        link = appmod.CustomerPaymentLink.query.filter_by(payment_id=payment_id).first()
+        assert link is not None
+        assert link.status == 'pending'
+        assert link.amount == 30.0
+
+
+def test_add_payment_no_link_when_whish_not_enabled(app, client):
+    hdr = make_tenant(client, "Biz Hook2", "hook2_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Hook2").first()
+        plan = appmod.SubscriptionPlan(tenant_id=tenant.id, name="P", price=30.0,
+                                        billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(tenant_id=tenant.id, name="Ali", phone="+96170000098",
+                                    subscription_plan_id=plan.id, address="Beirut",
+                                    subscription_expiry_date=appmod.datetime.utcnow() + timedelta(days=30))
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        customer_id = customer.id
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    assert r.status_code == 201
+    payment_id = r.get_json()['payment']['id']
+    with app.app_context():
+        assert appmod.CustomerPaymentLink.query.filter_by(payment_id=payment_id).first() is None
+
+
+def test_add_payment_no_link_for_non_whish_currency(app, client):
+    hdr = make_tenant(client, "Biz Hook3", "hook3_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Hook3")
+    with app.app_context():
+        appmod.db.session.add(appmod.Currency(code='EUR', name='Euro', decimal_places=2))
+        # add_payment() locks an FX rate at creation time (multi-currency
+        # accounting) -- without one on file for EUR->USD it 400s before ever
+        # reaching Payment creation, regardless of this test's actual concern.
+        appmod.db.session.add(appmod.ExchangeRate(
+            tenant_id=tenant_id, from_currency='EUR', to_currency='USD', rate=1.1,
+            effective_at=appmod.datetime.utcnow() - timedelta(days=1),
+        ))
+        plan = appmod.SubscriptionPlan(tenant_id=tenant_id, name="EuroPlan", price=30.0,
+                                        billing_cycle="monthly", currency="EUR")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(tenant_id=tenant_id, name="Marc", phone="+33600000000",
+                                    subscription_plan_id=plan.id, address="Paris",
+                                    subscription_expiry_date=appmod.datetime.utcnow() + timedelta(days=30))
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        eur_customer_id = customer.id
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": eur_customer_id, "amount": 30.0, "reason": "Monthly",
+        "currency": "EUR",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    assert r.status_code == 201
+    payment_id = r.get_json()['payment']['id']
+    with app.app_context():
+        assert appmod.CustomerPaymentLink.query.filter_by(payment_id=payment_id).first() is None
+
+
+def test_add_payment_no_link_when_payment_created_already_paid(app, client):
+    # add_payment()'s real contract: is_paid is derived from `pre_payment`
+    # (a pre-payment is paid at creation), not a separate `is_paid` field.
+    hdr = make_tenant(client, "Biz Hook4", "hook4_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Hook4")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": True,
+    })
+    assert r.status_code == 201
+    payment_id = r.get_json()['payment']['id']
+    with app.app_context():
+        payment = appmod.db.session.get(appmod.Payment, payment_id)
+        assert payment.paid is True  # confirms the premise: pre_payment=True -> paid=True
+        assert appmod.CustomerPaymentLink.query.filter_by(payment_id=payment_id).first() is None
+
+
+def test_generate_missing_payments_scheduler_job_creates_links(app, client):
+    # Exercises call site #2 (the daily scheduler job) directly, mirroring how
+    # tests/test_whish_billing.py calls check_pro_plan_expirations_for_tenant
+    # directly rather than through the scheduler itself.
+    #
+    # generate_missing_payments' billing cursor for a non-reseller customer
+    # with no prior payment is subscription_start_date (NOT
+    # subscription_expiry_date, which the plan's own test assumed) -- back-
+    # date that instead so a monthly-cycle billing date falls due.
+    hdr = make_tenant(client, "Biz Hook5", "hook5_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Hook5")
+    with app.app_context():
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        customer.subscription_start_date = appmod.datetime.utcnow() - timedelta(days=40)
+        appmod.db.session.commit()
+        appmod.generate_missing_payments(tenant_id)
+        links = appmod.CustomerPaymentLink.query.filter_by(customer_id=customer_id).all()
+        assert len(links) >= 1
