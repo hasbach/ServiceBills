@@ -861,6 +861,38 @@ class WhatsAppSettings(db.Model):
             'last_forwarding_keepalive_sent_at': self.last_forwarding_keepalive_sent_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_forwarding_keepalive_sent_at else None,
         }
 
+class TenantWhishSettings(db.Model):
+    """A tenant's own Whish merchant credentials, for accepting payments from
+    THEIR customers -- distinct from the platform-wide WHISH_CHANNEL/WHISH_SECRET
+    env vars used for Pro-plan billing (see
+    docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md).
+    Mirrors WhatsAppSettings' encrypted-credential pattern. See
+    docs/superpowers/specs/2026-08-27-tenant-whish-customer-payments-design.md."""
+    __tablename__ = "tenant_whish_settings"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    enabled = db.Column(db.Boolean, nullable=False, default=False)
+    whish_channel = db.Column(EncryptedString, nullable=True)  # encrypted at rest
+    whish_secret = db.Column(EncryptedString, nullable=True)   # encrypted at rest
+    # Shown on the public payment page in place of BusinessSettings.business_name,
+    # if a tenant wants a different display name there than internally. NOTE:
+    # per Resolved product decision #7 (neutral ServiceBills branding on the
+    # public page in v1), this field is captured now but NOT yet rendered
+    # anywhere -- see Task 7's public view route for exactly what IS shown.
+    display_name_override = db.Column(db.String(200), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'enabled': self.enabled,
+            'whish_channel': self.whish_channel or '',
+            'whish_secret': self.whish_secret or '',
+            'display_name_override': self.display_name_override or '',
+            'configured': bool(self.whish_channel and self.whish_secret),
+        }
+
 class ServiceStatus(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -1029,7 +1061,7 @@ class ExchangeRate(db.Model):
 TENANT_OWNED_MODELS = (
     Reseller, ResellerPayment, Customer, SubscriptionPlan, Sector, Supplier,
     SupplierPayment, ExpenseCategory, Expense, Payment, GeneratedReceipt,
-    AddonPurchase, BusinessSettings, WhatsAppSettings,
+    AddonPurchase, BusinessSettings, WhatsAppSettings, TenantWhishSettings,
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
     CustomerFeedback, PaymentReminder, UpgradeRequest, BillingPaymentAttempt,
     Employee, SalaryCharge, SalaryPayment,
