@@ -637,6 +637,19 @@ class Payment(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False, index=True)
     amount = db.Column(db.Float, nullable=False)
+    # Multi-currency (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
+    # `currency` is the currency `amount` is denominated in (inherited from the
+    # customer's subscription_plan.currency at the moment this payment was
+    # created). `fx_rate_to_reporting` is the rate used to convert `amount`
+    # into the tenant's reporting_currency AT THAT MOMENT -- frozen forever,
+    # never recomputed when new ExchangeRate rows are added later. This is the
+    # actual historical rate-locking mechanism. NOTE: as of this PR, only the
+    # explicit POST /api/payments (add_payment) path locks these correctly --
+    # other Payment-creation call sites (recurring/backdated billing,
+    # renewals, partial-payment splits) still use the plain defaults below;
+    # see the spec's Non-goals for why, and for the follow-up needed.
+    currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
+    fx_rate_to_reporting = db.Column(db.Numeric(18, 8), nullable=False, default=1)
     reason = db.Column(db.String(255), nullable=True)
     # `collected` and `paid` are two independent, sequential booleans, not
     # synonyms -- a payment goes uncollected -> collected -> paid, and only
@@ -3130,12 +3143,30 @@ def add_payment():
             return jsonify({'error': str(ve)}), 400
         is_pre_payment = data.get('pre_payment', False)
         # A pre-payment is paid, a non-pre-payment (manual charge) is unpaid
-        is_paid = is_pre_payment 
+        is_paid = is_pre_payment
+
+        # Multi-currency: lock the FX rate at creation time (see
+        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
+        # payment_date may be tz-aware (datetime.now(timezone.utc), the no-date
+        # default above) while ExchangeRate.effective_at is naive -- normalize
+        # before comparing.
+        settings = get_tenant_settings(BusinessSettings, business_name="Default Business", address="", mobile="")
+        subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
+        payment_currency = subscription_plan.currency if subscription_plan else 'USD'
+        fx_as_of = payment_date.replace(tzinfo=None) if payment_date.tzinfo else payment_date
+        try:
+            locked_rate = fx.get_rate(current_tenant_id(), payment_currency, settings.reporting_currency, as_of=fx_as_of)
+        except fx.FxRateMissingError:
+            return jsonify({'error': (
+                f"No exchange rate on file for {payment_currency}->{settings.reporting_currency} "
+                f"as of this payment's date; enter one under Settings -> Exchange Rates first.")}), 400
 
         # Create a new payment
         new_payment = Payment(
             customer_id=customer.id,
             amount=payment_amount,
+            currency=payment_currency,
+            fx_rate_to_reporting=locked_rate,
             reason=data['reason'],
             date=payment_date,
             pre_payment=is_pre_payment,
@@ -4430,6 +4461,58 @@ def get_business_settings():
                 'reporting_currency': 'USD'
             }
         }), 200
+
+
+@app.route('/api/exchange-rates', methods=['POST'])
+@jwt_required()
+@admin_required()
+def create_exchange_rate():
+    """Manual FX-rate entry (see
+    docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
+    Rejected outright when multi_currency_enabled is off -- no point letting a
+    tenant populate a table their own payment flow will never consult."""
+    settings = tenant_query(BusinessSettings).first()
+    if not settings or not settings.multi_currency_enabled:
+        return jsonify({'error': 'Multi-currency accounting is not enabled for this business.'}), 400
+
+    data = request.json or {}
+    from_currency = data.get('from_currency')
+    to_currency = data.get('to_currency')
+    if not Currency.query.filter_by(code=from_currency, active=True).first():
+        return jsonify({'error': f"Unknown or inactive currency code '{from_currency}'."}), 400
+    if not Currency.query.filter_by(code=to_currency, active=True).first():
+        return jsonify({'error': f"Unknown or inactive currency code '{to_currency}'."}), 400
+    try:
+        rate = float(data.get('rate'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'rate must be a valid number.'}), 400
+    if not math.isfinite(rate) or rate <= 0:
+        return jsonify({'error': 'rate must be greater than zero.'}), 400
+
+    effective_at = datetime.utcnow()
+    if data.get('effective_at'):
+        try:
+            effective_at = datetime.fromisoformat(data['effective_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+        except ValueError:
+            return jsonify({'error': 'effective_at must be a valid ISO-8601 datetime.'}), 400
+
+    current_username = get_jwt_identity()
+    current_user = User.query.filter_by(username=current_username).first()
+    row = new_for_tenant(
+        ExchangeRate, from_currency=from_currency, to_currency=to_currency, rate=rate,
+        effective_at=effective_at, created_by_id=current_user.id if current_user else None,
+    )
+    db.session.add(row)
+    db.session.commit()
+    return jsonify({'message': 'Exchange rate added.', 'exchange_rate': row.to_dict()}), 201
+
+
+@app.route('/api/exchange-rates', methods=['GET'])
+@jwt_required()
+def list_exchange_rates():
+    rows = tenant_query(ExchangeRate).order_by(ExchangeRate.effective_at.desc()).all()
+    return jsonify({'exchange_rates': [r.to_dict() for r in rows]}), 200
+
 
 @app.route('/api/whatsapp-settings', methods=['GET'])
 @jwt_required()

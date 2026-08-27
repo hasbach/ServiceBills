@@ -182,7 +182,7 @@ def test_add_payment_opted_out_tenant_locks_rate_one(app, client):
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust A", "phone": "123", "address": "addr", "subscription_plan_id": plan_id})
     assert r.status_code == 201, r.get_json()
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     r = client.post("/api/payments", headers=hdr, json={
         "customer_id": customer_id, "amount": 10.0, "reason": "test", "pre_payment": True})
     assert r.status_code == 201, r.get_json()
@@ -200,7 +200,7 @@ def test_add_payment_opted_in_tenant_without_rate_returns_400(app, client):
     plan_id = _make_plan(app, "Biz NoRate", name="LBP Plan", price=1000000.0, cost=0.0, currency="LBP")
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust B", "phone": "123", "address": "addr", "subscription_plan_id": plan_id})
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     r = client.post("/api/payments", headers=hdr, json={
         "customer_id": customer_id, "amount": 500000.0, "reason": "test", "pre_payment": True})
     assert r.status_code == 400
@@ -222,14 +222,14 @@ def test_add_payment_locks_rate_and_later_rate_changes_dont_affect_it(app, clien
         tenant_id = tenant.id
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust C", "phone": "123", "address": "addr", "subscription_plan_id": plan_id})
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     r = client.post("/api/payments", headers=hdr, json={
         "customer_id": customer_id, "amount": 500000.0, "reason": "test", "pre_payment": True})
     assert r.status_code == 201, r.get_json()
     with app.app_context():
         payment = appmod.Payment.query.filter_by(customer_id=customer_id, pre_payment=True).first()
         first_rate = payment.fx_rate_to_reporting
-        assert first_rate == pytest.approx(0.0000111)
+        assert float(first_rate) == pytest.approx(0.0000111)
 
         # A new rate is entered afterward -- must not retroactively change the locked payment.
         appmod.db.session.add(appmod.ExchangeRate(
@@ -330,7 +330,7 @@ def test_plan_change_blocked_when_currency_differs_and_balance_nonzero(app, clie
     lbp_plan_id = _make_plan(app, "Biz GuardBlock", name="LBP Plan", price=2700000.0, cost=900000.0, currency="LBP")
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust Guard", "phone": "1", "address": "a", "subscription_plan_id": usd_plan_id})
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     with app.app_context():
         customer = appmod.db.session.get(appmod.Customer, customer_id)
         customer.balance = 15.0
@@ -347,7 +347,7 @@ def test_plan_change_allowed_across_currencies_when_balance_zero(app, client):
     lbp_plan_id = _make_plan(app, "Biz GuardOk", name="LBP Plan 2", price=2700000.0, cost=900000.0, currency="LBP")
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust GuardOk", "phone": "1", "address": "a", "subscription_plan_id": usd_plan_id})
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     with app.app_context():
         customer = appmod.db.session.get(appmod.Customer, customer_id)
         customer.balance = 0.0
@@ -362,7 +362,7 @@ def test_plan_change_allowed_within_same_currency_even_with_balance(app, client)
     plan_b_id = _make_plan(app, "Biz GuardSame", name="USD Plan B", price=45.0, currency="USD")
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust GuardSame", "phone": "1", "address": "a", "subscription_plan_id": plan_a_id})
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     with app.app_context():
         customer = appmod.db.session.get(appmod.Customer, customer_id)
         customer.balance = 15.0
@@ -378,7 +378,7 @@ def test_financial_report_opted_out_tenant_reports_usd(app, client):
     plan_id = _make_plan(app, "Biz ReportOff")
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust Report", "phone": "1", "address": "a", "subscription_plan_id": plan_id})
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     client.post("/api/payments", headers=hdr, json={
         "customer_id": customer_id, "amount": 42.0, "reason": "t", "pre_payment": True})
     today = datetime.utcnow().strftime('%Y-%m-%d')
@@ -402,7 +402,7 @@ def test_financial_report_opted_in_tenant_converts_using_locked_rate(app, client
         appmod.db.session.commit()
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust ReportLbp", "phone": "1", "address": "a", "subscription_plan_id": plan_id})
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     client.post("/api/payments", headers=hdr, json={
         "customer_id": customer_id, "amount": 1000000.0, "reason": "t", "pre_payment": True})
     today = datetime.utcnow().strftime('%Y-%m-%d')
@@ -419,7 +419,7 @@ def test_total_sales_report_opted_out_tenant_unchanged(app, client):
     plan_id = _make_plan(app, "Biz TotalSales")
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust TS", "phone": "1", "address": "a", "subscription_plan_id": plan_id})
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     with app.app_context():
         customer = appmod.db.session.get(appmod.Customer, customer_id)
         payment = appmod.new_for_tenant(
@@ -441,7 +441,7 @@ def test_total_sales_report_opted_in_tenant_converts_using_locked_rate(app, clie
     plan_id = _make_plan(app, "Biz TotalSalesFx", name="LBP TS Plan", price=1000000.0, cost=0.0, currency="LBP")
     r = client.post("/api/customers", headers=hdr, json={
         "name": "Cust TSFX", "phone": "1", "address": "a", "subscription_plan_id": plan_id})
-    customer_id = r.get_json()['customer']['id']
+    customer_id = r.get_json()['customer_id']
     with app.app_context():
         customer = appmod.db.session.get(appmod.Customer, customer_id)
         payment = appmod.new_for_tenant(
