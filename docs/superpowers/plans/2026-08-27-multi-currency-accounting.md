@@ -4,6 +4,8 @@
 
 **Goal:** Backend-only multi-currency support for a tenant's own customer billing (`Customer`/`SubscriptionPlan`/`Payment`), opt-in per tenant (`BusinessSettings.multi_currency_enabled`, default off), with historical FX-rate locking on `Payment`, manual FX rate entry, and reporting-currency conversion. Bundled with the separately-scoped Float→Numeric migration for all 23 money columns in `app.py`.
 
+**Implementation-time amendment (see spec's Non-goals for full reasoning):** Task 4 wires FX-locking into `add_payment` (`POST /api/payments`) only. A `grep -n "Payment(" app.py` audit during implementation found ~11 total `Payment`-creation call sites; the others (recurring/backdated billing generation, renewals, partial-payment remainder splits, reseller debt reassignment) sit inside batch loops with a single top-level `try/except`/rollback per tenant, where making FX lookup raise would risk aborting a whole tenant's billing run over one missing rate. Left unwired, flagged as follow-up work, not silently dropped — see the spec's updated Non-goals and Open Questions #5.
+
 ## Global constraints
 
 - No scheduler involvement — FX rates are entered manually, never refreshed on a timer. The 2026-08-26 crash-loop lesson (scheduler-registered functions must be defined before `scheduler.add_job()`) does not apply to this plan; no task here touches the scheduler block (`app.py` ~2183-2196).
