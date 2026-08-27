@@ -5079,12 +5079,23 @@ def _apply_whish_debt_then_prepayment(customer, attempt):
     partial -- mirrors apply_customer_balance_to_unpaid_payments's existing
     all-or-nothing-per-row behavior, app.py's Payment.date.asc() ordering),
     then records any remainder as a new pre_payment=True Payment row,
-    matching the existing manual-add-payment pattern. Deliberately does not
-    touch Customer.balance -- this helper is anchored to real Payment rows
-    instead, so it's correct wherever the app reads balance that way (the
-    /balance endpoint, Task 13's report); see the plan's amendment
-    investigation for the open question of whether Customer.balance is
-    meant to always agree with that. Caller commits."""
+    matching the existing manual-add-payment pattern.
+
+    Also credits Customer.balance, exactly like every other money-moving
+    path in this app does: paying off an unpaid Payment credits its amount
+    (matching _mark_payment_fully_paid), and a new paid prepayment credits
+    its amount too (matching add_payment's pre_payment branch). Customer.balance
+    is not a display convenience -- it's an eagerly-maintained running ledger
+    (decremented the moment an unpaid Payment is created at every such call
+    site, credited the moment one is confirmed paid) read directly by the
+    dashboard, customer detail view, receipts, and every other WhatsApp
+    message. An earlier version of this helper deliberately skipped it,
+    which was wrong: skipping it here would leave Customer.balance stale
+    everywhere else it's read after a self-service Whish payment, even
+    though the underlying Payment rows are correctly updated. Ends by
+    calling apply_customer_balance_to_unpaid_payments, matching
+    add_payment's own pattern, so any pre-existing credit combines with
+    this payment to settle anything else newly payable. Caller commits."""
     remaining = float(attempt.amount)
     applied_to_debt = 0.0
     unpaid = Payment.query.filter_by(
@@ -5099,6 +5110,7 @@ def _apply_whish_debt_then_prepayment(customer, attempt):
             payment.paid_at = datetime.utcnow()
             payment.collected_via = 'whish'
             payment.whish_transaction_number = attempt.whish_transaction_number
+            customer.balance += payment.amount
             remaining -= payment.amount
             applied_to_debt += payment.amount
         # else: leave this and every later (ordered oldest-first) payment
@@ -5115,12 +5127,14 @@ def _apply_whish_debt_then_prepayment(customer, attempt):
             reason='Prepayment via self-service Whish payment page',
         )
         db.session.add(prepayment)
+        customer.balance += remaining
 
     attempt.applied_to_debt = applied_to_debt
     attempt.applied_as_prepayment = remaining
     if prepayment:
         db.session.flush()  # get prepayment.id before assigning the FK
         attempt.prepayment_id = prepayment.id
+    apply_customer_balance_to_unpaid_payments(customer)
     return applied_to_debt, remaining, prepayment
 
 
@@ -5221,17 +5235,12 @@ def customer_whish_attempt_success():
     db.session.commit()
 
     try:
-        # Same formula the /balance endpoint uses (calculated_pre_payment_balance
-        # - calculated_unpaid_balance), recomputed fresh after this helper's
-        # mutations -- not customer.balance, which this helper deliberately
-        # doesn't touch (see _apply_whish_debt_then_prepayment's docstring).
-        unpaid_total = sum(p.amount for p in Payment.query.filter_by(
-            customer_id=customer.id, tenant_id=customer.tenant_id, paid=False, pre_payment=False).all())
-        prepaid_total = sum(p.amount for p in Payment.query.filter_by(
-            customer_id=customer.id, tenant_id=customer.tenant_id, paid=True, pre_payment=True).all())
+        # customer.balance is now correctly moved by _apply_whish_debt_then_prepayment
+        # (see its docstring) -- same context shape Task 9's per-link callback
+        # and the manual mark-paid flow already use.
         send_whatsapp_message(customer, 'payment_paid', context={
             'amount': float(attempt.amount),
-            'balance': float(prepaid_total - unpaid_total),
+            'balance': float(customer.balance),
         })
     except Exception as e:
         logging.warning(f"payment_paid WhatsApp notification failed after self-service Whish success (attempt {attempt.id}): {e}")

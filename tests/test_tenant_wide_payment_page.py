@@ -217,6 +217,13 @@ def test_success_pays_down_debt_fully_no_prepayment(client, app):
         payment = appmod.Payment(tenant_id=tenant.id, customer_id=customer_id, amount=40.0,
                                   currency="USD", paid=False, date=appmod.datetime.utcnow())
         appmod.db.session.add(payment)
+        # Every real code path that creates an unpaid Payment (renewal,
+        # generate_missing_payments, add_payment's manual-charge branch)
+        # decrements Customer.balance by the same amount in the same
+        # transaction -- replicate that here so this fixture reflects the
+        # real invariant, not just an isolated Payment row.
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        customer.balance -= 40.0
         appmod.db.session.commit()
         payment_id = payment.id
     ext_id, cb_token, attempt_id, _ = _make_attempt_with_external_id(app, "Biz Success1", amount=40.0)
@@ -232,6 +239,12 @@ def test_success_pays_down_debt_fully_no_prepayment(client, app):
         assert attempt.status == 'succeeded'
         assert float(attempt.applied_to_debt) == 40.0
         assert float(attempt.applied_as_prepayment) == 0.0
+        # Customer.balance is a real, eagerly-maintained ledger read
+        # throughout the app (dashboard, customer detail, other WhatsApp
+        # messages) -- it must move exactly like a staff-confirmed payment
+        # would move it (_mark_payment_fully_paid: balance += amount).
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        assert float(customer.balance) == 0.0  # -40 debt fully paid off
 
 
 def test_success_debt_partially_covered_remainder_is_prepayment(client, app):
@@ -243,6 +256,8 @@ def test_success_debt_partially_covered_remainder_is_prepayment(client, app):
         payment = appmod.Payment(tenant_id=tenant.id, customer_id=customer_id, amount=40.0,
                                   currency="USD", paid=False, date=appmod.datetime.utcnow())
         appmod.db.session.add(payment)
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        customer.balance -= 40.0
         appmod.db.session.commit()
     ext_id, cb_token, _, _ = _make_attempt_with_external_id(app, "Biz Success2", amount=60.0)
     r = client.get(f"/api/pay-attempt/success?order={ext_id}&token={cb_token}", follow_redirects=False)
@@ -255,6 +270,10 @@ def test_success_debt_partially_covered_remainder_is_prepayment(client, app):
         assert float(prepayment.amount) == 20.0
         assert prepayment.paid is True
         assert prepayment.collected_via == 'whish'
+        # -40 debt paid off (+40) plus a 20 prepayment credited (+20) = +20 net,
+        # matching how a manual "Add New Payment" prepayment would credit it.
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        assert float(customer.balance) == 20.0
 
 
 def test_success_no_debt_entire_amount_is_prepayment(client, app):
@@ -268,6 +287,8 @@ def test_success_no_debt_entire_amount_is_prepayment(client, app):
         prepayment = appmod.Payment.query.filter_by(customer_id=customer_id, pre_payment=True).first()
         assert prepayment is not None
         assert float(prepayment.amount) == 15.0
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        assert float(customer.balance) == 15.0
 
 
 def test_success_never_partially_marks_a_single_payment(client, app):
@@ -286,6 +307,8 @@ def test_success_never_partially_marks_a_single_payment(client, app):
         p2 = appmod.Payment(tenant_id=tenant.id, customer_id=customer_id, amount=40.0,
                              currency="USD", paid=False, date=appmod.datetime.utcnow() - timedelta(days=1))
         appmod.db.session.add_all([p1, p2])
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        customer.balance -= 80.0
         appmod.db.session.commit()
         p1_id, p2_id = p1.id, p2.id
     ext_id, cb_token, _, _ = _make_attempt_with_external_id(app, "Biz Success4", amount=50.0)
@@ -298,6 +321,11 @@ def test_success_never_partially_marks_a_single_payment(client, app):
         assert p2.paid is False  # left untouched, not partially reduced
         prepayment = appmod.Payment.query.filter_by(customer_id=customer_id, pre_payment=True).first()
         assert float(prepayment.amount) == 10.0
+        # -80 debt, 40 paid off + 10 prepayment credited = -80 + 50 = -30 --
+        # still owed on the untouched second Payment, exactly as p2 (still
+        # unpaid, still 40.0) implies.
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        assert float(customer.balance) == -30.0
 
 
 def test_success_sends_whatsapp_payment_paid_confirmation(client, app, monkeypatch):
@@ -312,6 +340,10 @@ def test_success_sends_whatsapp_payment_paid_confirmation(client, app, monkeypat
     assert r.status_code == 302
     assert sent[0][0] == 'payment_paid'
     assert sent[0][1]['amount'] == 15.0
+    # No prior debt -- the whole 15.0 becomes a prepayment credit, so the
+    # WhatsApp message's balance context is customer.balance itself, now
+    # that _apply_whish_debt_then_prepayment actually moves it.
+    assert sent[0][1]['balance'] == 15.0
 
 
 def test_success_callback_wrong_token_rejected(client, app):
