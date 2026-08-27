@@ -664,3 +664,107 @@ def test_build_meta_template_payload_fills_url_button_from_view_token():
     assert button_components[0]['parameters'][0]['text'] == 'abc123view'
     body_components = [c for c in result.get('components', []) if c['type'] == 'body']
     assert len(body_components) == 0  # confirms the "0 placeholders -> omit BODY" path, not a false-positive send
+
+
+def test_resend_creates_a_fresh_link_and_leaves_old_one_alone(app, client):
+    hdr = make_tenant(client, "Biz Resend1", "resend1_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Resend1")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    payment_id = r.get_json()['payment']['id']
+    with app.app_context():
+        original_link = appmod.CustomerPaymentLink.query.filter_by(payment_id=payment_id).first()
+        original_token = original_link.view_token
+
+    r2 = client.post(f"/api/customers/{customer_id}/payments/{payment_id}/whish-link/resend", headers=hdr)
+    assert r2.status_code == 200
+    new_token = r2.get_json()['view_token']
+    assert '/pay?token=' in r2.get_json()['pay_url']  # query-string shape, not /pay/<token>
+    assert new_token != original_token
+    with app.app_context():
+        links = appmod.CustomerPaymentLink.query.filter_by(payment_id=payment_id).all()
+        assert len(links) == 2
+        original = next(l for l in links if l.view_token == original_token)
+        assert original.status == 'pending'  # untouched -- not explicitly revoked, see spec
+
+
+def test_resend_rejects_when_whish_not_enabled(app, client):
+    hdr = make_tenant(client, "Biz Resend2", "resend2_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Resend2").first()
+        plan = appmod.SubscriptionPlan(tenant_id=tenant.id, name="P", price=10.0, billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(tenant_id=tenant.id, name="X", phone="+96170000077",
+                                    subscription_plan_id=plan.id, address="Beirut",
+                                    subscription_expiry_date=appmod.datetime.utcnow() + timedelta(days=30))
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        payment = appmod.Payment(tenant_id=tenant.id, customer_id=customer.id, amount=10.0,
+                                  currency="USD", paid=False, date=appmod.datetime.utcnow())
+        appmod.db.session.add(payment)
+        appmod.db.session.commit()
+        customer_id, payment_id = customer.id, payment.id
+    r = client.post(f"/api/customers/{customer_id}/payments/{payment_id}/whish-link/resend", headers=hdr)
+    assert r.status_code == 402
+
+
+def test_resend_rejects_for_already_paid_payment(app, client):
+    hdr = make_tenant(client, "Biz Resend3", "resend3_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Resend3")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": True,
+    })
+    payment_id = r.get_json()['payment']['id']
+    r2 = client.post(f"/api/customers/{customer_id}/payments/{payment_id}/whish-link/resend", headers=hdr)
+    assert r2.status_code == 409
+
+
+def test_resend_tenant_isolation(app, client):
+    hdr_a = make_tenant(client, "Biz ResendIsoA", "resendisoa_admin")
+    hdr_b = make_tenant(client, "Biz ResendIsoB", "resendisob_admin")
+    tenant_b_id, customer_b_id = _enable_whish_for_tenant(app, "Biz ResendIsoB")
+    r = client.post("/api/payments", headers=hdr_b, json={
+        "customer_id": customer_b_id, "amount": 15.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    payment_b_id = r.get_json()['payment']['id']
+    # Tenant A's staff cannot resend a link for tenant B's payment.
+    r2 = client.post(f"/api/customers/{customer_b_id}/payments/{payment_b_id}/whish-link/resend", headers=hdr_a)
+    assert r2.status_code == 404
+
+
+def test_email_payment_link_sends_via_email_util(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz Email1", "email1_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Email1")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    payment_id = r.get_json()['payment']['id']
+
+    sent = {}
+    def fake_send(to, subject, body):
+        sent.update(to=to, subject=subject, body=body)
+    monkeypatch.setattr(appmod.email_util, "send", fake_send)
+
+    r2 = client.post(f"/api/customers/{customer_id}/payments/{payment_id}/whish-link/email", headers=hdr,
+                      json={"email": "customer@example.com", "pay_url": "https://x/pay?token=abc"})
+    assert r2.status_code == 200
+    assert sent["to"] == "customer@example.com"
+    assert "https://x/pay?token=abc" in sent["body"]
+
+
+def test_email_payment_link_requires_email_and_url(app, client):
+    hdr = make_tenant(client, "Biz Email2", "email2_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Email2")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    payment_id = r.get_json()['payment']['id']
+    r2 = client.post(f"/api/customers/{customer_id}/payments/{payment_id}/whish-link/email", headers=hdr, json={})
+    assert r2.status_code == 400

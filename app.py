@@ -862,6 +862,8 @@ class WhatsAppSettings(db.Model):
         default='Dear {customer_name}, your payment of ${amount} has been received. Thank you!')
     deeplink_msg_renewal = db.Column(db.Text, nullable=True,
         default='Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!')
+    deeplink_msg_payment_link = db.Column(db.Text, nullable=True,
+        default='Hi {customer_name}, here is your payment link: {pay_url}')
     forwarding_mobile = db.Column(db.String(50), nullable=True)
     webhook_verify_token = db.Column(db.String(100), nullable=True, default='delta_net_whatsapp_secret')
     auto_reply_enabled = db.Column(db.Boolean, default=True)
@@ -902,6 +904,7 @@ class WhatsAppSettings(db.Model):
             'template_language': self.template_language or 'en',
             'deeplink_msg_payment': self.deeplink_msg_payment or 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
             'deeplink_msg_renewal': self.deeplink_msg_renewal or 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
+            'deeplink_msg_payment_link': self.deeplink_msg_payment_link or 'Hi {customer_name}, here is your payment link: {pay_url}',
             'forwarding_mobile': self.forwarding_mobile or '',
             'webhook_verify_token': self.webhook_verify_token or 'delta_net_whatsapp_secret',
             'auto_reply_enabled': True if self.auto_reply_enabled is None else self.auto_reply_enabled,
@@ -4809,6 +4812,7 @@ def get_whatsapp_settings():
         'template_language': 'en',
         'deeplink_msg_payment': 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
         'deeplink_msg_renewal': 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
+        'deeplink_msg_payment_link': 'Hi {customer_name}, here is your payment link: {pay_url}',
         'forwarding_mobile': '', 'webhook_verify_token': 'delta_net_whatsapp_secret',
         'auto_reply_enabled': True,
         'auto_reply_message': "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\nسيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم",
@@ -4834,7 +4838,8 @@ def save_whatsapp_settings():
                   'template_subscription_created', 'template_subscription_renewed','template_payment_reminder', 'template_current_balance',
                   'template_forward_alert', 'template_bulk_outage', 'template_bulk_maintenance', 'template_bulk_feature', 'template_bulk_offer',
                   'template_payment_link',
-                  'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message',
+                  'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'deeplink_msg_payment_link',
+                  'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message',
                   'template_forward_keepalive']
         for f in fields:
             if f in data:
@@ -5043,6 +5048,79 @@ def customer_whish_failure():
         link.status = 'failed'
         db.session.commit()
     return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token if link else 'invalid'}&status=failed")
+
+
+@app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/resend', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def resend_customer_payment_link(customer_id, payment_id):
+    """Generate a fresh CustomerPaymentLink for an existing pending Payment.
+    Leaves any prior link for that Payment alone -- the old link is left to
+    expire/go stale naturally rather than being explicitly revoked, per the
+    spec. Unlike Task 6's auto-generation helper (which only checks
+    TenantWhishSettings.enabled), this re-checks the plan limit directly --
+    a staff member is actively clicking this right now and deserves an
+    accurate "you need to upgrade" message, not a silent no-op."""
+    payment = tenant_query(Payment).filter_by(id=payment_id, customer_id=customer_id).first()
+    if not payment:
+        return jsonify({"msg": "Payment not found."}), 404
+    if payment.paid:
+        return jsonify({"msg": "This payment is already paid -- nothing to send a link for."}), 409
+
+    tenant = current_tenant()
+    if not plans.limits(tenant.plan)["whish_customer_payments"]:
+        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
+    whish_settings = tenant_query(TenantWhishSettings).filter_by(enabled=True).first()
+    if not whish_settings:
+        return jsonify({"msg": "Whish customer payments are not configured for this business yet."}), 402
+
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
+    link = new_for_tenant(
+        CustomerPaymentLink,
+        customer_id=customer_id, payment_id=payment_id,
+        amount=payment.amount, currency=payment.currency or 'USD',
+        view_token=secrets.token_urlsafe(32), callback_token=secrets.token_urlsafe(32),
+        status='pending', expires_at=datetime.utcnow() + timedelta(days=7),
+    )
+    db.session.add(link)
+    db.session.commit()
+
+    # Query-string token, not a path segment -- see PublicPaymentView.js's
+    # own note (Task 10) for why /pay/<token> breaks this build's relative
+    # asset paths (needed for the Electron packaging).
+    pay_url = f"{Config.APP_BASE_URL}/pay?token={link.view_token}"
+    return jsonify({"view_token": link.view_token, "pay_url": pay_url}), 200
+
+
+@app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/email', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def email_customer_payment_link(customer_id, payment_id):
+    """Send a payment link to a staff-typed, ad-hoc email address -- this
+    codebase has no persisted Customer.email column and isn't adding one
+    (Resolved product decision #5), so the address is never stored."""
+    data = request.json or {}
+    to_email = (data.get('email') or '').strip()
+    pay_url = (data.get('pay_url') or '').strip()
+    if not to_email or not pay_url:
+        return jsonify({"msg": "email and pay_url are required."}), 400
+
+    payment = tenant_query(Payment).filter_by(id=payment_id, customer_id=customer_id).first()
+    if not payment:
+        return jsonify({"msg": "Payment not found."}), 404
+
+    business_settings = tenant_query(BusinessSettings).first()
+    business_name = business_settings.business_name if business_settings else "ServiceBills"
+    try:
+        email_util.send(
+            to=to_email,
+            subject=f"Payment link from {business_name}",
+            body=f"Here is your payment link: {pay_url}",
+        )
+    except Exception as e:
+        logging.error(f"Failed to email payment link (payment {payment_id}): {e}")
+        return jsonify({"msg": "Could not send the email. Please try again."}), 502
+    return jsonify({"message": "Email sent."}), 200
 
 
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
