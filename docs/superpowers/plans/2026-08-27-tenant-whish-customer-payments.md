@@ -28,6 +28,24 @@
 
 ---
 
+## Amendment (2026-08-27): tenant-wide self-service payment page (Tasks 15–20)
+
+Tasks 1–14 above are the **original** scope: a `CustomerPaymentLink` auto-generated for one specific pending `Payment`, delivered proactively (push) to that customer. This amendment adds a **second, complementary entry point** requested afterward: one static, tenant-branded page per tenant (not tied to any single `Payment`) that staff hand out to anyone ("pull" — the customer self-identifies and pays whatever amount they intend, e.g. at a front desk or over the phone). The customer types their registered phone number, the system looks up and shows their name so they can confirm they're paying against the right subscription, then enters an amount and pays via Whish using the tenant's own credentials (same `TenantWhishSettings`, Tasks 2–4, already Pro-gated). On success: the amount first pays down the customer's outstanding unpaid `Payment` rows (oldest first, in full only — never a partial payment against a single due), and anything left over is recorded as a new prepayment, using the `Payment.pre_payment=True` pattern that already exists in this codebase for exactly that purpose. The customer then gets the same WhatsApp payment-confirmation message (`send_whatsapp_message(..., 'payment_paid', ...)`) the app already sends today when staff record a payment.
+
+**Why a second flow rather than extending Tasks 5–10:** a `CustomerPaymentLink` is inherently one-token-per-one-`Payment` — its whole design (staleness guard invalidating it when *that* `Payment` changes, `view_token` scoped to *that* `Payment`'s amount) assumes a single known amount due. This new page is the opposite case: an unknown amount, potentially spanning several dues, entered by the customer themselves. Forcing that into `CustomerPaymentLink`'s shape would mean either fabricating a fake `Payment` row to hang a link off of, or hollowing out most of what makes that model useful for its original purpose. A second small model (Task 16) is simpler and keeps each flow's invariants clean. They share infrastructure freely: rate limiting (Task 1), `TenantWhishSettings` (Task 2), and — new in this amendment — `Payment.collected_via` (Task 15), which Task 9's existing success handler should also set for consistency (see the note added at the end of Task 9, and Task 14's updated self-review).
+
+**Branding note:** the original per-link page (Task 10) deliberately uses **neutral ServiceBills branding, no tenant chrome** (spec's Resolved decision #7) — a link a *system* sent to collect one specific due. This amendment's page is explicitly the opposite: it's a link the *tenant's own staff* hand out representing themselves, so it uses the tenant's logo and an optional brand color (Task 15, Task 19). This plan does not revisit Task 10's decision — the two pages serve different trust contexts and are allowed to look different on purpose.
+
+**Investigation this amendment relied on (grep-verified against `app.py` on this branch's base commit, not guessed):**
+- `Customer.phone` (`app.py:341`) has **no uniqueness constraint** — `grep -n "UniqueConstraint.*phone\|phone.*unique=True" app.py` is empty, and `Customer` has no `__table_args__` at all. Two customers of the same tenant can share a phone number today. Task 17's phone-lookup route handles this explicitly (see its Judgment call) rather than silently taking `.first()`.
+- **`Customer.balance` and the "negative balance = owes money" the request describes are not quite the same thing.** `Customer.balance` is a stored field, credited by `_mark_payment_fully_paid` (`app.py:3475`, confirmed real — see the note below and at the end of Task 9). But the balance-detail endpoint (`GET /api/customers/<id>/balance`, `app.py:4196`) computes what it displays from real `Payment` rows instead: `calculated_total_balance = calculated_pre_payment_balance - calculated_unpaid_balance`, with its own comment stating "positive for credit, negative for amount owed." This plan could not fully confirm, without a human familiar with how `Customer.balance` is used elsewhere in the app today, whether the two are meant to always agree. Task 18's helper is deliberately anchored to real `Payment` rows (the same ones the balance-detail endpoint and Task 13's report read) rather than to the stored `Customer.balance` field — see Task 18's Judgment call for the full reasoning and the one-line alternative if a reviewer disagrees.
+- **A "prepayment" concept already exists** — `Payment.pre_payment` (`app.py:674`, boolean), used today by the manual "add payment" path (`app.py:3207`) to record credit paid in advance, and already excluded from revenue reporting (`app.py:5096`). This amendment reuses that exact pattern rather than inventing a new "credit"/"advance" concept.
+- **`_mark_payment_fully_paid`'s real signature is now confirmed** (`app.py:3475-3485`) — Task 9 above flagged this as unresolved; it is real, and its last line, `payment.received_by_id = current_user.id`, unconditionally dereferences `current_user`. This is a genuine blocker for *any* customer-initiated success handler, including Task 9's own. See the note appended to the end of Task 9, and Task 18's Judgment call for why this amendment's Task 18 does not call this function at all (it may need to mark several `Payment` rows in one transaction, which this function isn't shaped for either).
+- **No tenant brand-color field exists anywhere** (`grep -ni "brand_color\|primary_color"` over `app.py` and the frontend is empty) — `BusinessSettings` (`app.py:717-750`) has `logo_url` but no color. The frontend's MUI theme (`frontend/src/theme.js`) is built once, globally, from ServiceBills' own brand tokens (`frontend/src/brand/tokens.js`) — there is no per-tenant theming plumbing to hook into. Task 15 adds the column; Task 19 adds the frontend plumbing from scratch.
+- **No rate-limiting/lockout prior art exists** to point to for the phone-lookup endpoint's enumeration risk (`grep -ni "failed_attempts\|max_attempts\|lockout"` over `app.py` is empty) — Task 17 has to design its own guard, not cite an existing pattern (Task 1's `Limiter` object is reused, but the specific per-route limit and its reasoning are new).
+
+---
+
 ## Task 1: Rate-limiting infrastructure (Flask-Limiter)
 
 Sequenced first because every public route added later (Tasks 7, 8, 9) depends on it, and because — per the spec's Resolved product decision #8 — this is meant to be shared infrastructure, not a one-off for this feature.
@@ -1648,6 +1666,8 @@ git add app.py tests/test_tenant_whish_customer_payments.py
 git commit -m "Add public customer-Whish success/failure callback routes"
 ```
 
+**Amendment (2026-08-27), added once this plan's open item above was actually resolved:** `_mark_payment_fully_paid`'s real signature is confirmed (`app.py:3475-3485`) — it does require a non-`None` `current_user` (`payment.received_by_id = current_user.id` is unconditional), so the `current_user=None` call above will raise `AttributeError` as written. The additive, backward-compatible fix: change the shared function's signature to `def _mark_payment_fully_paid(payment, customer, current_user=None):` and guard that one line — `if current_user: payment.received_by_id = current_user.id`. Every existing staff-facing caller keeps passing a real user and is unaffected; this route can then pass `current_user=None` as originally written. Fold this into this task's Step 3 during implementation, and add one test asserting `received_by_id is None` for a callback-driven payment while every pre-existing "mark paid" test still gets a non-`None` value. For consistency with the amendment's Task 15 (`Payment.collected_via`), also set `payment.collected_via = 'whish'` right after the `_mark_payment_fully_paid(...)` call above — it's the same signal the new self-service page (Task 18) sets, and Task 13's report should not have to special-case which flow collected a given payment.
+
 ---
 
 ## Task 10: Frontend — public payment page (`PublicPaymentView.js`)
@@ -2288,6 +2308,18 @@ Confirm `\d tenant_whish_settings` and `\d customer_payment_link` both look corr
 | Resolved decision #8 (rate-limiting infra, composability) | Task 1 |
 | Testing approach — every bullet | Distributed across Tasks 2, 3, 5–9, 12, 13's own test steps; see the table row above's task mapping for each specific behavior. |
 
+**Amendment (2026-08-27) self-review — tenant-wide self-service payment page:**
+
+| Requirement (from the follow-up request that produced Tasks 15–20) | Covered by |
+|---|---|
+| One page per tenant, not generated per Payment, staff hand out the link to anyone | Task 15 (`Tenant.public_pay_slug`), Task 17 (public branding route), Task 20 (staff can view/copy/regenerate it) |
+| Phone number field; name fetched from phone to confirm the right subscription | Task 17 (`POST /api/pay/t/<slug>/lookup`), with the phone-non-uniqueness judgment call documented there |
+| Amount field; pay by Whish button | Task 18 (checkout route, tenant's own `TenantWhishSettings` credentials, reused from Task 2) |
+| Tenant branding colors and logo, if available | Task 15 (`BusinessSettings.brand_color` column, new — `logo_url` already existed), Task 19 (frontend page-scoped theming, built from scratch since no per-tenant theming plumbing exists) |
+| Negative balance deducted; pending payments marked collected by Whish | Task 18's `_apply_whish_debt_then_prepayment` helper — pays down real unpaid `Payment` rows oldest-first, in full only; each gets `collected_via='whish'` (Task 15) |
+| Amount exceeding the debt (or the customer has no debt) becomes a prepayment | Task 18's helper — remainder recorded as a new `Payment(pre_payment=True, paid=True, ...)`, matching the existing manual-add-payment pattern at `app.py:3207` |
+| WhatsApp payment confirmation, using the already-configured WhatsApp API | Task 18 — reuses `send_whatsapp_message(customer, 'payment_paid', ...)` (`app.py:4926`), the same function and template the app already uses for staff-collected payments; no new template |
+
 - [ ] **Step 5: Scan for placeholders and cross-task consistency**
 
 Before opening the PR, grep this plan document itself (and the resulting diff, once implemented) for anything that slipped through as a placeholder rather than a real value:
@@ -2308,6 +2340,736 @@ Every hit in this plan is a deliberate, explicitly-flagged item for the implemen
 - [ ] **Step 6: What this plan could not cleanly fit a task to — flagged rather than silently dropped**
 
 - **`whish_transaction_number`'s real field name** (Task 9) — genuinely blocked on a real Whish callback payload this plan's author has no access to. Not a missing task; a missing *fact*, explicitly named as needing a supervised real-payment test before Task 9 can be called fully done, mirroring the same caveat the 2026-08-26 spec already carries for platform billing's own callback.
-- **`_mark_payment_fully_paid`'s real call signature** (Task 9) — this plan sketches the call with a placeholder `current_user=None` and flags that the real function must be read before this compiles; if that function turns out to require a non-nullable staff-user argument, this plan does not resolve what value to pass (a dedicated "system" user? a nullable-param addition to that shared function?) — genuinely a design question for whoever implements Task 9, not resolved here since guessing wrong risks a change to a function every other "mark paid" caller in this app also depends on.
+- **~~`_mark_payment_fully_paid`'s real call signature~~ — resolved by the 2026-08-27 amendment's investigation.** It's real (`app.py:3475-3485`) and does require a non-`None` `current_user`. The fix (an additive `current_user=None` default plus one guarded line) is now documented at the end of Task 9 and reused by Task 18. What's *still* open, and could not be resolved without a human: whether `Customer.balance` (which that function increments on every full payment) and the `Payment`-row-derived "balance" the `/balance` endpoint displays are meant to always agree — see the amendment's investigation note and Task 18's Judgment call. Task 18 deliberately does not touch `Customer.balance` at all; if a reviewer determines it must, the one-line alternative is documented there.
 - **A delivery-status indicator on `CustomerPaymentLink`** (flagged in Task 11, Step 5) — the spec doesn't explicitly ask for this, but this plan's own investigation into unapproved-template/deeplink-mode fallout surfaced it as a near-term-valuable gap. Deliberately scoped out of this plan's task list (to avoid growing it further) rather than silently built or silently ignored.
+- **Duplicate phone numbers within a tenant** (Task 17) — `Customer.phone` has no uniqueness constraint today, and this plan does not add one (retrofitting a constraint on a production table that may already carry real duplicates needs a human decision about the existing data, not a migration guessed through). Task 17's lookup route handles the *symptom* (never guesses which duplicate the customer means) but the underlying data-quality gap is not fixed by this plan.
+- **Whether `Customer.balance` needs to move too** (Task 18) — see above; genuinely open, flagged with a documented one-line alternative rather than guessed either way.
 - **Client-side plan-gating UX polish** (Task 4) — this plan specifies the *server-side* 402 gate precisely (Task 3) but is vague about exactly how polished the client-side "you're on Free, upgrade to use this" treatment should be, deferring some of that to whatever precedent `SettingsView.js`'s WhatsApp API card already sets. Not a spec gap (the spec doesn't prescribe UI polish level) — just an implementation-detail latitude intentionally left to whoever builds Task 4, following existing precedent rather than this plan inventing a new pattern.
+
+---
+
+## Task 15: Schema additions — `Payment.collected_via`, `Tenant.public_pay_slug`, `BusinessSettings.brand_color`
+
+**Files:**
+- Modify: `app.py` (`Payment`, `Tenant`, `BusinessSettings` classes)
+- Add: `migrations/versions/<new_revision>_add_collected_via_slug_brand_color.py`
+- Test: create `tests/test_tenant_wide_payment_page.py` (new file — everything in Tasks 15–20 lives here, kept separate from `tests/test_tenant_whish_customer_payments.py` since it's a distinct flow)
+
+**Interfaces:**
+- Produces: `Payment.collected_via` (`String(20)`, nullable — `None` = staff-collected/legacy, `'whish'` = collected by either Whish flow, this one or Task 9's), `Tenant.public_pay_slug` (`String(32)`, nullable, unique — `None` until first generated, Task 20), `BusinessSettings.brand_color` (`String(7)`, nullable — a `#rrggbb` hex string).
+
+**Judgment call:** bundling three small nullable-column additions on three *existing* tables into one task/migration, deviating from Tasks 2/5's one-new-table-per-task convention. Each is additive and independently defensive-checked in the migration below; none has gating/business logic of its own the way a new table would. Splitting these into three tasks would add process overhead without adding real review granularity.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+"""Schema additions shared by the tenant-wide self-service Whish payment
+page -- see the 2026-08-27 plan's amendment section. Payment.collected_via
+is also set by the existing per-link flow (Task 9's amendment note)."""
+import app as appmod
+
+
+def test_payment_has_collected_via_column():
+    insp = appmod.db.inspect(appmod.db.engine)
+    cols = {c['name'] for c in insp.get_columns('payment')}
+    assert 'collected_via' in cols
+
+
+def test_tenant_has_public_pay_slug_column():
+    insp = appmod.db.inspect(appmod.db.engine)
+    cols = {c['name'] for c in insp.get_columns('tenant')}
+    assert 'public_pay_slug' in cols
+
+
+def test_business_settings_has_brand_color_column():
+    insp = appmod.db.inspect(appmod.db.engine)
+    cols = {c['name'] for c in insp.get_columns('business_settings')}
+    assert 'brand_color' in cols
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `python -m pytest tests/test_tenant_wide_payment_page.py -v`
+Expected: FAIL — columns don't exist yet (or the whole module fails to import if the migration/model changes haven't landed — either failure mode is acceptable evidence the test is real).
+
+- [ ] **Step 3: Add the columns to the models**
+
+`app.py`, `Payment` class (`app.py:635-689`), add alongside the other status columns:
+
+```python
+    collected_via = db.Column(db.String(20), nullable=True)  # None | 'whish'
+```
+
+`app.py`, `Tenant` class, add:
+
+```python
+    public_pay_slug = db.Column(db.String(32), nullable=True, unique=True, index=True)
+```
+
+`app.py`, `BusinessSettings` class (`app.py:717-750`), add alongside `logo_url`:
+
+```python
+    brand_color = db.Column(db.String(7), nullable=True)  # '#rrggbb', optional
+```
+
+- [ ] **Step 4: Write the migration**
+
+```bash
+flask db revision -m "add collected_via, public_pay_slug, brand_color"
+```
+
+```python
+"""add collected_via, public_pay_slug, brand_color
+
+Revision ID: <new_revision>
+Revises: <real current migration head -- confirm with `flask db heads` at implementation time>
+Create Date: <today's real date>
+
+Three small, independent, additive nullable columns for the tenant-wide
+self-service Whish payment page (2026-08-27 plan amendment). Defensive
+per this repo's documented history of migrations that pass on SQLite dev
+and fail/drift on production Postgres -- see
+migrations/versions/c57bc44a51d0_cleanup_schema_drift_drop_stale_payment_.py.
+"""
+from alembic import op
+import sqlalchemy as sa
+
+revision = '<new_revision>'
+down_revision = '<real current migration head>'
+
+
+def upgrade():
+    bind = op.get_bind()
+    insp = sa.inspect(bind)
+
+    payment_cols = {c['name'] for c in insp.get_columns('payment')}
+    if 'collected_via' not in payment_cols:
+        op.add_column('payment', sa.Column('collected_via', sa.String(20), nullable=True))
+    else:
+        print("NOTE: payment.collected_via already exists -- skipping")
+
+    tenant_cols = {c['name'] for c in insp.get_columns('tenant')}
+    if 'public_pay_slug' not in tenant_cols:
+        op.add_column('tenant', sa.Column('public_pay_slug', sa.String(32), nullable=True))
+        op.create_unique_constraint('uq_tenant_public_pay_slug', 'tenant', ['public_pay_slug'])
+    else:
+        print("NOTE: tenant.public_pay_slug already exists -- skipping")
+
+    bs_cols = {c['name'] for c in insp.get_columns('business_settings')}
+    if 'brand_color' not in bs_cols:
+        op.add_column('business_settings', sa.Column('brand_color', sa.String(7), nullable=True))
+    else:
+        print("NOTE: business_settings.brand_color already exists -- skipping")
+
+
+def downgrade():
+    pass  # additive-only, matches this repo's existing convention of no-op downgrades on defensive migrations
+```
+
+- [ ] **Step 5: Run the test, then re-run the migration for real against Postgres**
+
+Run: `python -m pytest tests/test_tenant_wide_payment_page.py -v` — expect PASS.
+
+Then, per Global Constraints, run for real against `docker-compose.yml` Postgres (not just SQLite): `docker compose up -d db && DATABASE_URL=postgresql+psycopg2://servicesbills:localdevpass@localhost:5432/servicesbills JWT_SECRET_KEY=test SECRET_KEY=test flask db upgrade`, then `\d payment`, `\d tenant`, `\d business_settings` to confirm.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add app.py migrations/versions/ tests/test_tenant_wide_payment_page.py
+git commit -m "Add Payment.collected_via, Tenant.public_pay_slug, BusinessSettings.brand_color"
+```
+
+---
+
+## Task 16: `CustomerWhishPaymentAttempt` model + migration
+
+**Files:**
+- Modify: `app.py` (new model, `TENANT_OWNED_MODELS`)
+- Add: `migrations/versions/<new_revision>_add_customer_whish_payment_attempt.py`
+- Test: extend `tests/test_tenant_wide_payment_page.py`
+
+**Interfaces:**
+- Produces: `CustomerWhishPaymentAttempt` — one row per checkout attempt on the tenant-wide page. Unlike `CustomerPaymentLink` (Task 5), this is **not** addressed by a `view_token` and has no "page to view again" — a failed attempt just means the customer fills the form again on the same static tenant page. It exists purely to carry a `callback_token` through the Whish redirect round-trip and to record, after the fact, how a successful payment was applied (useful for support/debugging and for Task 13's report).
+
+**Judgment call — why this isn't just a reuse of `CustomerPaymentLink`:** `CustomerPaymentLink` is shaped around exactly one known `Payment` and one known amount (its staleness guard exists specifically to invalidate the link when *that* `Payment` changes). This page's whole point is an amount the customer decides, potentially applied across several `Payment` rows. Reusing that model would mean either faking a `Payment` row to hang a link off of, or stripping out the parts that make `CustomerPaymentLink` useful for its actual purpose. A second, smaller model keeps both flows' invariants simple.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+def test_customer_whish_payment_attempt_model_exists(app):
+    with app.app_context():
+        assert hasattr(appmod, 'CustomerWhishPaymentAttempt')
+        insp = appmod.db.inspect(appmod.db.engine)
+        assert 'customer_whish_payment_attempt' in insp.get_table_names()
+
+
+def test_customer_whish_payment_attempt_is_tenant_owned():
+    assert appmod.CustomerWhishPaymentAttempt in appmod.TENANT_OWNED_MODELS
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `python -m pytest tests/test_tenant_wide_payment_page.py -k attempt -v`
+Expected: FAIL — no such model/table.
+
+- [ ] **Step 3: Add the model**
+
+`app.py`, near `CustomerPaymentLink` (Task 5):
+
+```python
+class CustomerWhishPaymentAttempt(db.Model):
+    """One row per checkout attempt from the tenant-wide self-service Whish
+    payment page (2026-08-27 plan amendment). Not addressed by its own
+    view_token -- see this task's Judgment call for why it's a separate,
+    simpler model than CustomerPaymentLink."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False, index=True)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
+    callback_token = db.Column(db.String(64), nullable=False)
+    whish_external_id = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    status = db.Column(db.String(20), nullable=False, default='pending')  # pending | succeeded | failed
+    applied_to_debt = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
+    applied_as_prepayment = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
+    prepayment_id = db.Column(db.Integer, db.ForeignKey('payment.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+```
+
+Add to `TENANT_OWNED_MODELS` (`app.py:1018`) in the same step, per Global Constraints and this plan's own Type/name consistency check (Task 14, Step 5) — not deferred.
+
+- [ ] **Step 4: Migration**
+
+Same defensive `inspect(bind)` shape as Task 5's `CustomerPaymentLink` migration (`op.create_table(...)` guarded by `if 'customer_whish_payment_attempt' not in insp.get_table_names(): ... else: print("NOTE: ... already exists -- skipping")`). Not reproduced in full here — copy Task 5's migration structure and adjust the column list to match this model.
+
+- [ ] **Step 5: Run test, then re-run against Postgres; commit**
+
+```bash
+python -m pytest tests/test_tenant_wide_payment_page.py -v
+docker compose up -d db && DATABASE_URL=postgresql+psycopg2://servicesbills:localdevpass@localhost:5432/servicesbills JWT_SECRET_KEY=test SECRET_KEY=test flask db upgrade
+git add app.py migrations/versions/ tests/test_tenant_wide_payment_page.py
+git commit -m "Add CustomerWhishPaymentAttempt model + migration"
+```
+
+---
+
+## Task 17: Public tenant-branding + phone-lookup routes
+
+**Files:**
+- Modify: `app.py`
+- Test: extend `tests/test_tenant_wide_payment_page.py`
+
+**Interfaces:**
+- Produces: `GET /api/pay/t/<slug>` (public, rate-limited) → `{"business_name": ..., "logo_url": ..., "brand_color": ...}` or a generic invalid-shaped 404. `POST /api/pay/t/<slug>/lookup` (public, tightly rate-limited) body `{"phone": "..."}` → `{"customer_id": <int>, "name": "..."}` on a single match, or a generic error shape otherwise.
+
+**Convention note:** both routes are unauthenticated, so — exactly like Tasks 7–9's existing public routes — they bypass `tenant_query`/`new_for_tenant` (which depend on a request context the auth layer sets, absent here) and instead filter by `tenant_id` explicitly once the tenant is known from the slug.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+def _make_branded_tenant(app, business_name, logo_url=None, brand_color=None):
+    with app.app_context():
+        hdr = make_tenant_via_client_or_however_conftest_does_it(business_name)  # reuse tests/conftest.py's existing tenant-creation helper, matching this plan's other test files
+        tenant = appmod.Tenant.query.filter_by(name=business_name).first()
+        tenant.public_pay_slug = appmod.secrets.token_urlsafe(12)
+        bs = appmod.BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+        bs.logo_url = logo_url
+        bs.brand_color = brand_color
+        appmod.db.session.commit()
+        return tenant.public_pay_slug, hdr
+
+
+def test_public_branding_route_returns_name_logo_color(client, app):
+    slug, _ = _make_branded_tenant(app, "Biz Brand1", logo_url="https://x/logo.png", brand_color="#1a73e8")
+    r = client.get(f"/api/pay/t/{slug}")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["business_name"] == "Biz Brand1"
+    assert body["logo_url"] == "https://x/logo.png"
+    assert body["brand_color"] == "#1a73e8"
+
+
+def test_public_branding_route_unknown_slug_generic_404(client):
+    r = client.get("/api/pay/t/does-not-exist")
+    assert r.status_code == 404
+
+
+def test_phone_lookup_single_match_returns_name(client, app):
+    slug, hdr = _make_branded_tenant(app, "Biz Lookup1")
+    # create a customer under this tenant with a known phone, via the existing
+    # authenticated customer-creation endpoint and hdr, matching this repo's
+    # other test files' setup pattern
+    r = client.post(f"/api/pay/t/{slug}/lookup", json={"phone": "70123456"})
+    assert r.status_code == 200
+    assert r.get_json()["name"]  # exact assertion depends on the fixture customer's real name
+
+
+def test_phone_lookup_no_match_is_generic(client, app):
+    slug, _ = _make_branded_tenant(app, "Biz Lookup2")
+    r = client.post(f"/api/pay/t/{slug}/lookup", json={"phone": "00000000"})
+    assert r.status_code == 404
+
+
+def test_phone_lookup_multiple_matches_is_generic_not_first(client, app):
+    # Customer.phone has no uniqueness constraint (confirmed in this plan's
+    # amendment investigation) -- two customers can share a phone. This must
+    # never silently pick one, since that risks confirming the WRONG
+    # subscription name to whoever is paying.
+    slug, hdr = _make_branded_tenant(app, "Biz Lookup3")
+    # create two customers under this tenant sharing the same phone
+    r = client.post(f"/api/pay/t/{slug}/lookup", json={"phone": "70999999"})
+    assert r.status_code == 409
+    assert "contact" in r.get_json()["error"].lower()
+
+
+def test_phone_lookup_is_rate_limited(client, app):
+    slug, _ = _make_branded_tenant(app, "Biz Lookup4")
+    for _ in range(15):
+        r = client.post(f"/api/pay/t/{slug}/lookup", json={"phone": "00000000"})
+    assert r.status_code == 429
+```
+
+(These test bodies assume this repo's existing `tests/conftest.py` fixtures for creating a tenant/customer via the authenticated API — mirror whatever helper Tasks 5–9's own tests already use, e.g. the `_make_link`/`make_tenant` helpers referenced in Task 9's tests above, rather than reinventing one.)
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `python -m pytest tests/test_tenant_wide_payment_page.py -k "branding or lookup" -v`
+Expected: FAIL — 404 (routes don't exist).
+
+- [ ] **Step 3: Add the routes**
+
+```python
+@app.route('/api/pay/t/<slug>', methods=['GET'])
+@limiter.limit("60 per minute")
+def public_tenant_pay_branding(slug):
+    """Public: branding for the tenant-wide self-service Whish payment page.
+    Low-risk info (name/logo/color, nothing customer-specific) so the limit
+    here is generous compared to the lookup route below."""
+    tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
+    if not tenant:
+        return jsonify({"error": "not found"}), 404
+    bs = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+    return jsonify({
+        "business_name": bs.business_name if bs else tenant.name,
+        "logo_url": storage.url(bs.logo_url) if bs and bs.logo_url else DEFAULT_LOGO_URL,
+        "brand_color": bs.brand_color if bs else None,
+    })
+
+
+@app.route('/api/pay/t/<slug>/lookup', methods=['POST'])
+@limiter.limit("10 per minute")
+@limiter.limit("50 per hour", key_func=lambda: request.view_args.get("slug", ""))
+def public_tenant_pay_lookup(slug):
+    """Public: phone -> name lookup so the customer can confirm they're
+    paying against the right subscription before entering an amount. Two
+    stacked limits: per-IP (10/min, catches a single attacker) and
+    per-tenant-slug (50/hr across all IPs, catches distributed enumeration
+    against one tenant's customer list) -- there is no existing lockout
+    precedent in this codebase to reuse (see this plan's amendment
+    investigation), so both are new."""
+    tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
+    if not tenant:
+        return jsonify({"error": "not found"}), 404
+
+    phone = (request.get_json(silent=True) or {}).get('phone', '').strip()
+    if not phone:
+        return jsonify({"error": "phone required"}), 400
+
+    # Explicit tenant_id filter, not tenant_query -- see this task's
+    # Convention note (no request-context tenant exists on a public route).
+    matches = Customer.query.filter_by(tenant_id=tenant.id, phone=phone).all()
+
+    if len(matches) == 0:
+        return jsonify({"error": "not found"}), 404
+    if len(matches) > 1:
+        # Customer.phone has no uniqueness constraint (see amendment
+        # investigation) -- never guess which one the customer means.
+        logging.warning(f"Ambiguous phone lookup: tenant={tenant.id} phone={phone} matches={len(matches)}")
+        return jsonify({"error": "Multiple accounts found for this phone number -- please contact the business directly."}), 409
+
+    customer = matches[0]
+    return jsonify({"customer_id": customer.id, "name": customer.name})
+```
+
+**Judgment call — full name, not masked:** the request explicitly asks the customer's real name be shown so they can confirm the right subscription, so this returns it in full rather than a masked "J*** D." compromise. The mitigation for the resulting enumeration/PII exposure is the rate limiting above, not response redaction — a masked name would also partly defeat the point (a customer trying to confirm *their own* name against a mistyped digit needs to actually see it). Flagged here as a deliberate choice, not an oversight.
+
+**Judgment call — `customer_id` returned in plain, not wrapped in a token:** unlike `CustomerPaymentLink`'s `view_token`/`callback_token` (which gate an actual state transition — flipping a `Payment` to paid), this `customer_id` only lets whoever holds it *initiate a real Whish payment on that customer's behalf* at the checkout route (Task 18) -- Task 18 re-verifies `customer.tenant_id == tenant.id` server-side regardless of what's passed. There's no fraud vector in someone paying down a stranger's debt with their own money via a real Whish charge; the checkout route's own rate limit (Task 18) is the real guard against abuse (e.g. spamming a customer with WhatsApp confirmations), and that guard applies however `customer_id` was obtained. Wrapping it in a signed/short-lived token would add complexity without closing a real gap — flagged so a reviewer can weigh in if they see one this plan missed.
+
+- [ ] **Step 4: Run test to verify it passes; commit**
+
+```bash
+python -m pytest tests/test_tenant_wide_payment_page.py -v
+git add app.py tests/test_tenant_wide_payment_page.py
+git commit -m "Add public tenant branding + phone-lookup routes for self-service Whish page"
+```
+
+---
+
+## Task 18: Public checkout + success/failure callbacks; the debt-then-prepayment helper
+
+**Files:**
+- Modify: `app.py`
+- Test: extend `tests/test_tenant_wide_payment_page.py`
+
+**Interfaces:**
+- Produces: `POST /api/pay/t/<slug>/checkout` (public, rate-limited) → `{"redirect": "<collectUrl>"}`. `GET /api/pay-attempt/success` / `/api/pay-attempt/failure` (public, rate-limited, `order`/`token` query params) — Whish callbacks, redirect back to the tenant page.
+- Produces: `_apply_whish_debt_then_prepayment(customer, attempt)` — the helper that turns a successful payment into real `Payment`-row state.
+
+**Judgment call — currency:** the generic page has no single `Payment` to inherit a currency from. This task uses `BusinessSettings.reporting_currency` (already a real field, confirmed in the amendment's investigation) as the page's currency, with the same `currency not in ('USD', 'LBP')` guard the original plan's Task 6 already applies to the per-link flow (Whish's hard constraint) — if a tenant's reporting currency isn't Whish-supported, the checkout route returns a clear error rather than silently defaulting to USD and mismatching what the tenant's records show.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+def test_checkout_creates_attempt_and_redirects(client, app, monkeypatch):
+    slug, hdr = _make_branded_tenant(app, "Biz Checkout1")
+    # enable TenantWhishSettings for this tenant (Task 2/3), monkeypatch
+    # whish_billing.create_payment to avoid a real HTTP call, matching the
+    # pattern the sibling 2026-08-26 plan and this plan's own Task 8 already use
+    customer_id = _create_customer_for(app, "Biz Checkout1", phone="70123456")
+    r = client.post(f"/api/pay/t/{slug}/checkout", json={"customer_id": customer_id, "amount": 25.0})
+    assert r.status_code == 200
+    assert "redirect" in r.get_json()
+
+
+def test_checkout_rejects_customer_from_another_tenant(client, app):
+    slug, _ = _make_branded_tenant(app, "Biz Checkout2")
+    other_customer_id = _create_customer_for(app, "Some Other Tenant", phone="71000000")
+    r = client.post(f"/api/pay/t/{slug}/checkout", json={"customer_id": other_customer_id, "amount": 10.0})
+    assert r.status_code == 404  # generic, not a leaky 403
+
+
+def test_success_pays_down_debt_fully_no_prepayment(client, app):
+    # customer has exactly one unpaid Payment of 40.0; attempt.amount == 40.0
+    ...
+    assert payment.paid is True
+    assert payment.collected_via == 'whish'
+    assert prepayment_created is False
+
+
+def test_success_debt_partially_covered_remainder_is_prepayment(client, app):
+    # customer has one unpaid Payment of 40.0; attempt.amount == 60.0
+    ...
+    assert payment.paid is True
+    prepayment = appmod.Payment.query.filter_by(customer_id=customer.id, pre_payment=True).first()
+    assert prepayment.amount == 20.0
+    assert prepayment.paid is True
+    assert prepayment.collected_via == 'whish'
+
+
+def test_success_no_debt_entire_amount_is_prepayment(client, app):
+    # customer has zero unpaid Payments; attempt.amount == 15.0
+    ...
+    prepayment = appmod.Payment.query.filter_by(customer_id=customer.id, pre_payment=True).first()
+    assert prepayment.amount == 15.0
+
+
+def test_success_never_partially_marks_a_single_payment(client, app):
+    # two unpaid Payments of 40.0 each; attempt.amount == 50.0
+    # -> first one paid in full (40.0 applied), remaining 10.0 becomes
+    # prepayment -- the second unpaid Payment is left untouched, not
+    # partially reduced. Mirrors apply_customer_balance_to_unpaid_payments's
+    # existing all-or-nothing-per-row behavior (app.py:1107).
+    ...
+    assert unpaid_payment_2.paid is False
+
+
+def test_success_sends_whatsapp_payment_paid_confirmation(client, app, monkeypatch):
+    sent = []
+    monkeypatch.setattr(appmod, 'send_whatsapp_message', lambda customer, event_type, context=None: sent.append((event_type, context)))
+    ...
+    assert sent[0][0] == 'payment_paid'
+
+
+def test_success_callback_wrong_token_rejected(client, app):
+    ...
+    assert attempt.status == 'pending'  # untouched
+
+
+def test_success_callback_is_single_use(client, app):
+    ...  # second call doesn't double-apply
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `python -m pytest tests/test_tenant_wide_payment_page.py -k "checkout or success or debt or prepayment" -v`
+Expected: FAIL — routes/helper don't exist.
+
+- [ ] **Step 3: Add the helper and the routes**
+
+```python
+def _apply_whish_debt_then_prepayment(customer, attempt):
+    """Applies a successful self-service Whish payment: pays down the
+    customer's oldest unpaid, non-prepayment Payment rows in full (never
+    partial -- mirrors apply_customer_balance_to_unpaid_payments's existing
+    all-or-nothing-per-row behavior, app.py:1107), then records any
+    remainder as a new pre_payment=True Payment row, matching the existing
+    manual-add-payment pattern (app.py:3207). Deliberately does not touch
+    Customer.balance -- see this task's Judgment call. Caller commits."""
+    remaining = attempt.amount
+    applied_to_debt = 0.0
+    unpaid = Payment.query.filter_by(
+        customer_id=customer.id, tenant_id=customer.tenant_id, paid=False, pre_payment=False
+    ).order_by(Payment.date.asc()).all()  # confirm ordering matches apply_customer_balance_to_unpaid_payments during implementation
+
+    for payment in unpaid:
+        if remaining <= 0:
+            break
+        if remaining >= payment.amount:
+            payment.paid = True
+            payment.paid_at = datetime.utcnow()
+            payment.collected_via = 'whish'
+            remaining -= payment.amount
+            applied_to_debt += payment.amount
+        # else: leave this and every later (ordered oldest-first) payment
+        # untouched -- a partial amount is never applied against a single due.
+
+    prepayment = None
+    if remaining > 0:
+        prepayment = Payment(
+            tenant_id=customer.tenant_id, customer_id=customer.id,
+            amount=remaining, currency=attempt.currency,
+            paid=True, paid_at=datetime.utcnow(), pre_payment=True,
+            collected_via='whish',
+            reason='Prepayment via self-service Whish payment page',
+        )
+        db.session.add(prepayment)
+
+    attempt.applied_to_debt = applied_to_debt
+    attempt.applied_as_prepayment = remaining
+    if prepayment:
+        db.session.flush()  # get prepayment.id before assigning the FK
+        attempt.prepayment_id = prepayment.id
+    return applied_to_debt, remaining, prepayment
+
+
+@app.route('/api/pay/t/<slug>/checkout', methods=['POST'])
+@limiter.limit("10 per minute")
+def public_tenant_pay_checkout(slug):
+    tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
+    if not tenant:
+        return jsonify({"error": "not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    customer_id = body.get('customer_id')
+    amount = body.get('amount')
+    customer = Customer.query.filter_by(id=customer_id, tenant_id=tenant.id).first()
+    if not customer or not amount or float(amount) <= 0:
+        return jsonify({"error": "not found"}), 404  # generic, not a leaky 400 that confirms customer_id validity
+
+    settings = TenantWhishSettings.query.filter_by(tenant_id=tenant.id).first()
+    if not settings or not settings.enabled:
+        return jsonify({"error": "Whish payments are not available for this business right now."}), 404
+
+    bs = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+    currency = bs.reporting_currency if bs else 'USD'
+    if currency not in ('USD', 'LBP'):
+        return jsonify({"error": "Online payment isn't available in this business's currency."}), 400
+
+    attempt = CustomerWhishPaymentAttempt(
+        tenant_id=tenant.id, customer_id=customer.id,
+        amount=float(amount), currency=currency,
+        callback_token=secrets.token_urlsafe(32),
+    )
+    db.session.add(attempt)
+    db.session.flush()
+
+    result = whish_billing.create_payment(
+        external_id=f"cwpa-{attempt.id}", amount=attempt.amount, currency=currency,
+        callback_token=attempt.callback_token, requestee=customer.name, target=tenant.name,
+        email="",  # same resolved decision as Task 8 -- see that task's Judgment call
+        invoice=f"Payment - {tenant.name}",
+    )
+    attempt.whish_external_id = result['external_id']  # confirm real key name against whish_billing.py's actual return shape during implementation
+    db.session.commit()
+    return jsonify({"redirect": result['collectUrl']})  # confirm real key name during implementation
+
+
+@app.route('/api/pay-attempt/success', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_attempt_success():
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    attempt = CustomerWhishPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+
+    if (not attempt or attempt.status != 'pending'
+            or not secrets.compare_digest(attempt.callback_token, token)):
+        logging.warning(f"Customer-Whish attempt success callback rejected: order={external_id}")
+        tenant = Tenant.query.get(attempt.tenant_id) if attempt else None
+        slug = tenant.public_pay_slug if tenant else 'invalid'
+        return redirect(f"{Config.APP_BASE_URL}/pay/t/{slug}?status=error")
+
+    customer = db.session.get(Customer, attempt.customer_id)
+    applied_to_debt, applied_as_prepayment, _ = _apply_whish_debt_then_prepayment(customer, attempt)
+    attempt.status = 'succeeded'
+    attempt.completed_at = datetime.utcnow()
+    db.session.commit()
+
+    try:
+        send_whatsapp_message(customer, 'payment_paid', context={
+            'amount': float(attempt.amount),
+            'balance': float(applied_as_prepayment - (attempt.amount - applied_to_debt - applied_as_prepayment)),  # recompute via the /balance endpoint's own formula rather than trust customer.balance -- see this task's Judgment call
+        })
+    except Exception as e:
+        logging.warning(f"payment_paid WhatsApp notification failed after self-service Whish success (attempt {attempt.id}): {e}")
+
+    tenant = Tenant.query.get(attempt.tenant_id)
+    return redirect(f"{Config.APP_BASE_URL}/pay/t/{tenant.public_pay_slug}?status=success")
+
+
+@app.route('/api/pay-attempt/failure', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_attempt_failure():
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    attempt = CustomerWhishPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+    if attempt and attempt.status == 'pending' and secrets.compare_digest(attempt.callback_token, token):
+        attempt.status = 'failed'
+        db.session.commit()
+    tenant = Tenant.query.get(attempt.tenant_id) if attempt else None
+    slug = tenant.public_pay_slug if tenant else 'invalid'
+    return redirect(f"{Config.APP_BASE_URL}/pay/t/{slug}?status=failed")
+```
+
+**Note on the `balance` value passed to `send_whatsapp_message`:** the exact recomputation shown above is intentionally sketched, not final — implementation should call the same formula the `/balance` endpoint uses (`app.py:4196`, `calculated_pre_payment_balance - calculated_unpaid_balance`, recomputed fresh after this helper's mutations) rather than the inline arithmetic above, which is included only to show the shape of what's needed. Confirm and simplify during implementation.
+
+**Judgment call — `Customer.balance` is not touched by this helper (repeated from the amendment's investigation note, restated here since it's this task's central design decision):** `_mark_payment_fully_paid` (`app.py:3475`) increments `Customer.balance` on every full payment, and `apply_customer_balance_to_unpaid_payments` (`app.py:1107`) treats it as the credit source of truth. This plan could not confirm, without a human familiar with the app's actual use of that field, whether it's meant to always agree with the `Payment`-row-derived total the `/balance` endpoint displays. This helper is anchored to real `Payment` rows instead, so a self-service payment is guaranteed correct wherever the app reads balance *that* way (the `/balance` endpoint, Task 13's report). **The one-line alternative, if a reviewer determines `Customer.balance` must also move:** add `customer.balance += attempt.amount` at the top of this helper, and replace this helper's own unpaid-payment loop with a direct call to the existing `apply_customer_balance_to_unpaid_payments(customer)` — but note that function doesn't set `collected_via` or return the amounts this helper needs for `attempt.applied_to_debt`/`applied_as_prepayment` and `send_whatsapp_message`'s context, so it would need a small additive change (an optional `source=` kwarg) rather than a drop-in swap.
+
+- [ ] **Step 4: Run test to verify it passes; commit**
+
+```bash
+python -m pytest tests/test_tenant_wide_payment_page.py -v
+git add app.py tests/test_tenant_wide_payment_page.py
+git commit -m "Add self-service Whish checkout, callbacks, and debt/prepayment helper"
+```
+
+---
+
+## Task 19: Frontend — public tenant-wide payment page (`PublicTenantPayView.js`)
+
+**Files:**
+- Add: `frontend/src/components/PublicTenantPayView.js`
+- Modify: `frontend/src/App.js` (route)
+
+**Interfaces:**
+- Renders at `/pay/t/<slug>`. States: `loading branding → phone entry → confirm name + amount entry → redirecting to Whish → returned (?status=success|failed|error)`.
+
+- [ ] **Step 1: Add the route**
+
+`App.js`, in the same pre-auth public-screen block that already handles `/verify`, `/reset-password`, `/forgot-password` (`App.js:479-487`):
+
+```javascript
+if (location.pathname.startsWith('/pay/t/')) return <PublicTenantPayView />;
+```
+
+- [ ] **Step 2: Build the component**
+
+Shape mirrors `VerifyEmailView.js`'s token-in-URL → fetch → render pattern, extended with the extra phone/amount steps this page needs. **Judgment call:** does not wrap in the shared `<AuthShell>` (used by `VerifyEmailView`/`LoginView`) since that shell is styled for ServiceBills' own login/verify flows, not for showing a *tenant's* branding — this page needs its own minimal shell so the tenant's logo/color, not ServiceBills', is what the customer sees first.
+
+```javascript
+const PublicTenantPayView = () => {
+    const slug = window.location.pathname.split('/pay/t/')[1];
+    const [branding, setBranding] = useState(null);
+    const [step, setStep] = useState('phone'); // phone | confirm | redirecting | error
+    const [phone, setPhone] = useState('');
+    const [customer, setCustomer] = useState(null); // {customer_id, name}
+    const [amount, setAmount] = useState('');
+    const [error, setError] = useState(null);
+
+    useEffect(() => {
+        fetch(`/api/pay/t/${slug}`).then(r => r.ok ? r.json() : Promise.reject())
+            .then(setBranding).catch(() => setStep('error'));
+    }, [slug]);
+
+    const accentColor = branding?.brand_color || brandTokens.colors.primary; // frontend/src/brand/tokens.js fallback -- see this task's branding note
+
+    const lookupPhone = async () => {
+        const r = await fetch(`/api/pay/t/${slug}/lookup`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({phone})
+        });
+        if (r.status === 409) { setError('Multiple accounts found for this phone number -- please contact the business directly.'); return; }
+        if (!r.ok) { setError('No account found for this phone number.'); return; }
+        setCustomer(await r.json());
+        setStep('confirm');
+    };
+
+    const checkout = async () => {
+        setStep('redirecting');
+        const r = await fetch(`/api/pay/t/${slug}/checkout`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({customer_id: customer.customer_id, amount: parseFloat(amount)})
+        });
+        if (!r.ok) { setError('Could not start payment.'); setStep('confirm'); return; }
+        window.location.href = (await r.json()).redirect;
+    };
+
+    // ... render: logo, business_name, phone/confirm/error steps, a button
+    // styled with accentColor for both background and Whish CTA.
+};
+```
+
+Manual browser check only (repo has no frontend test suite, per Global Constraints) — verify: unbranded tenant (no `logo_url`/`brand_color` set) falls back cleanly to ServiceBills defaults, a branded tenant shows its own logo/color, the phone-not-found and multiple-match messages render distinctly, and a real (monkeypatched, per Task 18) checkout redirect round-trips through `?status=success` correctly.
+
+- [ ] **Step 3: Manual verification; commit**
+
+```bash
+git add frontend/src/components/PublicTenantPayView.js frontend/src/App.js
+git commit -m "Add public tenant-wide self-service Whish payment page (frontend)"
+```
+
+---
+
+## Task 20: Staff-facing — surface, copy, and regenerate the tenant's public pay link
+
+**Files:**
+- Modify: `app.py` (small endpoint, reusing Task 3's Pro-plan gate)
+- Modify: `frontend/src/components/SettingsView.js` (or wherever Task 4 placed the `TenantWhishSettings` card — extend it, not a new page)
+
+**Interfaces:**
+- Produces: `POST /api/tenant/whish/public-pay-link/regenerate` (authenticated, Pro-gated like Task 3) — generates (or replaces) `Tenant.public_pay_slug`, returns the new slug/URL.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+def test_regenerate_public_pay_slug_requires_pro(client, app):
+    hdr = make_tenant(client, "Biz Slug1", "slug_admin")  # Free plan by default
+    r = client.post("/api/tenant/whish/public-pay-link/regenerate", headers=hdr)
+    assert r.status_code == 402
+
+
+def test_regenerate_public_pay_slug_sets_and_changes_it(client, app):
+    hdr = make_pro_tenant(client, "Biz Slug2", "slug_admin")  # reuse whatever helper Task 3's tests use to get a Pro tenant
+    r1 = client.post("/api/tenant/whish/public-pay-link/regenerate", headers=hdr)
+    slug1 = r1.get_json()["slug"]
+    r2 = client.post("/api/tenant/whish/public-pay-link/regenerate", headers=hdr)
+    slug2 = r2.get_json()["slug"]
+    assert slug1 != slug2  # old link is deliberately invalidated -- see Step 2's Judgment call
+```
+
+- [ ] **Step 2: Run test to verify it fails; add the route**
+
+```python
+@app.route('/api/tenant/whish/public-pay-link/regenerate', methods=['POST'])
+@jwt_required()
+def regenerate_public_pay_link():
+    # Reuse Task 3's exact Pro-plan gate helper here (not reproduced -- see
+    # that task for the real check) rather than re-deriving it.
+    tenant = ...  # current tenant, per this app's existing auth-context convention
+    tenant.public_pay_slug = secrets.token_urlsafe(12)
+    db.session.commit()
+    return jsonify({"slug": tenant.public_pay_slug, "url": f"{Config.APP_BASE_URL}/pay/t/{tenant.public_pay_slug}"})
+```
+
+**Judgment call — regeneration invalidates the old link, on purpose:** the request describes staff handing this link out broadly ("send this page link to anyone"), so unlike a one-time secret, this link is meant to be long-lived and stable. Regenerating it is a deliberate "burn the old one" action (e.g. if it leaked somewhere unwanted), not something to do casually — the frontend step below must warn staff that regenerating breaks any copy of the link already shared, since there's no way to notify whoever's holding it.
+
+- [ ] **Step 3: Frontend — add a "Public payment page" card to the existing Whish settings screen**
+
+Lazily generates the slug on first load (call the regenerate endpoint once if `public_pay_slug` is null; do not auto-regenerate an existing one), shows the full URL with a copy-to-clipboard button, and a separate, clearly-labeled "Regenerate link (breaks the old one)" button behind a confirmation dialog per the Judgment call above. Manual browser check only, per Global Constraints.
+
+- [ ] **Step 4: Run test to verify it passes; commit**
+
+```bash
+python -m pytest tests/test_tenant_wide_payment_page.py -v
+git add app.py frontend/src/components/SettingsView.js tests/test_tenant_wide_payment_page.py
+git commit -m "Let staff view/copy/regenerate their tenant's public Whish pay link"
+```
