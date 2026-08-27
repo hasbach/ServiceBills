@@ -96,6 +96,17 @@ migrate = Migrate(app, db, render_as_batch=True)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+# Shared rate-limiting infrastructure -- see
+# docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 1
+# (Resolved product decision #8 in the sibling spec). In-memory storage
+# (single-gunicorn-worker deployment per render.yaml/Dockerfile today). No
+# default_limits: existing authenticated routes are unaffected by this --
+# only routes that opt in with @limiter.limit(...) are throttled.
+limiter = Limiter(key_func=get_remote_address, app=app, storage_uri="memory://", default_limits=[])
+
 # Multi-tenancy scoping helpers (Phase 2). tenancy.py imports `db` lazily inside
 # functions, so importing it here does not create a circular import.
 from tenancy import (
