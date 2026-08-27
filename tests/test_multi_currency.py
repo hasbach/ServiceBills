@@ -310,7 +310,11 @@ def test_money_columns_are_numeric_not_float(app, client):
     ]
     for model, colname in numeric_targets:
         coltype = getattr(model, colname).type
-        assert isinstance(coltype, sa.Numeric), f"{model.__name__}.{colname} is {type(coltype)}, expected Numeric"
+        # sa.Float IS-A sa.Numeric in SQLAlchemy's type hierarchy, so a bare
+        # isinstance(..., sa.Numeric) check would vacuously pass on an
+        # unconverted Float column -- explicitly exclude Float.
+        assert isinstance(coltype, sa.Numeric) and not isinstance(coltype, sa.Float), \
+            f"{model.__name__}.{colname} is {type(coltype)}, expected Numeric (not Float)"
 
 
 def test_money_values_still_round_trip_as_float_via_to_dict(app, client):
@@ -386,7 +390,18 @@ def test_financial_report_opted_out_tenant_reports_usd(app, client):
     assert r.status_code == 200
     body = r.get_json()
     assert body['currency'] == 'USD'
-    assert body['totals']['income'] == pytest.approx(42.0)
+    # Every payment locks fx_rate_to_reporting=1 for an opted-out tenant, so the
+    # reporting-currency-converted total must exactly equal the raw sum of paid
+    # amounts (a no-op multiply-by-1) -- computed independently here rather than
+    # hard-coding an expected figure, since add_customer's own backdated-payment
+    # backfill can add unrelated paid amounts depending on plan/date interaction.
+    with app.app_context():
+        expected = sum(
+            float(p.amount) for p in appmod.Payment.query.filter_by(
+                customer_id=customer_id, paid=True, is_gratis=False, is_refund=False)
+        )
+    assert body['totals']['income'] == pytest.approx(expected)
+    assert expected >= 42.0
 
 
 def test_financial_report_opted_in_tenant_converts_using_locked_rate(app, client):
@@ -422,8 +437,8 @@ def test_total_sales_report_opted_out_tenant_unchanged(app, client):
     customer_id = r.get_json()['customer_id']
     with app.app_context():
         customer = appmod.db.session.get(appmod.Customer, customer_id)
-        payment = appmod.new_for_tenant(
-            appmod.Payment, customer_id=customer.id, amount=25.0, paid=True,
+        payment = appmod.Payment(
+            tenant_id=customer.tenant_id, customer_id=customer.id, amount=25.0, paid=True,
             paid_at=datetime.utcnow(), pre_payment=False)
         appmod.db.session.add(payment)
         appmod.db.session.commit()
@@ -444,8 +459,8 @@ def test_total_sales_report_opted_in_tenant_converts_using_locked_rate(app, clie
     customer_id = r.get_json()['customer_id']
     with app.app_context():
         customer = appmod.db.session.get(appmod.Customer, customer_id)
-        payment = appmod.new_for_tenant(
-            appmod.Payment, customer_id=customer.id, amount=1000000.0, paid=True,
+        payment = appmod.Payment(
+            tenant_id=customer.tenant_id, customer_id=customer.id, amount=1000000.0, paid=True,
             paid_at=datetime.utcnow(), pre_payment=False, currency='LBP',
             fx_rate_to_reporting=Decimal('0.00001'))
         appmod.db.session.add(payment)

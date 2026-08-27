@@ -2706,7 +2706,20 @@ def update_customer(customer_id):
             new_plan = tenant_query(SubscriptionPlan).filter_by(id=data['subscription_plan_id']).first()
             if not new_plan:
                 return jsonify({'message': 'Subscription plan not found!'}), 404
-            
+
+            # Multi-currency (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md):
+            # a customer's balance is denominated in their current plan's
+            # currency. Changing to a plan in a different currency while a
+            # non-zero balance exists would silently re-value that balance --
+            # block it and require settling to zero first, rather than
+            # guessing at a conversion.
+            old_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
+            if old_plan and new_plan.currency != old_plan.currency and float(customer.balance or 0) != 0.0:
+                return jsonify({'error': (
+                    f"Cannot change this customer's plan from {old_plan.currency} to {new_plan.currency} "
+                    f"while they have a non-zero balance ({float(customer.balance):.2f} {old_plan.currency}). "
+                    f"Settle their balance to zero first, then change the plan.")}), 400
+
             old_plan_id = customer.subscription_plan_id
             customer.subscription_plan_id = data['subscription_plan_id']
             
@@ -3359,9 +3372,12 @@ def month_key(column):
 @app.route('/api/reports/total-sales', methods=['GET'])
 @jwt_required()
 def get_total_sales():
+    # Converted into the tenant's reporting_currency using each payment's own
+    # LOCKED rate (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md)
+    # -- a no-op multiply-by-1 for an opted-out (single-currency) tenant.
     total_sales = db.session.query(
         month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(Payment.amount).label('total_sales')
+        func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_sales')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
@@ -3380,7 +3396,7 @@ def get_total_sales():
 def get_unpaid_payments():
     unpaid_payments = db.session.query(
         month_key(Payment.date).label('month'),
-        func.sum(Payment.amount).label('unpaid')
+        func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('unpaid')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == False
@@ -4326,10 +4342,12 @@ def get_expenses_total():
 @app.route('/api/reports/monthly-revenue', methods=['GET'])
 @jwt_required()
 def get_monthly_revenue():
-    # Get total sales (paid only)
+    # Get total sales (paid only). Converted into the tenant's reporting_currency
+    # using each payment's own locked rate (no-op for an opted-out tenant) -- see
+    # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
     sales_query = db.session.query(
         month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(Payment.amount).label('total_sales')
+        func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_sales')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
@@ -6639,9 +6657,12 @@ def get_collector_progress():
         end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
         end_date = end_date.replace(hour=23, minute=59, second=59)
 
+        # Converted into the tenant's reporting_currency using each payment's own
+        # locked rate (no-op for an opted-out tenant) -- see
+        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
         collector_query = db.session.query(
             User.username,
-            func.sum(Payment.amount).label('total_amount'),
+            func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_amount'),
             func.count(Payment.id).label('total_payments')
         ).join(Payment, Payment.collected_by_id == User.id)\
          .filter(
@@ -6683,9 +6704,16 @@ def get_financial_report():
         end_date = end_date.replace(hour=23, minute=59, second=59)
 
         # 1. Income: Payments marked as paid. Fall back to date if paid_at is null.
+        # Converted into the tenant's reporting_currency using each payment's own
+        # LOCKED rate (fx_rate_to_reporting) -- not a live/current rate -- so a
+        # report over a date range spanning an FX-rate update always reflects
+        # what those payments were actually worth when they happened. For an
+        # opted-out (single-currency) tenant, fx_rate_to_reporting is always
+        # exactly 1, so this is a no-op multiply-by-1. See
+        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
         income_query = db.session.query(
             month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-            func.sum(Payment.amount).label('total')
+            func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total')
         ).filter(
             Payment.tenant_id == current_tenant_id(),
             Payment.paid == True,
@@ -6824,9 +6852,13 @@ def get_financial_report():
                 total_variance += data['variance']
 
         total_profit = total_income - total_expenses
+        _reporting_settings = tenant_query(BusinessSettings).first()
 
         return jsonify({
             'monthly_data': monthly_data,
+            # See docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md
+            # -- all totals above are already converted into this currency.
+            'currency': (_reporting_settings.reporting_currency if _reporting_settings else 'USD'),
             'totals': {
                 'income': total_income,
                 'expenses': total_expenses,
