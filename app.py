@@ -4981,6 +4981,45 @@ def save_tenant_whish_settings():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/tenant/whish/public-pay-link', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_public_pay_link():
+    """Staff-facing: the tenant-wide self-service Whish payment page's
+    current link, if one has been generated yet (Task 20). slug is None
+    until the frontend lazily generates it on first load of the settings
+    card, or a reviewer chooses to build a "generate" step in explicitly."""
+    tenant = current_tenant()
+    slug = tenant.public_pay_slug
+    return jsonify({
+        'slug': slug,
+        'url': f"{Config.APP_BASE_URL}/pay-business?slug={slug}" if slug else None,
+    }), 200
+
+
+@app.route('/api/tenant/whish/public-pay-link/regenerate', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def regenerate_public_pay_link():
+    """Staff-facing: (re)generate the tenant-wide self-service Whish payment
+    page's slug (Task 20). Same Pro-plan gate as Task 3's settings save --
+    this whole feature is Pro-only. Regenerating deliberately invalidates
+    the old link (a new random slug replaces it) -- unlike a one-time
+    secret, this link is meant to be long-lived and handed out broadly, so
+    regeneration is a deliberate "burn the old one" action (e.g. if it
+    leaked somewhere unwanted), not something to do casually. The frontend
+    must warn staff of that before calling this."""
+    tenant = current_tenant()
+    if not plans.limits(tenant.plan)["whish_customer_payments"]:
+        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
+    tenant.public_pay_slug = secrets.token_urlsafe(12)
+    db.session.commit()
+    return jsonify({
+        'slug': tenant.public_pay_slug,
+        'url': f"{Config.APP_BASE_URL}/pay-business?slug={tenant.public_pay_slug}",
+    }), 200
+
+
 @app.route('/api/pay/t/<slug>', methods=['GET'])
 @limiter.limit("60 per minute")
 def public_tenant_pay_branding(slug):

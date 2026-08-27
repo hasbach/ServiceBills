@@ -3,7 +3,8 @@ import {
     Box, Typography, Paper, Button, TextField, CircularProgress,
     Avatar, Grid, Divider, Switch, alpha, useTheme, FormControlLabel,
     Alert, Collapse, InputAdornment, IconButton, MenuItem,
-    ToggleButton, ToggleButtonGroup, Tab, Tabs
+    ToggleButton, ToggleButtonGroup, Tab, Tabs,
+    Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
 } from '@mui/material';
 import {
     Business as BusinessIcon,
@@ -20,6 +21,8 @@ import {
     Edit as EditIcon,
     Lock as LockIcon,
     Payments as PaymentsIcon,
+    ContentCopy as ContentCopyIcon,
+    Autorenew as AutorenewIcon,
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import ExpenseCategoryManager from './ExpenseCategoryManager.js';
@@ -238,6 +241,60 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     };
 
     const twsField = (key) => ({ value: twsForm[key], onChange: (e) => setTwsForm(f => ({ ...f, [key]: e.target.value })) });
+
+    // ── Tenant-wide public payment page link (Task 20) ──────────────────────────
+    const [publicPayLink, setPublicPayLink] = useState(null); // { slug, url } | null while loading
+    const [publicPayLinkLoading, setPublicPayLinkLoading] = useState(false);
+    const [regenerateConfirmOpen, setRegenerateConfirmOpen] = useState(false);
+    const [copied, setCopied] = useState(false);
+
+    const fetchPublicPayLink = useCallback(async () => {
+        try {
+            const res = await apiService.getPublicPayLink();
+            if (res.data?.slug) {
+                setPublicPayLink(res.data);
+            } else {
+                // Lazily generate on first load -- staff shouldn't need an
+                // extra manual step just to get a working link the first
+                // time they open this tab. Never auto-regenerates an
+                // EXISTING slug (that's the explicit, confirmed action
+                // below) -- only fires when none has been generated yet.
+                const gen = await apiService.regeneratePublicPayLink();
+                setPublicPayLink(gen.data);
+            }
+        } catch (e) {
+            console.error('Failed to load public payment page link', e);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [apiService]);
+
+    useEffect(() => { if (isPro) fetchPublicPayLink(); }, [isPro, fetchPublicPayLink]);
+
+    const generateOrRegeneratePublicPayLink = async () => {
+        setPublicPayLinkLoading(true);
+        try {
+            const res = await apiService.regeneratePublicPayLink();
+            setPublicPayLink(res.data);
+            setSnackbar({ open: true, message: 'Public payment page link generated!', severity: 'success' });
+        } catch (err) {
+            const detail = err?.response?.data?.msg || err?.message || 'Unknown error';
+            setSnackbar({ open: true, message: `Failed to generate link: ${detail}`, severity: 'error' });
+        } finally {
+            setPublicPayLinkLoading(false);
+            setRegenerateConfirmOpen(false);
+        }
+    };
+
+    const copyPublicPayLink = async () => {
+        if (!publicPayLink?.url) return;
+        try {
+            await navigator.clipboard.writeText(publicPayLink.url);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+        } catch (e) {
+            setSnackbar({ open: true, message: 'Could not copy link.', severity: 'error' });
+        }
+    };
 
     // ── Render ────────────────────────────────────────────────────────────────
     return (
@@ -649,10 +706,54 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                 sx={{ borderRadius: '12px', textTransform: 'none', fontWeight: 600, px: 4, py: 1.5 }}>
                                 {twsLoading ? 'Saving…' : 'Save Whish Payment Settings'}
                             </Button>
+
+                            <Box sx={{ mt: 3 }} />
+                            <Section icon={<LinkIcon />} title="Public Payment Page" subtitle="One link, safe to hand out to anyone -- customers self-identify by phone and pay whatever they owe" color={theme.palette.secondary.main}>
+                                {!publicPayLink ? (
+                                    <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}><CircularProgress size={24} /></Box>
+                                ) : (
+                                    <>
+                                        <TextField
+                                            fullWidth label="Payment page link" value={publicPayLink.url || ''} InputProps={{ readOnly: true }}
+                                            sx={{ mb: 2, '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}
+                                        />
+                                        <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
+                                            <Button variant="outlined" startIcon={<ContentCopyIcon />} onClick={copyPublicPayLink}
+                                                sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
+                                                {copied ? 'Copied!' : 'Copy Link'}
+                                            </Button>
+                                            <Button variant="outlined" color="warning" startIcon={<AutorenewIcon />}
+                                                onClick={() => setRegenerateConfirmOpen(true)} disabled={publicPayLinkLoading}
+                                                sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
+                                                Regenerate Link
+                                            </Button>
+                                        </Box>
+                                        <Alert severity="info" sx={{ mt: 2, borderRadius: '12px' }}>
+                                            Regenerating breaks the current link -- anyone who saved or bookmarked it will no longer be able to pay through it.
+                                        </Alert>
+                                    </>
+                                )}
+                            </Section>
                         </>
                     )}
                 </Box>
             )}
+
+            <Dialog open={regenerateConfirmOpen} onClose={() => setRegenerateConfirmOpen(false)}>
+                <DialogTitle>Regenerate the public payment link?</DialogTitle>
+                <DialogContent>
+                    <DialogContentText>
+                        This replaces your current public payment page link with a brand-new one. The old link will stop
+                        working immediately for anyone who has it saved, bookmarked, or shared. This can't be undone.
+                    </DialogContentText>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setRegenerateConfirmOpen(false)} disabled={publicPayLinkLoading}>Cancel</Button>
+                    <Button onClick={generateOrRegeneratePublicPayLink} color="warning" variant="contained" disabled={publicPayLinkLoading}>
+                        {publicPayLinkLoading ? 'Regenerating…' : 'Regenerate'}
+                    </Button>
+                </DialogActions>
+            </Dialog>
 
             {/* ── Tab 3: Expense Categories ── */}
             {tab === 3 && (

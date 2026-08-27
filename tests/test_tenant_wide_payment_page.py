@@ -350,3 +350,36 @@ def test_failure_callback_marks_attempt_failed(client, app):
     with app.app_context():
         attempt = appmod.db.session.get(appmod.CustomerWhishPaymentAttempt, attempt_id)
         assert attempt.status == 'failed'
+
+
+def _make_pro_tenant(client, business_name, admin_name):
+    hdr = make_tenant(client, business_name, admin_name)
+    with client.application.app_context():
+        tenant = appmod.Tenant.query.filter_by(name=business_name).first()
+        tenant.plan = 'pro'
+        appmod.db.session.commit()
+    return hdr
+
+
+def test_regenerate_public_pay_slug_requires_pro(client, app):
+    hdr = make_tenant(client, "Biz Slug1", "slug1_admin")  # Free plan by default
+    r = client.post("/api/tenant/whish/public-pay-link/regenerate", headers=hdr)
+    assert r.status_code == 402
+
+
+def test_regenerate_public_pay_slug_sets_and_changes_it(client, app):
+    hdr = _make_pro_tenant(client, "Biz Slug2", "slug2_admin")
+    r1 = client.post("/api/tenant/whish/public-pay-link/regenerate", headers=hdr)
+    assert r1.status_code == 200
+    slug1 = r1.get_json()["slug"]
+    assert slug1
+    r2 = client.post("/api/tenant/whish/public-pay-link/regenerate", headers=hdr)
+    slug2 = r2.get_json()["slug"]
+    assert slug1 != slug2  # old link is deliberately invalidated -- see this task's Judgment call
+
+
+def test_get_public_pay_link_returns_none_when_not_generated(client, app):
+    hdr = _make_pro_tenant(client, "Biz Slug3", "slug3_admin")
+    r = client.get("/api/tenant/whish/public-pay-link", headers=hdr)
+    assert r.status_code == 200
+    assert r.get_json()["slug"] is None
