@@ -713,6 +713,49 @@ class GeneratedReceipt(db.Model):
     customer = db.relationship('Customer', back_populates='generated_receipts')
 
 
+class CustomerPaymentLink(db.Model):
+    """One Whish payment link generated for a specific customer Payment. The
+    single-use, signed-token security boundary for the public payment page
+    and Whish callback. Parallel to BillingPaymentAttempt (platform billing)
+    but scoped to Payment/Customer, not Tenant. See
+    docs/superpowers/specs/2026-08-27-tenant-whish-customer-payments-design.md
+    (Data model, Security model sections) for the full rationale, including
+    why there are two tokens (view_token: repeatable, read-only;
+    callback_token: single-use, can flip Payment.paid)."""
+    __tablename__ = "customer_payment_link"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False, index=True)
+    payment_id = db.Column(db.Integer, db.ForeignKey('payment.id'), nullable=False, index=True)
+    # Snapshotted at creation, NOT re-read from Payment at checkout/callback
+    # time -- see the staleness guard below for what happens if Payment.amount
+    # changes after this snapshot.
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False)
+    view_token = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    callback_token = db.Column(db.String(64), nullable=False)
+    whish_external_id = db.Column(db.String(64), unique=True, nullable=True, index=True)
+    whish_transaction_number = db.Column(db.String(64), nullable=True)
+    status = db.Column(db.String(10), nullable=False, default='pending', index=True)  # pending, succeeded, failed, expired, stale
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    completed_at = db.Column(db.DateTime, nullable=True)
+
+    payment = db.relationship('Payment')
+    customer = db.relationship('Customer')
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'customer_id': self.customer_id, 'payment_id': self.payment_id,
+            'amount': float(self.amount), 'currency': self.currency,
+            'whish_transaction_number': self.whish_transaction_number,
+            'status': self.status,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+            'expires_at': self.expires_at.strftime('%Y-%m-%d %H:%M:%S'),
+            'completed_at': self.completed_at.strftime('%Y-%m-%d %H:%M:%S') if self.completed_at else None,
+        }
+
+
 class AddonPurchase(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -1067,7 +1110,7 @@ TENANT_OWNED_MODELS = (
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
-    ExchangeRate,
+    ExchangeRate, CustomerPaymentLink,
 )
 
 from sqlalchemy import event as _sa_event
@@ -1082,6 +1125,27 @@ def _stamp_tenant_id(session, flush_context, instances):
     for obj in session.new:
         if isinstance(obj, TENANT_OWNED_MODELS) and getattr(obj, "tenant_id", None) is None:
             obj.tenant_id = tid
+
+
+@_sa_event.listens_for(db.session, "before_flush")
+def _stale_customer_payment_links_on_payment_mutation(session, flush_context, instances):
+    """If a Payment this session is about to update has amount/paid/is_refund/
+    reverted_at changed, and it has a still-pending CustomerPaymentLink, mark
+    that link 'stale' in the same flush -- see the spec's Data model section
+    ("Link invalidation on Payment mutation"). Only inspects session.dirty
+    (updates), not session.deleted -- a Payment being deleted outright is
+    handled by the ORM's normal FK behavior for existing links and by this
+    app's existing tenant-delete cascade, not by this listener."""
+    watched_fields = ('amount', 'paid', 'is_refund', 'reverted_at')
+    for obj in session.dirty:
+        if not isinstance(obj, Payment):
+            continue
+        state = db.inspect(obj)
+        if not any(state.attrs[f].history.has_changes() for f in watched_fields):
+            continue
+        pending_links = CustomerPaymentLink.query.filter_by(payment_id=obj.id, status='pending').all()
+        for link in pending_links:
+            link.status = 'stale'
 
 
 # Schema is owned by Alembic (flask db upgrade). No import-time create_all or

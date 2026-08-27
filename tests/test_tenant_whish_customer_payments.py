@@ -4,6 +4,9 @@ Distinct from tests/test_whish_billing.py (platform billing: tenant -> ServiceBi
 This feature is: a tenant's own customer -> that tenant, via that tenant's own
 Whish credentials. whish_billing.create_payment (the HTTP client) is shared and
 reused unmodified; nothing else is."""
+import secrets
+from datetime import timedelta
+
 import app as appmod
 from tests.conftest import make_tenant
 
@@ -93,3 +96,145 @@ def test_save_tenant_whish_settings_enabled_requires_both_credentials(app, clien
                      json={"enabled": True, "whish_channel": "c1", "whish_secret": ""})
     assert r.status_code == 200
     assert r.get_json()["settings"]["enabled"] is False
+
+
+def test_customer_payment_link_model_roundtrip(app, client):
+    make_tenant(client, "Biz CPL", "cpl_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz CPL").first()
+        plan = appmod.SubscriptionPlan(tenant_id=tenant.id, name="Test Plan", price=50.0,
+                                        billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(tenant_id=tenant.id, name="Jane Doe", phone="+96170123456",
+                                    subscription_plan_id=plan.id, address="Beirut", subscription_expiry_date=appmod.datetime.utcnow() + timedelta(days=30))
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        payment = appmod.Payment(tenant_id=tenant.id, customer_id=customer.id, amount=50.0,
+                                  currency="USD", paid=False, date=appmod.datetime.utcnow())
+        appmod.db.session.add(payment)
+        appmod.db.session.commit()
+
+        link = appmod.CustomerPaymentLink(
+            tenant_id=tenant.id, customer_id=customer.id, payment_id=payment.id,
+            amount=payment.amount, currency=payment.currency,
+            view_token=secrets.token_urlsafe(32), callback_token=secrets.token_urlsafe(32),
+            status='pending', expires_at=appmod.datetime.utcnow() + timedelta(days=7),
+        )
+        appmod.db.session.add(link)
+        appmod.db.session.commit()
+
+        fetched = appmod.CustomerPaymentLink.query.filter_by(payment_id=payment.id).first()
+        assert fetched.status == 'pending'
+        assert fetched.tenant_id == tenant.id
+        assert fetched.customer_id == customer.id
+        assert len(fetched.view_token) > 32 and fetched.view_token != fetched.callback_token
+
+
+def test_customer_payment_link_goes_stale_when_payment_amount_changes(app, client):
+    make_tenant(client, "Biz Stale1", "stale1_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Stale1").first()
+        plan = appmod.SubscriptionPlan(tenant_id=tenant.id, name="P", price=50.0,
+                                        billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(tenant_id=tenant.id, name="Jane", phone="+96170000001",
+                                    subscription_plan_id=plan.id, address="Beirut", subscription_expiry_date=appmod.datetime.utcnow() + timedelta(days=30))
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        payment = appmod.Payment(tenant_id=tenant.id, customer_id=customer.id, amount=50.0,
+                                  currency="USD", paid=False, date=appmod.datetime.utcnow())
+        appmod.db.session.add(payment)
+        appmod.db.session.commit()
+        link = appmod.CustomerPaymentLink(
+            tenant_id=tenant.id, customer_id=customer.id, payment_id=payment.id,
+            amount=payment.amount, currency=payment.currency,
+            view_token=secrets.token_urlsafe(32), callback_token=secrets.token_urlsafe(32),
+            status='pending', expires_at=appmod.datetime.utcnow() + timedelta(days=7),
+        )
+        appmod.db.session.add(link)
+        appmod.db.session.commit()
+        payment_id, link_id = payment.id, link.id
+
+    with app.app_context():
+        payment = appmod.db.session.get(appmod.Payment, payment_id)
+        payment.amount = 75.0  # staff edits the amount after the link was generated
+        appmod.db.session.commit()
+        link = appmod.db.session.get(appmod.CustomerPaymentLink, link_id)
+        assert link.status == 'stale'
+
+
+def test_customer_payment_link_goes_stale_when_payment_marked_paid_out_of_band(app, client):
+    # Guards against: link generated, then staff marks the Payment paid through
+    # the normal admin flow WITHOUT going through this link -- the link must not
+    # remain "pending" and payable a second time.
+    make_tenant(client, "Biz Stale2", "stale2_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Stale2").first()
+        plan = appmod.SubscriptionPlan(tenant_id=tenant.id, name="P", price=20.0,
+                                        billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(tenant_id=tenant.id, name="Sam", phone="+96170000002",
+                                    subscription_plan_id=plan.id, address="Beirut", subscription_expiry_date=appmod.datetime.utcnow() + timedelta(days=30))
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        payment = appmod.Payment(tenant_id=tenant.id, customer_id=customer.id, amount=20.0,
+                                  currency="USD", paid=False, date=appmod.datetime.utcnow())
+        appmod.db.session.add(payment)
+        appmod.db.session.commit()
+        link = appmod.CustomerPaymentLink(
+            tenant_id=tenant.id, customer_id=customer.id, payment_id=payment.id,
+            amount=payment.amount, currency=payment.currency,
+            view_token=secrets.token_urlsafe(32), callback_token=secrets.token_urlsafe(32),
+            status='pending', expires_at=appmod.datetime.utcnow() + timedelta(days=7),
+        )
+        appmod.db.session.add(link)
+        appmod.db.session.commit()
+        payment_id, link_id = payment.id, link.id
+
+    with app.app_context():
+        payment = appmod.db.session.get(appmod.Payment, payment_id)
+        payment.paid = True
+        payment.paid_at = appmod.datetime.utcnow()
+        appmod.db.session.commit()
+        link = appmod.db.session.get(appmod.CustomerPaymentLink, link_id)
+        assert link.status == 'stale'
+
+
+def test_customer_payment_link_unaffected_by_mutation_when_not_pending(app, client):
+    # A link that's already succeeded/failed/expired/stale must not be
+    # re-touched by a later, unrelated Payment mutation -- the guard only
+    # ever acts on status == 'pending'.
+    make_tenant(client, "Biz StaleNoop", "stalenoop_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz StaleNoop").first()
+        plan = appmod.SubscriptionPlan(tenant_id=tenant.id, name="P", price=20.0,
+                                        billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(tenant_id=tenant.id, name="Sam", phone="+96170000003",
+                                    subscription_plan_id=plan.id, address="Beirut", subscription_expiry_date=appmod.datetime.utcnow() + timedelta(days=30))
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        payment = appmod.Payment(tenant_id=tenant.id, customer_id=customer.id, amount=20.0,
+                                  currency="USD", paid=True, date=appmod.datetime.utcnow())
+        appmod.db.session.add(payment)
+        appmod.db.session.commit()
+        link = appmod.CustomerPaymentLink(
+            tenant_id=tenant.id, customer_id=customer.id, payment_id=payment.id,
+            amount=payment.amount, currency=payment.currency,
+            view_token=secrets.token_urlsafe(32), callback_token=secrets.token_urlsafe(32),
+            status='succeeded', expires_at=appmod.datetime.utcnow() + timedelta(days=7),
+        )
+        appmod.db.session.add(link)
+        appmod.db.session.commit()
+        payment_id, link_id = payment.id, link.id
+
+    with app.app_context():
+        payment = appmod.db.session.get(appmod.Payment, payment_id)
+        payment.reason = "note added later"  # unrelated field, and link is not pending
+        appmod.db.session.commit()
+        link = appmod.db.session.get(appmod.CustomerPaymentLink, link_id)
+        assert link.status == 'succeeded'  # untouched
