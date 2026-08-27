@@ -15,6 +15,7 @@ PLANS = {
         "whish_price_yearly": None,
         "max_customers": 50,
         "whatsapp_api": False,
+        "whish_customer_payments": False,
     },
     "pro": {
         "stripe_price": os.environ.get("STRIPE_PRICE_PRO"),
@@ -22,6 +23,7 @@ PLANS = {
         "whish_price_yearly": 1000.0,
         "max_customers": None,
         "whatsapp_api": True,
+        "whish_customer_payments": True,
     },
 }
 

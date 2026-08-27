@@ -4698,6 +4698,53 @@ def save_whatsapp_settings():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/tenant-whish-settings', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_tenant_whish_settings():
+    settings = tenant_query(TenantWhishSettings).first()
+    if settings:
+        return jsonify({'settings': settings.to_dict()}), 200
+    return jsonify({'settings': {
+        'enabled': False, 'whish_channel': '', 'whish_secret': '',
+        'display_name_override': '', 'configured': False,
+    }}), 200
+
+
+@app.route('/api/tenant-whish-settings', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def save_tenant_whish_settings():
+    data = request.json or {}
+    tenant = current_tenant()
+    # Plan-gating: this whole feature is Pro-only -- see the spec's Resolved
+    # product decision #2. Mirrors the exact pattern save_whatsapp_settings
+    # already uses for whatsapp_api mode.
+    if not plans.limits(tenant.plan)["whish_customer_payments"]:
+        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
+    try:
+        settings = tenant_query(TenantWhishSettings).first()
+        if not settings:
+            settings = TenantWhishSettings()
+            db.session.add(settings)
+        for f in ('whish_channel', 'whish_secret', 'display_name_override'):
+            if f in data:
+                setattr(settings, f, data[f])
+        # 'enabled' only meaningfully flips true once both credentials are
+        # actually present -- server-side, not trusting the client's flag --
+        # matching the spec's Data model note ("enabled only flips to
+        # meaningfully-true once both credential fields are populated").
+        requested_enabled = bool(data.get('enabled'))
+        settings.enabled = requested_enabled and bool(settings.whish_channel) and bool(settings.whish_secret)
+        settings.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'message': 'Whish settings saved!', 'settings': settings.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
 @jwt_required()
 def subscribe_waba():
