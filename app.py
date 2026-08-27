@@ -3673,7 +3673,8 @@ def get_total_sales():
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.is_gratis == False,
-        Payment.pre_payment == False,
+        # Prepayments count as revenue -- see
+        # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
         Payment.is_refund == False
     ).group_by('month').all()
 
@@ -4677,7 +4678,8 @@ def get_monthly_revenue():
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.is_gratis == False,
-        Payment.pre_payment == False,
+        # Prepayments count as revenue -- see
+        # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
         Payment.is_refund == False
     ).group_by('month').all()
 
@@ -5918,7 +5920,9 @@ def get_dashboard_metrics():
     total_customers = tenant_query(Customer).count()
     active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).count()
 
-    revenue_query = tenant_query(Payment).filter_by(paid=True, pre_payment=False)  # Only actual revenue, not pre-payments
+    # Prepayments count as revenue -- see
+    # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
+    revenue_query = tenant_query(Payment).filter_by(paid=True)
     if start_date:
         revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
     if end_date:

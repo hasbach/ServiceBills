@@ -383,3 +383,47 @@ def test_get_public_pay_link_returns_none_when_not_generated(client, app):
     r = client.get("/api/tenant/whish/public-pay-link", headers=hdr)
     assert r.status_code == 200
     assert r.get_json()["slug"] is None
+
+
+def test_total_sales_report_includes_prepayments(client, app):
+    hdr = make_tenant(client, "Biz Rev1", "rev1_admin")
+    customer_id = _add_customer(app, "Biz Rev1", "Nadia", "70123456")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 50.0, "reason": "Prepay",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": True,
+    })
+    assert r.status_code == 201
+    r = client.get("/api/reports/total-sales", headers=hdr)
+    assert r.status_code == 200
+    total = sum(row["value"] for row in r.get_json())
+    assert total == 50.0  # the prepayment now counts, where it was previously excluded
+
+
+def test_monthly_revenue_report_includes_prepayments(client, app):
+    hdr = make_tenant(client, "Biz Rev2", "rev2_admin")
+    customer_id = _add_customer(app, "Biz Rev2", "Nadia", "70123456")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 50.0, "reason": "Prepay",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": True,
+    })
+    assert r.status_code == 201
+    r = client.get("/api/reports/monthly-revenue", headers=hdr)
+    assert r.status_code == 200
+    # 'value' here is sales minus expenses for the month; with no expenses in
+    # this test, it equals the prepayment amount now that it's counted as
+    # sales, where it was previously excluded entirely (net 0).
+    total = sum(row["value"] for row in r.get_json())
+    assert total == 50.0
+
+
+def test_dashboard_total_revenue_includes_prepayments(client, app):
+    hdr = make_tenant(client, "Biz Rev3", "rev3_admin")
+    customer_id = _add_customer(app, "Biz Rev3", "Nadia", "70123456")
+    r = client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 50.0, "reason": "Prepay",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": True,
+    })
+    assert r.status_code == 201
+    r = client.get("/api/dashboard", headers=hdr)
+    assert r.status_code == 200
+    assert r.get_json()["totalRevenue"] == 50.0
