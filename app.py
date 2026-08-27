@@ -5032,6 +5032,187 @@ def public_tenant_pay_lookup(slug):
     return jsonify({"customers": [{"customer_id": c.id, "name": c.name} for c in matches]})
 
 
+def _apply_whish_debt_then_prepayment(customer, attempt):
+    """Applies a successful self-service Whish payment: pays down the
+    customer's oldest unpaid, non-prepayment Payment rows in full (never
+    partial -- mirrors apply_customer_balance_to_unpaid_payments's existing
+    all-or-nothing-per-row behavior, app.py's Payment.date.asc() ordering),
+    then records any remainder as a new pre_payment=True Payment row,
+    matching the existing manual-add-payment pattern. Deliberately does not
+    touch Customer.balance -- this helper is anchored to real Payment rows
+    instead, so it's correct wherever the app reads balance that way (the
+    /balance endpoint, Task 13's report); see the plan's amendment
+    investigation for the open question of whether Customer.balance is
+    meant to always agree with that. Caller commits."""
+    remaining = float(attempt.amount)
+    applied_to_debt = 0.0
+    unpaid = Payment.query.filter_by(
+        customer_id=customer.id, tenant_id=customer.tenant_id, paid=False, pre_payment=False
+    ).order_by(Payment.date.asc()).all()
+
+    for payment in unpaid:
+        if remaining <= 0:
+            break
+        if remaining >= payment.amount:
+            payment.paid = True
+            payment.paid_at = datetime.utcnow()
+            payment.collected_via = 'whish'
+            payment.whish_transaction_number = attempt.whish_transaction_number
+            remaining -= payment.amount
+            applied_to_debt += payment.amount
+        # else: leave this and every later (ordered oldest-first) payment
+        # untouched -- a partial amount is never applied against a single due.
+
+    prepayment = None
+    if remaining > 0:
+        prepayment = Payment(
+            tenant_id=customer.tenant_id, customer_id=customer.id,
+            amount=remaining, currency=attempt.currency,
+            paid=True, paid_at=datetime.utcnow(), pre_payment=True,
+            collected_via='whish',
+            whish_transaction_number=attempt.whish_transaction_number,
+            reason='Prepayment via self-service Whish payment page',
+        )
+        db.session.add(prepayment)
+
+    attempt.applied_to_debt = applied_to_debt
+    attempt.applied_as_prepayment = remaining
+    if prepayment:
+        db.session.flush()  # get prepayment.id before assigning the FK
+        attempt.prepayment_id = prepayment.id
+    return applied_to_debt, remaining, prepayment
+
+
+@app.route('/api/pay/t/<slug>/checkout', methods=['POST'])
+@limiter.limit("10 per minute")
+def public_tenant_pay_checkout(slug):
+    tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
+    if not tenant:
+        return jsonify({"error": "not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    customer_id = body.get('customer_id')
+    amount = body.get('amount')
+    customer = Customer.query.filter_by(id=customer_id, tenant_id=tenant.id).first()
+    if not customer or not amount:
+        return jsonify({"error": "not found"}), 404  # generic, not a leaky 400 that confirms customer_id validity
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return jsonify({"error": "not found"}), 404
+    if amount <= 0:
+        return jsonify({"error": "not found"}), 404
+
+    settings = TenantWhishSettings.query.filter_by(tenant_id=tenant.id, enabled=True).first()
+    if not settings or not settings.whish_channel or not settings.whish_secret:
+        return jsonify({"msg": "Whish payments are not currently available for this business."}), 503
+
+    bs = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+    # The generic page has no single Payment to inherit a currency from --
+    # use the tenant's own reporting currency, matching the original
+    # per-link flow's Whish-supported-currency guard (Task 6).
+    currency = bs.reporting_currency if bs else 'USD'
+    if currency not in ('USD', 'LBP'):
+        return jsonify({"msg": "Online payment isn't available in this business's currency."}), 400
+
+    attempt = CustomerWhishPaymentAttempt(
+        tenant_id=tenant.id, customer_id=customer.id,
+        amount=amount, currency=currency,
+        callback_token=secrets.token_urlsafe(32),
+    )
+    db.session.add(attempt)
+    db.session.flush()  # assign attempt.id before building external_id
+
+    external_id = f"cwpa-{attempt.id}-{secrets.token_hex(4)}"
+    requestee = settings.display_name_override or (bs.business_name if bs else tenant.name)
+    target = (bs.mobile if bs else '') or ''
+
+    try:
+        collect_url = whish_billing.create_payment(
+            external_id=external_id,
+            amount=amount,
+            currency=currency,
+            callback_token=attempt.callback_token,
+            requestee=requestee,
+            target=target,
+            email="",  # same resolved decision as Task 8's per-link checkout
+            invoice=f"{customer.name} - {customer.phone}",
+            # This feature's own callback routes, not platform billing's or
+            # the per-link flow's -- see whish_billing.create_payment's own
+            # docstring for why this parameter exists at all.
+            success_path='/api/pay-attempt/success',
+            failure_path='/api/pay-attempt/failure',
+        )
+    except whish_billing.WhishAPIError as e:
+        logging.error(f"Whish checkout failed for CustomerWhishPaymentAttempt {attempt.id}: {e}")
+        return jsonify({"msg": "Could not start the Whish checkout. Please try again shortly."}), 502
+
+    attempt.whish_external_id = external_id
+    db.session.commit()
+    return jsonify({"redirect": collect_url}), 200
+
+
+@app.route('/api/pay-attempt/success', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_attempt_success():
+    """Public: Whish redirects the customer's browser here after payment on
+    the tenant-wide self-service page. Same token-match security model as
+    Task 9's per-link success callback -- see that route's docstring."""
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    attempt = CustomerWhishPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+
+    if (not attempt or attempt.status != 'pending'
+            or not secrets.compare_digest(attempt.callback_token, token)):
+        logging.warning(f"Customer-Whish attempt success callback rejected: order={external_id}")
+        tenant = db.session.get(Tenant, attempt.tenant_id) if attempt else None
+        slug = tenant.public_pay_slug if tenant else 'invalid'
+        return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={slug}&status=error")
+
+    # TBD: exact query-param name Whish's real success callback uses for the
+    # transaction number -- same unresolved-fact caveat as Task 9's callback
+    # (app.py's customer_whish_success), not re-guessed here.
+    attempt.whish_transaction_number = request.args.get('transactionNumber') or request.args.get('transaction_id')
+    customer = db.session.get(Customer, attempt.customer_id)
+    _apply_whish_debt_then_prepayment(customer, attempt)
+    attempt.status = 'succeeded'
+    attempt.completed_at = datetime.utcnow()
+    db.session.commit()
+
+    try:
+        # Same formula the /balance endpoint uses (calculated_pre_payment_balance
+        # - calculated_unpaid_balance), recomputed fresh after this helper's
+        # mutations -- not customer.balance, which this helper deliberately
+        # doesn't touch (see _apply_whish_debt_then_prepayment's docstring).
+        unpaid_total = sum(p.amount for p in Payment.query.filter_by(
+            customer_id=customer.id, tenant_id=customer.tenant_id, paid=False, pre_payment=False).all())
+        prepaid_total = sum(p.amount for p in Payment.query.filter_by(
+            customer_id=customer.id, tenant_id=customer.tenant_id, paid=True, pre_payment=True).all())
+        send_whatsapp_message(customer, 'payment_paid', context={
+            'amount': float(attempt.amount),
+            'balance': float(prepaid_total - unpaid_total),
+        })
+    except Exception as e:
+        logging.warning(f"payment_paid WhatsApp notification failed after self-service Whish success (attempt {attempt.id}): {e}")
+
+    tenant = db.session.get(Tenant, attempt.tenant_id)
+    return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={tenant.public_pay_slug}&status=success")
+
+
+@app.route('/api/pay-attempt/failure', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_attempt_failure():
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    attempt = CustomerWhishPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+    if attempt and attempt.status == 'pending' and secrets.compare_digest(attempt.callback_token, token):
+        attempt.status = 'failed'
+        db.session.commit()
+    tenant = db.session.get(Tenant, attempt.tenant_id) if attempt else None
+    slug = tenant.public_pay_slug if tenant else 'invalid'
+    return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={slug}&status=failed")
+
+
 @app.route('/api/pay/<view_token>', methods=['GET'])
 @limiter.limit("30 per minute")
 def public_pay_view(view_token):
