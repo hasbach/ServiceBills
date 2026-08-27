@@ -955,6 +955,38 @@ class WhatsAppSettings(db.Model):
             'last_forwarding_keepalive_sent_at': self.last_forwarding_keepalive_sent_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_forwarding_keepalive_sent_at else None,
         }
 
+class WhatsAppTemplate(db.Model):
+    """Local cache of a tenant's Meta WhatsApp message templates. Meta is the
+    source of truth; this table exists for fast list rendering and as the
+    target of the message_template_status_update webhook. Reconciled against
+    Meta's live GET on manual refresh (POST /api/whatsapp/templates/sync).
+    See docs/superpowers/specs/2026-08-28-whatsapp-template-management-design.md."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    name = db.Column(db.String(200), nullable=False)
+    language = db.Column(db.String(10), nullable=False)
+    category = db.Column(db.String(20), nullable=False)  # 'MARKETING' | 'UTILITY'
+    status = db.Column(db.String(20), nullable=False, default='PENDING')  # PENDING, APPROVED, REJECTED, PAUSED, DISABLED
+    rejected_reason = db.Column(db.String(500), nullable=True)
+    components = db.Column(db.JSON, nullable=False)
+    meta_template_id = db.Column(db.String(64), nullable=True, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'language': self.language,
+            'category': self.category,
+            'status': self.status,
+            'rejected_reason': self.rejected_reason,
+            'components': self.components,
+            'meta_template_id': self.meta_template_id,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
+        }
+
 class TenantWhishSettings(db.Model):
     """A tenant's own Whish merchant credentials, for accepting payments from
     THEIR customers -- distinct from the platform-wide WHISH_CHANNEL/WHISH_SECRET
@@ -1155,7 +1187,7 @@ class ExchangeRate(db.Model):
 TENANT_OWNED_MODELS = (
     Reseller, ResellerPayment, Customer, SubscriptionPlan, Sector, Supplier,
     SupplierPayment, ExpenseCategory, Expense, Payment, GeneratedReceipt,
-    AddonPurchase, BusinessSettings, WhatsAppSettings, TenantWhishSettings,
+    AddonPurchase, BusinessSettings, WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings,
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
     CustomerFeedback, PaymentReminder, UpgradeRequest, BillingPaymentAttempt,
     Employee, SalaryCharge, SalaryPayment,
@@ -1940,7 +1972,7 @@ _TENANT_DELETE_ORDER = [
     UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
     CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment,
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
-    WhatsAppSettings, TenantWhishSettings, ExpenseCategory, Sector,
+    WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
     # Phase 3 fix: MonthlyProfitEstimate was missing here entirely. SQLite
     # doesn't enforce FK constraints, so a tenant delete silently orphaned
