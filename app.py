@@ -4911,6 +4911,56 @@ def public_pay_view(view_token):
     }), 200
 
 
+@app.route('/api/pay/<view_token>/checkout', methods=['POST'])
+@limiter.limit("10 per minute")
+def public_pay_checkout(view_token):
+    link = CustomerPaymentLink.query.filter_by(view_token=view_token).first()
+    if not link:
+        return jsonify({"msg": "Payment link not found."}), 404
+    if link.status != 'pending' or link.expires_at < datetime.utcnow():
+        return jsonify({"msg": "This payment link is no longer valid."}), 409
+
+    tenant_whish = TenantWhishSettings.query.filter_by(tenant_id=link.tenant_id, enabled=True).first()
+    if not tenant_whish or not tenant_whish.whish_channel or not tenant_whish.whish_secret:
+        logging.error(f"Checkout attempted on link {link.id} but tenant {link.tenant_id} has no active Whish settings.")
+        return jsonify({"msg": "Whish payments are not currently available for this business."}), 503
+
+    business_settings = BusinessSettings.query.filter_by(tenant_id=link.tenant_id).first()
+    customer = link.customer
+    requestee = tenant_whish.display_name_override or (business_settings.business_name if business_settings else "ServiceBills")
+    target = (business_settings.mobile if business_settings else '') or ''
+    # Customer.phone identifies the payer on the tenant's own Whish dashboard --
+    # see Resolved product decision #5. No Customer.email column exists or is
+    # being added; email="" is passed to the shared whish_billing client (see
+    # this task's judgment-call note in the plan for why that's safe).
+    invoice = f"{customer.name} - {customer.phone}"
+    external_id = f"cpl-{link.id}-{secrets.token_hex(4)}"
+
+    try:
+        collect_url = whish_billing.create_payment(
+            external_id=external_id,
+            amount=float(link.amount),
+            currency=link.currency,
+            callback_token=link.callback_token,
+            requestee=requestee,
+            target=target,
+            email="",
+            invoice=invoice,
+            # This feature's own callback routes (Task 9), not platform
+            # billing's -- see whish_billing.create_payment's own docstring
+            # for why this parameter exists at all.
+            success_path='/api/customer-whish/success',
+            failure_path='/api/customer-whish/failure',
+        )
+    except whish_billing.WhishAPIError as e:
+        logging.error(f"Whish checkout failed for CustomerPaymentLink {link.id}: {e}")
+        return jsonify({"msg": "Could not start the Whish checkout. Please try again shortly."}), 502
+
+    link.whish_external_id = external_id
+    db.session.commit()
+    return jsonify({"redirect": collect_url}), 200
+
+
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
 @jwt_required()
 def subscribe_waba():

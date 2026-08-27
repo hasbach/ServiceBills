@@ -442,3 +442,73 @@ def test_public_pay_view_invalid_and_unknown_responses_are_shape_identical(clien
     r2 = client.get("/api/pay/totally-made-up-token-xyz")
     assert r1.status_code == r2.status_code
     assert set(r1.get_json().keys()) == set(r2.get_json().keys())
+
+
+def test_checkout_creates_whish_payment_with_tenant_own_credentials(client, app, monkeypatch):
+    token, _ = _make_link(app, "Biz Checkout1")
+
+    captured = {}
+    def fake_create_payment(external_id, amount, currency, callback_token, requestee, target, email, invoice,
+                             success_path=None, failure_path=None):
+        captured.update(locals())
+        return "https://whish.money/pay/tenant-own"
+    monkeypatch.setattr(appmod.whish_billing, "create_payment", fake_create_payment)
+
+    r = client.post(f"/api/pay/{token}/checkout")
+    assert r.status_code == 200
+    assert r.get_json()["redirect"] == "https://whish.money/pay/tenant-own"
+    assert captured["amount"] == 30.0
+    assert captured["currency"] == "USD"
+    assert captured["email"] == ""
+    # Never platform billing's own callback routes -- see whish_billing.py's
+    # create_payment docstring for why this matters (a payment meant for a
+    # tenant's customer must never redirect through the wrong success handler).
+    assert captured["success_path"] == "/api/customer-whish/success"
+    assert captured["failure_path"] == "/api/customer-whish/failure"
+    # Customer.phone in the invoice field, not a new email column -- per
+    # Resolved product decision #5.
+    assert "+96170000099" in captured["invoice"] or captured["invoice"]
+    # Regression test for the external_id-generated-twice bug class: the
+    # persisted whish_external_id must be the exact same value sent to Whish.
+    with app.app_context():
+        link = appmod.CustomerPaymentLink.query.filter_by(view_token=token).first()
+        assert link.whish_external_id == captured["external_id"]
+
+
+def test_checkout_uses_snapshotted_amount_not_live_payment_amount(client, app, monkeypatch):
+    # Regression test for the staleness handling: even in the narrow window
+    # before staleness flips (or if amount changed between link creation and
+    # checkout in the same instant this test simulates), checkout always uses
+    # CustomerPaymentLink.amount, never a live re-read of Payment.amount.
+    token, _ = _make_link(app, "Biz Checkout2")
+    with app.app_context():
+        link = appmod.CustomerPaymentLink.query.filter_by(view_token=token).first()
+        payment = appmod.db.session.get(appmod.Payment, link.payment_id)
+        payment.amount = 999.0  # would flip the link to 'stale' via Task 5's guard --
+        appmod.db.session.commit()               # confirms checkout now correctly rejects it (see next test)
+
+    captured = {}
+    monkeypatch.setattr(appmod.whish_billing, "create_payment",
+                         lambda **kw: (captured.update(kw), "https://x")[1])
+    r = client.post(f"/api/pay/{token}/checkout")
+    assert r.status_code == 409  # link is now stale -- see Task 5's guard firing on the amount change above
+    assert captured == {}  # create_payment never called
+
+
+def test_checkout_rejects_non_pending_link(client, app):
+    token, _ = _make_link(app, "Biz Checkout3", status='succeeded')
+    r = client.post(f"/api/pay/{token}/checkout")
+    assert r.status_code == 409
+
+
+def test_checkout_rejects_unknown_token(client):
+    r = client.post("/api/pay/does-not-exist/checkout")
+    assert r.status_code == 404
+
+
+def test_checkout_rejects_when_whish_api_fails(client, app, monkeypatch):
+    token, _ = _make_link(app, "Biz Checkout4")
+    monkeypatch.setattr(appmod.whish_billing, "create_payment",
+                         lambda **kw: (_ for _ in ()).throw(appmod.whish_billing.WhishAPIError("boom")))
+    r = client.post(f"/api/pay/{token}/checkout")
+    assert r.status_code == 502
