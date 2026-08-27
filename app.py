@@ -1469,17 +1469,67 @@ def admin_reactivate_tenant(tid):
     return jsonify(t.to_dict()), 200
 
 
+# A superadmin "indefinite" grant is represented as a far-future
+# plan_expires_at rather than NULL, since NULL means "not on a paid plan"
+# to check_pro_plan_expirations_for_tenant (and to the to_dict()/UI
+# contract) -- see that function's guard clause.
+_PLAN_GRANT_INDEFINITE_YEARS = 100
+
+
 @app.route('/api/admin/tenants/<int:tid>/set-plan', methods=['POST'])
 @superadmin_required
 def admin_set_plan(tid):
-    # Manual upgrade/downgrade (offline payment path, before/without Stripe).
-    plan = (request.json or {}).get('plan')
+    # Manual upgrade/downgrade (offline payment path, before/without
+    # Stripe/Whish), and manual Pro-period grants/extensions -- e.g. comping
+    # the platform owner's own tenant, or a promotional Pro period for any
+    # other tenant -- via the optional duration/plan_expires_at fields.
+    # A grant is stored in the same field a paid Whish period uses, so it is
+    # subject to check_pro_plan_expirations_for_tenant's reminder/grace/revert
+    # logic exactly like any other Pro period -- no separate code path.
+    data = request.json or {}
+    plan = data.get('plan')
     if plan not in plans.PLANS:
         return jsonify({"msg": f"Unknown plan '{plan}'"}), 400
     t = db.session.get(Tenant, tid)
     if not t:
         return jsonify({"msg": "Tenant not found"}), 404
     t.plan = plan
+
+    if plan == 'pro':
+        now = datetime.utcnow()
+        raw_expiry = data.get('plan_expires_at')
+        duration = data.get('duration')
+        if raw_expiry:
+            try:
+                expires_at = datetime.fromisoformat(str(raw_expiry).replace('Z', '+00:00')).replace(tzinfo=None)
+            except ValueError:
+                return jsonify({"msg": "plan_expires_at must be an ISO date/datetime string"}), 400
+            if expires_at <= now:
+                return jsonify({"msg": "plan_expires_at must be in the future"}), 400
+            t.plan_expires_at = expires_at
+            t.plan_expiry_reminder_sent_at = None
+        elif duration in ('1_month', '1_year', 'indefinite'):
+            if duration == 'indefinite':
+                expires_at = now + relativedelta(years=_PLAN_GRANT_INDEFINITE_YEARS)
+            else:
+                # Stack onto a still-active expiry (an early extension) the
+                # same way a paid Whish renewal does -- see
+                # _apply_whish_payment_success.
+                base = t.plan_expires_at if (t.plan_expires_at and t.plan_expires_at > now) else now
+                expires_at = base + (relativedelta(years=1) if duration == '1_year' else relativedelta(months=1))
+            t.plan_expires_at = expires_at
+            t.plan_expiry_reminder_sent_at = None
+        elif duration:
+            return jsonify({"msg": f"Unknown duration '{duration}'"}), 400
+        # else: plan set to 'pro' with neither field given -- preserves the
+        # pre-existing set-plan behavior (e.g. the contact-upgrade approval
+        # flow), leaving plan_expires_at untouched.
+    else:
+        # Downgrading (or setting to any non-pro plan) clears the paid-through
+        # timestamp, preserving the "NULL iff not on a paid plan" invariant.
+        t.plan_expires_at = None
+        t.plan_expiry_reminder_sent_at = None
+
     # Resolve any pending upgrade requests for this tenant.
     for r in UpgradeRequest.query.filter_by(tenant_id=tid, status='pending').all():
         r.status = 'handled'
