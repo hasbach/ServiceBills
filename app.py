@@ -185,6 +185,9 @@ class Tenant(db.Model):
     # scheduler job sends it once per expiry cycle, not once per tick.
     plan_expiry_reminder_sent_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # The tenant-wide self-service Whish payment page's URL slug (2026-08-27
+    # plan amendment) -- null until staff first generate it (Task 20).
+    public_pay_slug = db.Column(db.String(32), nullable=True, unique=True, index=True)
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "slug": self.slug,
@@ -692,6 +695,14 @@ class Payment(db.Model):
     refund_reason = db.Column(db.Text, nullable=True)
     refunded_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     refunded_at = db.Column(db.DateTime, nullable=True)
+    # Set by either Whish-collection flow (the per-Payment CustomerPaymentLink
+    # success callback, or the tenant-wide self-service page's checkout) --
+    # neither sets received_by_id (no staff current_user to attribute it to),
+    # so collected_via is how the frontend shows "via Whish" instead of
+    # nothing. None means staff-collected/legacy. See the 2026-08-27 plan
+    # amendment's investigation note.
+    collected_via = db.Column(db.String(20), nullable=True)  # None | 'whish'
+    whish_transaction_number = db.Column(db.String(64), nullable=True)
     addon_purchases = db.relationship('AddonPurchase', backref='payment', lazy=True)
 
     collected_by = db.relationship('User', foreign_keys=[collected_by_id])
@@ -3538,6 +3549,8 @@ def get_payments():
             'collected_amount': float(p.collected_amount) if p.collected_amount is not None else None,
             'collected_by': p.collected_by.username if p.collected_by else None,
             'received_by': p.received_by.username if p.received_by else None,
+            'collected_via': p.collected_via,
+            'whish_transaction_number': p.whish_transaction_number,
             'pre_payment': p.pre_payment,
             'reason': p.reason,
             'is_gratis': p.is_gratis,
