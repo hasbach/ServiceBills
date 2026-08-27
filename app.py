@@ -206,7 +206,7 @@ class Reseller(db.Model):
     name = db.Column(db.String(100), nullable=False)
     phone = db.Column(db.String(20), nullable=False)
     type = db.Column(db.String(20), nullable=False) # 'type1' or 'type2'
-    balance = db.Column(db.Float, default=0.0)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
     customers = db.relationship('Customer', backref='reseller', lazy=True)
     payments = db.relationship('ResellerPayment', backref='reseller', lazy=True, cascade="all, delete-orphan")
 
@@ -226,7 +226,7 @@ class ResellerPayment(db.Model):
     # Set for per-customer billing entries (credit_added charges); null for reseller-level
     # entries not tied to one customer (manual add_credit/apply_discount/collect_payment).
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True, index=True)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     type = db.Column(db.String(50), nullable=False) # 'credit_added', 'payment_received', 'discount_applied'
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     description = db.Column(db.String(200))
@@ -253,7 +253,7 @@ class UpstreamProvider(db.Model):
     portal_url = db.Column(db.String(300), nullable=True)
     portal_username = db.Column(db.String(100), nullable=True)
     portal_password = db.Column(EncryptedString, nullable=True)  # encrypted at rest; unused until portal automation ships
-    balance = db.Column(db.Float, default=0.0)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
     status = db.Column(db.String(20), default='active')
     customers = db.relationship('Customer', backref='upstream_provider', lazy=True)
     payments = db.relationship('UpstreamProviderPayment', backref='upstream_provider', lazy=True, cascade="all, delete-orphan")
@@ -275,7 +275,7 @@ class UpstreamProviderPayment(db.Model):
     upstream_provider_id = db.Column(db.Integer, db.ForeignKey('upstream_provider.id'), nullable=False)
     # Set for a specific customer's renewal cost; null for provider-level manual top-ups.
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True, index=True)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     type = db.Column(db.String(50), nullable=False)  # 'balance_topup', 'renewal_cost', 'manual_adjustment'
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     description = db.Column(db.String(200))
@@ -346,9 +346,9 @@ class Customer(db.Model):
     subscription_start_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     subscription_expiry_date = db.Column(db.DateTime, nullable=False, index=True)
     is_subscription_active = db.Column(db.Boolean, default=True)
-    balance = db.Column(db.Float, default=0.0)
-    discount = db.Column(db.Float, default=0.0)
-    cost_override = db.Column(db.Float, nullable=True)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
+    discount = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
+    cost_override = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
     reseller_id = db.Column(db.Integer, db.ForeignKey('reseller.id'), nullable=True)
     # Populated only when the tenant's BusinessSettings.network_mode is
     # 'upstream_bridge' -- the upstream RADIUS operator and this customer's
@@ -389,8 +389,8 @@ class SubscriptionPlan(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
-    price = db.Column(db.Float, nullable=False)
-    cost = db.Column(db.Float, nullable=False, default=0.0)
+    price = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    cost = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
     billing_cycle = db.Column(db.String(20), nullable=False)
     status = db.Column(db.String(50), default='active') # active, inactive
     # Multi-currency (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md):
@@ -426,7 +426,7 @@ class Supplier(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
     phone = db.Column(db.String(20), nullable=True)
-    balance = db.Column(db.Float, default=0.0)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
     address = db.Column(db.String(200), nullable=True)
     notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -446,7 +446,7 @@ class SupplierPayment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     supplier_id = db.Column(db.Integer, db.ForeignKey('supplier.id'), nullable=False)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     payment_date = db.Column(db.DateTime, default=datetime.utcnow)
     payment_method = db.Column(db.String(50), nullable=True)
     reference_note = db.Column(db.Text, nullable=True)
@@ -510,7 +510,7 @@ class Expense(db.Model):
     # purposes, independent of whatever the category happens to be named.
     employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=True)
     is_credit = db.Column(db.Boolean, default=False)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     description = db.Column(db.String(200), nullable=False)
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
@@ -539,11 +539,11 @@ class Employee(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
-    monthly_salary = db.Column(db.Float, nullable=False, default=0.0)
+    monthly_salary = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
     hire_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     active = db.Column(db.Boolean, default=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
-    balance = db.Column(db.Float, default=0.0)
+    balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
     notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -567,7 +567,7 @@ class SalaryCharge(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=False)
     type = db.Column(db.String(20), nullable=False)  # 'salary' | 'bonus' | 'deduction'
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     period = db.Column(db.String(7), nullable=False)  # 'YYYY-MM'
     date = db.Column(db.DateTime, default=datetime.utcnow)
     reason = db.Column(db.String(200), nullable=True)
@@ -589,7 +589,7 @@ class SalaryPayment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=False)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     payment_date = db.Column(db.DateTime, default=datetime.utcnow)
     method = db.Column(db.String(50), nullable=True)
     is_advance = db.Column(db.Boolean, default=False)
@@ -616,9 +616,9 @@ class MonthlyProfitEstimate(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     month = db.Column(db.String(7), nullable=False)  # 'YYYY-MM'
-    estimated_income = db.Column(db.Float, nullable=False, default=0.0)
-    estimated_cost = db.Column(db.Float, nullable=False, default=0.0)
-    estimated_profit = db.Column(db.Float, nullable=False, default=0.0)  # denormalized: income - cost
+    estimated_income = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
+    estimated_cost = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
+    estimated_profit = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)  # denormalized: income - cost
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (db.UniqueConstraint('tenant_id', 'month', name='uq_monthly_profit_estimate_tenant_month'),)
 
@@ -636,7 +636,7 @@ class Payment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False, index=True)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     # Multi-currency (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
     # `currency` is the currency `amount` is denominated in (inherited from the
     # customer's subscription_plan.currency at the moment this payment was
@@ -668,7 +668,7 @@ class Payment(db.Model):
     collected = db.Column(db.Boolean, default=False, index=True)
     collected_at = db.Column(db.DateTime, nullable=True)
     collected_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
-    collected_amount = db.Column(db.Float, nullable=True)
+    collected_amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
     received_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     pre_payment = db.Column(db.Boolean, default=False)
@@ -708,7 +708,7 @@ class AddonPurchase(db.Model):
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     description = db.Column(db.String(200))
     purchase_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     paid = db.Column(db.Boolean, default=False)
     payment_id = db.Column(db.Integer, db.ForeignKey('payment.id'), nullable=True)
     notes = db.Column(db.String(200))
@@ -956,7 +956,7 @@ class BillingPaymentAttempt(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     billing_cycle = db.Column(db.String(10), nullable=False)  # 'monthly' or 'yearly'
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     currency = db.Column(db.String(3), nullable=False, default='USD')
     whish_external_id = db.Column(db.String(64), unique=True, nullable=False, index=True)
     callback_token = db.Column(db.String(64), nullable=False)
