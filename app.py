@@ -3654,6 +3654,33 @@ def get_unpaid_payments():
         'value': float(payment.unpaid or 0.0)
     } for payment in unpaid_payments])
 
+@app.route('/api/reports/customer-whish-payments', methods=['GET'])
+@jwt_required()
+def customer_whish_payments_report():
+    query = tenant_query(CustomerPaymentLink).join(Customer)
+    status = request.args.get('status')
+    start_date_str = request.args.get('start_date')
+    end_date_str = request.args.get('end_date')
+    # Frontend sends full ISO-8601 datetimes (toISOString()), not plain
+    # 'YYYY-MM-DD' -- parse the same way get_financial_report/get_revenue_report do.
+    start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if start_date_str else None
+    end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if end_date_str else None
+    if status:
+        query = query.filter(CustomerPaymentLink.status == status)
+    if start_date:
+        query = query.filter(CustomerPaymentLink.created_at >= start_date)
+    if end_date:
+        query = query.filter(CustomerPaymentLink.created_at <= end_date)
+    query = query.order_by(CustomerPaymentLink.created_at.desc())
+
+    rows = []
+    for link in query.all():
+        d = link.to_dict()
+        d['customer_name'] = link.customer.name
+        d['customer_phone'] = link.customer.phone
+        rows.append(d)
+    return jsonify({"links": rows}), 200
+
 @app.route('/api/reports/customer-numbers', methods=['GET'])
 @jwt_required()
 def get_customer_numbers():

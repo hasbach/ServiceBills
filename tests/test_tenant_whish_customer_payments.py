@@ -768,3 +768,46 @@ def test_email_payment_link_requires_email_and_url(app, client):
     payment_id = r.get_json()['payment']['id']
     r2 = client.post(f"/api/customers/{customer_id}/payments/{payment_id}/whish-link/email", headers=hdr, json={})
     assert r2.status_code == 400
+
+
+def test_customer_whish_payments_report_lists_links(app, client):
+    hdr = make_tenant(client, "Biz Report1", "report1_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Report1")
+    client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    r = client.get("/api/reports/customer-whish-payments", headers=hdr)
+    assert r.status_code == 200
+    rows = r.get_json()["links"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "pending"
+    assert rows[0]["customer_name"] == "Nadia"
+    assert "whish_transaction_number" in rows[0]
+
+
+def test_customer_whish_payments_report_filters_by_status(app, client):
+    hdr = make_tenant(client, "Biz Report2", "report2_admin")
+    tenant_id, customer_id = _enable_whish_for_tenant(app, "Biz Report2")
+    client.post("/api/payments", headers=hdr, json={
+        "customer_id": customer_id, "amount": 30.0, "reason": "Monthly",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    r = client.get("/api/reports/customer-whish-payments?status=succeeded", headers=hdr)
+    assert r.get_json()["links"] == []
+
+
+def test_customer_whish_payments_report_tenant_isolated(app, client):
+    hdr_a = make_tenant(client, "Biz ReportIsoA", "reportisoa_admin")
+    make_tenant(client, "Biz ReportIsoB", "reportisob_admin")
+    tenant_b_id, customer_b_id = _enable_whish_for_tenant(app, "Biz ReportIsoB")
+    # Tenant A's staff attempting to create a payment for tenant B's customer
+    # is rejected upstream (tenant-scoped customer lookup) -- confirms the
+    # isolation boundary already exists before this report even runs.
+    r_cross = client.post("/api/payments", headers=hdr_a, json={
+        "customer_id": customer_b_id, "amount": 5.0, "reason": "x",
+        "date": appmod.datetime.utcnow().strftime('%Y-%m-%d'), "pre_payment": False,
+    })
+    assert r_cross.status_code == 404
+    r = client.get("/api/reports/customer-whish-payments", headers=hdr_a)
+    assert r.get_json()["links"] == []  # tenant A sees none of tenant B's links
