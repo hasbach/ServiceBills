@@ -4981,6 +4981,57 @@ def save_tenant_whish_settings():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/pay/t/<slug>', methods=['GET'])
+@limiter.limit("60 per minute")
+def public_tenant_pay_branding(slug):
+    """Public: branding for the tenant-wide self-service Whish payment page
+    (2026-08-27 plan amendment). Logo only -- no brand color, per the
+    amendment's explicit decision (no such field exists in this codebase,
+    and it was decided not to add one). Low-risk info (name/logo, nothing
+    customer-specific) so the limit here is generous compared to the lookup
+    route below."""
+    tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
+    if not tenant:
+        return jsonify({"error": "not found"}), 404
+    bs = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+    return jsonify({
+        "business_name": bs.business_name if bs else tenant.name,
+        "logo_url": bs.to_dict()['logo_url'] if bs else DEFAULT_LOGO_URL,
+    })
+
+
+@app.route('/api/pay/t/<slug>/lookup', methods=['POST'])
+@limiter.limit("10 per minute")
+@limiter.limit("50 per hour", key_func=lambda: request.view_args.get("slug", ""))
+def public_tenant_pay_lookup(slug):
+    """Public: phone -> name lookup so the customer can confirm they're
+    paying against the right subscription before entering an amount. Two
+    stacked limits: per-IP (10/min, catches a single attacker) and
+    per-tenant-slug (50/hr across all IPs, catches distributed enumeration
+    against one tenant's customer list) -- there is no existing lockout
+    precedent in this codebase to reuse (see the plan amendment's
+    investigation), so both are new. Returns every phone match rather than
+    guessing which one the customer means -- Customer.phone has no
+    uniqueness constraint (e.g. a household sharing one number across two
+    family members' subscriptions); see Task 17's Judgment call."""
+    tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
+    if not tenant:
+        return jsonify({"error": "not found"}), 404
+
+    phone = (request.get_json(silent=True) or {}).get('phone', '').strip()
+    if not phone:
+        return jsonify({"error": "phone required"}), 400
+
+    # Explicit tenant_id filter, not tenant_query -- this is a public route
+    # with no request-context tenant, same convention as Tasks 7-9's routes.
+    matches = Customer.query.filter_by(tenant_id=tenant.id, phone=phone).all()
+
+    if not matches:
+        return jsonify({"error": "not found"}), 404
+
+    return jsonify({"customers": [{"customer_id": c.id, "name": c.name} for c in matches]})
+
+
 @app.route('/api/pay/<view_token>', methods=['GET'])
 @limiter.limit("30 per minute")
 def public_pay_view(view_token):
