@@ -535,6 +535,11 @@ def test_success_callback_marks_link_and_payment_paid(client, app):
         assert payment.paid is True
         assert payment.paid_at is not None
         assert payment.received_by_id is None  # customer-initiated, no staff involved
+        # Task 15's amendment: both Whish flows set collected_via so the
+        # payment card shows "via Whish" instead of nothing (received_by is
+        # always null for a customer-initiated payment).
+        assert payment.collected_via == 'whish'
+        assert payment.whish_transaction_number == link.whish_transaction_number
         customer = appmod.db.session.get(appmod.Customer, customer_id)
         # Balance moved the same way the existing "mark paid" path already
         # does it -- see the spec's Payment flow step 8 ("reusing that

@@ -5068,6 +5068,12 @@ def customer_whish_success():
     # block payment.paid/balance from updating, it only leaves Task 13's
     # report column empty until this is confirmed against a real payload.
     link.whish_transaction_number = request.args.get('transactionNumber') or request.args.get('transaction_id')
+    # Task 15's amendment: set the same two signals the tenant-wide
+    # self-service page (Task 18) sets, so Task 13's report and the
+    # PaymentsView.js "collected by" display don't have to special-case
+    # which of the two Whish flows collected a given payment.
+    payment.collected_via = 'whish'
+    payment.whish_transaction_number = link.whish_transaction_number
     db.session.commit()
 
     try:
