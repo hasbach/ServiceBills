@@ -18,3 +18,14 @@ def test_tenant_has_public_pay_slug_column(app):
         insp = appmod.db.inspect(appmod.db.engine)
         cols = {c['name'] for c in insp.get_columns('tenant')}
         assert 'public_pay_slug' in cols
+
+
+def test_customer_whish_payment_attempt_model_exists(app):
+    with app.app_context():
+        assert hasattr(appmod, 'CustomerWhishPaymentAttempt')
+        insp = appmod.db.inspect(appmod.db.engine)
+        assert 'customer_whish_payment_attempt' in insp.get_table_names()
+
+
+def test_customer_whish_payment_attempt_is_tenant_owned():
+    assert appmod.CustomerWhishPaymentAttempt in appmod.TENANT_OWNED_MODELS

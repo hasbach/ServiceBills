@@ -767,6 +767,37 @@ class CustomerPaymentLink(db.Model):
         }
 
 
+class CustomerWhishPaymentAttempt(db.Model):
+    """One row per checkout attempt from the tenant-wide self-service Whish
+    payment page (2026-08-27 plan amendment). Not addressed by its own
+    view_token, unlike CustomerPaymentLink -- that model is shaped around
+    exactly one known Payment/amount (its staleness guard exists to
+    invalidate the link when that Payment changes); this page's whole point
+    is an amount the customer decides, potentially applied across several
+    Payment rows, so a failed attempt just means the customer fills the form
+    again on the same static tenant page. Exists to carry a callback_token
+    through the Whish redirect round-trip and to record, after the fact, how
+    a successful payment was applied (support/debugging, Task 13's report)."""
+    __tablename__ = "customer_whish_payment_attempt"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False, index=True)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
+    callback_token = db.Column(db.String(64), nullable=False)
+    whish_external_id = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    whish_transaction_number = db.Column(db.String(64), nullable=True)  # same TBD-real-param-name caveat as CustomerPaymentLink's (Task 9) -- see Task 18
+    status = db.Column(db.String(20), nullable=False, default='pending')  # pending | succeeded | failed
+    applied_to_debt = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
+    applied_as_prepayment = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
+    prepayment_id = db.Column(db.Integer, db.ForeignKey('payment.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+
+    customer = db.relationship('Customer')
+    prepayment = db.relationship('Payment', foreign_keys=[prepayment_id])
+
+
 class AddonPurchase(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -1130,7 +1161,7 @@ TENANT_OWNED_MODELS = (
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
-    ExchangeRate, CustomerPaymentLink,
+    ExchangeRate, CustomerPaymentLink, CustomerWhishPaymentAttempt,
 )
 
 from sqlalchemy import event as _sa_event
