@@ -352,9 +352,11 @@ const PaymentCardItem = React.memo(({
                                     by {payment.collected_by} {payment.collected_amount ? `($${payment.collected_amount.toFixed(2)})` : ''}
                                 </Typography>
                             )}
-                            {payment.paid && payment.received_by && (
+                            {payment.paid && (payment.received_by || payment.collected_via === 'whish') && (
                                 <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
-                                    rcvd by {payment.received_by}
+                                    {payment.received_by
+                                        ? `rcvd by ${payment.received_by}`
+                                        : `via Whish${payment.whish_transaction_number ? ` (#${payment.whish_transaction_number})` : ''}`}
                                 </Typography>
                             )}
                         </Box>
