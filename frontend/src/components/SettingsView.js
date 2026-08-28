@@ -5,6 +5,7 @@ import {
     Alert, Collapse, InputAdornment, IconButton, MenuItem,
     ToggleButton, ToggleButtonGroup, Tab, Tabs,
     Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
+    Autocomplete,
 } from '@mui/material';
 import {
     Business as BusinessIcon,
@@ -525,94 +526,139 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                     <Divider sx={{ my: 3 }} />
                                     <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 2 }}>Approved Template Names</Typography>
                                     <Alert severity="info" sx={{ mb: 2, borderRadius: '12px' }}>
-                                        These must exactly match the template names you approved in Meta Business Manager → WhatsApp → Message Templates.
+                                        Pick from your templates approved via the <strong>WhatsApp Templates</strong> tab above (use its Refresh button to pull in anything approved directly in Meta), or type a template name directly if you haven't synced yet.
                                     </Alert>
                                     <Grid container spacing={2}>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth select label="Payment Received Template" {...waField('template_payment_paid')}
-                                                helperText="Triggered when a payment is marked as paid"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
-                                                <MenuItem value={waForm.template_payment_paid}>{waForm.template_payment_paid || '(none selected)'}</MenuItem>
-                                                {approvedTemplates.filter(t => t.name !== waForm.template_payment_paid).map(t => (
-                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
-                                                ))}
-                                            </TextField>
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_payment_paid}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_payment_paid: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_payment_paid: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Payment Received Template"
+                                                        helperText="Triggered when a payment is marked as paid"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth select label="Subscription Renewed Template" {...waField('template_subscription_renewed')}
-                                                helperText="Triggered when subscription is renewed"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
-                                                <MenuItem value={waForm.template_subscription_renewed}>{waForm.template_subscription_renewed || '(none selected)'}</MenuItem>
-                                                {approvedTemplates.filter(t => t.name !== waForm.template_subscription_renewed).map(t => (
-                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
-                                                ))}
-                                            </TextField>
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_subscription_renewed}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_subscription_renewed: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_subscription_renewed: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Subscription Renewed Template"
+                                                        helperText="Triggered when subscription is renewed"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth select label="Payment Reminder Template" {...waField('template_payment_reminder')}
-                                                helperText="For future manual or scheduled reminders"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
-                                                <MenuItem value={waForm.template_payment_reminder}>{waForm.template_payment_reminder || '(none selected)'}</MenuItem>
-                                                {approvedTemplates.filter(t => t.name !== waForm.template_payment_reminder).map(t => (
-                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
-                                                ))}
-                                            </TextField>
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_payment_reminder}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_payment_reminder: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_payment_reminder: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Payment Reminder Template"
+                                                        helperText="For future manual or scheduled reminders"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth select label="Current Balance Template" {...waField('template_current_balance')}
-                                                helperText="For balance & expiry reminders"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
-                                                <MenuItem value={waForm.template_current_balance}>{waForm.template_current_balance || '(none selected)'}</MenuItem>
-                                                {approvedTemplates.filter(t => t.name !== waForm.template_current_balance).map(t => (
-                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
-                                                ))}
-                                            </TextField>
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_current_balance}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_current_balance: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_current_balance: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Current Balance Template"
+                                                        helperText="For balance & expiry reminders"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth select label="Forwarding Alert Template (unused)" {...waField('template_forward_alert')}
-                                                helperText="Not sent by the current forwarding flow (see Daily Keep-Alive Template below) — kept only in case you revert to template-only alerts"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
-                                                <MenuItem value={waForm.template_forward_alert}>{waForm.template_forward_alert || '(none selected)'}</MenuItem>
-                                                {approvedTemplates.filter(t => t.name !== waForm.template_forward_alert).map(t => (
-                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
-                                                ))}
-                                            </TextField>
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_forward_alert}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_forward_alert: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_forward_alert: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Forwarding Alert Template (unused)"
+                                                        helperText="Not sent by the current forwarding flow (see Daily Keep-Alive Template below) — kept only in case you revert to template-only alerts"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth select label="Outage Template" {...waField('template_bulk_outage')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
-                                                <MenuItem value={waForm.template_bulk_outage}>{waForm.template_bulk_outage || '(none selected)'}</MenuItem>
-                                                {approvedTemplates.filter(t => t.name !== waForm.template_bulk_outage).map(t => (
-                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
-                                                ))}
-                                            </TextField>
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_outage}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_outage: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_outage: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Outage Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth select label="Maintenance Template" {...waField('template_bulk_maintenance')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
-                                                <MenuItem value={waForm.template_bulk_maintenance}>{waForm.template_bulk_maintenance || '(none selected)'}</MenuItem>
-                                                {approvedTemplates.filter(t => t.name !== waForm.template_bulk_maintenance).map(t => (
-                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
-                                                ))}
-                                            </TextField>
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_maintenance}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_maintenance: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_maintenance: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Maintenance Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth select label="Feature Template" {...waField('template_bulk_feature')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
-                                                <MenuItem value={waForm.template_bulk_feature}>{waForm.template_bulk_feature || '(none selected)'}</MenuItem>
-                                                {approvedTemplates.filter(t => t.name !== waForm.template_bulk_feature).map(t => (
-                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
-                                                ))}
-                                            </TextField>
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_feature}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_feature: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_feature: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Feature Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth select label="Offer Template" {...waField('template_bulk_offer')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
-                                                <MenuItem value={waForm.template_bulk_offer}>{waForm.template_bulk_offer || '(none selected)'}</MenuItem>
-                                                {approvedTemplates.filter(t => t.name !== waForm.template_bulk_offer).map(t => (
-                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
-                                                ))}
-                                            </TextField>
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_offer}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_offer: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_offer: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Offer Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                     </Grid>
 
@@ -678,9 +724,10 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                         <Typography variant="caption" color="text.secondary">
                                             1. Go to <strong>developers.facebook.com</strong> → Create App → Business type<br />
                                             2. Add <strong>WhatsApp</strong> product → Get Phone Number ID + WABA ID<br />
-                                            3. Create a <strong>System User</strong> in Business Settings → Generate token with whatsapp_business_messaging permission<br />
-                                            4. Submit message templates for approval in <strong>Meta Business Manager</strong><br />
-                                            5. Paste credentials above and save
+                                            3. Create a <strong>System User</strong> in Business Settings → Generate a token with both <strong>whatsapp_business_messaging</strong> and <strong>whatsapp_business_management</strong> permissions (the second is required to create/edit/delete templates from this app)<br />
+                                            4. Create and manage your message templates directly in the <strong>WhatsApp Templates</strong> tab above — no need to go to Meta Business Manager for template creation or approval status anymore, only to obtain your account/App ID/credentials<br />
+                                            5. Paste credentials above and save<br />
+                                            6. For real-time approval-status updates, enable <strong>message_template_status_update</strong> as a subscribed webhook field in your Meta App Dashboard (App configuration on Meta's side — this app's UI can't set it for you)
                                         </Typography>
                                     </Box>
                                 </Section>

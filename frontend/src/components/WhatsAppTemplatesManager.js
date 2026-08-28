@@ -255,22 +255,30 @@ const WhatsAppTemplatesManager = () => {
                             onChange={e => setForm(f => ({ ...f, headerText: e.target.value }))} fullWidth />
                     )}
                     {['IMAGE', 'VIDEO', 'DOCUMENT'].includes(form.headerType) && (
-                        <Button variant="outlined" component="label" size="small" sx={{ alignSelf: 'flex-start' }}>
-                            {form.headerHandle ? 'Sample uploaded ✓' : 'Upload Sample File'}
-                            <input type="file" hidden onChange={async (e) => {
-                                const f = e.target.files[0];
-                                if (!f) return;
-                                const formData = new FormData();
-                                formData.append('file', f);
-                                try {
-                                    const res = await apiService.uploadWhatsAppTemplateSample(formData);
-                                    setForm(prev => ({ ...prev, headerHandle: res.data.header_handle }));
-                                    setSnackbar({ open: true, message: 'Sample uploaded.', severity: 'success' });
-                                } catch (error) {
-                                    setSnackbar({ open: true, message: error.response?.data?.error || 'Failed to upload sample.', severity: 'error' });
-                                }
-                            }} />
-                        </Button>
+                        <>
+                            {editingTemplate && !form.headerHandle && (
+                                <Alert severity="warning">
+                                    This template has a media header. You must re-upload a sample file before saving,
+                                    since Meta doesn't let us retrieve the original one.
+                                </Alert>
+                            )}
+                            <Button variant="outlined" component="label" size="small" sx={{ alignSelf: 'flex-start' }}>
+                                {form.headerHandle ? 'Sample uploaded ✓' : 'Upload Sample File'}
+                                <input type="file" hidden onChange={async (e) => {
+                                    const f = e.target.files[0];
+                                    if (!f) return;
+                                    const formData = new FormData();
+                                    formData.append('file', f);
+                                    try {
+                                        const res = await apiService.uploadWhatsAppTemplateSample(formData);
+                                        setForm(prev => ({ ...prev, headerHandle: res.data.header_handle }));
+                                        setSnackbar({ open: true, message: 'Sample uploaded.', severity: 'success' });
+                                    } catch (error) {
+                                        setSnackbar({ open: true, message: error.response?.data?.error || 'Failed to upload sample.', severity: 'error' });
+                                    }
+                                }} />
+                            </Button>
+                        </>
                     )}
 
                     <Divider />
