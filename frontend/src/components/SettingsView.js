@@ -28,6 +28,7 @@ import { useAppContext } from '../context/AppContext.js';
 import ExpenseCategoryManager from './ExpenseCategoryManager.js';
 import UserManagement from './UserManagement.js';
 import SectorManager from './SectorManager.js';
+import WhatsAppTemplatesManager from './WhatsAppTemplatesManager.js';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
 
@@ -314,6 +315,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ px: 2, '& .MuiTab-root': { textTransform: 'none', fontWeight: 600 } }}>
                     <Tab icon={<BusinessIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Business Details" />
                     <Tab icon={<WhatsAppIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="WhatsApp Notifications" />
+                    <Tab icon={<WhatsAppIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="WhatsApp Templates" />
                     <Tab icon={<PaymentsIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Whish Payments" />
                     <Tab icon={<MessageIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Expense Categories" />
                     <Tab icon={<PeopleIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="User Management" />
@@ -643,8 +645,11 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 </Box>
             )}
 
-            {/* ── Tab 2: Whish Payments (tenant-facing customer payments) ── */}
-            {tab === 2 && (
+            {/* ── Tab 2: WhatsApp Templates ── */}
+            {tab === 2 && <WhatsAppTemplatesManager />}
+
+            {/* ── Tab 3: Whish Payments (tenant-facing customer payments) ── */}
+            {tab === 3 && (
                 <Box>
                     {twsFetching || !tenant ? (
                         <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}><CircularProgress /></Box>
@@ -755,20 +760,20 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 </DialogActions>
             </Dialog>
 
-            {/* ── Tab 3: Expense Categories ── */}
-            {tab === 3 && (
+            {/* ── Tab 4: Expense Categories ── */}
+            {tab === 4 && (
                 <Section icon={<MessageIcon />} title="Expense Categories" subtitle="Manage the categories used to classify expenses" color={theme.palette.warning.main}>
                     <ExpenseCategoryManager />
                 </Section>
             )}
 
-            {/* ── Tab 4: User Management ── */}
-            {tab === 4 && (
+            {/* ── Tab 5: User Management ── */}
+            {tab === 5 && (
                 <UserManagement />
             )}
 
-            {/* Tab 5: Sectors */}
-            {tab === 5 && (
+            {/* Tab 6: Sectors */}
+            {tab === 6 && (
                 <SectorManager />
             )}
 

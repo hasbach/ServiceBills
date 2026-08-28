@@ -269,6 +269,11 @@ const rawApiService = {
     // Bulk Messaging
     sendBulkMessage: (payload) => api.post('/messages/bulk_send', payload),
     fetchMetaTemplates: () => api.get('/whatsapp/templates'),
+    fetchWhatsAppTemplates: () => api.get('/whatsapp/templates'),
+    syncWhatsAppTemplates: () => api.post('/whatsapp/templates/sync'),
+    createWhatsAppTemplate: (data) => api.post('/whatsapp/templates', data),
+    updateWhatsAppTemplate: (id, data) => api.put(`/whatsapp/templates/${id}`, data),
+    deleteWhatsAppTemplate: (id) => api.delete(`/whatsapp/templates/${id}`),
 };
 
 export const apiService = Object.fromEntries(
