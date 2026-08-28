@@ -5669,6 +5669,75 @@ def create_whatsapp_template():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/whatsapp/templates/<int:template_id>', methods=['PUT'])
+@jwt_required()
+@admin_or_finance_required()
+def update_whatsapp_template(template_id):
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    row = tenant_query(WhatsAppTemplate).filter_by(id=template_id).first()
+    if not row:
+        return jsonify({'error': 'Template not found.'}), 404
+    if row.status == 'APPROVED':
+        return jsonify({'error': 'An approved template cannot be edited -- create a new template instead.'}), 400
+    if not row.meta_template_id:
+        return jsonify({'error': 'This template has no known Meta template ID to edit.'}), 400
+
+    data = request.json or {}
+    components = data.get('components') or row.components
+    error = _validate_template_components(components)
+    if error:
+        return jsonify({'error': error}), 400
+
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{row.meta_template_id}'
+        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+        resp = requests.post(url, headers=headers, json={'components': components}, timeout=15)
+        if not resp.ok:
+            return jsonify({'error': _parse_meta_error(resp)}), 400
+        row.components = components
+        row.status = 'PENDING'
+        row.rejected_reason = None
+        row.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'message': 'Template updated and resubmitted for review.', 'template': row.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/whatsapp/templates/<int:template_id>', methods=['DELETE'])
+@jwt_required()
+@admin_or_finance_required()
+def delete_whatsapp_template(template_id):
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    row = tenant_query(WhatsAppTemplate).filter_by(id=template_id).first()
+    if not row:
+        return jsonify({'error': 'Template not found.'}), 404
+    try:
+        if settings.access_token and settings.business_account_id:
+            api_version = settings.api_version or 'v19.0'
+            url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates?name={row.name}'
+            headers = {'Authorization': f'Bearer {settings.access_token}'}
+            resp = requests.delete(url, headers=headers, timeout=10)
+            if not resp.ok:
+                return jsonify({'error': _parse_meta_error(resp)}), 400
+        db.session.delete(row)
+        db.session.commit()
+        return jsonify({'message': 'Template deleted.'}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 _template_def_cache = {}
 
 def normalize_whatsapp_phone(phone_raw):

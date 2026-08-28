@@ -166,3 +166,66 @@ def test_create_template_rejects_null_component_type(app, client):
     })
     assert r.status_code == 400
     assert "error" in r.get_json()
+
+
+def _seed_template(app, slug, status="PENDING", meta_id="meta_x"):
+    with app.app_context():
+        tid = appmod.Tenant.query.filter_by(slug=slug).first().id
+        row = appmod.WhatsAppTemplate(tenant_id=tid, name="editable", language="en", category="UTILITY",
+                                       status=status, meta_template_id=meta_id,
+                                       components=[{"type": "BODY", "text": "Hi"}])
+        appmod.db.session.add(row)
+        appmod.db.session.commit()
+        return row.id
+
+
+def test_update_template_blocked_when_approved(app, client):
+    hdr = make_tenant(client, "Biz T9", "t9_admin")
+    _pro_api_mode(app, client, hdr, "biz-t9")
+    tpl_id = _seed_template(app, "biz-t9", status="APPROVED")
+    r = client.put(f"/api/whatsapp/templates/{tpl_id}", headers=hdr,
+                   json={"components": [{"type": "BODY", "text": "New text"}]})
+    assert r.status_code == 400
+    assert "approved" in r.get_json()["error"].lower()
+
+
+def test_update_template_success_resets_to_pending(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz T10", "t10_admin")
+    _pro_api_mode(app, client, hdr, "biz-t10")
+    tpl_id = _seed_template(app, "biz-t10", status="REJECTED")
+    monkeypatch.setattr(appmod.requests, "post",
+                         lambda url, headers, json, timeout: FakeResponse(json_data={"success": True}))
+
+    r = client.put(f"/api/whatsapp/templates/{tpl_id}", headers=hdr,
+                   json={"components": [{"type": "BODY", "text": "New text"}]})
+    assert r.status_code == 200
+    assert r.get_json()["template"]["status"] == "PENDING"
+    assert r.get_json()["template"]["rejected_reason"] is None
+
+
+def test_delete_template_calls_meta_and_removes_local_row(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz T11", "t11_admin")
+    _pro_api_mode(app, client, hdr, "biz-t11")
+    tpl_id = _seed_template(app, "biz-t11", status="PENDING")
+    calls = []
+    monkeypatch.setattr(appmod.requests, "delete",
+                         lambda url, headers, timeout: (calls.append(url), FakeResponse())[1])
+
+    r = client.delete(f"/api/whatsapp/templates/{tpl_id}", headers=hdr)
+    assert r.status_code == 200
+    assert len(calls) == 1 and "editable" in calls[0]
+    with app.app_context():
+        assert appmod.db.session.get(appmod.WhatsAppTemplate, tpl_id) is None
+
+
+def test_delete_template_tenant_isolation(app, client):
+    hdr_a = make_tenant(client, "Biz T12A", "t12a_admin")
+    hdr_b = make_tenant(client, "Biz T12B", "t12b_admin")
+    _pro_api_mode(app, client, hdr_a, "biz-t12a")
+    _pro_api_mode(app, client, hdr_b, "biz-t12b")
+    tpl_id = _seed_template(app, "biz-t12a", status="PENDING")
+
+    r = client.delete(f"/api/whatsapp/templates/{tpl_id}", headers=hdr_b)
+    assert r.status_code == 404
+    with app.app_context():
+        assert appmod.db.session.get(appmod.WhatsAppTemplate, tpl_id) is not None
