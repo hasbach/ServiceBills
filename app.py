@@ -6790,10 +6790,14 @@ def whatsapp_webhook():
 
                     if change.get('field') == 'message_template_status_update':
                         waba_id = entry.get('id')
-                        tpl_settings = WhatsAppSettings.query.filter_by(business_account_id=waba_id).first() if waba_id else None
+                        tpl_matches = WhatsAppSettings.query.filter_by(business_account_id=waba_id).all() if waba_id else []
+                        tpl_settings = tpl_matches[0] if tpl_matches else None
                         if not tpl_settings:
                             logging.warning(f"WhatsApp template status webhook: no tenant for business_account_id={waba_id}; skipping.")
                             continue
+                        if len(tpl_matches) > 1:
+                            logging.warning(f"WhatsApp template status webhook: {len(tpl_matches)} settings rows share business_account_id={waba_id} "
+                                             f"(tenant_ids={[m.tenant_id for m in tpl_matches]}); using settings.id={tpl_settings.id} tenant_id={tpl_settings.tenant_id}.")
                         if not tpl_settings.app_secret or not signature_header.startswith('sha256='):
                             logging.warning(f"WhatsApp template status webhook: missing app_secret/signature for tenant_id={tpl_settings.tenant_id}; rejecting.")
                             return jsonify({'error': 'Invalid signature'}), 401
