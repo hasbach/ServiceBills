@@ -147,6 +147,13 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     // Edit to unlock, and it re-locks after every save.
     const [waCredsEditing, setWaCredsEditing] = useState(false);
 
+    const [approvedTemplates, setApprovedTemplates] = useState([]);
+    useEffect(() => {
+        apiService.fetchWhatsAppTemplates()
+            .then(res => setApprovedTemplates((res.data.templates || []).filter(t => t.status === 'APPROVED')))
+            .catch(() => {}); // Settings page still works with free-text fallback if this fails
+    }, [apiService]);
+
     const fetchWASettings = useCallback(async () => {
         setWaFetching(true);
         try {
@@ -522,45 +529,90 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                     </Alert>
                                     <Grid container spacing={2}>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Payment Received Template" placeholder="payment_confirmation" {...waField('template_payment_paid')}
+                                            <TextField fullWidth select label="Payment Received Template" {...waField('template_payment_paid')}
                                                 helperText="Triggered when a payment is marked as paid"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                                <MenuItem value={waForm.template_payment_paid}>{waForm.template_payment_paid || '(none selected)'}</MenuItem>
+                                                {approvedTemplates.filter(t => t.name !== waForm.template_payment_paid).map(t => (
+                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+                                                ))}
+                                            </TextField>
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Subscription Renewed Template" placeholder="subscription_renewal" {...waField('template_subscription_renewed')}
+                                            <TextField fullWidth select label="Subscription Renewed Template" {...waField('template_subscription_renewed')}
                                                 helperText="Triggered when subscription is renewed"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                                <MenuItem value={waForm.template_subscription_renewed}>{waForm.template_subscription_renewed || '(none selected)'}</MenuItem>
+                                                {approvedTemplates.filter(t => t.name !== waForm.template_subscription_renewed).map(t => (
+                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+                                                ))}
+                                            </TextField>
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Payment Reminder Template" placeholder="payment_reminder" {...waField('template_payment_reminder')}
+                                            <TextField fullWidth select label="Payment Reminder Template" {...waField('template_payment_reminder')}
                                                 helperText="For future manual or scheduled reminders"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                                <MenuItem value={waForm.template_payment_reminder}>{waForm.template_payment_reminder || '(none selected)'}</MenuItem>
+                                                {approvedTemplates.filter(t => t.name !== waForm.template_payment_reminder).map(t => (
+                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+                                                ))}
+                                            </TextField>
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Current Balance Template" placeholder="current_balance" {...waField('template_current_balance')}
+                                            <TextField fullWidth select label="Current Balance Template" {...waField('template_current_balance')}
                                                 helperText="For balance & expiry reminders"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                                <MenuItem value={waForm.template_current_balance}>{waForm.template_current_balance || '(none selected)'}</MenuItem>
+                                                {approvedTemplates.filter(t => t.name !== waForm.template_current_balance).map(t => (
+                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+                                                ))}
+                                            </TextField>
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Forwarding Alert Template (unused)" placeholder="customer_reply_alert" {...waField('template_forward_alert')}
+                                            <TextField fullWidth select label="Forwarding Alert Template (unused)" {...waField('template_forward_alert')}
                                                 helperText="Not sent by the current forwarding flow (see Daily Keep-Alive Template below) — kept only in case you revert to template-only alerts"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                                <MenuItem value={waForm.template_forward_alert}>{waForm.template_forward_alert || '(none selected)'}</MenuItem>
+                                                {approvedTemplates.filter(t => t.name !== waForm.template_forward_alert).map(t => (
+                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+                                                ))}
+                                            </TextField>
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Outage Template" placeholder="outage_alert" {...waField('template_bulk_outage')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <TextField fullWidth select label="Outage Template" {...waField('template_bulk_outage')}
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                                <MenuItem value={waForm.template_bulk_outage}>{waForm.template_bulk_outage || '(none selected)'}</MenuItem>
+                                                {approvedTemplates.filter(t => t.name !== waForm.template_bulk_outage).map(t => (
+                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+                                                ))}
+                                            </TextField>
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Maintenance Template" placeholder="maintenance_alert" {...waField('template_bulk_maintenance')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <TextField fullWidth select label="Maintenance Template" {...waField('template_bulk_maintenance')}
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                                <MenuItem value={waForm.template_bulk_maintenance}>{waForm.template_bulk_maintenance || '(none selected)'}</MenuItem>
+                                                {approvedTemplates.filter(t => t.name !== waForm.template_bulk_maintenance).map(t => (
+                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+                                                ))}
+                                            </TextField>
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Feature Template" placeholder="feature_update" {...waField('template_bulk_feature')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <TextField fullWidth select label="Feature Template" {...waField('template_bulk_feature')}
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                                <MenuItem value={waForm.template_bulk_feature}>{waForm.template_bulk_feature || '(none selected)'}</MenuItem>
+                                                {approvedTemplates.filter(t => t.name !== waForm.template_bulk_feature).map(t => (
+                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+                                                ))}
+                                            </TextField>
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Offer Template" placeholder="special_offer" {...waField('template_bulk_offer')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <TextField fullWidth select label="Offer Template" {...waField('template_bulk_offer')}
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                                <MenuItem value={waForm.template_bulk_offer}>{waForm.template_bulk_offer || '(none selected)'}</MenuItem>
+                                                {approvedTemplates.filter(t => t.name !== waForm.template_bulk_offer).map(t => (
+                                                    <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+                                                ))}
+                                            </TextField>
                                         </Grid>
                                     </Grid>
 
