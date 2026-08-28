@@ -229,3 +229,55 @@ def test_delete_template_tenant_isolation(app, client):
     assert r.status_code == 404
     with app.app_context():
         assert appmod.db.session.get(appmod.WhatsAppTemplate, tpl_id) is not None
+
+
+def test_update_template_leaves_row_untouched_when_meta_call_fails(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz T17", "t17_admin")
+    _pro_api_mode(app, client, hdr, "biz-t17")
+    tpl_id = _seed_template(app, "biz-t17", status="REJECTED")
+    monkeypatch.setattr(appmod.requests, "post",
+                         lambda url, headers, json, timeout: FakeResponse(
+                             ok=False, status_code=400,
+                             json_data={"error": {"error_user_msg": "Edit rejected by Meta"}}))
+
+    r = client.put(f"/api/whatsapp/templates/{tpl_id}", headers=hdr,
+                   json={"components": [{"type": "BODY", "text": "New text"}]})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "Edit rejected by Meta"
+
+    with app.app_context():
+        row = appmod.db.session.get(appmod.WhatsAppTemplate, tpl_id)
+        assert row.status == "REJECTED"  # unchanged, not flipped to PENDING
+        assert row.components != [{"type": "BODY", "text": "New text"}]  # not overwritten
+
+
+def test_delete_template_leaves_row_when_meta_call_fails(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz T18", "t18_admin")
+    _pro_api_mode(app, client, hdr, "biz-t18")
+    tpl_id = _seed_template(app, "biz-t18", status="PENDING")
+    monkeypatch.setattr(appmod.requests, "delete",
+                         lambda url, headers, timeout: FakeResponse(
+                             ok=False, status_code=400,
+                             json_data={"error": {"error_user_msg": "Delete rejected by Meta"}}))
+
+    r = client.delete(f"/api/whatsapp/templates/{tpl_id}", headers=hdr)
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "Delete rejected by Meta"
+
+    with app.app_context():
+        assert appmod.db.session.get(appmod.WhatsAppTemplate, tpl_id) is not None  # not deleted
+
+
+def test_update_template_tenant_isolation(app, client):
+    hdr_a = make_tenant(client, "Biz T19A", "t19a_admin")
+    hdr_b = make_tenant(client, "Biz T19B", "t19b_admin")
+    _pro_api_mode(app, client, hdr_a, "biz-t19a")
+    _pro_api_mode(app, client, hdr_b, "biz-t19b")
+    tpl_id = _seed_template(app, "biz-t19a", status="PENDING")
+
+    r = client.put(f"/api/whatsapp/templates/{tpl_id}", headers=hdr_b,
+                   json={"components": [{"type": "BODY", "text": "Hijacked"}]})
+    assert r.status_code == 404
+    with app.app_context():
+        row = appmod.db.session.get(appmod.WhatsAppTemplate, tpl_id)
+        assert row.status == "PENDING"  # untouched by the other tenant's attempt
