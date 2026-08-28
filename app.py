@@ -6787,6 +6787,39 @@ def whatsapp_webhook():
             for entry in data.get('entry', []):
                 for change in entry.get('changes', []):
                     val = change.get('value', {})
+
+                    if change.get('field') == 'message_template_status_update':
+                        waba_id = entry.get('id')
+                        tpl_settings = WhatsAppSettings.query.filter_by(business_account_id=waba_id).first() if waba_id else None
+                        if not tpl_settings:
+                            logging.warning(f"WhatsApp template status webhook: no tenant for business_account_id={waba_id}; skipping.")
+                            continue
+                        if not tpl_settings.app_secret or not signature_header.startswith('sha256='):
+                            logging.warning(f"WhatsApp template status webhook: missing app_secret/signature for tenant_id={tpl_settings.tenant_id}; rejecting.")
+                            return jsonify({'error': 'Invalid signature'}), 401
+                        tpl_expected_sig = hmac.new(tpl_settings.app_secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+                        tpl_provided_sig = signature_header[len('sha256='):]
+                        if not hmac.compare_digest(tpl_expected_sig, tpl_provided_sig):
+                            logging.warning(f"WhatsApp template status webhook: signature mismatch for tenant_id={tpl_settings.tenant_id}; rejecting.")
+                            return jsonify({'error': 'Invalid signature'}), 401
+
+                        tpl_name = val.get('message_template_name')
+                        tpl_language = val.get('message_template_language')
+                        tpl_new_status = val.get('event')
+                        tpl_reason = val.get('reason')
+                        if tpl_name and tpl_new_status:
+                            tpl_row = WhatsAppTemplate.query.filter_by(
+                                tenant_id=tpl_settings.tenant_id, name=tpl_name, language=tpl_language).first()
+                            if tpl_row:
+                                tpl_row.status = tpl_new_status
+                                tpl_row.rejected_reason = tpl_reason
+                                tpl_row.updated_at = datetime.utcnow()
+                                db.session.commit()
+                                logging.info(f"WhatsApp template status webhook: tenant_id={tpl_settings.tenant_id} name={tpl_name} -> {tpl_new_status}")
+                            else:
+                                logging.warning(f"WhatsApp template status webhook: no local WhatsAppTemplate for tenant_id={tpl_settings.tenant_id} name={tpl_name} language={tpl_language}; skipping.")
+                        continue
+
                     messages = val.get('messages', [])
                     contacts = val.get('contacts', [])
 
