@@ -73,3 +73,74 @@ def test_sync_requires_pro_plan(app, client):
                 json={"enabled": True, "mode": "deeplink"})
     r = client.post("/api/whatsapp/templates/sync", headers=hdr)
     assert r.status_code in (400, 402)  # not in api mode -> 400; free plan would be 402 if mode were api
+
+
+def test_create_template_rejects_authentication_category(app, client):
+    hdr = make_tenant(client, "Biz T4", "t4_admin")
+    _pro_api_mode(app, client, hdr, "biz-t4")
+    r = client.post("/api/whatsapp/templates", headers=hdr, json={
+        "name": "otp_code", "language": "en", "category": "AUTHENTICATION",
+        "components": [{"type": "BODY", "text": "Your code is {{1}}"}],
+    })
+    assert r.status_code == 400
+    assert "MARKETING" in r.get_json()["error"] or "UTILITY" in r.get_json()["error"]
+
+
+def test_create_template_rejects_missing_body(app, client):
+    hdr = make_tenant(client, "Biz T5", "t5_admin")
+    _pro_api_mode(app, client, hdr, "biz-t5")
+    r = client.post("/api/whatsapp/templates", headers=hdr, json={
+        "name": "no_body", "language": "en", "category": "UTILITY",
+        "components": [{"type": "FOOTER", "text": "footer only"}],
+    })
+    assert r.status_code == 400
+    assert "BODY" in r.get_json()["error"]
+
+
+def test_create_template_rejects_variable_without_sample(app, client):
+    hdr = make_tenant(client, "Biz T6", "t6_admin")
+    _pro_api_mode(app, client, hdr, "biz-t6")
+    r = client.post("/api/whatsapp/templates", headers=hdr, json={
+        "name": "no_sample", "language": "en", "category": "UTILITY",
+        "components": [{"type": "BODY", "text": "Hi {{1}}"}],
+    })
+    assert r.status_code == 400
+    assert "sample" in r.get_json()["error"].lower()
+
+
+def test_create_template_success(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz T7", "t7_admin")
+    _pro_api_mode(app, client, hdr, "biz-t7")
+    monkeypatch.setattr(appmod.requests, "post",
+                         lambda url, headers, json, timeout: FakeResponse(
+                             json_data={"id": "meta_new_1", "status": "PENDING"}))
+
+    r = client.post("/api/whatsapp/templates", headers=hdr, json={
+        "name": "greeting", "language": "en", "category": "UTILITY",
+        "components": [{"type": "BODY", "text": "Hi {{1}}",
+                         "example": {"body_text": [["Alex"]]}}],
+    })
+    assert r.status_code == 201
+    body = r.get_json()
+    assert body["template"]["status"] == "PENDING"
+    assert body["template"]["meta_template_id"] == "meta_new_1"
+
+    with app.app_context():
+        tid = appmod.Tenant.query.filter_by(slug="biz-t7").first().id
+        assert appmod.WhatsAppTemplate.query.filter_by(tenant_id=tid, name="greeting").count() == 1
+
+
+def test_create_template_surfaces_meta_error(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz T8", "t8_admin")
+    _pro_api_mode(app, client, hdr, "biz-t8")
+    monkeypatch.setattr(appmod.requests, "post",
+                         lambda url, headers, json, timeout: FakeResponse(
+                             ok=False, status_code=400,
+                             json_data={"error": {"error_user_msg": "Template name already exists"}}))
+
+    r = client.post("/api/whatsapp/templates", headers=hdr, json={
+        "name": "greeting", "language": "en", "category": "UTILITY",
+        "components": [{"type": "BODY", "text": "Hi"}],
+    })
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "Template name already exists"

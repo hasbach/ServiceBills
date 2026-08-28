@@ -5595,6 +5595,75 @@ def sync_whatsapp_templates():
         return jsonify({'error': str(e)}), 500
 
 
+_ALLOWED_TEMPLATE_CATEGORIES = {'MARKETING', 'UTILITY'}
+
+
+def _validate_template_components(components):
+    """Server-side shape validation before ever calling Meta -- catches the
+    cheap mistakes locally so a tenant isn't waiting on a round-trip to Meta
+    just to learn BODY was missing. Meta's own API remains the final word on
+    anything more subtle (policy, wording, button-count limits)."""
+    has_body = False
+    for c in components or []:
+        if c.get('type', '').upper() == 'BODY':
+            has_body = True
+            text = c.get('text', '')
+            var_count = len(re.findall(r'\{\{(\d+)\}\}', text))
+            example = (c.get('example') or {}).get('body_text')
+            if var_count > 0 and not example:
+                return f"BODY has {var_count} variable(s) but no sample values were provided."
+    if not has_body:
+        return "A template must have a BODY component."
+    return None
+
+
+@app.route('/api/whatsapp/templates', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def create_whatsapp_template():
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    if not settings.access_token or not settings.business_account_id:
+        return jsonify({'error': 'Please configure your WABA ID and Access Token first.'}), 400
+
+    data = request.json or {}
+    name = (data.get('name') or '').strip()
+    language = (data.get('language') or '').strip()
+    category = (data.get('category') or '').strip().upper()
+    components = data.get('components') or []
+
+    if not name or not language:
+        return jsonify({'error': 'Name and language are required.'}), 400
+    if category not in _ALLOWED_TEMPLATE_CATEGORIES:
+        return jsonify({'error': f"Category must be one of {sorted(_ALLOWED_TEMPLATE_CATEGORIES)}."}), 400
+    error = _validate_template_components(components)
+    if error:
+        return jsonify({'error': error}), 400
+
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates'
+        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+        payload = {'name': name, 'language': language, 'category': category, 'components': components}
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if not resp.ok:
+            return jsonify({'error': _parse_meta_error(resp)}), 400
+        body = resp.json()
+        row = new_for_tenant(WhatsAppTemplate, name=name, language=language, category=category,
+                              status=body.get('status', 'PENDING'), components=components,
+                              meta_template_id=body.get('id'))
+        db.session.add(row)
+        db.session.commit()
+        return jsonify({'message': 'Template submitted to Meta for review.', 'template': row.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 
 
 
