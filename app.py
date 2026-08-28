@@ -5532,54 +5532,66 @@ def subscribe_waba():
         return jsonify({'error': str(e)}), 500
 
 
+def _parse_meta_error(resp):
+    """Meta's template-management errors carry the actionable message under
+    error.error_user_msg (shown to end users) or error.message (developer-
+    facing) -- surface it verbatim rather than a generic failure, matching
+    the pattern already used for Whish checkout rejections."""
+    try:
+        err = resp.json().get('error', {})
+        return err.get('error_user_msg') or err.get('message') or resp.text
+    except Exception:
+        return resp.text
+
+
 @app.route('/api/whatsapp/templates', methods=['GET'])
 @jwt_required()
-def get_meta_templates():
-    try:
-        settings = tenant_query(WhatsAppSettings).first()
-        meta_templates = []
-        if settings and settings.access_token and settings.business_account_id:
-            try:
-                api_version = settings.api_version or 'v19.0'
-                url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates?limit=100'
-                headers = {'Authorization': f'Bearer {settings.access_token}'}
-                resp = requests.get(url, headers=headers, timeout=10)
-                if resp.ok:
-                    data = resp.json().get('data', [])
-                    for t in data:
-                        if t.get('status') == 'APPROVED':
-                            if settings.business_account_id:
-                                _template_def_cache[(settings.business_account_id, t.get('name'))] = (time.time(), t)
-                            if settings.phone_number_id:
-                                _template_def_cache[(settings.phone_number_id, t.get('name'))] = (time.time(), t)
-                            meta_templates.append({
-                                'name': t.get('name'),
-                                'language': t.get('language', 'en'),
-                                'category': t.get('category', 'MARKETING'),
-                                'components': t.get('components', [])
-                            })
-            except Exception as ex:
-                logging.error(f"Failed fetching Meta templates: {ex}")
+def get_whatsapp_templates():
+    templates = tenant_query(WhatsAppTemplate).order_by(WhatsAppTemplate.created_at.desc()).all()
+    return jsonify({'templates': [t.to_dict() for t in templates]}), 200
 
-        if not meta_templates:
-            if settings:
-                for attr in ['template_bulk_offer', 'template_bulk_feature', 'template_bulk_outage', 'template_bulk_maintenance', 'template_payment_paid', 'template_subscription_renewed']:
-                    val = getattr(settings, attr, None)
-                    if val and val not in [m['name'] for m in meta_templates]:
-                        meta_templates.append({
-                            'name': val,
-                            'language': settings.template_language or 'en',
-                            'category': 'MARKETING',
-                            'components': [{'type': 'BODY', 'text': f'Configured template: {val}'}]
-                        })
-            if not meta_templates:
-                meta_templates = [
-                    {'name': 'special_offer', 'language': 'en', 'category': 'MARKETING', 'components': [{'type': 'BODY', 'text': 'Special offer notification template'}]},
-                    {'name': 'feature_update', 'language': 'en', 'category': 'MARKETING', 'components': [{'type': 'BODY', 'text': 'Feature update notification template'}]},
-                    {'name': 'marketing_promo', 'language': 'en', 'category': 'MARKETING', 'components': [{'type': 'BODY', 'text': 'Promotional marketing message template'}]}
-                ]
-        return jsonify({'templates': meta_templates}), 200
+
+@app.route('/api/whatsapp/templates/sync', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def sync_whatsapp_templates():
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    if not settings.access_token or not settings.business_account_id:
+        return jsonify({'error': 'Please configure your WABA ID and Access Token first.'}), 400
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates?limit=100'
+        headers = {'Authorization': f'Bearer {settings.access_token}'}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if not resp.ok:
+            return jsonify({'error': _parse_meta_error(resp)}), 400
+        remote = resp.json().get('data', [])
+        synced = 0
+        for t in remote:
+            name = t.get('name')
+            language = t.get('language', 'en')
+            if not name:
+                continue
+            row = tenant_query(WhatsAppTemplate).filter_by(name=name, language=language).first()
+            if not row:
+                row = new_for_tenant(WhatsAppTemplate, name=name, language=language, components=t.get('components', []))
+                db.session.add(row)
+            row.category = t.get('category', 'MARKETING')
+            row.status = t.get('status', 'PENDING')
+            row.components = t.get('components', [])
+            row.meta_template_id = t.get('id')
+            row.updated_at = datetime.utcnow()
+            synced += 1
+        db.session.commit()
+        return jsonify({'message': f'Synced {synced} template(s) from Meta.',
+                         'templates': [t.to_dict() for t in tenant_query(WhatsAppTemplate).all()]}), 200
     except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 

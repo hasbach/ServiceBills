@@ -48,8 +48,8 @@ const MessagingView = () => {
     const handleSyncTemplates = useCallback(async () => {
         setSyncing(true);
         try {
-            const res = await apiService.fetchMetaTemplates();
-            const loaded = res.data.templates || [];
+            const res = await apiService.syncWhatsAppTemplates();
+            const loaded = (res.data.templates || []).filter(t => t.status === 'APPROVED');
             setMetaTemplates(loaded);
             if (loaded.length > 0 && !selectedTemplate) {
                 setSelectedTemplate(loaded[0].name);
