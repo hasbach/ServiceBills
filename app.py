@@ -5605,7 +5605,12 @@ def _validate_template_components(components):
     anything more subtle (policy, wording, button-count limits)."""
     has_body = False
     for c in components or []:
-        if c.get('type', '').upper() == 'BODY':
+        if not isinstance(c, dict):
+            return "Each component must be an object with a 'type' field."
+        ctype = c.get('type') or ''
+        if not isinstance(ctype, str):
+            return "Each component's 'type' must be a string."
+        if ctype.upper() == 'BODY':
             has_body = True
             text = c.get('text', '')
             var_count = len(re.findall(r'\{\{(\d+)\}\}', text))
@@ -5662,9 +5667,6 @@ def create_whatsapp_template():
         db.session.rollback()
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
-
-
-
 
 
 _template_def_cache = {}

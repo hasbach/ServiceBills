@@ -144,3 +144,25 @@ def test_create_template_surfaces_meta_error(app, client, monkeypatch):
     })
     assert r.status_code == 400
     assert r.get_json()["error"] == "Template name already exists"
+
+
+def test_create_template_rejects_non_dict_component(app, client):
+    hdr = make_tenant(client, "Biz T15", "t15_admin")
+    _pro_api_mode(app, client, hdr, "biz-t15")
+    r = client.post("/api/whatsapp/templates", headers=hdr, json={
+        "name": "bad_shape", "language": "en", "category": "UTILITY",
+        "components": ["oops"],
+    })
+    assert r.status_code == 400
+    assert "error" in r.get_json()
+
+
+def test_create_template_rejects_null_component_type(app, client):
+    hdr = make_tenant(client, "Biz T16", "t16_admin")
+    _pro_api_mode(app, client, hdr, "biz-t16")
+    r = client.post("/api/whatsapp/templates", headers=hdr, json={
+        "name": "bad_type", "language": "en", "category": "UTILITY",
+        "components": [{"type": None}],
+    })
+    assert r.status_code == 400
+    assert "error" in r.get_json()
