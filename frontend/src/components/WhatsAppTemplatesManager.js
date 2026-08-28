@@ -138,11 +138,10 @@ const WhatsAppTemplatesManager = () => {
 
     const bodyVarCount = countBodyVariables(form.bodyText);
     useEffect(() => {
-        setForm(f => {
-            const samples = [...f.bodySamples];
-            samples.length = bodyVarCount;
-            return { ...f, bodySamples: samples.map(s => s || '') };
-        });
+        setForm(f => ({
+            ...f,
+            bodySamples: Array.from({ length: bodyVarCount }, (_, i) => f.bodySamples[i] || ''),
+        }));
     }, [bodyVarCount]);
 
     const handleSaveTemplate = async () => {
