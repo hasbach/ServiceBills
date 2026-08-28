@@ -5,6 +5,7 @@ import {
     Alert, Collapse, InputAdornment, IconButton, MenuItem,
     ToggleButton, ToggleButtonGroup, Tab, Tabs,
     Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
+    Autocomplete,
 } from '@mui/material';
 import {
     Business as BusinessIcon,
@@ -28,6 +29,7 @@ import { useAppContext } from '../context/AppContext.js';
 import ExpenseCategoryManager from './ExpenseCategoryManager.js';
 import UserManagement from './UserManagement.js';
 import SectorManager from './SectorManager.js';
+import WhatsAppTemplatesManager from './WhatsAppTemplatesManager.js';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
 
@@ -145,6 +147,13 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     // token/ID that's just sitting in the field being viewed -- must click
     // Edit to unlock, and it re-locks after every save.
     const [waCredsEditing, setWaCredsEditing] = useState(false);
+
+    const [approvedTemplates, setApprovedTemplates] = useState([]);
+    useEffect(() => {
+        apiService.fetchWhatsAppTemplates()
+            .then(res => setApprovedTemplates((res.data.templates || []).filter(t => t.status === 'APPROVED')))
+            .catch(() => {}); // Settings page still works with free-text fallback if this fails
+    }, [apiService]);
 
     const fetchWASettings = useCallback(async () => {
         setWaFetching(true);
@@ -314,6 +323,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ px: 2, '& .MuiTab-root': { textTransform: 'none', fontWeight: 600 } }}>
                     <Tab icon={<BusinessIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Business Details" />
                     <Tab icon={<WhatsAppIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="WhatsApp Notifications" />
+                    <Tab icon={<WhatsAppIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="WhatsApp Templates" />
                     <Tab icon={<PaymentsIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Whish Payments" />
                     <Tab icon={<MessageIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Expense Categories" />
                     <Tab icon={<PeopleIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="User Management" />
@@ -516,49 +526,139 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                     <Divider sx={{ my: 3 }} />
                                     <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 2 }}>Approved Template Names</Typography>
                                     <Alert severity="info" sx={{ mb: 2, borderRadius: '12px' }}>
-                                        These must exactly match the template names you approved in Meta Business Manager → WhatsApp → Message Templates.
+                                        Pick from your templates approved via the <strong>WhatsApp Templates</strong> tab above (use its Refresh button to pull in anything approved directly in Meta), or type a template name directly if you haven't synced yet.
                                     </Alert>
                                     <Grid container spacing={2}>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Payment Received Template" placeholder="payment_confirmation" {...waField('template_payment_paid')}
-                                                helperText="Triggered when a payment is marked as paid"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_payment_paid}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_payment_paid: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_payment_paid: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Payment Received Template"
+                                                        helperText="Triggered when a payment is marked as paid"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Subscription Renewed Template" placeholder="subscription_renewal" {...waField('template_subscription_renewed')}
-                                                helperText="Triggered when subscription is renewed"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_subscription_renewed}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_subscription_renewed: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_subscription_renewed: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Subscription Renewed Template"
+                                                        helperText="Triggered when subscription is renewed"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Payment Reminder Template" placeholder="payment_reminder" {...waField('template_payment_reminder')}
-                                                helperText="For future manual or scheduled reminders"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_payment_reminder}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_payment_reminder: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_payment_reminder: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Payment Reminder Template"
+                                                        helperText="For future manual or scheduled reminders"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Current Balance Template" placeholder="current_balance" {...waField('template_current_balance')}
-                                                helperText="For balance & expiry reminders"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_current_balance}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_current_balance: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_current_balance: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Current Balance Template"
+                                                        helperText="For balance & expiry reminders"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Forwarding Alert Template (unused)" placeholder="customer_reply_alert" {...waField('template_forward_alert')}
-                                                helperText="Not sent by the current forwarding flow (see Daily Keep-Alive Template below) — kept only in case you revert to template-only alerts"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_forward_alert}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_forward_alert: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_forward_alert: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Forwarding Alert Template (unused)"
+                                                        helperText="Not sent by the current forwarding flow (see Daily Keep-Alive Template below) — kept only in case you revert to template-only alerts"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Outage Template" placeholder="outage_alert" {...waField('template_bulk_outage')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_outage}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_outage: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_outage: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Outage Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Maintenance Template" placeholder="maintenance_alert" {...waField('template_bulk_maintenance')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_maintenance}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_maintenance: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_maintenance: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Maintenance Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Feature Template" placeholder="feature_update" {...waField('template_bulk_feature')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_feature}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_feature: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_feature: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Feature Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Offer Template" placeholder="special_offer" {...waField('template_bulk_offer')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_offer}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_offer: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_offer: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Offer Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                     </Grid>
 
@@ -624,9 +724,10 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                         <Typography variant="caption" color="text.secondary">
                                             1. Go to <strong>developers.facebook.com</strong> → Create App → Business type<br />
                                             2. Add <strong>WhatsApp</strong> product → Get Phone Number ID + WABA ID<br />
-                                            3. Create a <strong>System User</strong> in Business Settings → Generate token with whatsapp_business_messaging permission<br />
-                                            4. Submit message templates for approval in <strong>Meta Business Manager</strong><br />
-                                            5. Paste credentials above and save
+                                            3. Create a <strong>System User</strong> in Business Settings → Generate a token with both <strong>whatsapp_business_messaging</strong> and <strong>whatsapp_business_management</strong> permissions (the second is required to create/edit/delete templates from this app)<br />
+                                            4. Create and manage your message templates directly in the <strong>WhatsApp Templates</strong> tab above — no need to go to Meta Business Manager for template creation or approval status anymore, only to obtain your account/App ID/credentials<br />
+                                            5. Paste credentials above and save<br />
+                                            6. For real-time approval-status updates, enable <strong>message_template_status_update</strong> as a subscribed webhook field in your Meta App Dashboard (App configuration on Meta's side — this app's UI can't set it for you)
                                         </Typography>
                                     </Box>
                                 </Section>
@@ -643,8 +744,11 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 </Box>
             )}
 
-            {/* ── Tab 2: Whish Payments (tenant-facing customer payments) ── */}
-            {tab === 2 && (
+            {/* ── Tab 2: WhatsApp Templates ── */}
+            {tab === 2 && <WhatsAppTemplatesManager />}
+
+            {/* ── Tab 3: Whish Payments (tenant-facing customer payments) ── */}
+            {tab === 3 && (
                 <Box>
                     {twsFetching || !tenant ? (
                         <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}><CircularProgress /></Box>
@@ -755,20 +859,20 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 </DialogActions>
             </Dialog>
 
-            {/* ── Tab 3: Expense Categories ── */}
-            {tab === 3 && (
+            {/* ── Tab 4: Expense Categories ── */}
+            {tab === 4 && (
                 <Section icon={<MessageIcon />} title="Expense Categories" subtitle="Manage the categories used to classify expenses" color={theme.palette.warning.main}>
                     <ExpenseCategoryManager />
                 </Section>
             )}
 
-            {/* ── Tab 4: User Management ── */}
-            {tab === 4 && (
+            {/* ── Tab 5: User Management ── */}
+            {tab === 5 && (
                 <UserManagement />
             )}
 
-            {/* Tab 5: Sectors */}
-            {tab === 5 && (
+            {/* Tab 6: Sectors */}
+            {tab === 6 && (
                 <SectorManager />
             )}
 

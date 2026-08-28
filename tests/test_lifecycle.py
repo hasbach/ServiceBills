@@ -79,3 +79,21 @@ def test_superadmin_delete_removes_only_that_tenant(app, client):
         assert appmod.Customer.query.filter_by(tenant_id=a_tid).count() == 0
         assert appmod.User.query.filter_by(tenant_id=a_tid).count() == 0
         assert appmod.db.session.get(appmod.Tenant, b_tid) is not None   # B untouched
+
+
+def test_tenant_owned_models_all_in_delete_order():
+    """Guards against the exact bug found and fixed twice before (Phase 3:
+    MonthlyProfitEstimate, Phase 4a: BillingPaymentAttempt) -- a model present
+    in TENANT_OWNED_MODELS but missing from _TENANT_DELETE_ORDER causes a
+    ForeignKeyViolation on Postgres (not SQLite, which doesn't enforce FKs)
+    when a tenant is deleted. Known pre-existing gaps are excluded here (see
+    the separate _TENANT_DELETE_ORDER cleanup follow-up, not part of this
+    plan) so this test only guards against NEW regressions -- starting with
+    WhatsAppTemplate, added by this task."""
+    known_pre_existing_gaps = {
+        appmod.Employee, appmod.SalaryCharge, appmod.SalaryPayment,
+        appmod.UpstreamProvider, appmod.UpstreamProviderPayment, appmod.MikrotikServer,
+        appmod.ExchangeRate,
+    }
+    missing = set(appmod.TENANT_OWNED_MODELS) - set(appmod._TENANT_DELETE_ORDER) - known_pre_existing_gaps
+    assert missing == set(), f"Models missing from _TENANT_DELETE_ORDER: {missing}"

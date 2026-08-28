@@ -955,6 +955,38 @@ class WhatsAppSettings(db.Model):
             'last_forwarding_keepalive_sent_at': self.last_forwarding_keepalive_sent_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_forwarding_keepalive_sent_at else None,
         }
 
+class WhatsAppTemplate(db.Model):
+    """Local cache of a tenant's Meta WhatsApp message templates. Meta is the
+    source of truth; this table exists for fast list rendering and as the
+    target of the message_template_status_update webhook. Reconciled against
+    Meta's live GET on manual refresh (POST /api/whatsapp/templates/sync).
+    See docs/superpowers/specs/2026-08-28-whatsapp-template-management-design.md."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    name = db.Column(db.String(200), nullable=False)
+    language = db.Column(db.String(10), nullable=False)
+    category = db.Column(db.String(20), nullable=False)  # 'MARKETING' | 'UTILITY'
+    status = db.Column(db.String(20), nullable=False, default='PENDING')  # PENDING, APPROVED, REJECTED, PAUSED, DISABLED
+    rejected_reason = db.Column(db.String(500), nullable=True)
+    components = db.Column(db.JSON, nullable=False)
+    meta_template_id = db.Column(db.String(64), nullable=True, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'language': self.language,
+            'category': self.category,
+            'status': self.status,
+            'rejected_reason': self.rejected_reason,
+            'components': self.components,
+            'meta_template_id': self.meta_template_id,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
+        }
+
 class TenantWhishSettings(db.Model):
     """A tenant's own Whish merchant credentials, for accepting payments from
     THEIR customers -- distinct from the platform-wide WHISH_CHANNEL/WHISH_SECRET
@@ -1155,7 +1187,7 @@ class ExchangeRate(db.Model):
 TENANT_OWNED_MODELS = (
     Reseller, ResellerPayment, Customer, SubscriptionPlan, Sector, Supplier,
     SupplierPayment, ExpenseCategory, Expense, Payment, GeneratedReceipt,
-    AddonPurchase, BusinessSettings, WhatsAppSettings, TenantWhishSettings,
+    AddonPurchase, BusinessSettings, WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings,
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
     CustomerFeedback, PaymentReminder, UpgradeRequest, BillingPaymentAttempt,
     Employee, SalaryCharge, SalaryPayment,
@@ -1938,9 +1970,9 @@ def tenant_export():
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
     UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
-    CustomerFeedback, ServiceStatus, Payment, ResellerPayment, SupplierPayment,
+    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment,
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
-    WhatsAppSettings, ExpenseCategory, Sector,
+    WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
     # Phase 3 fix: MonthlyProfitEstimate was missing here entirely. SQLite
     # doesn't enforce FK constraints, so a tenant delete silently orphaned
@@ -5500,58 +5532,259 @@ def subscribe_waba():
         return jsonify({'error': str(e)}), 500
 
 
+def _parse_meta_error(resp):
+    """Meta's template-management errors carry the actionable message under
+    error.error_user_msg (shown to end users) or error.message (developer-
+    facing) -- surface it verbatim rather than a generic failure, matching
+    the pattern already used for Whish checkout rejections."""
+    try:
+        err = resp.json().get('error', {})
+        return err.get('error_user_msg') or err.get('message') or resp.text
+    except Exception:
+        return resp.text
+
+
 @app.route('/api/whatsapp/templates', methods=['GET'])
 @jwt_required()
-def get_meta_templates():
-    try:
-        settings = tenant_query(WhatsAppSettings).first()
-        meta_templates = []
-        if settings and settings.access_token and settings.business_account_id:
-            try:
-                api_version = settings.api_version or 'v19.0'
-                url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates?limit=100'
-                headers = {'Authorization': f'Bearer {settings.access_token}'}
-                resp = requests.get(url, headers=headers, timeout=10)
-                if resp.ok:
-                    data = resp.json().get('data', [])
-                    for t in data:
-                        if t.get('status') == 'APPROVED':
-                            if settings.business_account_id:
-                                _template_def_cache[(settings.business_account_id, t.get('name'))] = (time.time(), t)
-                            if settings.phone_number_id:
-                                _template_def_cache[(settings.phone_number_id, t.get('name'))] = (time.time(), t)
-                            meta_templates.append({
-                                'name': t.get('name'),
-                                'language': t.get('language', 'en'),
-                                'category': t.get('category', 'MARKETING'),
-                                'components': t.get('components', [])
-                            })
-            except Exception as ex:
-                logging.error(f"Failed fetching Meta templates: {ex}")
+def get_whatsapp_templates():
+    templates = tenant_query(WhatsAppTemplate).order_by(WhatsAppTemplate.created_at.desc()).all()
+    return jsonify({'templates': [t.to_dict() for t in templates]}), 200
 
-        if not meta_templates:
-            if settings:
-                for attr in ['template_bulk_offer', 'template_bulk_feature', 'template_bulk_outage', 'template_bulk_maintenance', 'template_payment_paid', 'template_subscription_renewed']:
-                    val = getattr(settings, attr, None)
-                    if val and val not in [m['name'] for m in meta_templates]:
-                        meta_templates.append({
-                            'name': val,
-                            'language': settings.template_language or 'en',
-                            'category': 'MARKETING',
-                            'components': [{'type': 'BODY', 'text': f'Configured template: {val}'}]
-                        })
-            if not meta_templates:
-                meta_templates = [
-                    {'name': 'special_offer', 'language': 'en', 'category': 'MARKETING', 'components': [{'type': 'BODY', 'text': 'Special offer notification template'}]},
-                    {'name': 'feature_update', 'language': 'en', 'category': 'MARKETING', 'components': [{'type': 'BODY', 'text': 'Feature update notification template'}]},
-                    {'name': 'marketing_promo', 'language': 'en', 'category': 'MARKETING', 'components': [{'type': 'BODY', 'text': 'Promotional marketing message template'}]}
-                ]
-        return jsonify({'templates': meta_templates}), 200
+
+@app.route('/api/whatsapp/templates/sync', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def sync_whatsapp_templates():
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    if not settings.access_token or not settings.business_account_id:
+        return jsonify({'error': 'Please configure your WABA ID and Access Token first.'}), 400
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates?limit=100'
+        headers = {'Authorization': f'Bearer {settings.access_token}'}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if not resp.ok:
+            return jsonify({'error': _parse_meta_error(resp)}), 400
+        remote = resp.json().get('data', [])
+        synced = 0
+        for t in remote:
+            name = t.get('name')
+            language = t.get('language', 'en')
+            if not name:
+                continue
+            row = tenant_query(WhatsAppTemplate).filter_by(name=name, language=language).first()
+            if not row:
+                row = new_for_tenant(WhatsAppTemplate, name=name, language=language, components=t.get('components', []))
+                db.session.add(row)
+            row.category = t.get('category', 'MARKETING')
+            row.status = t.get('status', 'PENDING')
+            row.components = t.get('components', [])
+            row.meta_template_id = t.get('id')
+            row.updated_at = datetime.utcnow()
+            synced += 1
+        db.session.commit()
+        return jsonify({'message': f'Synced {synced} template(s) from Meta.',
+                         'templates': [t.to_dict() for t in tenant_query(WhatsAppTemplate).all()]}), 200
     except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
+_ALLOWED_TEMPLATE_CATEGORIES = {'MARKETING', 'UTILITY'}
 
+
+def _validate_template_components(components):
+    """Server-side shape validation before ever calling Meta -- catches the
+    cheap mistakes locally so a tenant isn't waiting on a round-trip to Meta
+    just to learn BODY was missing. Meta's own API remains the final word on
+    anything more subtle (policy, wording, button-count limits)."""
+    has_body = False
+    for c in components or []:
+        if not isinstance(c, dict):
+            return "Each component must be an object with a 'type' field."
+        ctype = c.get('type') or ''
+        if not isinstance(ctype, str):
+            return "Each component's 'type' must be a string."
+        if ctype.upper() == 'BODY':
+            has_body = True
+            text = c.get('text', '')
+            var_count = len(re.findall(r'\{\{(\d+)\}\}', text))
+            example = (c.get('example') or {}).get('body_text')
+            if var_count > 0 and not example:
+                return f"BODY has {var_count} variable(s) but no sample values were provided."
+    if not has_body:
+        return "A template must have a BODY component."
+    return None
+
+
+@app.route('/api/whatsapp/templates', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def create_whatsapp_template():
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    if not settings.access_token or not settings.business_account_id:
+        return jsonify({'error': 'Please configure your WABA ID and Access Token first.'}), 400
+
+    data = request.json or {}
+    name = (data.get('name') or '').strip()
+    language = (data.get('language') or '').strip()
+    category = (data.get('category') or '').strip().upper()
+    components = data.get('components') or []
+
+    if not name or not language:
+        return jsonify({'error': 'Name and language are required.'}), 400
+    if category not in _ALLOWED_TEMPLATE_CATEGORIES:
+        return jsonify({'error': f"Category must be one of {sorted(_ALLOWED_TEMPLATE_CATEGORIES)}."}), 400
+    error = _validate_template_components(components)
+    if error:
+        return jsonify({'error': error}), 400
+
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates'
+        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+        payload = {'name': name, 'language': language, 'category': category, 'components': components}
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if not resp.ok:
+            return jsonify({'error': _parse_meta_error(resp)}), 400
+        body = resp.json()
+        row = new_for_tenant(WhatsAppTemplate, name=name, language=language, category=category,
+                              status=body.get('status', 'PENDING'), components=components,
+                              meta_template_id=body.get('id'))
+        db.session.add(row)
+        db.session.commit()
+        return jsonify({'message': 'Template submitted to Meta for review.', 'template': row.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/whatsapp/templates/<int:template_id>', methods=['PUT'])
+@jwt_required()
+@admin_or_finance_required()
+def update_whatsapp_template(template_id):
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    row = tenant_query(WhatsAppTemplate).filter_by(id=template_id).first()
+    if not row:
+        return jsonify({'error': 'Template not found.'}), 404
+    if row.status == 'APPROVED':
+        return jsonify({'error': 'An approved template cannot be edited -- create a new template instead.'}), 400
+    if not row.meta_template_id:
+        return jsonify({'error': 'This template has no known Meta template ID to edit.'}), 400
+
+    data = request.json or {}
+    components = data.get('components') or row.components
+    error = _validate_template_components(components)
+    if error:
+        return jsonify({'error': error}), 400
+
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{row.meta_template_id}'
+        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+        resp = requests.post(url, headers=headers, json={'components': components}, timeout=15)
+        if not resp.ok:
+            return jsonify({'error': _parse_meta_error(resp)}), 400
+        row.components = components
+        row.status = 'PENDING'
+        row.rejected_reason = None
+        row.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'message': 'Template updated and resubmitted for review.', 'template': row.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/whatsapp/templates/<int:template_id>', methods=['DELETE'])
+@jwt_required()
+@admin_or_finance_required()
+def delete_whatsapp_template(template_id):
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    row = tenant_query(WhatsAppTemplate).filter_by(id=template_id).first()
+    if not row:
+        return jsonify({'error': 'Template not found.'}), 404
+    try:
+        if settings.access_token and settings.business_account_id:
+            api_version = settings.api_version or 'v19.0'
+            url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates?name={row.name}'
+            headers = {'Authorization': f'Bearer {settings.access_token}'}
+            resp = requests.delete(url, headers=headers, timeout=10)
+            if not resp.ok:
+                return jsonify({'error': _parse_meta_error(resp)}), 400
+        db.session.delete(row)
+        db.session.commit()
+        return jsonify({'message': 'Template deleted.'}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/whatsapp/templates/upload-sample', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def upload_whatsapp_template_sample():
+    """Uploads a sample media file for a media (image/video/document) HEADER
+    component via Meta's resumable-upload API, returning the 'handle' Meta
+    requires in the template's example.header_handle at submission time.
+    Two-step flow: create an upload session, then upload the file bytes."""
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    if not settings.access_token or not settings.app_id:
+        return jsonify({'error': 'Please configure your App ID and Access Token first.'}), 400
+
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'No file provided.'}), 400
+    file_bytes = file.read()
+
+    try:
+        api_version = settings.api_version or 'v19.0'
+        session_url = f'https://graph.facebook.com/{api_version}/{settings.app_id}/uploads'
+        session_resp = requests.post(session_url, params={
+            'file_length': len(file_bytes),
+            'file_type': file.mimetype or 'application/octet-stream',
+            'access_token': settings.access_token,
+        }, timeout=15)
+        if not session_resp.ok:
+            return jsonify({'error': _parse_meta_error(session_resp)}), 400
+        upload_session_id = session_resp.json().get('id')
+        if not upload_session_id:
+            return jsonify({'error': 'Meta did not return an upload session ID.'}), 400
+
+        upload_url = f'https://graph.facebook.com/{api_version}/{upload_session_id}'
+        upload_headers = {'Authorization': f'OAuth {settings.access_token}'}
+        upload_resp = requests.post(upload_url, headers=upload_headers, data=file_bytes, timeout=30)
+        if not upload_resp.ok:
+            return jsonify({'error': _parse_meta_error(upload_resp)}), 400
+        handle = upload_resp.json().get('h')
+        if not handle:
+            return jsonify({'error': 'Meta did not return an upload handle.'}), 400
+        return jsonify({'header_handle': handle}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 _template_def_cache = {}
@@ -6603,6 +6836,43 @@ def whatsapp_webhook():
             for entry in data.get('entry', []):
                 for change in entry.get('changes', []):
                     val = change.get('value', {})
+
+                    if change.get('field') == 'message_template_status_update':
+                        waba_id = entry.get('id')
+                        tpl_matches = WhatsAppSettings.query.filter_by(business_account_id=waba_id).all() if waba_id else []
+                        tpl_settings = tpl_matches[0] if tpl_matches else None
+                        if not tpl_settings:
+                            logging.warning(f"WhatsApp template status webhook: no tenant for business_account_id={waba_id}; skipping.")
+                            continue
+                        if len(tpl_matches) > 1:
+                            logging.warning(f"WhatsApp template status webhook: {len(tpl_matches)} settings rows share business_account_id={waba_id} "
+                                             f"(tenant_ids={[m.tenant_id for m in tpl_matches]}); using settings.id={tpl_settings.id} tenant_id={tpl_settings.tenant_id}.")
+                        if not tpl_settings.app_secret or not signature_header.startswith('sha256='):
+                            logging.warning(f"WhatsApp template status webhook: missing app_secret/signature for tenant_id={tpl_settings.tenant_id}; rejecting.")
+                            return jsonify({'error': 'Invalid signature'}), 401
+                        tpl_expected_sig = hmac.new(tpl_settings.app_secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+                        tpl_provided_sig = signature_header[len('sha256='):]
+                        if not hmac.compare_digest(tpl_expected_sig, tpl_provided_sig):
+                            logging.warning(f"WhatsApp template status webhook: signature mismatch for tenant_id={tpl_settings.tenant_id}; rejecting.")
+                            return jsonify({'error': 'Invalid signature'}), 401
+
+                        tpl_name = val.get('message_template_name')
+                        tpl_language = val.get('message_template_language')
+                        tpl_new_status = val.get('event')
+                        tpl_reason = val.get('reason')
+                        if tpl_name and tpl_new_status:
+                            tpl_row = WhatsAppTemplate.query.filter_by(
+                                tenant_id=tpl_settings.tenant_id, name=tpl_name, language=tpl_language).first()
+                            if tpl_row:
+                                tpl_row.status = tpl_new_status
+                                tpl_row.rejected_reason = tpl_reason
+                                tpl_row.updated_at = datetime.utcnow()
+                                db.session.commit()
+                                logging.info(f"WhatsApp template status webhook: tenant_id={tpl_settings.tenant_id} name={tpl_name} -> {tpl_new_status}")
+                            else:
+                                logging.warning(f"WhatsApp template status webhook: no local WhatsAppTemplate for tenant_id={tpl_settings.tenant_id} name={tpl_name} language={tpl_language}; skipping.")
+                        continue
+
                     messages = val.get('messages', [])
                     contacts = val.get('contacts', [])
 
