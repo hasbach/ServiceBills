@@ -274,6 +274,8 @@ const rawApiService = {
     createWhatsAppTemplate: (data) => api.post('/whatsapp/templates', data),
     updateWhatsAppTemplate: (id, data) => api.put(`/whatsapp/templates/${id}`, data),
     deleteWhatsAppTemplate: (id) => api.delete(`/whatsapp/templates/${id}`),
+    uploadWhatsAppTemplateSample: (formData) => api.post('/whatsapp/templates/upload-sample', formData,
+        { headers: { 'Content-Type': 'multipart/form-data' } }),
 };
 
 export const apiService = Object.fromEntries(

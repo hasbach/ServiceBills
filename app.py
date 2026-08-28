@@ -5738,6 +5738,55 @@ def delete_whatsapp_template(template_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/whatsapp/templates/upload-sample', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def upload_whatsapp_template_sample():
+    """Uploads a sample media file for a media (image/video/document) HEADER
+    component via Meta's resumable-upload API, returning the 'handle' Meta
+    requires in the template's example.header_handle at submission time.
+    Two-step flow: create an upload session, then upload the file bytes."""
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    if not settings.access_token or not settings.app_id:
+        return jsonify({'error': 'Please configure your App ID and Access Token first.'}), 400
+
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'No file provided.'}), 400
+    file_bytes = file.read()
+
+    try:
+        api_version = settings.api_version or 'v19.0'
+        session_url = f'https://graph.facebook.com/{api_version}/{settings.app_id}/uploads'
+        session_resp = requests.post(session_url, params={
+            'file_length': len(file_bytes),
+            'file_type': file.mimetype or 'application/octet-stream',
+            'access_token': settings.access_token,
+        }, timeout=15)
+        if not session_resp.ok:
+            return jsonify({'error': _parse_meta_error(session_resp)}), 400
+        upload_session_id = session_resp.json().get('id')
+        if not upload_session_id:
+            return jsonify({'error': 'Meta did not return an upload session ID.'}), 400
+
+        upload_url = f'https://graph.facebook.com/{api_version}/{upload_session_id}'
+        upload_headers = {'Authorization': f'OAuth {settings.access_token}'}
+        upload_resp = requests.post(upload_url, headers=upload_headers, data=file_bytes, timeout=30)
+        if not upload_resp.ok:
+            return jsonify({'error': _parse_meta_error(upload_resp)}), 400
+        handle = upload_resp.json().get('h')
+        if not handle:
+            return jsonify({'error': 'Meta did not return an upload handle.'}), 400
+        return jsonify({'header_handle': handle}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 _template_def_cache = {}
 
 def normalize_whatsapp_phone(phone_raw):

@@ -1,3 +1,5 @@
+import io
+
 import app as appmod
 from tests.conftest import make_tenant
 
@@ -281,3 +283,34 @@ def test_update_template_tenant_isolation(app, client):
     with app.app_context():
         row = appmod.db.session.get(appmod.WhatsAppTemplate, tpl_id)
         assert row.status == "PENDING"  # untouched by the other tenant's attempt
+
+
+def test_upload_sample_two_step_flow(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz T13", "t13_admin")
+    _pro_api_mode(app, client, hdr, "biz-t13")
+
+    calls = []
+
+    def fake_post(url, timeout, headers=None, params=None, data=None):
+        calls.append((url, params, headers))
+        if len(calls) == 1:
+            return FakeResponse(json_data={"id": "upload:session123"})
+        return FakeResponse(json_data={"h": "HANDLE_ABC"})
+
+    monkeypatch.setattr(appmod.requests, "post", fake_post)
+
+    r = client.post("/api/whatsapp/templates/upload-sample", headers=hdr,
+                    data={"file": (io.BytesIO(b"fake-image-bytes"), "sample.jpg")},
+                    content_type="multipart/form-data")
+    assert r.status_code == 200
+    assert r.get_json()["header_handle"] == "HANDLE_ABC"
+    assert len(calls) == 2
+    assert calls[0][1]["file_type"]  # file_type param sent on session creation
+    assert calls[1][2]["Authorization"].startswith("OAuth ")
+
+
+def test_upload_sample_requires_file(app, client):
+    hdr = make_tenant(client, "Biz T14", "t14_admin")
+    _pro_api_mode(app, client, hdr, "biz-t14")
+    r = client.post("/api/whatsapp/templates/upload-sample", headers=hdr, data={}, content_type="multipart/form-data")
+    assert r.status_code == 400
