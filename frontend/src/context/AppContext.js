@@ -139,6 +139,16 @@ const rawApiService = {
     deleteMikrotikServer: (id) => api.delete(`/mikrotik-servers/${id}`),
     testMikrotikConnection: (id) => api.post(`/mikrotik-servers/${id}/test-connection`),
 
+    // Network Device API methods (device-health monitoring, independent of
+    // MikrotikServer/PPPoE -- see
+    // docs/superpowers/specs/2026-09-01-network-device-health-monitoring-design.md)
+    fetchNetworkDevices: () => api.get('/network-devices'),
+    addNetworkDevice: (data) => api.post('/network-devices', data),
+    updateNetworkDevice: (id, data) => api.put(`/network-devices/${id}`, data),
+    deleteNetworkDevice: (id) => api.delete(`/network-devices/${id}`),
+    checkNetworkDeviceNow: (id) => api.post(`/network-devices/${id}/check-now`),
+    setNetworkDeviceInterfaceLabel: (id, data) => api.patch(`/network-devices/${id}/interface-labels`, data),
+
     // Customer <-> Mikrotik live actions (staff-confirmed only, see spec)
     fetchCustomerMikrotikStatus: (customerId) => api.get(`/customers/${customerId}/mikrotik-status`),
     suspendCustomerMikrotik: (customerId) => api.post(`/customers/${customerId}/mikrotik-suspend`),
