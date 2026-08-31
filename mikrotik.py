@@ -1,4 +1,10 @@
-"""RouterOS API adapter for MikrotikServer (self-hosted local PPPoE).
+"""RouterOS API adapter for MikrotikServer (self-hosted local PPPoE) and
+NetworkDevice (on-demand device-health monitoring, e.g. a core CCR) -- the
+two models are independent (see docs/superpowers/specs/2026-09-01-network-
+device-health-monitoring-design.md for why), but both are plain RouterOS
+routers reached the same way, so they're duck-typed on the same connection
+fields (host/username/password/api_port/use_tls/last_checked_at/last_status)
+and share this one adapter.
 
 See docs/superpowers/specs/2026-08-12-network-enforcement-design.md, Concept B.
 

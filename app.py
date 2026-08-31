@@ -7613,7 +7613,11 @@ def set_network_device_interface_label(device_id):
     if not interface_name:
         return jsonify({'error': 'interface_name is required'}), 400
     labels = dict(device.interface_labels or {})
-    labels[interface_name] = data.get('label') or None
+    label = data.get('label') or None
+    if label:
+        labels[interface_name] = label
+    else:
+        labels.pop(interface_name, None)
     device.interface_labels = labels
     db.session.commit()
     return jsonify({'device': device.to_dict()}), 200
