@@ -335,6 +335,46 @@ class MikrotikServer(db.Model):
             'last_status': self.last_status
         }
 
+class NetworkDevice(db.Model):
+    """A network device the tenant owns, monitored for RouterOS-level health
+    (reachability, uptime, interface status) -- independent of MikrotikServer,
+    which is specifically about local PPPoE secret management. A tenant's CCR
+    can run in bridge mode (no local PPPoE) and still be worth monitoring here.
+    On-demand only: no scheduled job, no history -- see
+    docs/superpowers/specs/2026-09-01-network-device-health-monitoring-design.md."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    name = db.Column(db.String(100), nullable=False)
+    host = db.Column(db.String(255), nullable=False)
+    api_port = db.Column(db.Integer, nullable=False, default=8728)
+    use_tls = db.Column(db.Boolean, nullable=False, default=False)
+    username = db.Column(db.String(100), nullable=False)
+    password = db.Column(EncryptedString, nullable=False)  # encrypted at rest
+    status = db.Column(db.String(20), default='active')
+    # Set opportunistically by the most recent "Check Now" click -- there is
+    # no standalone scheduled health-check job in this scope.
+    last_checked_at = db.Column(db.DateTime, nullable=True)
+    last_status = db.Column(db.String(20), nullable=True)  # 'online', 'unreachable', 'auth_failed'
+    # Raw RouterOS interface name -> staff-assigned friendly label, e.g.
+    # {"ether1": "thglobal", "sfp1": "smart networks"}. Populated by staff
+    # after a first Check Now reveals the device's real interface names --
+    # nobody has confirmed the exact interface-to-upstream mapping in advance.
+    interface_labels = db.Column(db.JSON, nullable=False, default=dict)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'host': self.host,
+            'api_port': self.api_port,
+            'use_tls': self.use_tls,
+            'username': self.username,
+            'status': self.status,
+            'last_checked_at': self.last_checked_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_checked_at else None,
+            'last_status': self.last_status,
+            'interface_labels': self.interface_labels or {},
+        }
+
 class Customer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -1024,7 +1064,7 @@ TENANT_OWNED_MODELS = (
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
-    ExchangeRate,
+    ExchangeRate, NetworkDevice,
 )
 
 from sqlalchemy import event as _sa_event
