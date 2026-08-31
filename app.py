@@ -7509,6 +7509,115 @@ def test_mikrotik_connection(server_id):
     return jsonify({'ok': ok, 'message': message, 'server': server.to_dict()}), 200
 
 
+@app.route('/api/network-devices', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_network_devices():
+    devices = tenant_query(NetworkDevice).order_by(NetworkDevice.name).all()
+    return jsonify([d.to_dict() for d in devices]), 200
+
+@app.route('/api/network-devices', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def create_network_device():
+    data = request.json
+    try:
+        if not data.get('password'):
+            return jsonify({'error': 'password is required'}), 400
+        device = NetworkDevice(
+            name=data['name'],
+            host=data['host'],
+            api_port=int(data.get('api_port') or (8729 if data.get('use_tls') else 8728)),
+            use_tls=bool(data.get('use_tls', False)),
+            username=data['username'],
+            password=data['password'],
+            status=data.get('status', 'active'),
+        )
+        db.session.add(device)
+        db.session.commit()
+        return jsonify({'message': 'Network device created successfully!', 'device': device.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/network-devices/<int:device_id>', methods=['PUT'])
+@jwt_required()
+@admin_or_finance_required()
+def update_network_device(device_id):
+    data = request.json
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Network device not found!'}), 404
+    try:
+        device.name = data.get('name', device.name)
+        device.host = data.get('host', device.host)
+        if 'api_port' in data:
+            device.api_port = int(data['api_port'])
+        if 'use_tls' in data:
+            device.use_tls = bool(data['use_tls'])
+        device.username = data.get('username', device.username)
+        # Leave the stored password unchanged unless a new one is actually
+        # provided -- the edit form never pre-fills this field.
+        if data.get('password'):
+            device.password = data['password']
+        if 'status' in data:
+            device.status = data['status']
+        db.session.commit()
+        return jsonify({'message': 'Network device updated successfully!', 'device': device.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/network-devices/<int:device_id>', methods=['DELETE'])
+@jwt_required()
+@admin_or_finance_required()
+def delete_network_device(device_id):
+    try:
+        device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+        if not device:
+            return jsonify({'message': 'Network device not found!'}), 404
+        db.session.delete(device)
+        db.session.commit()
+        return jsonify({'message': 'Network device deleted successfully!'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/network-devices/<int:device_id>/check-now', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def check_network_device_now(device_id):
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Network device not found!'}), 404
+    ok, result = mikrotik.get_device_health(device)
+    db.session.commit()  # persists last_checked_at/last_status set by get_device_health
+    if not ok:
+        return jsonify({'ok': False, 'message': result, 'health': None, 'device': device.to_dict()}), 200
+    labels = device.interface_labels or {}
+    health = dict(result)
+    health['interfaces'] = [
+        {**iface, 'label': labels.get(iface['name'])} for iface in result['interfaces']
+    ]
+    return jsonify({'ok': True, 'message': None, 'health': health, 'device': device.to_dict()}), 200
+
+@app.route('/api/network-devices/<int:device_id>/interface-labels', methods=['PATCH'])
+@jwt_required()
+@admin_or_finance_required()
+def set_network_device_interface_label(device_id):
+    data = request.json
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Network device not found!'}), 404
+    interface_name = data.get('interface_name')
+    if not interface_name:
+        return jsonify({'error': 'interface_name is required'}), 400
+    labels = dict(device.interface_labels or {})
+    labels[interface_name] = data.get('label') or None
+    device.interface_labels = labels
+    db.session.commit()
+    return jsonify({'device': device.to_dict()}), 200
+
 # --- Live actions on a customer's PPPoE secret (Concept B). Staff-triggered
 # only -- nothing in the app calls these automatically off a billing rule. ---
 
