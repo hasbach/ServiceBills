@@ -49,9 +49,11 @@ class FakePath:
 
 
 class FakeApi:
-    def __init__(self, secret_rows=None, active_rows=None):
+    def __init__(self, secret_rows=None, active_rows=None, resource_rows=None, interface_rows=None):
         self.secret_rows = secret_rows if secret_rows is not None else []
         self.active_rows = active_rows if active_rows is not None else []
+        self.resource_rows = resource_rows if resource_rows is not None else [{"uptime": "1w2d3h4m5s"}]
+        self.interface_rows = interface_rows if interface_rows is not None else []
         self.updates = []
         self.captured = {}
         self.closed = False
@@ -63,6 +65,10 @@ class FakeApi:
             return FakePath(self.active_rows, self.captured, self.updates)
         if parts == ("system", "identity"):
             return FakePath([{"name": "test-router"}], self.captured, self.updates)
+        if parts == ("system", "resource"):
+            return FakePath(self.resource_rows, self.captured, self.updates)
+        if parts == ("interface",):
+            return FakePath(self.interface_rows, self.captured, self.updates)
         raise AssertionError(f"unexpected path {parts}")
 
     def close(self):
@@ -218,3 +224,69 @@ def test_test_connection_marks_online_on_success(monkeypatch):
     assert server.last_status == "online"
     assert server.last_checked_at is not None
     assert api.closed is True
+
+
+# --- get_device_health ---
+
+def test_get_device_health_success(monkeypatch):
+    server = make_server()
+    api = FakeApi(
+        resource_rows=[{"uptime": "3w1d00:12:34"}],
+        interface_rows=[
+            {"name": "ether1", "running": True, "disabled": False},
+            {"name": "sfp1", "running": False, "disabled": True},
+        ],
+    )
+    monkeypatch.setattr(mikrotik, "_connect", lambda s: api)
+
+    ok, health = mikrotik.get_device_health(server)
+
+    assert ok is True
+    assert health["identity"] == "test-router"
+    assert health["uptime"] == "3w1d00:12:34"
+    assert health["interfaces"] == [
+        {"name": "ether1", "running": True, "disabled": False},
+        {"name": "sfp1", "running": False, "disabled": True},
+    ]
+
+
+def test_get_device_health_marks_online_on_success(monkeypatch):
+    server = make_server()
+    api = FakeApi()
+    monkeypatch.setattr(mikrotik, "_connect", lambda s: api)
+
+    ok, health = mikrotik.get_device_health(server)
+
+    assert ok is True
+    assert server.last_status == "online"
+    assert server.last_checked_at is not None
+    assert api.closed is True
+
+
+def test_get_device_health_unreachable_never_raises(monkeypatch):
+    server = make_server()
+
+    def boom(s):
+        raise OSError("Connection refused")
+
+    monkeypatch.setattr(mikrotik, "_connect", boom)
+
+    ok, message = mikrotik.get_device_health(server)
+
+    assert ok is False
+    assert isinstance(message, str) and message
+    assert server.last_status == "unreachable"
+
+
+def test_get_device_health_auth_failed_never_raises(monkeypatch):
+    server = make_server()
+
+    def boom(s):
+        raise TrapError(message="cannot log in")
+
+    monkeypatch.setattr(mikrotik, "_connect", boom)
+
+    ok, message = mikrotik.get_device_health(server)
+
+    assert ok is False
+    assert server.last_status == "auth_failed"

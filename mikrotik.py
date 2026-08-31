@@ -176,3 +176,48 @@ def get_active_session(server, pppoe_username):
     except _CONNECTION_ERRORS as e:
         logger.warning("Mikrotik get_active_session failed for server %s: %s", server.id, e)
         return False, str(e) or e.__class__.__name__
+
+
+def get_device_health(server):
+    """Read this device's identity, uptime, and interface list.
+
+    Deliberately generic -- returns whatever interfaces RouterOS reports
+    rather than filtering/renaming them. Nobody has confirmed the exact
+    interface-to-upstream mapping (VLAN vs physical port) in advance, so
+    staff label the raw names via the app UI after seeing a first result,
+    rather than this module guessing at a mapping.
+
+    Side effect: sets server.last_checked_at / server.last_status -- caller
+    is responsible for committing.
+
+    Returns (ok: bool, health_or_message). On success, health_or_message is
+    a dict: {"identity": str, "uptime": str, "interfaces": [{"name": str,
+    "running": bool, "disabled": bool}, ...]}. On failure it is a
+    human-readable error message.
+    """
+    try:
+        api = _connect(server)
+        try:
+            identity_rows = list(api.path("system", "identity").select())
+            resource_rows = list(api.path("system", "resource").select())
+            interface_rows = list(api.path("interface").select())
+        finally:
+            _safe_close(api)
+        health = {
+            "identity": identity_rows[0]["name"] if identity_rows else "",
+            "uptime": resource_rows[0].get("uptime", "") if resource_rows else "",
+            "interfaces": [
+                {
+                    "name": row.get("name", ""),
+                    "running": bool(row.get("running")),
+                    "disabled": bool(row.get("disabled")),
+                }
+                for row in interface_rows
+            ],
+        }
+        _mark_checked(server, "online")
+        return True, health
+    except _CONNECTION_ERRORS as e:
+        _mark_checked(server, _classify_error(e))
+        logger.warning("Mikrotik get_device_health failed for server %s: %s", server.id, e)
+        return False, str(e) or e.__class__.__name__
