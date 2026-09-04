@@ -27,6 +27,7 @@ import os
 import shutil
 import tempfile
 
+import pytest
 import sqlalchemy as sa
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
@@ -68,6 +69,11 @@ def _table_names(engine):
 # top of the merge revision 6129b0fb0885 -- the current Alembic head at the
 # time this was written.
 NETWORK_AGENT_REVISION = "5f65a6fd6e8d"
+
+# Task 5 review fix: tightens network_agent.tenant_id from 5f65a6fd6e8d's
+# plain, non-unique index to a unique constraint -- the schema-level backstop
+# for "one agent per tenant" (see that migration file for the full story).
+TENANT_UNIQUE_REVISION = "b71fe5010a39"
 
 
 def test_migration_chain_adds_and_removes_topology_columns():
@@ -183,6 +189,117 @@ def test_network_agent_migration_adds_and_removes_its_tables_and_column():
             assert "network_agent" in _table_names(engine)
             assert "network_agent_job" in _table_names(engine)
             assert "network_access_mode" in _table_columns(engine, "business_settings")
+
+            engine.dispose()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _unique_constraint_columns(engine, table_name):
+    return [tuple(uc["column_names"])
+            for uc in sa.inspect(engine).get_unique_constraints(table_name)]
+
+
+# The exact shape network_agent.tenant_id had right after 5f65a6fd6e8d's own
+# upgrade(): a plain, non-unique index, not yet the unique constraint
+# TENANT_UNIQUE_REVISION adds. Built by hand (rather than reusing
+# appmod.db.metadata, which already reflects the *post*-fix model) so the
+# bootstrapped schema below genuinely represents the pre-migration state.
+_PRE_UNIQUE_METADATA = sa.MetaData()
+# A stub, uncreated 'tenant' table -- present only so the FK below can
+# resolve its target within this standalone MetaData at DDL-compile time.
+# The real tenant table already exists in the target DB by the time
+# _pre_unique_network_agent.create() runs (via appmod.db.metadata.create_all()
+# below); this Table object is never itself .create()'d.
+sa.Table('tenant', _PRE_UNIQUE_METADATA, sa.Column('id', sa.Integer, primary_key=True))
+_pre_unique_network_agent = sa.Table(
+    'network_agent', _PRE_UNIQUE_METADATA,
+    sa.Column('id', sa.Integer, primary_key=True),
+    sa.Column('tenant_id', sa.Integer, sa.ForeignKey('tenant.id'), nullable=False),
+    sa.Column('name', sa.String(100), nullable=False),
+    sa.Column('token_hash', sa.String(255), nullable=False),
+    sa.Column('last_seen_at', sa.DateTime()),
+    sa.Column('agent_version', sa.String(20)),
+    sa.Column('created_at', sa.DateTime()),
+    sa.Index('ix_network_agent_tenant_id', 'tenant_id', unique=False),
+)
+
+
+def test_network_agent_tenant_unique_migration_adds_and_removes_the_constraint():
+    """Proves TENANT_UNIQUE_REVISION's upgrade()/downgrade() genuinely turn
+    network_agent.tenant_id's plain index into a real unique constraint and
+    back -- the schema-level backstop for "one agent per tenant" (Task 5
+    review finding 2: the create route's pre-insert check alone can't stop
+    two concurrent creates from both inserting).
+
+    Bootstrapped the same way test_network_agent_migration_adds_and_removes_its_tables_and_column
+    above is: walking the real chain from base hits bd054e2e7cf9's
+    op.create_unique_constraint outside batch mode, unsupported by SQLite.
+    TENANT_UNIQUE_REVISION's own parent is 5f65a6fd6e8d (not the merge), but
+    getting there still means walking through it, so the same dodge applies:
+    build the pre-migration schema directly (every current table except
+    network_agent, which is rebuilt by hand in its pre-fix shape), stamp at
+    5f65a6fd6e8d, then let Alembic run this migration's real upgrade()/
+    downgrade() from there.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="network_agent_unique_migration_test_")
+    db_path = os.path.join(tmpdir, "network_agent_unique_migration.db")
+    mig_app = Flask("test_network_agent_unique_migration")
+    mig_app.config["SQLALCHEMY_DATABASE_URI"] = (
+        "sqlite:///" + db_path.replace("\\", "/"))
+    mig_db = SQLAlchemy(mig_app)
+    Migrate(mig_app, mig_db, directory=MIGRATIONS_DIR, render_as_batch=True)
+
+    try:
+        with mig_app.app_context():
+            engine = mig_db.engine
+
+            pre_tables = [t for name, t in appmod.db.metadata.tables.items()
+                         if name != 'network_agent']
+            appmod.db.metadata.create_all(bind=engine, tables=pre_tables)
+            _pre_unique_network_agent.create(bind=engine)
+            stamp(directory=MIGRATIONS_DIR, revision=NETWORK_AGENT_REVISION)
+
+            with engine.begin() as conn:
+                conn.execute(sa.text(
+                    "INSERT INTO tenant (id, name, slug, status, plan) "
+                    "VALUES (1, 'T', 't-slug', 'active', 'free')"))
+
+            def _insert_two_agents_for_the_same_tenant():
+                with engine.begin() as conn:
+                    conn.execute(sa.text(
+                        "INSERT INTO network_agent (tenant_id, name, token_hash) "
+                        "VALUES (1, 'a', 'x')"))
+                    conn.execute(sa.text(
+                        "INSERT INTO network_agent (tenant_id, name, token_hash) "
+                        "VALUES (1, 'b', 'y')"))
+
+            def _clear_agents():
+                with engine.begin() as conn:
+                    conn.execute(sa.text("DELETE FROM network_agent"))
+
+            # Pre-migration: no unique constraint yet, so a second agent for
+            # the same tenant inserts cleanly -- exactly the gap the finding
+            # describes.
+            assert ('tenant_id',) not in _unique_constraint_columns(engine, "network_agent")
+            _insert_two_agents_for_the_same_tenant()
+            _clear_agents()
+
+            upgrade(directory=MIGRATIONS_DIR, revision=TENANT_UNIQUE_REVISION)
+            assert ('tenant_id',) in _unique_constraint_columns(engine, "network_agent")
+            with pytest.raises(sa.exc.IntegrityError):
+                _insert_two_agents_for_the_same_tenant()
+            _clear_agents()
+
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            assert ('tenant_id',) not in _unique_constraint_columns(engine, "network_agent")
+            _insert_two_agents_for_the_same_tenant()  # constraint gone again
+            _clear_agents()
+
+            upgrade(directory=MIGRATIONS_DIR, revision=TENANT_UNIQUE_REVISION)
+            assert ('tenant_id',) in _unique_constraint_columns(engine, "network_agent")
+            with pytest.raises(sa.exc.IntegrityError):
+                _insert_two_agents_for_the_same_tenant()
 
             engine.dispose()
     finally:

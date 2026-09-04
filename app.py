@@ -423,9 +423,12 @@ AGENT_ONLINE_WINDOW_SECONDS = 30
 
 class NetworkAgent(db.Model):
     """A relay running on the tenant's own LAN. It polls for jobs outbound, so
-    nothing connects inbound to their network. One agent per tenant."""
+    nothing connects inbound to their network. One agent per tenant --
+    enforced both by the create route's pre-insert check (for a friendly 400)
+    and by this unique constraint (the backstop: two concurrent creates can
+    both pass the application check, but only one can insert)."""
     id = db.Column(db.Integer, primary_key=True)
-    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, unique=True)
     name = db.Column(db.String(100), nullable=False)
     # bcrypt hash of the token's secret half only. The token is shown once at
     # creation and never stored. See _verify_agent_token for the format.
@@ -8874,7 +8877,18 @@ def get_network_devices():
 def create_network_device():
     data = request.json
     try:
-        if _tenant_access_mode() != 'agent' and not data.get('password'):
+        mode = _tenant_access_mode()
+        if mode == 'agent':
+            # The whole point of agent mode is that the cloud never holds a
+            # device credential -- it lives only in agent.toml on the
+            # on-prem box. A supplied password here is a client error, not
+            # something to silently ignore: a user who typed one deserves to
+            # be told it will not be stored, not to believe that it was.
+            if data.get('password'):
+                return jsonify({'error': 'In agent mode, device credentials belong in '
+                                         "agent.toml on the on-prem agent, not in the "
+                                         'cloud. Remove the password field.'}), 400
+        elif not data.get('password'):
             return jsonify({'error': 'password is required'}), 400
         device_type = data.get('device_type')
         if device_type not in NETWORK_DEVICE_TYPES:
@@ -8913,6 +8927,12 @@ def update_network_device(device_id):
     if not device:
         return jsonify({'message': 'Network device not found!'}), 404
     try:
+        if data.get('password') and _tenant_access_mode() == 'agent':
+            # Same rule as create: in agent mode the cloud must never hold a
+            # device credential, so reject rather than silently drop it.
+            return jsonify({'error': 'In agent mode, device credentials belong in '
+                                     "agent.toml on the on-prem agent, not in the "
+                                     'cloud. Remove the password field.'}), 400
         device.name = data.get('name', device.name)
         device.host = data.get('host', device.host)
         # use_tls must land before the device_type block below computes a new

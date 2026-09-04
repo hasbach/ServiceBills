@@ -38,15 +38,21 @@ def test_agent_to_dict_never_leaks_the_token_hash(app, client):
 
 
 def test_agent_is_online_only_within_the_window(app, client):
-    make_tenant(client, "Agent B", "agent_b_admin")
+    # One tenant per agent -- network_agent.tenant_id is unique (Task 5
+    # review fix: "one agent per tenant" is a schema constraint, not just
+    # application-level convention), so three agents under test each need
+    # their own tenant rather than sharing "Agent B".
+    make_tenant(client, "Agent B Never", "agent_b_never_admin")
+    make_tenant(client, "Agent B Fresh", "agent_b_fresh_admin")
+    make_tenant(client, "Agent B Stale", "agent_b_stale_admin")
     with app.app_context():
-        tenant = _tenant("Agent B")
-        never = appmod.NetworkAgent(tenant_id=tenant.id, name="Never", token_hash="h")
+        never = appmod.NetworkAgent(
+            tenant_id=_tenant("Agent B Never").id, name="Never", token_hash="h")
         fresh = appmod.NetworkAgent(
-            tenant_id=tenant.id, name="Fresh", token_hash="h",
+            tenant_id=_tenant("Agent B Fresh").id, name="Fresh", token_hash="h",
             last_seen_at=datetime.utcnow())
         stale = appmod.NetworkAgent(
-            tenant_id=tenant.id, name="Stale", token_hash="h",
+            tenant_id=_tenant("Agent B Stale").id, name="Stale", token_hash="h",
             last_seen_at=datetime.utcnow() - timedelta(
                 seconds=appmod.AGENT_ONLINE_WINDOW_SECONDS + 5))
         appmod.db.session.add_all([never, fresh, stale])
