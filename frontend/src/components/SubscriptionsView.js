@@ -222,6 +222,7 @@ const SubscriptionsView = ({
         upstream_username: '',
         mikrotik_server_id: '',
         pppoe_username: '',
+        onu_mac_address: '',
         discount: 0.0,
         cost_override: '',
         subscription_start_date: new Date().toISOString().split('T')[0],
@@ -687,7 +688,8 @@ const SubscriptionsView = ({
                 upstream_provider_id: editingCustomer.upstream_provider_id || "",
                 upstream_username: editingCustomer.upstream_username || "",
                 mikrotik_server_id: editingCustomer.mikrotik_server_id || "",
-                pppoe_username: editingCustomer.pppoe_username || ""
+                pppoe_username: editingCustomer.pppoe_username || "",
+                onu_mac_address: editingCustomer.onu_mac_address || ""
             });
 
             setSnackbar({
@@ -723,7 +725,7 @@ const SubscriptionsView = ({
             await apiService.addCustomer(newCustomer);
             setSnackbar({ open: true, message: 'Customer added successfully!', severity: 'success' });
             setShowAddCustomerForm(false);
-            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', reseller_id: '', upstream_provider_id: '', upstream_username: '', mikrotik_server_id: '', pppoe_username: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
+            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', reseller_id: '', upstream_provider_id: '', upstream_username: '', mikrotik_server_id: '', pppoe_username: '', onu_mac_address: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
             refetchCustomers(1, itemsPerPage, ''); // Go to first page after adding
         } catch (error) {
             console.error('Error adding customer:', error);
@@ -923,6 +925,11 @@ const SubscriptionsView = ({
                                 </Grid>
                             </>
                         )}
+                        <Grid item xs={12} md={6}>
+                            <TextField fullWidth label="ONU MAC Address (Optional)" value={newCustomer.onu_mac_address || ''}
+                                onChange={(e) => setNewCustomer({ ...newCustomer, onu_mac_address: e.target.value })}
+                                helperText="Links this customer to the ONU serving them on the Network Tree. Leave blank if unknown; clearing it later unlinks the customer from their ONU." />
+                        </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount (Fixed Amount)" value={newCustomer.discount} onChange={(e) => setNewCustomer({ ...newCustomer, discount: parseFloat(e.target.value) || 0.0 })} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={newCustomer.cost_override} onChange={(e) => setNewCustomer({ ...newCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="date" label="Subscription Start Date" value={newCustomer.subscription_start_date} onChange={(e) => setNewCustomer({ ...newCustomer, subscription_start_date: e.target.value })} InputLabelProps={{ shrink: true }} /></Grid>
@@ -1292,6 +1299,11 @@ const SubscriptionsView = ({
                                 </Grid>
                             </>
                         )}
+                        <Grid item xs={12} md={6}>
+                            <TextField fullWidth label="ONU MAC Address (Optional)" value={editingCustomer?.onu_mac_address || ''}
+                                onChange={(e) => setEditingCustomer({ ...editingCustomer, onu_mac_address: e.target.value })}
+                                helperText="Links this customer to the ONU serving them on the Network Tree. Clearing this unlinks the customer from their ONU." />
+                        </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount ($)" value={editingCustomer?.discount || 0} onChange={(e) => setEditingCustomer({ ...editingCustomer, discount: parseFloat(e.target.value) || 0 })} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={editingCustomer?.cost_override ?? ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Account Balance ($)" value={editingCustomer?.balance !== undefined ? editingCustomer.balance : 0} helperText="Negative value = Customer owes money. 0 = Paid." onChange={(e) => setEditingCustomer({ ...editingCustomer, balance: parseFloat(e.target.value) || 0 })} /></Grid>

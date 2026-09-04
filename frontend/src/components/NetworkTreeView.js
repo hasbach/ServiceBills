@@ -10,14 +10,14 @@ import {
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
 import OnuLabelMatcherDialog from './OnuLabelMatcherDialog';
+import { STATUS_COLOR, STATUS_LABEL } from './deviceStatus';
 
-// green = online/reachable, red = offline/unreachable -- the same convention
-// the Network Devices page already uses for last_status chips.
-const statusColor = (status) => {
-    if (status === 'online') return 'success';
-    if (!status) return 'default';
-    return 'error';
-};
+// ONU-level status is only ever 'online'/'offline' (see vsol_olt.py
+// get_olt_status) -- a simpler two-state domain than NetworkDevice's
+// last_status, so it keeps its own local color helper rather than using the
+// shared STATUS_COLOR/STATUS_LABEL maps (those cover 'auth_failed' too,
+// which never applies to an individual ONU).
+const onuStatusColor = (status) => (status === 'online' ? 'success' : 'error');
 
 const NetworkTreeView = () => {
     // apiService is a direct module export here, not part of the hook's value
@@ -97,7 +97,7 @@ const NetworkTreeView = () => {
     const renderOnu = (onu) => (
         <Box key={onu.mac_address} sx={{ pl: 4, py: 0.75, borderLeft: '2px solid', borderColor: 'divider' }}>
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-                <Chip size="small" label={onu.status} color={statusColor(onu.status)} />
+                <Chip size="small" label={onu.status} color={onuStatusColor(onu.status)} />
                 <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{onu.onu_id}</Typography>
                 <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
                     {onu.mac_address}
@@ -145,8 +145,9 @@ const NetworkTreeView = () => {
                         <Typography variant="caption" color="text.secondary">
                             {device.host}:{device.api_port}
                         </Typography>
-                        <Chip size="small" label={device.last_status || 'never checked'}
-                            color={statusColor(device.last_status)} />
+                        <Chip size="small"
+                            label={device.last_status ? (STATUS_LABEL[device.last_status] || device.last_status) : 'Never checked'}
+                            color={device.last_status ? (STATUS_COLOR[device.last_status] || 'default') : 'default'} />
                         {device.last_checked_at && (
                             <Typography variant="caption" color="text.secondary">
                                 checked {device.last_checked_at}
@@ -209,7 +210,18 @@ const NetworkTreeView = () => {
                 <OnuLabelMatcherDialog
                     device={matcherDevice}
                     onClose={() => setMatcherDevice(null)}
-                    onApplied={() => { setMatcherDevice(null); loadTree(false); }}
+                    onApplied={() => {
+                        // Re-run the ONU refresh for this OLT (through the
+                        // same refreshOlt path used by "Load ONUs", so the
+                        // per-device refreshingIds/refreshSeqRef guards stay
+                        // intact) rather than loadTree(), which only refetches
+                        // the device skeleton and carries no ONU/customer
+                        // data -- without this, links just applied here stay
+                        // invisible until a separate manual refresh.
+                        const d = matcherDevice;
+                        setMatcherDevice(null);
+                        refreshOlt(d);
+                    }}
                 />
             )}
         </Box>

@@ -3,7 +3,7 @@ import {
     Box, Typography, Button, TextField, Dialog, DialogTitle,
     DialogContent, DialogActions, Grid, Paper, TableContainer,
     Table, TableHead, TableRow, TableCell, TableBody, MenuItem,
-    IconButton, Tooltip, Chip, CircularProgress, Switch, FormControlLabel
+    IconButton, Tooltip, Chip, CircularProgress, Switch, FormControlLabel, Stack
 } from '@mui/material';
 import {
     Add as AddIcon,
@@ -12,9 +12,7 @@ import {
     NetworkCheck as CheckNowIcon
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
-
-const STATUS_COLOR = { online: 'success', unreachable: 'error', auth_failed: 'warning' };
-const STATUS_LABEL = { online: 'Online', unreachable: 'Unreachable', auth_failed: 'Auth Failed' };
+import { STATUS_COLOR, STATUS_LABEL } from './deviceStatus';
 
 // A network device the tenant owns (starting with a core CCR), monitored for
 // RouterOS-level health -- independent of MikrotikServer, which is
@@ -32,6 +30,11 @@ const NetworkDeviceManagementView = () => {
     const [healthDialogOpen, setHealthDialogOpen] = useState(false);
     const [healthDevice, setHealthDevice] = useState(null);
     const [health, setHealth] = useState(null);
+    // Check-now result for a vsol_olt device: the ONU list (health stays
+    // null for this device type -- see handleCheckNow). Kept separate from
+    // `health` so the dialog can tell at a glance which device type's
+    // result it's holding, rather than inferring it from field shape.
+    const [onuResult, setOnuResult] = useState(null);
     const [healthError, setHealthError] = useState(null);
     const [labelDrafts, setLabelDrafts] = useState({});
 
@@ -86,17 +89,28 @@ const NetworkDeviceManagementView = () => {
         setCheckingId(device.id);
         setHealthDevice(device);
         setHealth(null);
+        setOnuResult(null);
         setHealthError(null);
         setHealthDialogOpen(true);
         try {
             const response = await apiService.checkNetworkDeviceNow(device.id);
-            const { ok, message, health: healthResult, device: updatedDevice } = response.data;
+            const { ok, message, health: healthResult, onus, device: updatedDevice } = response.data;
             setDevices(prev => prev.map(d => d.id === device.id ? updatedDevice : d));
             if (ok) {
-                setHealth(healthResult);
-                const drafts = {};
-                healthResult.interfaces.forEach(iface => { drafts[iface.name] = iface.label || ''; });
-                setLabelDrafts(drafts);
+                if (device.device_type === 'vsol_olt') {
+                    // For a vsol_olt, check-now returns health: null and the
+                    // ONU list under `onus` instead -- there's no
+                    // interface-label workflow for this device type, so we
+                    // don't touch labelDrafts/health at all here.
+                    setOnuResult(onus || []);
+                } else {
+                    setHealth(healthResult);
+                    const drafts = {};
+                    // Defensive: degrade to no drafts rather than throwing if
+                    // a future response shape omits interfaces.
+                    healthResult?.interfaces?.forEach(iface => { drafts[iface.name] = iface.label || ''; });
+                    setLabelDrafts(drafts);
+                }
             } else {
                 setHealthError(message);
             }
@@ -295,6 +309,18 @@ const NetworkDeviceManagementView = () => {
                         <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress /></Box>
                     ) : healthError ? (
                         <Typography color="error">{healthError}</Typography>
+                    ) : onuResult ? (
+                        <Box>
+                            <Typography variant="body2" sx={{ mb: 1 }}>
+                                <b>{onuResult.length}</b> ONU{onuResult.length === 1 ? '' : 's'} reporting
+                            </Typography>
+                            <Stack direction="row" spacing={1}>
+                                <Chip size="small" color="success"
+                                    label={`${onuResult.filter((o) => o.status === 'online').length} online`} />
+                                <Chip size="small" color="error"
+                                    label={`${onuResult.filter((o) => o.status !== 'online').length} offline`} />
+                            </Stack>
+                        </Box>
                     ) : health ? (
                         <Box>
                             <Typography variant="body2" sx={{ mb: 1 }}><b>Identity:</b> {health.identity}</Typography>
