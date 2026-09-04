@@ -155,6 +155,59 @@ def test_refresh_surfaces_connector_failure(app, client, monkeypatch):
     assert "timeout" in polled["error"]
 
 
+def test_onu_entry_missing_mac_address_still_polls_and_shows_the_onu(app, client, monkeypatch):
+    """Mirrors what agent_post_result persists verbatim from an on-prem agent:
+    the stored result can be whatever JSON the agent posted, with no shape
+    validation (see tests/test_network_devices.py's interface-label
+    equivalents for the device_health path this mirrors). An ONU entry that
+    is a dict but has no 'mac_address' key must not raise KeyError -- it
+    should still come back in the tree, with an empty 'customers' list
+    (it can't be matched to anyone without a MAC), so a bad entry doesn't
+    turn every subsequent poll of that job into a 500."""
+    hdr = make_tenant(client, "Tree N", "tree_n_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+
+    started = client.post(f"/api/network-tree/olt/{olt['id']}/refresh", headers=hdr).get_json()
+    job_id = started["job_id"]
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = [{"pon_port": "PON1", "description": "NoMac"}]  # no mac_address
+        appmod.db.session.commit()
+
+    resp = client.get(f"/api/network-jobs/{job_id}", headers=hdr)
+    assert resp.status_code == 200
+    polled = resp.get_json()
+    assert polled["result"][0]["customers"] == []
+    assert polled["result"][0]["description"] == "NoMac"
+
+
+def test_onu_entry_that_is_not_a_dict_survives_untouched(app, client, monkeypatch):
+    """Same agent-supplied-JSON scenario, but the entry isn't a dict at all.
+    It must be passed through untouched rather than crashing or being
+    dropped -- the goal is that a poll always returns, never that the data
+    is silently reshaped."""
+    hdr = make_tenant(client, "Tree O", "tree_o_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+
+    started = client.post(f"/api/network-tree/olt/{olt['id']}/refresh", headers=hdr).get_json()
+    job_id = started["job_id"]
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = ["onu1"]  # not a dict at all
+        appmod.db.session.commit()
+
+    resp = client.get(f"/api/network-jobs/{job_id}", headers=hdr)
+    assert resp.status_code == 200
+    polled = resp.get_json()
+    assert polled["result"][0] == "onu1"
+
+
 def _walk_ids(nodes):
     """Flatten a tree's node ids (depth-first), duplicates and all -- used to
     assert both presence and uniqueness across the whole returned structure."""

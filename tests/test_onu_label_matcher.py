@@ -463,3 +463,76 @@ def test_customer_put_rejects_malformed_onu_mac_address(app, client):
         # Rejected input must not overwrite the existing valid value.
         assert appmod.Customer.query.filter_by(id=customer_id).first().onu_mac_address == \
             "aa:bb:cc:dd:ee:04"
+
+
+# --- Fix round 1: GET .../label-matches?job_id=... must tolerate a malformed
+# ONU entry in the job's stored result (same bug, and same fix shape, as
+# _with_interface_labels on the device_health path), and must 404 a job_id
+# that names a job for some other operation rather than trusting the
+# convention that only olt_status jobs ever exist for a vsol_olt device. ---
+
+def test_label_matches_skips_a_malformed_onu_entry(app, client, monkeypatch):
+    """job.result is whatever JSON an agent posted, with no shape validation
+    (see agent_post_result). Matching happens by MAC, so an entry that isn't
+    a dict, or a dict with no 'mac_address', can't be matched to a customer
+    by definition -- unlike the job-poll/tree path (which still shows a
+    malformed ONU so the operator doesn't lose visibility into real
+    hardware), here it's simply dropped from consideration. The well-formed
+    entry in the same batch must still be matched normally."""
+    hdr = make_tenant(client, "Match Z", "match_z_admin")
+    olt = setup_devices(client, hdr)
+    add_customer(app, "Match Z", "Moussa Ghadir")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
+                        lambda d: (True, [onu("b4:64:15:3f:c1:94", "MoussaGhadir")]))
+
+    started = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                         headers=hdr).get_json()
+    job_id = started["job_id"]
+    assert job_id
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = [
+            {"description": "NoMacHere"},                   # dict, no mac_address
+            "onu1",                                          # not a dict at all
+            onu("b4:64:15:3f:c1:94", "MoussaGhadir"),         # well-formed
+        ]
+        appmod.db.session.commit()
+
+    resp = client.get(
+        f"/api/network-tree/olt/{olt['id']}/label-matches?job_id={job_id}",
+        headers=hdr)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["customer"]["name"] == "Moussa Ghadir"
+    assert body["proposals"][0]["onu"]["mac_address"] == "b4:64:15:3f:c1:94"
+
+
+def test_label_matches_job_id_for_a_non_olt_status_job_is_not_found(app, client):
+    """Today only three call sites ever create a NetworkAgentJob, and all
+    three derive `operation` from device_type -- so a device_health job can
+    never actually exist for a vsol_olt device in practice. But
+    get_onu_label_matches's job_id branch only checked job.device_id, not
+    job.operation, so correctness rested on that convention holding forever
+    rather than being enforced here. Construct the convention-violating job
+    directly (bypassing _create_device_job) to prove the guard itself, not
+    the convention, is what keeps this endpoint from computing proposals off
+    the wrong kind of job."""
+    hdr = make_tenant(client, "Match Z2", "match_z2_admin")
+    olt = setup_devices(client, hdr)
+
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Match Z2").first()
+        job = appmod.NetworkAgentJob(
+            tenant_id=tenant.id, device_id=olt["id"], operation="device_health",
+            status="done", result=[])
+        appmod.db.session.add(job)
+        appmod.db.session.commit()
+        job_id = job.id
+
+    resp = client.get(
+        f"/api/network-tree/olt/{olt['id']}/label-matches?job_id={job_id}",
+        headers=hdr)
+    assert resp.status_code == 404

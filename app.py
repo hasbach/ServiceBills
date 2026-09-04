@@ -9134,11 +9134,21 @@ def _resolve_onu_customers(onus):
     the OLT connector happens to already lowercase every MAC it returns,
     but that's an invariant of a different module, so this function
     normalizes the ONU-side MAC itself rather than relying on it.
+
+    Deliberately defensive, same reasoning as _with_interface_labels: this
+    runs on a polling endpoint hit repeatedly by the browser, and agent-mode
+    results are whatever JSON the on-prem agent posted (see
+    agent_post_result), not something this endpoint can assume is
+    well-formed. A malformed entry -- not a dict, or a dict missing
+    'mac_address' -- is passed through rather than dropped or raising: it's
+    still real hardware the tree should show the operator, it just can't be
+    matched to a customer. A bad entry here must never turn every
+    subsequent poll of that job into a 500.
     """
     def normalize_mac(mac):
         return (mac or '').strip().lower()
 
-    wanted = {normalize_mac(onu['mac_address']) for onu in onus}
+    wanted = {normalize_mac(onu.get('mac_address')) for onu in onus if isinstance(onu, dict)}
     matches = {}
     if wanted:
         rows = tenant_query(Customer).filter(Customer.onu_mac_address.isnot(None)).all()
@@ -9152,8 +9162,10 @@ def _resolve_onu_customers(onus):
                 })
     return [
         # Display keeps onu['mac_address'] exactly as reported; only the
-        # lookup key is normalized.
-        {**onu, 'customers': matches.get(normalize_mac(onu['mac_address']), [])}
+        # lookup key is normalized. A non-dict entry is handed back verbatim,
+        # exactly as _with_interface_labels does for a non-dict interface.
+        {**onu, 'customers': matches.get(normalize_mac(onu.get('mac_address')), [])}
+        if isinstance(onu, dict) else onu
         for onu in onus
     ]
 
@@ -9476,7 +9488,15 @@ def _propose_label_matches(onus, customers):
     Greedy on descending confidence, and each ONU and each customer is claimed
     at most once -- so two similar labels can't both grab the same customer.
     Returns (proposals, unmatched_onus, unmatched_customers).
+
+    `onus` comes (transitively) from a job's stored result -- whatever JSON
+    an on-prem agent posted, with no shape validation (see
+    agent_post_result). Matching happens by MAC, so an entry that isn't a
+    dict, or has no 'mac_address', can't be matched to a customer by
+    definition; it's dropped here rather than raising, before any of the
+    matching logic below (which is unchanged) ever sees it.
     """
+    onus = [o for o in onus if isinstance(o, dict) and o.get('mac_address')]
     candidates = []
     for onu in onus:
         onu_key = _normalize_label(onu.get('description'))
@@ -9550,7 +9570,12 @@ def get_onu_label_matches(device_id):
         return jsonify({'message': 'Invalid job_id'}), 400
 
     job = tenant_query(NetworkAgentJob).filter_by(id=job_id).first()
-    if not job or job.device_id != device.id:
+    # The operation check doesn't just mirror device_id -- without it,
+    # correctness would rest entirely on the convention (followed today by
+    # all three _create_device_job call sites) that a device_health job is
+    # never created for a vsol_olt device. Check it here instead of trusting
+    # that convention to hold forever.
+    if not job or job.device_id != device.id or job.operation != 'olt_status':
         return jsonify({'message': 'Job not found'}), 404
     _expire_job_if_stale(job)
     if job.status != 'done':
@@ -9569,9 +9594,14 @@ def get_onu_label_matches(device_id):
     # Only ever propose for work still to be done: ONUs nobody is linked to,
     # and customers with no ONU yet. Normalise the ONU side the same way the
     # customer side already is, rather than trusting the connector to always
-    # hand back lowercase MACs.
+    # hand back lowercase MACs. The isinstance guard matters because
+    # job.result is whatever JSON an agent posted, with no shape validation
+    # (see agent_post_result) -- a non-dict entry would otherwise blow up on
+    # .get() here, before _propose_label_matches even gets a chance to skip
+    # it.
     onus = [o for o in (job.result or [])
-            if (o.get('mac_address') or '').strip().lower() not in linked]
+            if isinstance(o, dict)
+            and (o.get('mac_address') or '').strip().lower() not in linked]
     customers = tenant_query(Customer).filter(
         Customer.onu_mac_address.is_(None)).order_by(Customer.name).all()
 
