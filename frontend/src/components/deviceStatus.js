@@ -8,5 +8,13 @@
 // ever 'online'/'offline' -- see vsol_olt.py get_olt_status), which the
 // Network Tree page still colors locally since it's a different, simpler
 // two-state domain.
-export const STATUS_COLOR = { online: 'success', unreachable: 'error', auth_failed: 'warning' };
-export const STATUS_LABEL = { online: 'Online', unreachable: 'Unreachable', auth_failed: 'Auth Failed' };
+//
+// last_status itself is null until a device's first check-now (or scheduled
+// sync) completes. null can't be a real object key, so consumers resolve it
+// to this sentinel before indexing STATUS_LABEL/STATUS_COLOR -- one
+// definition for "not yet checked" that both pages look up, instead of each
+// spelling/coloring that state on its own.
+export const NOT_CHECKED = 'not_checked';
+
+export const STATUS_COLOR = { online: 'success', unreachable: 'error', auth_failed: 'warning', [NOT_CHECKED]: 'default' };
+export const STATUS_LABEL = { online: 'Online', unreachable: 'Unreachable', auth_failed: 'Auth Failed', [NOT_CHECKED]: 'Never checked' };

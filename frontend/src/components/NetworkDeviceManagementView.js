@@ -12,7 +12,7 @@ import {
     NetworkCheck as CheckNowIcon
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
-import { STATUS_COLOR, STATUS_LABEL } from './deviceStatus';
+import { STATUS_COLOR, STATUS_LABEL, NOT_CHECKED } from './deviceStatus';
 
 // A network device the tenant owns (starting with a core CCR), monitored for
 // RouterOS-level health -- independent of MikrotikServer, which is
@@ -178,13 +178,9 @@ const NetworkDeviceManagementView = () => {
                                         {d.device_type === 'vsol_olt' ? ' — OLT (SNMP)' : ' — CCR (RouterOS)'}
                                     </TableCell>
                                     <TableCell>
-                                        {d.last_status ? (
-                                            <Tooltip title={d.last_checked_at || ''}>
-                                                <Chip size="small" label={STATUS_LABEL[d.last_status] || d.last_status} color={STATUS_COLOR[d.last_status] || 'default'} />
-                                            </Tooltip>
-                                        ) : (
-                                            <Typography variant="body2" color="text.secondary">Never checked</Typography>
-                                        )}
+                                        <Tooltip title={d.last_checked_at || ''}>
+                                            <Chip size="small" label={STATUS_LABEL[d.last_status || NOT_CHECKED] || d.last_status} color={STATUS_COLOR[d.last_status || NOT_CHECKED] || 'default'} />
+                                        </Tooltip>
                                     </TableCell>
                                     <TableCell align="right">
                                         <Tooltip title="Check Now">
@@ -335,7 +331,7 @@ const NetworkDeviceManagementView = () => {
                                     </TableRow>
                                 </TableHead>
                                 <TableBody>
-                                    {health.interfaces.map((iface) => (
+                                    {health.interfaces?.map((iface) => (
                                         <TableRow key={iface.name}>
                                             <TableCell>{iface.name}</TableCell>
                                             <TableCell>
@@ -356,7 +352,9 @@ const NetworkDeviceManagementView = () => {
                                 </TableBody>
                             </Table>
                         </Box>
-                    ) : null}
+                    ) : (
+                        <Typography variant="body2" color="text.secondary">No health data returned for this device.</Typography>
+                    )}
                 </DialogContent>
                 <DialogActions>
                     <Button onClick={() => setHealthDialogOpen(false)}>Close</Button>

@@ -10,7 +10,7 @@ import {
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
 import OnuLabelMatcherDialog from './OnuLabelMatcherDialog';
-import { STATUS_COLOR, STATUS_LABEL } from './deviceStatus';
+import { STATUS_COLOR, STATUS_LABEL, NOT_CHECKED } from './deviceStatus';
 
 // ONU-level status is only ever 'online'/'offline' (see vsol_olt.py
 // get_olt_status) -- a simpler two-state domain than NetworkDevice's
@@ -146,8 +146,8 @@ const NetworkTreeView = () => {
                             {device.host}:{device.api_port}
                         </Typography>
                         <Chip size="small"
-                            label={device.last_status ? (STATUS_LABEL[device.last_status] || device.last_status) : 'Never checked'}
-                            color={device.last_status ? (STATUS_COLOR[device.last_status] || 'default') : 'default'} />
+                            label={STATUS_LABEL[device.last_status || NOT_CHECKED] || device.last_status}
+                            color={STATUS_COLOR[device.last_status || NOT_CHECKED] || 'default'} />
                         {device.last_checked_at && (
                             <Typography variant="caption" color="text.secondary">
                                 checked {device.last_checked_at}

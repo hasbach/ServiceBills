@@ -238,6 +238,16 @@ const SubscriptionsView = ({
     const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
     const [editDialogOpen, setEditDialogOpen] = useState(false);
     const [editingCustomer, setEditingCustomer] = useState(null);
+    // Snapshot of onu_mac_address as of the moment the edit dialog was opened.
+    // editingCustomer itself can be a stale row (the customers list is only
+    // refetched on mount/page/search/sort -- not when the Network Tree page's
+    // label-matcher `/apply` links a customer's ONU out-of-band and the user
+    // then navigates back here), so we can't tell "untouched" from "cleared"
+    // by looking at editingCustomer alone. Comparing against this snapshot
+    // lets handleUpdateCustomer omit the field entirely when the user never
+    // touched it, instead of always sending it (which would silently unlink
+    // the ONU whenever the snapshot predates an out-of-band Apply).
+    const editingOnuMacSnapshotRef = React.useRef('');
 
     // --- NEW STATE ---
     const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'list'
@@ -671,11 +681,20 @@ const SubscriptionsView = ({
         }
     };
 
+    // Opens the edit dialog for a customer, capturing the ONU MAC it started
+    // with so handleUpdateCustomer can tell later whether the user actually
+    // touched that field (see editingOnuMacSnapshotRef above).
+    const openEditCustomerDialog = useCallback((customer) => {
+        editingOnuMacSnapshotRef.current = customer.onu_mac_address || '';
+        setEditingCustomer(customer);
+        setEditDialogOpen(true);
+    }, []);
+
     const handleUpdateCustomer = useCallback(async () => {
         if (!editingCustomer) return;
 
         try {
-            const response = await apiService.updateCustomer(editingCustomer.id, {
+            const payload = {
                 name: editingCustomer.name,
                 phone: editingCustomer.phone,
                 address: editingCustomer.address,
@@ -689,8 +708,20 @@ const SubscriptionsView = ({
                 upstream_username: editingCustomer.upstream_username || "",
                 mikrotik_server_id: editingCustomer.mikrotik_server_id || "",
                 pppoe_username: editingCustomer.pppoe_username || "",
-                onu_mac_address: editingCustomer.onu_mac_address || ""
-            });
+            };
+
+            // Only include onu_mac_address when the user actually changed it
+            // in this dialog session. editingCustomer can be a stale snapshot
+            // (see editingOnuMacSnapshotRef), and the backend treats an absent
+            // key as "leave unchanged" vs. a present-but-empty key as "clear" --
+            // so omitting an untouched field is both cheaper and strictly
+            // correct, while an intentional clear still sends "".
+            const currentOnuMac = editingCustomer.onu_mac_address || '';
+            if (currentOnuMac !== editingOnuMacSnapshotRef.current) {
+                payload.onu_mac_address = currentOnuMac;
+            }
+
+            const response = await apiService.updateCustomer(editingCustomer.id, payload);
 
             setSnackbar({
                 open: true,
@@ -1038,7 +1069,7 @@ const SubscriptionsView = ({
                                                     <Divider sx={{ my: 2, opacity: 0.6 }} />
                                                     <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                                                         <Button size="small" variant="outlined" startIcon={isExpanded ? <VisibilityOffIcon /> : <VisibilityIcon />} onClick={() => fetchCustomerPayments(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>{isExpanded ? 'Hide' : 'Payments'}</Button>
-                                                        <Button size="small" variant="outlined" color="info" startIcon={<EditIcon />} onClick={() => { setEditingCustomer(customer); setEditDialogOpen(true); }} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Edit</Button>
+                                                        <Button size="small" variant="outlined" color="info" startIcon={<EditIcon />} onClick={() => openEditCustomerDialog(customer)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Edit</Button>
                                                         <Button size="small" variant="outlined" color="success" startIcon={<RefreshIcon />} onClick={() => handleSubscriptionAction(apiService.renewSubscription, customer.id, "Renew subscription? (Reseller customers will have their reseller charged, others will get a new pending payment)")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Renew</Button>
                                                         <Button size="small" variant="outlined" color="primary" startIcon={<ChatIcon />} onClick={() => handleSendWAReminder(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>WA Reminder</Button>
                                                         {customer.is_subscription_active ? (
@@ -1201,7 +1232,7 @@ const SubscriptionsView = ({
                                                         </IconButton>
                                                     </Tooltip>
                                                     <Tooltip title="Edit">
-                                                        <IconButton size="small" color="info" onClick={() => { setEditingCustomer(customer); setEditDialogOpen(true); }}>
+                                                        <IconButton size="small" color="info" onClick={() => openEditCustomerDialog(customer)}>
                                                             <EditIcon fontSize="small" />
                                                         </IconButton>
                                                     </Tooltip>
