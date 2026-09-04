@@ -135,3 +135,91 @@ def test_refresh_surfaces_connector_failure(app, client, monkeypatch):
     assert body["ok"] is False
     assert body["onus"] is None
     assert "timeout" in body["message"]
+
+
+def _walk_ids(nodes):
+    """Flatten a tree's node ids (depth-first), duplicates and all -- used to
+    assert both presence and uniqueness across the whole returned structure."""
+    ids = []
+    for node in nodes:
+        ids.append(node["id"])
+        ids.extend(_walk_ids(node["children"]))
+    return ids
+
+
+# --- Cyclic parent_device_id data. These rows are written directly through
+# the model (appmod.db.session), not through the API: Task 3's cycle guard
+# rejects cycles at the API layer, so the only way to prove the tree builder
+# itself survives corrupted same-tenant data (pre-existing rows, or rows
+# written directly, per the documented migration/schema drift on this
+# project) is to bypass that guard and write the bad rows ourselves. ---
+
+def test_self_parented_device_still_appears_in_the_tree(app, client):
+    hdr = make_tenant(client, "Tree H", "tree_h_admin")
+    ccr = make_ccr(client, hdr)
+    with app.app_context():
+        device = appmod.NetworkDevice.query.filter_by(id=ccr["id"]).first()
+        device.parent_device_id = device.id
+        appmod.db.session.commit()
+
+    ids = _walk_ids(client.get("/api/network-tree", headers=hdr).get_json()["tree"])
+    assert ids == [ccr["id"]]
+
+
+def test_two_device_parent_cycle_both_appear_and_endpoint_returns(app, client):
+    hdr = make_tenant(client, "Tree I", "tree_i_admin")
+    device_a = make_ccr(client, hdr)
+    device_b = make_ccr(client, hdr)
+    with app.app_context():
+        a = appmod.NetworkDevice.query.filter_by(id=device_a["id"]).first()
+        b = appmod.NetworkDevice.query.filter_by(id=device_b["id"]).first()
+        a.parent_device_id = b.id
+        b.parent_device_id = a.id
+        appmod.db.session.commit()
+
+    # The point of this assertion is as much "it returns at all" (rather than
+    # hanging in infinite recursion) as it is the content of the response.
+    resp = client.get("/api/network-tree", headers=hdr)
+    assert resp.status_code == 200
+    ids = _walk_ids(resp.get_json()["tree"])
+    assert sorted(ids) == sorted([device_a["id"], device_b["id"]])
+
+
+def test_healthy_device_parented_by_a_cycle_member_still_appears(app, client):
+    hdr = make_tenant(client, "Tree J", "tree_j_admin")
+    device_a = make_ccr(client, hdr)
+    device_b = make_ccr(client, hdr)
+    healthy = make_olt(client, hdr, device_a["id"])
+    with app.app_context():
+        a = appmod.NetworkDevice.query.filter_by(id=device_a["id"]).first()
+        b = appmod.NetworkDevice.query.filter_by(id=device_b["id"]).first()
+        a.parent_device_id = b.id
+        b.parent_device_id = a.id
+        appmod.db.session.commit()
+
+    ids = _walk_ids(client.get("/api/network-tree", headers=hdr).get_json()["tree"])
+    assert healthy["id"] in ids
+
+
+def test_every_device_appears_exactly_once_despite_a_cycle(app, client):
+    """The assertion that most directly encodes 'nothing vanishes': walk the
+    whole returned structure and confirm every device in the tenant shows up,
+    and shows up exactly once -- not zero times (swallowed by the cycle) and
+    not twice (double-rendered by the promotion pass)."""
+    hdr = make_tenant(client, "Tree K", "tree_k_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+    cycle_a = make_ccr(client, hdr)
+    cycle_b = make_ccr(client, hdr)
+    healthy_leaf = make_olt(client, hdr, cycle_a["id"])
+    with app.app_context():
+        a = appmod.NetworkDevice.query.filter_by(id=cycle_a["id"]).first()
+        b = appmod.NetworkDevice.query.filter_by(id=cycle_b["id"]).first()
+        a.parent_device_id = b.id
+        b.parent_device_id = a.id
+        appmod.db.session.commit()
+
+    ids = _walk_ids(client.get("/api/network-tree", headers=hdr).get_json()["tree"])
+    expected = [ccr["id"], olt["id"], cycle_a["id"], cycle_b["id"], healthy_leaf["id"]]
+    assert sorted(ids) == sorted(expected)
+    assert len(ids) == len(set(ids))

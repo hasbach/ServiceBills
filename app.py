@@ -7764,25 +7764,61 @@ def _build_device_tree(devices):
 
     Any device whose parent is missing (deleted, or another tenant's) is
     promoted to a root rather than dropped -- a broken link must not make
-    hardware silently vanish from the page.
+    hardware silently vanish from the page. The same guarantee has to hold
+    for corrupted same-tenant links too: a device can name itself as its
+    own parent, or two-or-more devices can point at each other in a cycle
+    entirely within this tenant's data. (Task 3's cycle guard only runs at
+    the API layer, and this project has documented drift between migration
+    history and the real schema, plus rows written directly -- a same-
+    tenant cycle is realistic, not theoretical.) No cycle member, nor a
+    healthy device parented by one, is ever reachable from a real root, so
+    a naive top-down walk starting only from roots would silently drop the
+    whole component with no error -- exactly the "hardware vanishes" bug
+    this function exists to prevent.
+
+    To guarantee every device renders exactly once no matter how corrupt
+    the parent links are: a self-parent is treated as a root; ids are
+    tracked as they're visited while walking down from the real roots,
+    and a child already visited is skipped rather than recursed into
+    (this is what makes a cycle terminate instead of being walked
+    forever); and afterwards, any device the walk never reached --
+    necessarily a cycle member, or hanging off one -- is promoted to an
+    additional root, in ascending id order so the result is deterministic
+    across runs regardless of set/dict iteration order.
     """
     by_id = {d.id: d for d in devices}
     children_of = {}
     roots = []
     for device in devices:
         parent_id = device.parent_device_id
-        if parent_id is None or parent_id not in by_id:
+        if parent_id is None or parent_id == device.id or parent_id not in by_id:
             roots.append(device)
         else:
             children_of.setdefault(parent_id, []).append(device)
 
-    def node(device):
-        return {
-            **device.to_dict(),
-            'children': [node(child) for child in children_of.get(device.id, [])],
-        }
+    visited = set()
 
-    return [node(device) for device in roots]
+    def node(device):
+        visited.add(device.id)
+        children = [
+            node(child) for child in children_of.get(device.id, [])
+            if child.id not in visited
+        ]
+        return {**device.to_dict(), 'children': children}
+
+    tree = [node(device) for device in roots]
+
+    # Anything still unvisited only exists inside a same-tenant cycle (or
+    # hangs off one) -- promote it so it isn't lost. Recheck `visited` at
+    # each step (not a snapshot taken before this loop): rendering one
+    # promoted device walks and marks its whole cyclic component, so later
+    # members of that same component are skipped here rather than
+    # re-rendered as a second, duplicate root.
+    for device in sorted(devices, key=lambda d: d.id):
+        if device.id not in visited:
+            tree.append(node(device))
+
+    return tree
 
 
 def _resolve_onu_customers(onus):
@@ -7790,14 +7826,20 @@ def _resolve_onu_customers(onus):
 
     Many customers can share one ONU (transparent bridges), so this is a
     one-to-many attach, and an ONU with no match keeps an empty list rather
-    than being filtered out.
+    than being filtered out. Matching is case-insensitive on both sides:
+    the OLT connector happens to already lowercase every MAC it returns,
+    but that's an invariant of a different module, so this function
+    normalizes the ONU-side MAC itself rather than relying on it.
     """
-    wanted = {onu['mac_address'] for onu in onus}
+    def normalize_mac(mac):
+        return (mac or '').strip().lower()
+
+    wanted = {normalize_mac(onu['mac_address']) for onu in onus}
     matches = {}
     if wanted:
         rows = tenant_query(Customer).filter(Customer.onu_mac_address.isnot(None)).all()
         for customer in rows:
-            key = (customer.onu_mac_address or '').strip().lower()
+            key = normalize_mac(customer.onu_mac_address)
             if key in wanted:
                 matches.setdefault(key, []).append({
                     'id': customer.id,
@@ -7805,7 +7847,9 @@ def _resolve_onu_customers(onus):
                     'is_subscription_active': bool(customer.is_subscription_active),
                 })
     return [
-        {**onu, 'customers': matches.get(onu['mac_address'], [])}
+        # Display keeps onu['mac_address'] exactly as reported; only the
+        # lookup key is normalized.
+        {**onu, 'customers': matches.get(normalize_mac(onu['mac_address']), [])}
         for onu in onus
     ]
 
