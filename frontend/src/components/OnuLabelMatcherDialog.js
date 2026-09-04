@@ -57,14 +57,20 @@ const OnuLabelMatcherDialog = ({ device, onClose, onApplied }) => {
                 message: `Linked ${res.data.applied} customer(s) to their ONU.` });
             onApplied();
         } catch (e) {
-            setSnackbar({ open: true, severity: 'error', message: 'Failed to apply links' });
+            const message = e?.response?.data?.error || 'Failed to apply links';
+            setSnackbar({ open: true, severity: 'error', message });
         } finally {
             setApplying(false);
         }
     };
 
+    const handleDialogClose = () => {
+        if (applying) return;
+        onClose();
+    };
+
     return (
-        <Dialog open onClose={onClose} fullWidth maxWidth="md">
+        <Dialog open onClose={handleDialogClose} disableEscapeKeyDown={applying} fullWidth maxWidth="md">
             <DialogTitle>Match ONU labels to customers — {device.name}</DialogTitle>
             <DialogContent dividers>
                 {loading && <Box sx={{ p: 4, textAlign: 'center' }}><CircularProgress /></Box>}
@@ -142,7 +148,7 @@ const OnuLabelMatcherDialog = ({ device, onClose, onApplied }) => {
                 )}
             </DialogContent>
             <DialogActions>
-                <Button onClick={onClose}>Cancel</Button>
+                <Button onClick={onClose} disabled={applying}>Cancel</Button>
                 <Button variant="contained" onClick={apply}
                     disabled={applying || acceptedCount === 0}>
                     {applying ? 'Applying…' : `Apply ${acceptedCount} link(s)`}
