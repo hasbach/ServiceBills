@@ -2038,6 +2038,13 @@ _TENANT_DELETE_ORDER = [
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
     WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
+    # NetworkDevice arrived on the network-topology branch, so origin/main's
+    # copy of this list never knew about it and won the merge. Without it a
+    # tenant delete raises ForeignKeyViolation on Postgres (SQLite doesn't
+    # enforce FKs, so the gap is invisible there). Position is unconstrained:
+    # the only inbound FK is its own parent_device_id self-link, and one
+    # DELETE removes parent and child rows in the same statement.
+    NetworkDevice,
     # Phase 3 fix: MonthlyProfitEstimate was missing here entirely. SQLite
     # doesn't enforce FK constraints, so a tenant delete silently orphaned
     # these rows there; Postgres correctly rejects the DELETE FROM tenant
