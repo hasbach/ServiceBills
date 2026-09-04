@@ -155,3 +155,196 @@ def test_config_indexes_devices_by_id():
     })
     assert parsed["devices"][2]["host"] == "192.168.8.100"
     assert parsed["poll_seconds"] == 2  # default
+
+
+# --- Finding 1: secret_status/active_session/test_connection dispatch, and
+# the service_name field build_server must supply for _secret_where. -------
+
+CCR_CONFIG = {
+    "cloud_url": "https://example.test",
+    "token": "1.secret",
+    "poll_seconds": 2,
+    "devices": {
+        1: {"id": 1, "host": "192.168.8.1", "type": "mikrotik_ccr",
+            "api_port": 8728, "use_tls": False, "username": "admin",
+            "password": "pw"},
+    },
+}
+
+
+def ccr_job(**over):
+    base = {"job_id": 7, "device_id": 1, "operation": "secret_status",
+            "host": "192.168.8.1", "api_port": 8728,
+            "params": {"pppoe_username": "user1"}}
+    base.update(over)
+    return base
+
+
+def test_secret_status_dispatches_to_mikrotik_and_service_name_defaults_to_none(monkeypatch):
+    seen = {}
+
+    def fake(server, pppoe_username):
+        seen["host"] = server.host
+        seen["username"] = server.username
+        seen["password"] = server.password
+        seen["api_port"] = server.api_port
+        seen["service_name"] = server.service_name
+        seen["pppoe_username"] = pppoe_username
+        return True, "enabled"
+
+    monkeypatch.setattr(agent.mikrotik, "get_secret_status", fake)
+    ok, result, error = agent.execute_job(ccr_job(), CCR_CONFIG)
+    assert ok is True and error is None and result == "enabled"
+    assert seen == {"host": "192.168.8.1", "username": "admin", "password": "pw",
+                    "api_port": 8728, "service_name": None, "pppoe_username": "user1"}
+
+
+def test_secret_status_passes_a_configured_service_name_to_mikrotik(monkeypatch):
+    config = {
+        "cloud_url": CCR_CONFIG["cloud_url"], "token": CCR_CONFIG["token"],
+        "poll_seconds": CCR_CONFIG["poll_seconds"],
+        "devices": {1: dict(CCR_CONFIG["devices"][1], service_name="isp-a")},
+    }
+    seen = {}
+
+    def fake(server, pppoe_username):
+        seen["service_name"] = server.service_name
+        return True, "enabled"
+
+    monkeypatch.setattr(agent.mikrotik, "get_secret_status", fake)
+    ok, result, error = agent.execute_job(ccr_job(), config)
+    assert ok is True
+    assert seen["service_name"] == "isp-a"
+
+
+def test_active_session_dispatches_to_mikrotik(monkeypatch):
+    seen = {}
+
+    def fake(server, pppoe_username):
+        seen["host"] = server.host
+        seen["username"] = server.username
+        seen["password"] = server.password
+        seen["api_port"] = server.api_port
+        seen["pppoe_username"] = pppoe_username
+        return True, {"address": "10.0.0.5"}
+
+    monkeypatch.setattr(agent.mikrotik, "get_active_session", fake)
+    ok, result, error = agent.execute_job(
+        ccr_job(operation="active_session"), CCR_CONFIG)
+    assert ok is True and result == {"address": "10.0.0.5"}
+    assert seen == {"host": "192.168.8.1", "username": "admin", "password": "pw",
+                    "api_port": 8728, "pppoe_username": "user1"}
+
+
+def test_test_connection_dispatches_to_mikrotik(monkeypatch):
+    seen = {}
+
+    def fake(server):
+        seen["host"] = server.host
+        seen["username"] = server.username
+        seen["password"] = server.password
+        seen["api_port"] = server.api_port
+        seen["use_tls"] = server.use_tls
+        return True, "Connected successfully."
+
+    monkeypatch.setattr(agent.mikrotik, "test_connection", fake)
+    ok, result, error = agent.execute_job(
+        ccr_job(operation="test_connection", params={}), CCR_CONFIG)
+    assert ok is True and result == "Connected successfully."
+    assert seen == {"host": "192.168.8.1", "username": "admin", "password": "pw",
+                    "api_port": 8728, "use_tls": False}
+
+
+# --- Finding 2: a malformed job must never crash the agent process. -------
+
+def test_run_once_survives_a_null_device_id(monkeypatch):
+    called = []
+    monkeypatch.setattr(agent.vsol_olt, "get_olt_status",
+                        lambda s: called.append(s) or (True, []))
+    session = FakeSession([FakeResponse(200, job(device_id=None))])
+    handled = agent.run_once(session, CONFIG)
+    assert handled is True
+    assert called == []
+    _, payload = session.posted[0]
+    assert payload["ok"] is False and payload["error"]
+
+
+def test_run_once_survives_a_non_numeric_device_id(monkeypatch):
+    called = []
+    monkeypatch.setattr(agent.vsol_olt, "get_olt_status",
+                        lambda s: called.append(s) or (True, []))
+    session = FakeSession([FakeResponse(200, job(device_id="not-a-number"))])
+    handled = agent.run_once(session, CONFIG)
+    assert handled is True
+    assert called == []
+    _, payload = session.posted[0]
+    assert payload["ok"] is False and payload["error"]
+
+
+def test_run_once_survives_a_job_with_no_job_id(monkeypatch):
+    called = []
+    monkeypatch.setattr(agent.vsol_olt, "get_olt_status",
+                        lambda s: called.append(s) or (True, []))
+    bad_job = job()
+    del bad_job["job_id"]
+    session = FakeSession([FakeResponse(200, bad_job)])
+    handled = agent.run_once(session, CONFIG)
+    # No job_id means there is no URL to post a result to at all.
+    assert handled is False
+    assert called == []
+    assert session.posted == []
+
+
+def test_main_loop_survives_an_unexpected_exception_from_run_once(monkeypatch):
+    """A bug anywhere in the poll cycle -- not just a network error -- must
+    degrade to a logged, retried cycle, not a dead agent. Bounded by having
+    the fake run_once raise SystemExit on its second call (which `except
+    Exception` does not catch), so the test terminates instead of looping
+    forever, while still proving the loop survived the first, ordinary
+    exception and came back around for a second poll."""
+    calls = {"n": 0}
+
+    def fake_run_once(session, config):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        raise SystemExit(0)
+
+    monkeypatch.setattr(agent, "run_once", fake_run_once)
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    monkeypatch.setattr(agent, "load_config", lambda path: CONFIG)
+    monkeypatch.setattr(agent, "_warn_if_world_readable", lambda path: None)
+    monkeypatch.setattr(agent, "_configure_logging", lambda path: None)
+
+    with pytest.raises(SystemExit):
+        agent.main([])
+
+    assert calls["n"] == 2
+
+
+# --- Finding 3: a missing/null job host must be treated as a mismatch, not
+# skipped -- the trust boundary is "every job's host is verified", not
+# "every job that bothers to send one". ------------------------------------
+
+def test_a_job_with_no_host_key_is_refused(monkeypatch):
+    called = []
+    monkeypatch.setattr(agent.vsol_olt, "get_olt_status",
+                        lambda s: called.append(s) or (True, []))
+    j = job()
+    del j["host"]
+    reason = agent.validate_job(j, CONFIG)
+    assert reason is not None and "host" in reason.lower()
+    ok, result, error = agent.execute_job(j, CONFIG)
+    assert ok is False
+    assert called == []
+
+
+def test_a_job_with_a_null_host_is_refused(monkeypatch):
+    called = []
+    monkeypatch.setattr(agent.vsol_olt, "get_olt_status",
+                        lambda s: called.append(s) or (True, []))
+    reason = agent.validate_job(job(host=None), CONFIG)
+    assert reason is not None and "host" in reason.lower()
+    ok, result, error = agent.execute_job(job(host=None), CONFIG)
+    assert ok is False
+    assert called == []

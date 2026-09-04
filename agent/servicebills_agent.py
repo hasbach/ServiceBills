@@ -84,6 +84,7 @@ def parse_config(raw):
             "use_tls": bool(entry.get("use_tls", False)),
             "username": entry.get("username", ""),
             "password": entry.get("password", ""),
+            "service_name": entry.get("service_name"),
         }
     if not devices:
         raise AgentConfigError("at least one [[device]] is required")
@@ -103,20 +104,43 @@ def load_config(path):
         return parse_config(tomllib.load(handle))
 
 
+def _resolve_device_id(job):
+    """Return (device_id, None) on success, or (None, refusal_reason).
+
+    A job is untrusted input from the cloud: `device_id` may be missing,
+    null, or a non-numeric string. int() raises TypeError/ValueError for
+    those instead of returning a sentinel, so this is the one place that
+    conversion happens -- both validate_job and execute_job call it instead
+    of indexing/converting the job dict directly, so the malformed cases
+    become an ordinary refusal instead of an uncaught exception.
+    """
+    raw = job.get("device_id", -1)
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, "Device id {!r} is not a valid integer".format(raw)
+
+
 def validate_job(job, config):
     """Return a refusal reason, or None if the job may run.
 
-    Three checks, in the order that fails cheapest first. Each one exists
+    Checks run in the order that fails cheapest first. Each one exists
     because the cloud is not fully trusted with this decision.
     """
-    device = config["devices"].get(int(job.get("device_id", -1)))
+    device_id, reason = _resolve_device_id(job)
+    if reason:
+        return reason
+    device = config["devices"].get(device_id)
     if device is None:
         return "Device {} is not configured on this agent".format(job.get("device_id"))
     if job.get("operation") not in ALLOWED_OPERATIONS:
         return "Operation {!r} is not permitted by this agent".format(job.get("operation"))
-    if job.get("host") and job["host"] != device["host"]:
+    # A missing/None/empty host is treated as a mismatch, not skipped: the
+    # whole point of this check is that every job's host must be verified
+    # against local config, so "the job didn't say" cannot be a free pass.
+    if not job.get("host") or job["host"] != device["host"]:
         return ("Refusing job: host {!r} does not match the configured host {!r} "
-                "for device {}".format(job["host"], device["host"], device["id"]))
+                "for device {}".format(job.get("host"), device["host"], device["id"]))
     return None
 
 
@@ -124,9 +148,12 @@ def build_server(device_cfg):
     """The duck-typed object mikrotik.py and vsol_olt.py expect.
 
     Only id/host/api_port are load-bearing for dispatch and the host check;
-    use_tls/username/password are read with defaults so a hand-built config
-    (as in tests, or a minimal [[device]] block) doesn't have to spell out
-    every optional field.
+    use_tls/username/password/service_name are read with defaults so a
+    hand-built config (as in tests, or a minimal [[device]] block) doesn't
+    have to spell out every optional field. service_name in particular
+    defaults to None -- mikrotik._secret_where() treats a falsy service_name
+    as "match by /ppp/secret name only", which is the correct behaviour for
+    a router that isn't shared between more than one ISP.
     """
     return types.SimpleNamespace(
         id=device_cfg["id"],
@@ -135,6 +162,7 @@ def build_server(device_cfg):
         use_tls=device_cfg.get("use_tls", False),
         username=device_cfg.get("username", ""),
         password=device_cfg.get("password", ""),
+        service_name=device_cfg.get("service_name"),
         last_checked_at=None,
         last_status=None,
     )
@@ -147,7 +175,11 @@ def execute_job(job, config):
         logger.warning("Refused job %s: %s", job.get("job_id"), reason)
         return False, None, reason
 
-    device = config["devices"][int(job["device_id"])]
+    # validate_job (via _resolve_device_id) already proved this device_id
+    # parses and resolves to a configured device, so this cannot KeyError or
+    # raise on the int() conversion the way indexing job["device_id"] could.
+    device_id, _ = _resolve_device_id(job)
+    device = config["devices"][device_id]
     server = build_server(device)
     params = job.get("params") or {}
     operation = job["operation"]
@@ -194,13 +226,25 @@ def run_once(session, config):
         return False
 
     job = response.json()
+    job_id = job.get("job_id")
+    if job_id is None:
+        # No usable job_id means there is nowhere to POST a result to -- the
+        # URL itself needs it. This is unlike every other malformed-job case
+        # (which still gets refused with an ok:false result the cloud can
+        # see): here the cloud never learns anything happened, so make sure
+        # it is at least loud in the local log.
+        logger.error("Received a job with no job_id; cannot post a result. "
+                     "operation=%r device_id=%r",
+                     job.get("operation"), job.get("device_id"))
+        return False
+
     ok, result, error = execute_job(job, config)
     session.post(
-        "{}/api/agent/jobs/{}/result".format(config["cloud_url"], job["job_id"]),
+        "{}/api/agent/jobs/{}/result".format(config["cloud_url"], job_id),
         json={"ok": ok, "result": result, "error": error},
         timeout=HTTP_TIMEOUT_SECONDS, headers=_headers(config),
     )
-    logger.info("Job %s (%s) -> %s", job["job_id"], job["operation"],
+    logger.info("Job %s (%s) -> %s", job_id, job.get("operation"),
                 "ok" if ok else "error: {}".format(error))
     return True
 
@@ -252,6 +296,21 @@ def main(argv=None):
             handled = run_once(session, config)
         except requests.RequestException as exc:
             logger.warning("Cloud unreachable: %s", exc)
+            handled = False
+        except Exception as exc:  # noqa: BLE001 -- a bug anywhere in the poll
+            # cycle must degrade to a logged, retried cycle, never a dead
+            # agent (this is what actually keeps an unattended box running).
+            # Deliberately not logger.exception/exc_info=True: this frame
+            # wraps run_once, whose local `config` dict holds every device's
+            # plaintext password, so a traceback dumped from here (or from
+            # anywhere run_once calls) would put those in the log file the
+            # same way execute_job's own except-block avoids doing. Logging
+            # only the exception's type and message -- never its traceback or
+            # this frame's locals -- carries the same guarantee: Python's
+            # built-in exceptions don't embed unrelated local variables into
+            # their str(), only a short, generic description.
+            logger.error("Unexpected error in poll loop: %s: %s",
+                         exc.__class__.__name__, exc)
             handled = False
         if args.once:
             return 0

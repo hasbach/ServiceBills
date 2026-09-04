@@ -14,6 +14,7 @@ api_port = 8728
 use_tls  = false
 username = "admin"
 password = "ROUTEROS-PASSWORD"
+# service_name = "pppoe-out"  # optional: only set this if this router hosts PPPoE secrets for more than one ISP, to disambiguate which secret "name" belongs to yours
 
 [[device]]
 id       = 2
