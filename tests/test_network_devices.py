@@ -156,3 +156,62 @@ def test_get_network_job_device_health_missing_interfaces_key_does_not_raise(cli
     polled = resp.get_json()
     assert polled["result"]["identity"] == "ccr-router"
     assert "interfaces" not in polled["result"]
+
+
+def test_interface_entry_missing_name_still_polls_and_gets_label_none(client, app, monkeypatch):
+    """Mirrors what agent_post_result persists verbatim from an on-prem agent:
+    the stored result can be whatever JSON the agent posted, with no shape
+    validation. An interface entry that is a dict but has no 'name' key must
+    not raise KeyError -- it should still come back enriched, with label:
+    None, so a bad entry doesn't turn every subsequent poll into a 500."""
+    hdr = make_tenant(client, "Biz L", "l_admin")
+    device_id = _create_device(client, hdr)
+
+    monkeypatch.setattr(appmod.mikrotik, "get_device_health", lambda server: (True, {
+        "identity": "ccr-router", "uptime": "1w2d",
+        "interfaces": [{"name": "ether1", "running": True, "disabled": False}],
+    }))
+    r = client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr)
+    job_id = r.get_json()["job_id"]
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = {
+            "identity": "ccr-router", "uptime": "1w2d",
+            "interfaces": [{"running": True, "disabled": False}],  # no 'name'
+        }
+        appmod.db.session.commit()
+
+    resp = client.get(f"/api/network-jobs/{job_id}", headers=hdr)
+    assert resp.status_code == 200
+    polled = resp.get_json()
+    assert polled["result"]["interfaces"][0]["label"] is None
+
+
+def test_interface_entry_that_is_not_a_dict_survives_untouched(client, app, monkeypatch):
+    """Same agent-supplied-JSON scenario, but the entry isn't a dict at all.
+    It must be passed through untouched rather than crashing or being
+    dropped -- the goal is that a poll always returns, never that the data is
+    silently reshaped."""
+    hdr = make_tenant(client, "Biz M", "m_admin")
+    device_id = _create_device(client, hdr)
+
+    monkeypatch.setattr(appmod.mikrotik, "get_device_health", lambda server: (True, {
+        "identity": "ccr-router", "uptime": "1w2d",
+        "interfaces": [{"name": "ether1", "running": True, "disabled": False}],
+    }))
+    r = client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr)
+    job_id = r.get_json()["job_id"]
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = {
+            "identity": "ccr-router", "uptime": "1w2d",
+            "interfaces": ["ether1"],  # not a dict at all
+        }
+        appmod.db.session.commit()
+
+    resp = client.get(f"/api/network-jobs/{job_id}", headers=hdr)
+    assert resp.status_code == 200
+    polled = resp.get_json()
+    assert polled["result"]["interfaces"][0] == "ether1"

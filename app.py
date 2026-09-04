@@ -9377,8 +9377,12 @@ def _with_interface_labels(job, payload):
     agent's box.
 
     Deliberately defensive: this runs on a polling endpoint hit repeatedly by
-    the browser, so a missing 'interfaces' key or a since-deleted device row
-    must fall through cleanly rather than raise.
+    the browser, so a missing 'interfaces' key, a since-deleted device row, or
+    a malformed entry inside the list must fall through cleanly rather than
+    raise. The last of those matters because agent-mode results are whatever
+    JSON the on-prem agent posted (see agent_post_result), not something this
+    endpoint can assume is well-formed -- a bad entry here must not turn every
+    subsequent poll of that job into a 500.
     """
     if job.operation != 'device_health' or job.status != 'done':
         return payload
@@ -9391,7 +9395,8 @@ def _with_interface_labels(job, payload):
     payload = dict(payload)
     payload['result'] = dict(result)
     payload['result']['interfaces'] = [
-        {**iface, 'label': labels.get(iface['name'])} for iface in interfaces
+        {**iface, 'label': labels.get(iface.get('name'))} if isinstance(iface, dict) else iface
+        for iface in interfaces
     ]
     return payload
 
