@@ -5009,6 +5009,7 @@ def save_business_settings():
                 email=request.form.get('email', ""),
                 website=request.form.get('website', ""),
                 network_mode=request.form.get('network_mode', "none"),
+                network_access_mode=request.form.get('network_access_mode', 'direct'),
                 upstream_sync_automation_enabled=_parse_bool_form_field(
                     request.form.get('upstream_sync_automation_enabled'), default=False),
                 multi_currency_enabled=_parse_bool_form_field(
@@ -5031,6 +5032,8 @@ def save_business_settings():
         settings.email = request.form.get('email', settings.email)
         settings.website = request.form.get('website', settings.website)
         settings.network_mode = request.form.get('network_mode', settings.network_mode)
+        settings.network_access_mode = request.form.get(
+            'network_access_mode', settings.network_access_mode)
         if 'upstream_sync_automation_enabled' in request.form:
             settings.upstream_sync_automation_enabled = _parse_bool_form_field(
                 request.form.get('upstream_sync_automation_enabled'), default=settings.upstream_sync_automation_enabled)
@@ -8871,7 +8874,7 @@ def get_network_devices():
 def create_network_device():
     data = request.json
     try:
-        if not data.get('password'):
+        if _tenant_access_mode() != 'agent' and not data.get('password'):
             return jsonify({'error': 'password is required'}), 400
         device_type = data.get('device_type')
         if device_type not in NETWORK_DEVICE_TYPES:
@@ -8889,7 +8892,7 @@ def create_network_device():
             # An OLT has no username -- SNMP's only credential is the community
             # string, held in `password`. Default to '' so the NOT NULL holds.
             username=data.get('username') or '',
-            password=data['password'],
+            password=data.get('password') or '',
             status=data.get('status', 'active'),
             device_type=device_type,
             parent_device_id=parent_id,
@@ -9578,6 +9581,51 @@ def get_network_job(job_id):
         payload = dict(payload)
         payload['result'] = _resolve_onu_customers(job.result)
     return jsonify(payload), 200
+
+
+@app.route('/api/network-agents', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def list_network_agents():
+    agents = tenant_query(NetworkAgent).order_by(NetworkAgent.name).all()
+    return jsonify([a.to_dict() for a in agents]), 200
+
+
+@app.route('/api/network-agents', methods=['POST'])
+@jwt_required()
+@admin_required()
+def create_network_agent():
+    if tenant_query(NetworkAgent).first():
+        return jsonify({'error': 'This tenant already has an agent. '
+                                 'Regenerate its token instead.'}), 400
+    data = request.json or {}
+    try:
+        agent = NetworkAgent(name=data.get('name') or 'Network Agent', token_hash='')
+        db.session.add(agent)
+        db.session.flush()          # assign the id -- the token embeds it
+        token = _issue_agent_token(agent)
+        db.session.commit()
+        # The only time the token is ever returned. It is not recoverable.
+        return jsonify({'agent': agent.to_dict(), 'token': token}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/network-agents/<int:agent_id>/regenerate-token', methods=['POST'])
+@jwt_required()
+@admin_required()
+def regenerate_network_agent_token(agent_id):
+    agent = tenant_query(NetworkAgent).filter_by(id=agent_id).first()
+    if not agent:
+        return jsonify({'message': 'Agent not found'}), 404
+    try:
+        token = _issue_agent_token(agent)
+        db.session.commit()
+        return jsonify({'agent': agent.to_dict(), 'token': token}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
 
 
 @app.route('/api/network-tree', methods=['GET'])
