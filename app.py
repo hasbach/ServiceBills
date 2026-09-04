@@ -360,6 +360,20 @@ class NetworkDevice(db.Model):
     # after a first Check Now reveals the device's real interface names --
     # nobody has confirmed the exact interface-to-upstream mapping in advance.
     interface_labels = db.Column(db.JSON, nullable=False, default=dict)
+    # Which connector module handles this row: mikrotik.py for 'mikrotik_ccr',
+    # vsol_olt.py for 'vsol_olt'. A string discriminator, mirroring the existing
+    # UpstreamProvider.product convention rather than an enum table. The default
+    # exists to backfill the one pre-existing row (DeltaNet's CCR) during the
+    # migration -- the create endpoint requires callers to state it explicitly.
+    device_type = db.Column(db.String(20), nullable=False, default='mikrotik_ccr',
+                            server_default='mikrotik_ccr')
+    # Self-referential: the CCR is the root (null parent); the OLT's parent is
+    # the CCR. This is what turns the flat device list into the Network Tree.
+    parent_device_id = db.Column(db.Integer, db.ForeignKey('network_device.id'), nullable=True)
+    children = db.relationship(
+        'NetworkDevice', backref=db.backref('parent', remote_side=[id]),
+        lazy='select',
+    )
 
     def to_dict(self):
         return {
@@ -368,6 +382,8 @@ class NetworkDevice(db.Model):
             'host': self.host,
             'api_port': self.api_port,
             'use_tls': self.use_tls,
+            'device_type': self.device_type,
+            'parent_device_id': self.parent_device_id,
             'username': self.username,
             'status': self.status,
             'last_checked_at': self.last_checked_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_checked_at else None,
@@ -410,6 +426,11 @@ class Customer(db.Model):
     # customer authenticates against and their /ppp/secret name on it.
     mikrotik_server_id = db.Column(db.Integer, db.ForeignKey('mikrotik_server.id'), nullable=True)
     pppoe_username = db.Column(db.String(100), nullable=True)
+    # MAC of the ONU serving this customer, as the OLT reports it. Many
+    # customers can sit behind one ONU (DeltaNet's ONUs are transparent
+    # bridges), so this is a plain many-to-one string -- no unique constraint,
+    # no join table -- the same shape as mikrotik_server_id/upstream_provider_id.
+    onu_mac_address = db.Column(db.String(20), nullable=True, index=True)
     payments = db.relationship('Payment', backref='customer', lazy=True, cascade="all, delete-orphan")
     generated_receipts = db.relationship('GeneratedReceipt', back_populates='customer', cascade="all, delete-orphan")
     addon_purchases = db.relationship('AddonPurchase', backref='customer', lazy=True, cascade="all, delete-orphan")
