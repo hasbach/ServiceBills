@@ -89,6 +89,18 @@ def test_device_with_an_unreachable_parent_still_appears_as_a_root(app, client):
     assert sorted(ids) == sorted([ccr["id"], olt["id"]])
 
 
+def refresh_and_poll(client, hdr, olt_id):
+    """The refresh endpoint is job-based (Task 4): POST starts an olt_status
+    walk -- or, in 'direct' mode (the default here; these tests never create
+    a BusinessSettings row), runs it inline -- and returns a job_id. The
+    enriched ONU list, with customers attached, comes back from polling that
+    job (see get_network_job's _resolve_onu_customers call), not from the
+    POST response itself."""
+    started = client.post(f"/api/network-tree/olt/{olt_id}/refresh", headers=hdr).get_json()
+    assert started["ok"] is True and started["job_id"], started
+    return client.get(f"/api/network-jobs/{started['job_id']}", headers=hdr).get_json()
+
+
 def test_refresh_resolves_many_customers_behind_one_onu(app, client, monkeypatch):
     hdr = make_tenant(client, "Tree D", "tree_d_admin")
     ccr = make_ccr(client, hdr)
@@ -98,9 +110,9 @@ def test_refresh_resolves_many_customers_behind_one_onu(app, client, monkeypatch
     add_customer(app, "Tree D", "Unlinked Person", None)
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
 
-    body = client.post(f"/api/network-tree/olt/{olt['id']}/refresh", headers=hdr).get_json()
-    assert body["ok"] is True
-    first, second = body["onus"]
+    polled = refresh_and_poll(client, hdr, olt["id"])
+    assert polled["status"] == "done"
+    first, second = polled["result"]
     assert sorted(c["name"] for c in first["customers"]) == [
         "Moussa Ghadir", "Second Behind Same ONU"]
     # An ONU nobody is linked to still renders, with its OLT label intact.
@@ -114,8 +126,8 @@ def test_refresh_matches_mac_case_insensitively(app, client, monkeypatch):
     olt = make_olt(client, hdr, ccr["id"])
     add_customer(app, "Tree E", "Upper Mac", "B4:64:15:3F:C1:94")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
-    body = client.post(f"/api/network-tree/olt/{olt['id']}/refresh", headers=hdr).get_json()
-    assert [c["name"] for c in body["onus"][0]["customers"]] == ["Upper Mac"]
+    polled = refresh_and_poll(client, hdr, olt["id"])
+    assert [c["name"] for c in polled["result"][0]["customers"]] == ["Upper Mac"]
 
 
 def test_refresh_on_a_non_olt_is_rejected(app, client):
@@ -131,10 +143,16 @@ def test_refresh_surfaces_connector_failure(app, client, monkeypatch):
     olt = make_olt(client, hdr, ccr["id"])
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (False, "No SNMP response received before timeout"))
-    body = client.post(f"/api/network-tree/olt/{olt['id']}/refresh", headers=hdr).get_json()
-    assert body["ok"] is False
-    assert body["onus"] is None
-    assert "timeout" in body["message"]
+    # In direct mode the job is created successfully (ok:true) regardless of
+    # whether the connector itself succeeds -- the connector failure surfaces
+    # on the job once polled, as an error with no result, not as ok:false on
+    # the POST. (The ok:false path belongs to _create_device_job's own
+    # refusal -- e.g. agent mode with no online agent -- covered in
+    # tests/test_network_agent_jobs.py.)
+    polled = refresh_and_poll(client, hdr, olt["id"])
+    assert polled["status"] == "done"
+    assert polled["result"] is None
+    assert "timeout" in polled["error"]
 
 
 def _walk_ids(nodes):

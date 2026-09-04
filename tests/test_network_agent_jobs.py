@@ -91,18 +91,27 @@ def test_agent_mode_creates_a_pending_job_and_returns_its_id(app, client):
 
 def test_direct_mode_returns_an_already_completed_job(app, client, monkeypatch):
     """Direct mode must give the frontend the SAME shape, so the UI has one
-    code path -- the job simply arrives already done."""
+    code path -- the job simply arrives already done.
+
+    The fake connector result must be shaped like a real ONU record (a
+    'mac_address' key) because Task 4 added customer resolution on read for
+    completed olt_status jobs -- see test_refresh_returns_a_job_and_customers_
+    are_resolved_on_poll below for that behaviour itself. An ONU with no
+    matching customer still gets an empty 'customers' list attached, which
+    this test's assertion accounts for.
+    """
     hdr = make_tenant(client, "Job D", "job_d_admin")
     set_mode(app, "Job D", "direct")
     device_id = make_device(app, "Job D")
-    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, [{"x": 1}]))
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
+                        lambda d: (True, [{"mac_address": "aa:bb:cc:dd:ee:ff"}]))
 
     body = client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr).get_json()
     assert body["ok"] is True
     job_id = body["job_id"]
     polled = client.get(f"/api/network-jobs/{job_id}", headers=hdr).get_json()
     assert polled["status"] == "done"
-    assert polled["result"] == [{"x": 1}]
+    assert polled["result"] == [{"mac_address": "aa:bb:cc:dd:ee:ff", "customers": []}]
 
 
 def test_direct_mode_records_a_connector_failure_as_error(app, client, monkeypatch):
@@ -178,3 +187,83 @@ def test_job_poll_is_tenant_scoped(app, client, monkeypatch):
 
     hdr_two = make_tenant(client, "Job I2", "job_i2_admin")
     assert client.get(f"/api/network-jobs/{job_id}", headers=hdr_two).status_code == 404
+
+
+ONUS = [
+    {"pon_port": "PON1", "onu_id": "EPON0/1:2", "status": "online",
+     "mac_address": "b4:64:15:3f:c1:94", "description": "MoussaGhadir",
+     "model": "V2801D", "distance_m": 531},
+]
+
+
+def test_refresh_returns_a_job_and_customers_are_resolved_on_poll(app, client, monkeypatch):
+    hdr = make_tenant(client, "Job K", "job_k_admin")
+    set_mode(app, "Job K", "direct")
+    device_id = make_device(app, "Job K")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+
+    with app.app_context():
+        tenant = _tenant("Job K")
+        plan = appmod.SubscriptionPlan(
+            tenant_id=tenant.id, name="Basic", price=10, cost=5,
+            billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        appmod.db.session.add(appmod.Customer(
+            tenant_id=tenant.id, name="Moussa Ghadir", phone="1", address="a",
+            subscription_plan_id=plan.id,
+            subscription_expiry_date=appmod.datetime.utcnow(),
+            onu_mac_address="b4:64:15:3f:c1:94"))
+        appmod.db.session.commit()
+
+    body = client.post(f"/api/network-tree/olt/{device_id}/refresh", headers=hdr).get_json()
+    assert body["ok"] is True and body["job_id"]
+    polled = client.get(f"/api/network-jobs/{body['job_id']}", headers=hdr).get_json()
+    assert polled["status"] == "done"
+    assert [c["name"] for c in polled["result"][0]["customers"]] == ["Moussa Ghadir"]
+
+
+def test_refresh_on_a_non_olt_is_rejected(app, client):
+    hdr = make_tenant(client, "Job L", "job_l_admin")
+    set_mode(app, "Job L", "direct")
+    with app.app_context():
+        tenant = _tenant("Job L")
+        ccr = appmod.NetworkDevice(
+            tenant_id=tenant.id, name="CCR", host="192.168.8.1",
+            username="admin", password="p", device_type="mikrotik_ccr", api_port=8728)
+        appmod.db.session.add(ccr)
+        appmod.db.session.commit()
+        ccr_id = ccr.id
+    assert client.post(f"/api/network-tree/olt/{ccr_id}/refresh",
+                       headers=hdr).status_code == 400
+
+
+def test_label_matches_computes_proposals_from_a_completed_job(app, client, monkeypatch):
+    hdr = make_tenant(client, "Job M", "job_m_admin")
+    set_mode(app, "Job M", "direct")
+    device_id = make_device(app, "Job M")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+
+    with app.app_context():
+        tenant = _tenant("Job M")
+        plan = appmod.SubscriptionPlan(
+            tenant_id=tenant.id, name="Basic", price=10, cost=5,
+            billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        appmod.db.session.add(appmod.Customer(
+            tenant_id=tenant.id, name="Moussa Ghadir", phone="1", address="a",
+            subscription_plan_id=plan.id,
+            subscription_expiry_date=appmod.datetime.utcnow()))
+        appmod.db.session.commit()
+
+    started = client.get(f"/api/network-tree/olt/{device_id}/label-matches",
+                         headers=hdr).get_json()
+    assert started["job_id"]
+    done = client.get(
+        f"/api/network-tree/olt/{device_id}/label-matches?job_id={started['job_id']}",
+        headers=hdr).get_json()
+    assert done["ok"] is True
+    assert len(done["proposals"]) == 1
+    assert done["proposals"][0]["customer"]["name"] == "Moussa Ghadir"
+    assert done["proposals"][0]["confidence"] == 1.0

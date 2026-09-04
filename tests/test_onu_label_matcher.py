@@ -25,6 +25,22 @@ def setup_devices(client, hdr):
     return olt
 
 
+def get_label_matches(client, hdr, olt_id):
+    """The label-matches endpoint is two-phase: a bare GET starts an
+    olt_status walk and hands back its job_id; the proposals themselves only
+    come back once that job_id is passed back in. In 'direct' mode (the
+    default for these tests -- no BusinessSettings row is created) the walk
+    runs inline, so the job is already done by the time the first call
+    returns and this helper's second call gets the real proposals straight
+    away."""
+    started = client.get(f"/api/network-tree/olt/{olt_id}/label-matches",
+                         headers=hdr).get_json()
+    assert started["job_id"], started
+    return client.get(
+        f"/api/network-tree/olt/{olt_id}/label-matches?job_id={started['job_id']}",
+        headers=hdr).get_json()
+
+
 def add_customer(app, tenant_name, name, mac=None):
     with app.app_context():
         tenant = appmod.Tenant.query.filter_by(name=tenant_name).first()
@@ -52,8 +68,7 @@ def test_squashed_label_matches_spaced_customer_name(app, client, monkeypatch):
     cid = add_customer(app, "Match A", "Moussa Ghadir")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("b4:64:15:3f:c1:94", "MoussaGhadir")]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert body["ok"] is True
     assert len(body["proposals"]) == 1
     proposal = body["proposals"][0]
@@ -69,8 +84,7 @@ def test_case_and_punctuation_are_ignored(app, client, monkeypatch):
     add_customer(app, "Match B", "Ali Hachem")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("f4:c4:d6:4d:88:81", "aLIhACHEM")]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert len(body["proposals"]) == 1
     assert body["proposals"][0]["confidence"] == 1.0
 
@@ -81,8 +95,7 @@ def test_unrelated_label_produces_no_proposal(app, client, monkeypatch):
     add_customer(app, "Match C", "Completely Different Person")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("aa:bb:cc:dd:ee:ff", "zein_khodor")]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert body["proposals"] == []
     assert len(body["unmatched_onus"]) == 1
     assert len(body["unmatched_customers"]) == 1
@@ -94,8 +107,7 @@ def test_unlabelled_onus_are_never_proposed(app, client, monkeypatch):
     add_customer(app, "Match D", "Somebody")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("aa:bb:cc:dd:ee:ff", None)]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert body["proposals"] == []
     assert body["unmatched_onus"][0]["mac_address"] == "aa:bb:cc:dd:ee:ff"
 
@@ -106,8 +118,7 @@ def test_already_linked_customers_are_not_proposed_again(app, client, monkeypatc
     add_customer(app, "Match E", "Moussa Ghadir", mac="b4:64:15:3f:c1:94")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("b4:64:15:3f:c1:94", "MoussaGhadir")]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert body["proposals"] == []
     assert body["unmatched_customers"] == []
 
@@ -121,8 +132,7 @@ def test_one_customer_is_proposed_at_most_once(app, client, monkeypatch):
         onu("aa:00:00:00:00:01", "TalebCaffe", onu_id="EPON0/1:1"),
         onu("aa:00:00:00:00:02", "TalebCaffee", onu_id="EPON0/1:2"),
     ]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert len(body["proposals"]) == 1
     # The stronger (exact) match wins the customer; the other is left unmatched.
     assert body["proposals"][0]["onu"]["mac_address"] == "aa:00:00:00:00:01"
@@ -144,8 +154,7 @@ def test_one_onu_label_colliding_with_two_customers_proposes_only_the_stronger_m
     loser = add_customer(app, "Match F2", "Taleb Caffee")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("aa:00:00:00:00:03", "TalebCaffe")]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert len(body["proposals"]) == 1
     assert body["proposals"][0]["customer"]["id"] == winner
     assert body["proposals"][0]["confidence"] == 1.0
@@ -159,7 +168,7 @@ def test_get_writes_nothing(app, client, monkeypatch):
     cid = add_customer(app, "Match G", "Moussa Ghadir")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("b4:64:15:3f:c1:94", "MoussaGhadir")]))
-    client.get(f"/api/network-tree/olt/{olt['id']}/label-matches", headers=hdr)
+    get_label_matches(client, hdr, olt['id'])
     with app.app_context():
         assert appmod.Customer.query.filter_by(id=cid).first().onu_mac_address is None
 
@@ -208,8 +217,7 @@ def test_short_names_below_length_gate_do_not_propose(app, client, monkeypatch):
     add_customer(app, "Match K", "Ali")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("aa:bb:cc:dd:ee:01", "alia")]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert body["proposals"] == []
 
 
@@ -221,8 +229,7 @@ def test_short_names_below_length_gate_do_not_propose_2(app, client, monkeypatch
     add_customer(app, "Match L", "Sam")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("aa:bb:cc:dd:ee:02", "sami")]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert body["proposals"] == []
 
 
@@ -235,8 +242,7 @@ def test_exact_short_match_still_proposes_despite_length_gate(app, client, monke
     cid = add_customer(app, "Match M", "Ali")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("aa:bb:cc:dd:ee:03", "aLI")]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert len(body["proposals"]) == 1
     assert body["proposals"][0]["customer"]["id"] == cid
     assert body["proposals"][0]["confidence"] == 1.0
@@ -251,8 +257,7 @@ def test_long_near_miss_still_proposes(app, client, monkeypatch):
     cid = add_customer(app, "Match N", "Taleb Caffe")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
                         lambda d: (True, [onu("aa:bb:cc:dd:ee:04", "TalebCaffee")]))
-    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                      headers=hdr).get_json()
+    body = get_label_matches(client, hdr, olt['id'])
     assert len(body["proposals"]) == 1
     assert body["proposals"][0]["customer"]["id"] == cid
     assert 0.82 <= body["proposals"][0]["confidence"] < 1.0
@@ -421,8 +426,7 @@ def test_customer_put_can_correct_a_previously_applied_onu_link(app, client, mon
 
     # Confirm the finding's premise: the now-linked customer is excluded from
     # the only endpoint that could previously write this field.
-    matches = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
-                         headers=hdr).get_json()
+    matches = get_label_matches(client, hdr, olt['id'])
     assert all(c["id"] != customer_id for c in matches["unmatched_customers"])
 
     # The wrong link must still be correctable directly.

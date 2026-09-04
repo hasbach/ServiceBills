@@ -9410,6 +9410,12 @@ def get_network_job(job_id):
         return jsonify({'message': 'Job not found'}), 404
     job = _expire_job_if_stale(job)
     payload = _with_interface_labels(job, job.to_dict())
+    if job.operation == 'olt_status' and job.status == 'done' and job.result:
+        # Resolved at read time, not at write time: the customer<->ONU links
+        # can change between the walk and the render (the label matcher writes
+        # them), and the agent has no access to Customer rows anyway.
+        payload = dict(payload)
+        payload['result'] = _resolve_onu_customers(job.result)
     return jsonify(payload), 200
 
 
@@ -9432,14 +9438,11 @@ def refresh_olt_onus(device_id):
         return jsonify({'message': 'Network device not found!'}), 404
     if device.device_type != 'vsol_olt':
         return jsonify({'error': 'That device is not an OLT'}), 400
-    ok, result = _get_olt_status_core(
-        device, block=True, timeout=_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS)
-    db.session.commit()  # persists last_checked_at/last_status
-    if not ok:
-        return jsonify({'ok': False, 'message': result, 'onus': None,
+    job, error = _create_device_job(device, 'olt_status')
+    if error:
+        return jsonify({'ok': False, 'message': error, 'job_id': None,
                         'device': device.to_dict()}), 200
-    return jsonify({'ok': True, 'message': None,
-                    'onus': _resolve_onu_customers(result),
+    return jsonify({'ok': True, 'message': None, 'job_id': job.id,
                     'device': device.to_dict()}), 200
 
 
@@ -9518,19 +9521,45 @@ def _propose_label_matches(onus, customers):
 @jwt_required()
 @admin_or_finance_required()
 def get_onu_label_matches(device_id):
-    """Propose customer <-> ONU links from the labels already typed into the
-    OLT. Read-only: nothing is written until /apply."""
+    """Two-phase. Without job_id: start a walk and return the job. With
+    job_id: compute proposals from that job's stored ONU list.
+
+    Matching stays in the cloud because it needs Customer rows -- the agent
+    only ever returns what the OLT reported.
+    """
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
         return jsonify({'message': 'Network device not found!'}), 404
     if device.device_type != 'vsol_olt':
         return jsonify({'error': 'That device is not an OLT'}), 400
 
-    ok, result = _get_olt_status_core(
-        device, block=True, timeout=_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS)
-    db.session.commit()  # persists last_checked_at/last_status
-    if not ok:
-        return jsonify({'ok': False, 'message': result, 'proposals': [],
+    raw_job_id = request.args.get('job_id')
+    if not raw_job_id:
+        job, error = _create_device_job(device, 'olt_status')
+        if error:
+            return jsonify({'ok': False, 'message': error, 'job_id': None,
+                            'proposals': [], 'unmatched_onus': [],
+                            'unmatched_customers': []}), 200
+        return jsonify({'ok': True, 'message': None, 'job_id': job.id,
+                        'proposals': [], 'unmatched_onus': [],
+                        'unmatched_customers': []}), 200
+
+    try:
+        job_id = int(raw_job_id)
+    except (TypeError, ValueError):
+        return jsonify({'message': 'Invalid job_id'}), 400
+
+    job = tenant_query(NetworkAgentJob).filter_by(id=job_id).first()
+    if not job or job.device_id != device.id:
+        return jsonify({'message': 'Job not found'}), 404
+    _expire_job_if_stale(job)
+    if job.status != 'done':
+        return jsonify({'ok': False, 'message': job.error or 'Still running',
+                        'job_id': job.id, 'status': job.status, 'proposals': [],
+                        'unmatched_onus': [], 'unmatched_customers': []}), 200
+    if job.error:
+        return jsonify({'ok': False, 'message': job.error, 'job_id': job.id,
+                        'status': job.status, 'proposals': [],
                         'unmatched_onus': [], 'unmatched_customers': []}), 200
 
     linked = {
@@ -9541,14 +9570,14 @@ def get_onu_label_matches(device_id):
     # and customers with no ONU yet. Normalise the ONU side the same way the
     # customer side already is, rather than trusting the connector to always
     # hand back lowercase MACs.
-    onus = [o for o in result
+    onus = [o for o in (job.result or [])
             if (o.get('mac_address') or '').strip().lower() not in linked]
     customers = tenant_query(Customer).filter(
         Customer.onu_mac_address.is_(None)).order_by(Customer.name).all()
 
     proposals, unmatched_onus, unmatched_customers = _propose_label_matches(onus, customers)
-    return jsonify({'ok': True, 'message': None, 'proposals': proposals,
-                    'unmatched_onus': unmatched_onus,
+    return jsonify({'ok': True, 'message': None, 'job_id': job.id, 'status': 'done',
+                    'proposals': proposals, 'unmatched_onus': unmatched_onus,
                     'unmatched_customers': unmatched_customers}), 200
 
 
