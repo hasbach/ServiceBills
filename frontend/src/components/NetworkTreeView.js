@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     Box, Typography, Button, Paper, Chip, CircularProgress, Alert,
     Collapse, IconButton, Stack, Divider,
@@ -27,40 +27,70 @@ const NetworkTreeView = () => {
     const [loading, setLoading] = useState(true);
     const [onusByDevice, setOnusByDevice] = useState({});
     const [errorByDevice, setErrorByDevice] = useState({});
-    const [refreshingId, setRefreshingId] = useState(null);
+    // Per-device in-flight indicator -- a plain object keyed by device.id
+    // (same keying convention as onusByDevice/errorByDevice), NOT a single
+    // scalar. A scalar would make one device's "Checking..." state get
+    // clobbered by a refresh started on a different device.
+    const [refreshingIds, setRefreshingIds] = useState({});
     const [expanded, setExpanded] = useState({});
     const [matcherDevice, setMatcherDevice] = useState(null);
 
-    const loadTree = useCallback(async () => {
-        setLoading(true);
+    // Per-device request sequence numbers, used to discard a stale
+    // refreshOlt response that resolves after a newer one for the same
+    // device (out-of-order network responses). Not component state --
+    // updating it must never itself trigger a render.
+    const refreshSeqRef = useRef({});
+
+    // showSpinner distinguishes the genuine first load (full-page spinner is
+    // fine, there's nothing on screen yet) from a background resync after an
+    // OLT refresh or a label-match apply, which must update state quietly
+    // without blanking anything already on screen.
+    const loadTree = useCallback(async (showSpinner = true) => {
+        if (showSpinner) setLoading(true);
         try {
             const res = await apiService.fetchNetworkTree();
             setTree(res.data.tree || []);
         } catch (e) {
             setSnackbar({ open: true, message: 'Failed to load the network tree', severity: 'error' });
         } finally {
-            setLoading(false);
+            if (showSpinner) setLoading(false);
         }
     }, [setSnackbar]);
 
     useEffect(() => { loadTree(); }, [loadTree]);
 
     const refreshOlt = async (device) => {
-        setRefreshingId(device.id);
+        const seq = (refreshSeqRef.current[device.id] || 0) + 1;
+        refreshSeqRef.current[device.id] = seq;
+
+        setRefreshingIds((prev) => ({ ...prev, [device.id]: true }));
         setErrorByDevice((prev) => ({ ...prev, [device.id]: null }));
         try {
             const res = await apiService.refreshOltOnus(device.id);
+            // A newer refresh for this same device has started since this
+            // request went out -- this response is stale, discard it silently.
+            if (refreshSeqRef.current[device.id] !== seq) return;
             if (res.data.ok) {
                 setOnusByDevice((prev) => ({ ...prev, [device.id]: res.data.onus }));
                 setExpanded((prev) => ({ ...prev, [device.id]: true }));
             } else {
                 setErrorByDevice((prev) => ({ ...prev, [device.id]: res.data.message }));
             }
-            loadTree();  // pick up the new last_status/last_checked_at
+            loadTree(false);  // background sync to pick up the new last_status/last_checked_at
         } catch (e) {
+            if (refreshSeqRef.current[device.id] !== seq) return;
             setErrorByDevice((prev) => ({ ...prev, [device.id]: 'Request failed' }));
         } finally {
-            setRefreshingId(null);
+            // Only clear the in-flight indicator if no newer request for this
+            // device has superseded this one -- otherwise we'd clear the
+            // spinner for the request that's actually still running.
+            if (refreshSeqRef.current[device.id] === seq) {
+                setRefreshingIds((prev) => {
+                    const next = { ...prev };
+                    delete next[device.id];
+                    return next;
+                });
+            }
         }
     };
 
@@ -99,6 +129,7 @@ const NetworkTreeView = () => {
         const isOlt = device.device_type === 'vsol_olt';
         const onus = onusByDevice[device.id];
         const isOpen = !!expanded[device.id];
+        const isRefreshing = !!refreshingIds[device.id];
         return (
             <Box key={device.id} sx={{ pl: depth * 3 }}>
                 <Paper variant="outlined" sx={{ p: 1.5, mb: 1 }}>
@@ -129,9 +160,9 @@ const NetworkTreeView = () => {
                                     Match Labels
                                 </Button>
                                 <Button size="small" variant="outlined" startIcon={<RefreshIcon />}
-                                    disabled={refreshingId === device.id}
+                                    disabled={isRefreshing}
                                     onClick={() => refreshOlt(device)}>
-                                    {refreshingId === device.id ? 'Checking…' : 'Load ONUs'}
+                                    {isRefreshing ? 'Checking…' : 'Load ONUs'}
                                 </Button>
                             </>
                         )}
@@ -164,7 +195,7 @@ const NetworkTreeView = () => {
             <Stack direction="row" alignItems="center" sx={{ mb: 2 }}>
                 <Typography variant="h5" sx={{ fontWeight: 600 }}>Network Tree</Typography>
                 <Box sx={{ flexGrow: 1 }} />
-                <Button startIcon={<RefreshIcon />} onClick={loadTree}>Reload</Button>
+                <Button startIcon={<RefreshIcon />} onClick={() => loadTree()}>Reload</Button>
             </Stack>
 
             {tree.length === 0 ? (
@@ -178,7 +209,7 @@ const NetworkTreeView = () => {
                 <OnuLabelMatcherDialog
                     device={matcherDevice}
                     onClose={() => setMatcherDevice(null)}
-                    onApplied={() => { setMatcherDevice(null); loadTree(); }}
+                    onApplied={() => { setMatcherDevice(null); loadTree(false); }}
                 />
             )}
         </Box>
