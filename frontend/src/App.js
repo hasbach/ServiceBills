@@ -30,6 +30,7 @@ import {
     CloudQueue as UpstreamProviderIcon,
     Router as MikrotikIcon,
     NetworkCheck as NetworkDeviceIcon,
+    AccountTree as NetworkTreeIcon,
 } from '@mui/icons-material';
 import { AppContextProvider, useAppContext, apiService } from './context/AppContext.js';
 import DashboardView from './components/DashboardView.js';
@@ -57,6 +58,7 @@ import EmployeesView from './components/EmployeesView.js';
 import UpstreamProviderManagementView from './components/UpstreamProviderManagementView.js';
 import MikrotikServerManagementView from './components/MikrotikServerManagementView.js';
 import NetworkDeviceManagementView from './components/NetworkDeviceManagementView.js';
+import NetworkTreeView from './components/NetworkTreeView.js';
 
 // ── Navigation config ────────────────────────────────────────────────────────
 const NAV_ITEMS = [
@@ -73,6 +75,7 @@ const NAV_ITEMS = [
     { key: 'upstream-providers',  label: 'Upstream Providers',  icon: <UpstreamProviderIcon />, group: 'main',    allowedRoles: ['admin', 'finance'], visibleWhen: (bs) => bs?.network_mode === 'upstream_bridge' },
     { key: 'mikrotik-servers',    label: 'Mikrotik Servers',    icon: <MikrotikIcon />,         group: 'main',    allowedRoles: ['admin', 'finance'], visibleWhen: (bs) => bs?.network_mode === 'local_mikrotik' },
     { key: 'network-devices',    label: 'Network Devices',    icon: <NetworkDeviceIcon />,    group: 'main',    allowedRoles: ['admin', 'finance'] },
+    { key: 'network-tree',       label: 'Network Tree',       icon: <NetworkTreeIcon />,      group: 'main',    allowedRoles: ['admin', 'finance'] },
     { key: 'employees',          label: 'Payroll',            icon: <PayrollIcon />,             group: 'main',      allowedRoles: ['admin'] },
     { key: 'payments',           label: 'Payments',           icon: <PaymentIcon />,         group: 'main',      allowedRoles: ['admin', 'finance', 'collector'] },
     { key: 'receipts',           label: 'Receipts',           icon: <ReceiptIcon />,         group: 'main',      allowedRoles: ['admin', 'finance'] },
@@ -271,6 +274,7 @@ const MainApp = ({
             case 'upstream-providers': return <UpstreamProviderManagementView customers={customers} />;
             case 'mikrotik-servers': return <MikrotikServerManagementView />;
             case 'network-devices': return <NetworkDeviceManagementView />;
+            case 'network-tree': return <NetworkTreeView />;
             case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
             case 'payments': return <PaymentsView />;
             case 'receipts': return <ReceiptsView />;
