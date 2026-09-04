@@ -106,6 +106,7 @@ from crypto import EncryptedString
 import storage
 import email_util
 import mikrotik
+import vsol_olt
 import upstream_portal
 import upstream_portal_krypton
 import fx
@@ -2212,6 +2213,28 @@ _upstream_sync_semaphore = threading.Semaphore(_UPSTREAM_SYNC_CONCURRENCY_LIMIT)
 # inside gunicorn's 120s request timeout. The scheduled job (no HTTP client
 # waiting) blocks with no timeout instead -- see block=True below.
 _UPSTREAM_SYNC_ACQUIRE_TIMEOUT_SECONDS = 30
+
+# Separate from _upstream_sync_semaphore above, deliberately: keeping them
+# independent means the OLT path never touches the already-tested upstream
+# concurrency code. The reason for gating at all is narrower than the
+# upstream one -- an SNMP walk is cheap in memory (no Chromium), but it is not
+# instant and this OLT does time out under sustained walking, so checks are
+# serialized per process rather than piling onto one device.
+_OLT_CHECK_CONCURRENCY_LIMIT = 1
+_olt_check_semaphore = threading.Semaphore(_OLT_CHECK_CONCURRENCY_LIMIT)
+_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS = 30
+
+
+def _get_olt_status_core(device, block=True, timeout=None):
+    """The actual OLT walk, gated by the concurrency semaphore above.
+    Returns (ok, result) in the same shape as vsol_olt.get_olt_status."""
+    acquired = _olt_check_semaphore.acquire(blocking=block, timeout=timeout)
+    if not acquired:
+        return False, 'Too many OLT checks already in progress -- try again shortly.'
+    try:
+        return vsol_olt.get_olt_status(device)
+    finally:
+        _olt_check_semaphore.release()
 
 
 def _sync_customer_upstream_status_core(customer, provider, block=True, timeout=None):
@@ -7530,6 +7553,47 @@ def test_mikrotik_connection(server_id):
     return jsonify({'ok': ok, 'message': message, 'server': server.to_dict()}), 200
 
 
+NETWORK_DEVICE_TYPES = ('mikrotik_ccr', 'vsol_olt')
+
+
+def _default_device_api_port(device_type, use_tls):
+    if device_type == 'vsol_olt':
+        return 161  # SNMP
+    return 8729 if use_tls else 8728  # RouterOS API / API-SSL
+
+
+def _resolve_parent_device_id(raw_parent_id, device_id=None):
+    """Validate a proposed parent. Returns (parent_id_or_None, error_or_None).
+
+    Guards three ways this can go wrong: a parent in someone else's tenant, a
+    device parented to itself, and a cycle (which would make the tree builder
+    recurse forever).
+    """
+    if raw_parent_id in (None, '', 0):
+        return None, None
+    try:
+        parent_id = int(raw_parent_id)
+    except (TypeError, ValueError):
+        return None, 'parent_device_id must be an integer'
+    if device_id is not None and parent_id == device_id:
+        return None, 'A device cannot be its own parent'
+    parent = tenant_query(NetworkDevice).filter_by(id=parent_id).first()
+    if not parent:
+        return None, 'parent_device_id does not match a device in this tenant'
+    if device_id is not None:
+        seen = set()
+        cursor = parent
+        while cursor is not None:
+            if cursor.id == device_id:
+                return None, 'That parent would create a cycle'
+            if cursor.id in seen:
+                break  # pre-existing loop in the data -- don't spin on it
+            seen.add(cursor.id)
+            cursor = tenant_query(NetworkDevice).filter_by(
+                id=cursor.parent_device_id).first() if cursor.parent_device_id else None
+    return parent_id, None
+
+
 @app.route('/api/network-devices', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
@@ -7545,14 +7609,26 @@ def create_network_device():
     try:
         if not data.get('password'):
             return jsonify({'error': 'password is required'}), 400
+        device_type = data.get('device_type')
+        if device_type not in NETWORK_DEVICE_TYPES:
+            return jsonify({'error': 'device_type is required and must be one of: '
+                                     + ', '.join(NETWORK_DEVICE_TYPES)}), 400
+        parent_id, parent_error = _resolve_parent_device_id(data.get('parent_device_id'))
+        if parent_error:
+            return jsonify({'error': parent_error}), 400
+        use_tls = bool(data.get('use_tls', False))
         device = NetworkDevice(
             name=data['name'],
             host=data['host'],
-            api_port=int(data.get('api_port') or (8729 if data.get('use_tls') else 8728)),
-            use_tls=bool(data.get('use_tls', False)),
-            username=data['username'],
+            api_port=int(data.get('api_port') or _default_device_api_port(device_type, use_tls)),
+            use_tls=use_tls,
+            # An OLT has no username -- SNMP's only credential is the community
+            # string, held in `password`. Default to '' so the NOT NULL holds.
+            username=data.get('username') or '',
             password=data['password'],
             status=data.get('status', 'active'),
+            device_type=device_type,
+            parent_device_id=parent_id,
         )
         db.session.add(device)
         db.session.commit()
@@ -7577,6 +7653,17 @@ def update_network_device(device_id):
         if 'use_tls' in data:
             device.use_tls = bool(data['use_tls'])
         device.username = data.get('username', device.username)
+        if 'device_type' in data:
+            if data['device_type'] not in NETWORK_DEVICE_TYPES:
+                return jsonify({'error': 'device_type must be one of: '
+                                         + ', '.join(NETWORK_DEVICE_TYPES)}), 400
+            device.device_type = data['device_type']
+        if 'parent_device_id' in data:
+            parent_id, parent_error = _resolve_parent_device_id(
+                data['parent_device_id'], device_id=device.id)
+            if parent_error:
+                return jsonify({'error': parent_error}), 400
+            device.parent_device_id = parent_id
         # Leave the stored password unchanged unless a new one is actually
         # provided -- the edit form never pre-fills this field.
         if data.get('password'):
@@ -7597,6 +7684,10 @@ def delete_network_device(device_id):
         device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
         if not device:
             return jsonify({'message': 'Network device not found!'}), 404
+        # Orphan rather than cascade: deleting the CCR must not silently take
+        # the OLT with it, and the self-FK would otherwise refuse the delete.
+        for child in tenant_query(NetworkDevice).filter_by(parent_device_id=device.id).all():
+            child.parent_device_id = None
         db.session.delete(device)
         db.session.commit()
         return jsonify({'message': 'Network device deleted successfully!'}), 200
@@ -7611,16 +7702,29 @@ def check_network_device_now(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
         return jsonify({'message': 'Network device not found!'}), 404
+
+    if device.device_type == 'vsol_olt':
+        ok, result = _get_olt_status_core(
+            device, block=True, timeout=_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS)
+        db.session.commit()  # persists last_checked_at/last_status
+        if not ok:
+            return jsonify({'ok': False, 'message': result, 'health': None,
+                            'onus': None, 'device': device.to_dict()}), 200
+        return jsonify({'ok': True, 'message': None, 'health': None,
+                        'onus': result, 'device': device.to_dict()}), 200
+
     ok, result = mikrotik.get_device_health(device)
     db.session.commit()  # persists last_checked_at/last_status set by get_device_health
     if not ok:
-        return jsonify({'ok': False, 'message': result, 'health': None, 'device': device.to_dict()}), 200
+        return jsonify({'ok': False, 'message': result, 'health': None,
+                        'onus': None, 'device': device.to_dict()}), 200
     labels = device.interface_labels or {}
     health = dict(result)
     health['interfaces'] = [
         {**iface, 'label': labels.get(iface['name'])} for iface in result['interfaces']
     ]
-    return jsonify({'ok': True, 'message': None, 'health': health, 'device': device.to_dict()}), 200
+    return jsonify({'ok': True, 'message': None, 'health': health,
+                    'onus': None, 'device': device.to_dict()}), 200
 
 @app.route('/api/network-devices/<int:device_id>/interface-labels', methods=['PATCH'])
 @jwt_required()

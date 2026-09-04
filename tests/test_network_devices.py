@@ -9,6 +9,7 @@ from tests.conftest import make_tenant
 def _create_device(client, hdr, name="Core CCR", host="10.0.0.1"):
     r = client.post("/api/network-devices", headers=hdr, json={
         "name": name, "host": host, "username": "admin", "password": "pw",
+        "device_type": "mikrotik_ccr",
     })
     return r.get_json()["device"]["id"]
 
