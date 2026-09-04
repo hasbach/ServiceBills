@@ -9312,15 +9312,36 @@ def _validate_agent_result(operation, result):
             mac = entry.get('mac_address')
             if not isinstance(mac, str) or not mac:
                 return 'every ONU entry must have a non-empty string mac_address'
+            # Fix round 3: description is read by _propose_label_matches (via
+            # _normalize_label) even though _resolve_onu_customers never
+            # touches it. A truthy non-string (e.g. a purely numeric OLT
+            # label parsed as an int) used to raise AttributeError there,
+            # permanently wedging GET .../label-matches?job_id= for this job
+            # -- the same failure class as mac_address above, one field to
+            # the left. null is a legitimate "unlabelled ONU" value and must
+            # stay accepted.
+            description = entry.get('description')
+            if description is not None and not isinstance(description, str):
+                return 'every ONU entry description must be a string or null'
         return None
     if operation == 'device_health':
         if not isinstance(result, dict):
             return 'result must be an object'
         interfaces = result.get('interfaces')
-        if interfaces is not None and (
-                not isinstance(interfaces, list)
-                or not all(isinstance(i, dict) for i in interfaces)):
-            return 'interfaces must be a list of objects'
+        if interfaces is not None:
+            if (not isinstance(interfaces, list)
+                    or not all(isinstance(i, dict) for i in interfaces)):
+                return 'interfaces must be a list of objects'
+            # Fix round 3: _with_interface_labels uses iface['name'] as a
+            # dict key to look up its staff-assigned label. An unhashable
+            # name (e.g. a list) raises TypeError: unhashable type there,
+            # permanently wedging GET /api/network-jobs/<id> for this job.
+            # null is legitimate (an interface the connector didn't name)
+            # and must stay accepted.
+            for iface in interfaces:
+                name = iface.get('name')
+                if name is not None and not isinstance(name, str):
+                    return 'every interface name must be a string or null'
         return None
     return None
 
@@ -9342,6 +9363,17 @@ def agent_post_result(job_id):
     data = request.json or {}
     job.status = 'done'
     job.finished_at = datetime.utcnow()
+    if not isinstance(data, dict):
+        # Fix round 3: valid JSON that isn't an object (e.g. a bare list)
+        # made data.get('ok') below raise AttributeError -> 500, instead of
+        # the 400 this boundary is supposed to return for any malformed
+        # agent payload. Mirrors the malformed-result branch immediately
+        # below: job goes terminal with no stored result and a descriptive
+        # error, agent gets a 400 so a broken build surfaces in its own logs.
+        job.result = None
+        job.error = 'Malformed request body from agent: expected a JSON object'
+        db.session.commit()
+        return jsonify({'error': job.error}), 400
     if data.get('ok'):
         result = data.get('result')
         problem = _validate_agent_result(job.operation, result)
@@ -9470,6 +9502,16 @@ def _with_interface_labels(job, payload):
     JSON the on-prem agent posted (see agent_post_result), not something this
     endpoint can assume is well-formed -- a bad entry here must not turn every
     subsequent poll of that job into a 500.
+
+    That includes an interface's 'name': it's used below as a dict key to
+    look up that interface's label, and a 'name' that isn't hashable (e.g. a
+    list, from a malformed agent payload) would raise TypeError: unhashable
+    type right there. New results are rejected at the boundary by
+    _validate_agent_result's interface-name check (fix round 3); this stays
+    defensive for rows stored before that validation existed. Since `labels`
+    is only ever keyed by string interface names, any non-string 'name'
+    (hashable or not, missing or not) can never have a label to find anyway,
+    so it degrades to the same label: None a missing name already gets.
     """
     if job.operation != 'device_health' or job.status != 'done':
         return payload
@@ -9482,7 +9524,9 @@ def _with_interface_labels(job, payload):
     payload = dict(payload)
     payload['result'] = dict(result)
     payload['result']['interfaces'] = [
-        {**iface, 'label': labels.get(iface.get('name'))} if isinstance(iface, dict) else iface
+        {**iface,
+         'label': labels.get(iface.get('name')) if isinstance(iface.get('name'), str) else None}
+        if isinstance(iface, dict) else iface
         for iface in interfaces
     ]
     return payload
@@ -9553,8 +9597,21 @@ _LABEL_FUZZY_MIN_LENGTH = 6
 
 def _normalize_label(text):
     """Strip everything that varies between an OLT label and a customer name:
-    case, spaces, underscores, punctuation."""
-    return re.sub(r'[^a-z0-9]', '', (text or '').lower())
+    case, spaces, underscores, punctuation.
+
+    A value that isn't a string -- e.g. a purely numeric OLT label like
+    12345, parsed as an int rather than a string (the same failure mode
+    _normalize_mac guards against for mac_address; see its docstring) --
+    normalizes to '' rather than reaching str.lower(), so it never raises.
+    An empty normalized label is already the "unlabelled ONU" case
+    _propose_label_matches skips (`if not onu_key: continue`), so a
+    non-string description degrades to exactly that instead of wedging
+    every future GET .../label-matches?job_id= for that job. New results
+    are rejected at the boundary by _validate_agent_result's description
+    check (fix round 3); this stays defensive for rows stored before that
+    validation existed.
+    """
+    return re.sub(r'[^a-z0-9]', '', text.lower()) if isinstance(text, str) else ''
 
 
 def _propose_label_matches(onus, customers):

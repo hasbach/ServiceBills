@@ -215,3 +215,36 @@ def test_interface_entry_that_is_not_a_dict_survives_untouched(client, app, monk
     assert resp.status_code == 200
     polled = resp.get_json()
     assert polled["result"]["interfaces"][0] == "ether1"
+
+
+def test_interface_entry_with_a_list_name_still_polls_and_gets_label_none(client, app, monkeypatch):
+    """Fix round 3: a pre-existing row (stored before this round's validation
+    existed) can carry a 'name' that isn't hashable -- e.g. a list, from a
+    malformed agent payload. _with_interface_labels used to do
+    labels.get(iface.get('name')) unconditionally, which raises TypeError:
+    unhashable type on a list name, wedging GET /api/network-jobs/<id> for
+    that job forever. It must treat any non-string name as unlabelled
+    instead of raising."""
+    hdr = make_tenant(client, "Biz N", "n_admin")
+    device_id = _create_device(client, hdr)
+
+    monkeypatch.setattr(appmod.mikrotik, "get_device_health", lambda server: (True, {
+        "identity": "ccr-router", "uptime": "1w2d",
+        "interfaces": [{"name": "ether1", "running": True, "disabled": False}],
+    }))
+    r = client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr)
+    job_id = r.get_json()["job_id"]
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = {
+            "identity": "ccr-router", "uptime": "1w2d",
+            "interfaces": [{"name": ["eth1"], "running": True}],  # unhashable name
+        }
+        appmod.db.session.commit()
+
+    resp = client.get(f"/api/network-jobs/{job_id}", headers=hdr)
+    assert resp.status_code == 200
+    polled = resp.get_json()
+    assert polled["result"]["interfaces"][0]["label"] is None
+    assert polled["result"]["interfaces"][0]["name"] == ["eth1"]

@@ -259,6 +259,154 @@ def test_a_well_formed_olt_status_result_is_still_accepted(app, client):
         assert job.result == onus
 
 
+# --- Fix round 3: two more fields that consumers actually read --
+# olt_status's description (read by _propose_label_matches, via
+# _normalize_label) and device_health's interface name (used by
+# _with_interface_labels as a dict key) -- were never part of the boundary
+# contract, so a validator-approved payload could still permanently wedge a
+# terminal job one field to the left of what round 2 covered. ---
+
+def test_olt_status_entry_with_a_non_string_description_is_rejected(app, client):
+    """A plausible agent bug, exactly as round 2 built around a colon-less
+    MAC parsed as an int: a purely numeric OLT label (e.g. "12345") parsed
+    as an int rather than a string. _normalize_label's old (text or
+    '').lower() raised AttributeError on this, wedging the label matcher."""
+    make_tenant(client, "Api P", "api_p_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api P")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True,
+                          "result": [{"mac_address": "b4:64:15:3f:c1:94",
+                                      "description": 12345}],
+                          "error": None})
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error and "olt_status" in job.error
+
+
+def test_olt_status_entry_with_a_null_description_is_accepted(app, client):
+    """null is a legitimate value a correct agent sends for an unlabelled
+    ONU -- it must not be rejected."""
+    make_tenant(client, "Api Q", "api_q_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api Q")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    onus = [{"mac_address": "b4:64:15:3f:c1:94", "description": None}]
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": onus, "error": None})
+    assert r.status_code == 200
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.error is None
+        assert job.result == onus
+
+
+def test_device_health_interface_with_a_list_name_is_rejected(app, client):
+    """_with_interface_labels uses iface['name'] as a dict key to look up its
+    label; an unhashable name (e.g. a list) raises TypeError: unhashable
+    type there, wedging GET /api/network-jobs/<id> forever."""
+    make_tenant(client, "Api R", "api_r_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api R")
+    job_id = make_job(app, tenant_id, device_id, operation="device_health")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": {"interfaces": [{"name": ["eth1"]}]},
+                          "error": None})
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error and "device_health" in job.error
+
+
+def test_device_health_interface_with_a_null_name_is_accepted(app, client):
+    """null is a legitimate value for an interface the connector didn't
+    name -- it must not be rejected."""
+    make_tenant(client, "Api S", "api_s_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api S")
+    job_id = make_job(app, tenant_id, device_id, operation="device_health")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    result = {"interfaces": [{"name": None, "running": True}]}
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": result, "error": None})
+    assert r.status_code == 200
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.error is None
+        assert job.result == result
+
+
+def test_device_health_result_with_non_dict_interface_entries_is_rejected(app, client):
+    """Test gap, not a code gap: the validator already required every
+    interfaces entry to be a dict (`all(isinstance(i, dict) ...)`), but no
+    test exercised it with actual non-dict entries -- only a non-list
+    `interfaces` value (test_device_health_result_with_non_list_interfaces_
+    is_rejected, above)."""
+    make_tenant(client, "Api T", "api_t_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api T")
+    job_id = make_job(app, tenant_id, device_id, operation="device_health")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": {"interfaces": [1, 2]}, "error": None})
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error and "device_health" in job.error
+
+
+def test_a_well_formed_device_health_result_is_still_accepted(app, client):
+    """Mirrors test_a_well_formed_olt_status_result_is_still_accepted --
+    proves the validator doesn't reject valid device_health data."""
+    make_tenant(client, "Api U", "api_u_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api U")
+    job_id = make_job(app, tenant_id, device_id, operation="device_health")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    result = {"identity": "ccr-router", "uptime": "1w2d",
+              "interfaces": [{"name": "ether1", "running": True, "disabled": False}]}
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": result, "error": None})
+    assert r.status_code == 200
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.error is None
+        assert job.result == result
+
+
+def test_a_non_dict_json_body_is_rejected(app, client):
+    """agent_post_result did data.get('ok') on the parsed body -- a JSON body
+    that's a list rather than an object raised AttributeError -> 500 instead
+    of the clean 400 this boundary is supposed to return for any malformed
+    agent payload."""
+    make_tenant(client, "Api V", "api_v_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api V")
+    job_id = make_job(app, tenant_id, device_id)
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json=["not", "an", "object"])
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+
+
 def test_a_regenerated_token_invalidates_the_old_one(app, client):
     make_tenant(client, "Api J", "api_j_admin")
     old_token, _, tenant_id = make_agent_and_device(app, "Api J")

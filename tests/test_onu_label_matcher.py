@@ -572,3 +572,45 @@ def test_label_matches_skips_an_onu_with_a_non_string_mac_address(app, client, m
     assert body["ok"] is True
     assert len(body["proposals"]) == 1
     assert body["proposals"][0]["customer"]["name"] == "Moussa Ghadir"
+
+
+# --- Fix round 3: a pre-existing row (stored before this round's validation
+# existed) can carry a description that isn't a string at all -- e.g. a
+# purely numeric OLT label parsed as an int, at least as plausible as the
+# colon-less-MAC-as-int case round 2 was built around. The old
+# _normalize_label's (text or '').lower() raised AttributeError on this,
+# wedging every future GET .../label-matches?job_id= for that job. ---
+
+def test_label_matches_skips_an_onu_with_a_non_string_description(app, client, monkeypatch):
+    """Matching happens on the normalized description; an entry whose
+    description can't be normalized to a non-empty string is treated the
+    same as an unlabelled ONU -- skipped from matching -- rather than
+    raising. The well-formed entry in the same batch must still match."""
+    hdr = make_tenant(client, "Match Z4", "match_z4_admin")
+    olt = setup_devices(client, hdr)
+    add_customer(app, "Match Z4", "Moussa Ghadir")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
+                        lambda d: (True, [onu("b4:64:15:3f:c1:94", "MoussaGhadir")]))
+
+    started = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                         headers=hdr).get_json()
+    job_id = started["job_id"]
+    assert job_id
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = [
+            {"mac_address": "aa:bb:cc:dd:ee:01", "description": 12345},  # non-string
+            onu("b4:64:15:3f:c1:94", "MoussaGhadir"),                     # well-formed
+        ]
+        appmod.db.session.commit()
+
+    resp = client.get(
+        f"/api/network-tree/olt/{olt['id']}/label-matches?job_id={job_id}",
+        headers=hdr)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["customer"]["name"] == "Moussa Ghadir"
+    assert body["proposals"][0]["onu"]["mac_address"] == "b4:64:15:3f:c1:94"
