@@ -7648,16 +7648,28 @@ def update_network_device(device_id):
     try:
         device.name = data.get('name', device.name)
         device.host = data.get('host', device.host)
-        if 'api_port' in data:
-            device.api_port = int(data['api_port'])
+        # use_tls must land before the device_type block below computes a new
+        # default port, since the CCR default depends on it.
         if 'use_tls' in data:
             device.use_tls = bool(data['use_tls'])
         device.username = data.get('username', device.username)
+        device_type_changed = False
         if 'device_type' in data:
             if data['device_type'] not in NETWORK_DEVICE_TYPES:
                 return jsonify({'error': 'device_type must be one of: '
                                          + ', '.join(NETWORK_DEVICE_TYPES)}), 400
+            device_type_changed = data['device_type'] != device.device_type
             device.device_type = data['device_type']
+        if 'api_port' in data:
+            # An explicit port always wins, no matter where device_type/use_tls
+            # fall in the request body -- a caller who states a port means it.
+            device.api_port = int(data['api_port'])
+        elif device_type_changed:
+            # Retyping without an explicit port would otherwise leave the old
+            # type's port stale (e.g. RouterOS 8728 on a device now reached by
+            # SNMP), so reset to the new type's default. Uses device.use_tls,
+            # which is already updated above to reflect this same request.
+            device.api_port = _default_device_api_port(device.device_type, device.use_tls)
         if 'parent_device_id' in data:
             parent_id, parent_error = _resolve_parent_device_id(
                 data['parent_device_id'], device_id=device.id)

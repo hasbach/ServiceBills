@@ -178,3 +178,78 @@ def test_olt_semaphore_is_independent_of_the_upstream_one(app, client, monkeypat
         assert r.get_json()["ok"] is True
     finally:
         appmod._upstream_sync_semaphore.release()
+
+
+def test_update_retypes_ccr_to_olt_resets_port_to_snmp_default(app, client):
+    """Retyping without an explicit api_port must not leave the old type's
+    port stale -- a CCR's 8728 has no meaning once the device is an SNMP OLT."""
+    hdr = make_tenant(client, "Api M", "api_m_admin")
+    ccr = make_ccr(client, hdr)
+    assert ccr["api_port"] == 8728
+    r = client.put(f"/api/network-devices/{ccr['id']}", headers=hdr,
+                   json={"device_type": "vsol_olt"})
+    assert r.status_code == 200
+    assert r.get_json()["device"]["api_port"] == 161
+
+
+def test_update_retypes_olt_to_ccr_resets_port_to_routeros_default(app, client):
+    hdr = make_tenant(client, "Api N", "api_n_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+    assert olt["api_port"] == 161
+    r = client.put(f"/api/network-devices/{olt['id']}", headers=hdr,
+                   json={"device_type": "mikrotik_ccr"})
+    assert r.status_code == 200
+    assert r.get_json()["device"]["api_port"] == 8728
+
+
+def test_update_retype_with_explicit_api_port_keeps_the_explicit_value(app, client):
+    """A caller who states a port means it, even on the same request that
+    changes device_type."""
+    hdr = make_tenant(client, "Api O", "api_o_admin")
+    ccr = make_ccr(client, hdr)
+    r = client.put(f"/api/network-devices/{ccr['id']}", headers=hdr,
+                   json={"device_type": "vsol_olt", "api_port": 5000})
+    assert r.status_code == 200
+    assert r.get_json()["device"]["api_port"] == 5000
+
+
+def test_update_without_changing_device_type_leaves_api_port_untouched(app, client):
+    """An unrelated edit must not clobber a deliberately customised port."""
+    hdr = make_tenant(client, "Api P", "api_p_admin")
+    ccr = make_ccr(client, hdr)
+    custom = client.put(f"/api/network-devices/{ccr['id']}", headers=hdr,
+                         json={"api_port": 9999})
+    assert custom.get_json()["device"]["api_port"] == 9999
+    r = client.put(f"/api/network-devices/{ccr['id']}", headers=hdr,
+                   json={"name": "Renamed CCR"})
+    assert r.status_code == 200
+    assert r.get_json()["device"]["api_port"] == 9999
+
+
+def test_update_retype_with_use_tls_false_still_uses_snmp_default(app, client):
+    """The OLT default ignores use_tls entirely -- 161 either way."""
+    hdr = make_tenant(client, "Api Q", "api_q_admin")
+    ccr = make_ccr(client, hdr)
+    r = client.put(f"/api/network-devices/{ccr['id']}", headers=hdr,
+                   json={"device_type": "vsol_olt", "use_tls": False})
+    assert r.status_code == 200
+    assert r.get_json()["device"]["api_port"] == 161
+
+
+def test_update_rejects_non_integer_parent_device_id(app, client):
+    hdr = make_tenant(client, "Api R", "api_r_admin")
+    ccr = make_ccr(client, hdr)
+    r = client.put(f"/api/network-devices/{ccr['id']}", headers=hdr,
+                   json={"parent_device_id": "not-a-number"})
+    assert r.status_code == 400
+    assert "must be an integer" in r.get_json()["error"]
+
+
+def test_update_rejects_parent_device_id_that_matches_no_tenant(app, client):
+    hdr = make_tenant(client, "Api S", "api_s_admin")
+    ccr = make_ccr(client, hdr)
+    r = client.put(f"/api/network-devices/{ccr['id']}", headers=hdr,
+                   json={"parent_device_id": 999999})
+    assert r.status_code == 400
+    assert "does not match a device in this tenant" in r.get_json()["error"]
