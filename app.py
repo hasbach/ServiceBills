@@ -1,5 +1,6 @@
 import os
 import re
+import difflib
 import hmac
 import hashlib
 import math
@@ -7938,6 +7939,124 @@ def refresh_olt_onus(device_id):
     return jsonify({'ok': True, 'message': None,
                     'onus': _resolve_onu_customers(result),
                     'device': device.to_dict()}), 200
+
+
+# Two labels count as the same person above this similarity. Tuned against the
+# real OLT's labels, which are mostly the customer's name with the spaces
+# squeezed out ("MoussaGhadir") and arbitrary capitalisation ("aLIhACHEM") --
+# both normalise to an exact match, so this threshold only has to catch
+# genuine near-misses (a missing initial, a doubled letter) without pairing
+# two unrelated names.
+_LABEL_MATCH_THRESHOLD = 0.82
+
+
+def _normalize_label(text):
+    """Strip everything that varies between an OLT label and a customer name:
+    case, spaces, underscores, punctuation."""
+    return re.sub(r'[^a-z0-9]', '', (text or '').lower())
+
+
+def _propose_label_matches(onus, customers):
+    """Pair labelled ONUs with unlinked customers, best matches first.
+
+    Greedy on descending confidence, and each ONU and each customer is claimed
+    at most once -- so two similar labels can't both grab the same customer.
+    Returns (proposals, unmatched_onus, unmatched_customers).
+    """
+    candidates = []
+    for onu in onus:
+        onu_key = _normalize_label(onu.get('description'))
+        if not onu_key:
+            continue  # unlabelled ONU -- nothing to match on
+        for customer in customers:
+            customer_key = _normalize_label(customer.name)
+            if not customer_key:
+                continue
+            ratio = difflib.SequenceMatcher(None, onu_key, customer_key).ratio()
+            if ratio >= _LABEL_MATCH_THRESHOLD:
+                candidates.append((ratio, onu, customer))
+
+    candidates.sort(key=lambda row: (-row[0], row[1]['mac_address'], row[2].id))
+    claimed_macs, claimed_customers, proposals = set(), set(), []
+    for ratio, onu, customer in candidates:
+        if onu['mac_address'] in claimed_macs or customer.id in claimed_customers:
+            continue
+        claimed_macs.add(onu['mac_address'])
+        claimed_customers.add(customer.id)
+        proposals.append({
+            'onu': onu,
+            'customer': {'id': customer.id, 'name': customer.name},
+            'confidence': round(ratio, 3),
+        })
+
+    unmatched_onus = [o for o in onus if o['mac_address'] not in claimed_macs]
+    unmatched_customers = [
+        {'id': c.id, 'name': c.name} for c in customers if c.id not in claimed_customers
+    ]
+    return proposals, unmatched_onus, unmatched_customers
+
+
+@app.route('/api/network-tree/olt/<int:device_id>/label-matches', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_onu_label_matches(device_id):
+    """Propose customer <-> ONU links from the labels already typed into the
+    OLT. Read-only: nothing is written until /apply."""
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Network device not found!'}), 404
+    if device.device_type != 'vsol_olt':
+        return jsonify({'error': 'That device is not an OLT'}), 400
+
+    ok, result = _get_olt_status_core(
+        device, block=True, timeout=_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS)
+    db.session.commit()  # persists last_checked_at/last_status
+    if not ok:
+        return jsonify({'ok': False, 'message': result, 'proposals': [],
+                        'unmatched_onus': [], 'unmatched_customers': []}), 200
+
+    linked = {
+        (c.onu_mac_address or '').strip().lower()
+        for c in tenant_query(Customer).filter(Customer.onu_mac_address.isnot(None)).all()
+    }
+    # Only ever propose for work still to be done: ONUs nobody is linked to,
+    # and customers with no ONU yet.
+    onus = [o for o in result if o['mac_address'] not in linked]
+    customers = tenant_query(Customer).filter(
+        Customer.onu_mac_address.is_(None)).order_by(Customer.name).all()
+
+    proposals, unmatched_onus, unmatched_customers = _propose_label_matches(onus, customers)
+    return jsonify({'ok': True, 'message': None, 'proposals': proposals,
+                    'unmatched_onus': unmatched_onus,
+                    'unmatched_customers': unmatched_customers}), 200
+
+
+@app.route('/api/network-tree/olt/<int:device_id>/label-matches/apply', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def apply_onu_label_matches(device_id):
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Network device not found!'}), 404
+    links = (request.json or {}).get('links') or []
+    try:
+        applied = 0
+        for link in links:
+            mac = (link.get('mac_address') or '').strip().lower()
+            if not mac:
+                return jsonify({'error': 'Every link needs a mac_address'}), 400
+            customer = tenant_query(Customer).filter_by(id=link.get('customer_id')).first()
+            if not customer:
+                return jsonify({'error': 'customer_id {} is not in this tenant'.format(
+                    link.get('customer_id'))}), 400
+            customer.onu_mac_address = mac
+            applied += 1
+        db.session.commit()
+        return jsonify({'applied': applied}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
 
 # --- Live actions on a customer's PPPoE secret (Concept B). Staff-triggered
 # only -- nothing in the app calls these automatically off a billing rule. ---
