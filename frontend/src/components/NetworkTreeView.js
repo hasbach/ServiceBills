@@ -77,7 +77,19 @@ const NetworkTreeView = () => {
                 setSnackbar({ open: true, message: 'Failed to load the network tree', severity: 'error' });
             }
         } finally {
-            if (showSpinner && treeSeqRef.current === seq) setLoading(false);
+            // Two different questions, gated two different ways: "is my data
+            // still the freshest?" (treeSeqRef check) governs setTree/the
+            // error snackbar above -- a superseded call must not overwrite a
+            // newer response. "Do I own the spinner I turned on?" governs
+            // setLoading(false) here, and does NOT take the seq check --
+            // whichever call set loading=true is unconditionally responsible
+            // for clearing it, superseded or not. Gating this on the seq
+            // check too was a real bug: Load ONUs' quiet loadTree(false)
+            // resync can bump treeSeqRef after Reload's loadTree(true) set
+            // it, so when Reload's own response lands it would see itself as
+            // "superseded" and skip setLoading(false) -- leaving the
+            // full-page spinner (and no Reload button) on screen forever.
+            if (showSpinner) setLoading(false);
         }
     }, [setSnackbar]);
 

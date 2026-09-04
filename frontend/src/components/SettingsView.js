@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     Box, Typography, Paper, Button, TextField, CircularProgress,
     Avatar, Grid, Divider, Switch, alpha, useTheme, FormControlLabel,
@@ -172,6 +172,14 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
     const [revealedToken, setRevealedToken] = useState(null);
     const [tokenCopied, setTokenCopied] = useState(false);
+    const tokenInputRef = useRef(null);
+
+    // Regenerating knocks the live agent offline immediately (it invalidates
+    // the credential the running agent is authenticating with, per the Alert
+    // in the agent panel below) with no undo -- same destructive shape as
+    // the public pay link's Regenerate, so it gets the same confirm-dialog
+    // gate rather than firing straight off the button.
+    const [agentRegenerateConfirmOpen, setAgentRegenerateConfirmOpen] = useState(false);
 
     const handleCreateAgent = async () => {
         setAgentActionLoading(true);
@@ -201,17 +209,42 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
             setSnackbar({ open: true, message: detail, severity: 'error' });
         } finally {
             setAgentActionLoading(false);
+            setAgentRegenerateConfirmOpen(false);
         }
     };
 
     const handleCopyToken = async () => {
         if (!revealedToken) return;
+        // navigator.clipboard is undefined on plain HTTP (exactly how this
+        // app is served in local dev, since the Clipboard API requires a
+        // secure context) -- check for it up front rather than relying on
+        // the throw, so that case degrades gracefully instead of surfacing
+        // an error for something that isn't really a failure.
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            try {
+                await navigator.clipboard.writeText(revealedToken);
+                setTokenCopied(true);
+                setTimeout(() => setTokenCopied(false), 2000);
+                return;
+            } catch (e) {
+                // Fall through to the manual-selection fallback below.
+            }
+        }
+        // Fallback: select the token text so the user can copy it manually
+        // (Ctrl/Cmd+C), and make a best-effort attempt at execCommand('copy')
+        // on top of that selection. Only surface an error if the selection
+        // itself isn't possible -- a failed execCommand still leaves the
+        // text selected and copyable by hand.
         try {
-            await navigator.clipboard.writeText(revealedToken);
+            const input = tokenInputRef.current;
+            if (!input) throw new Error('Token field not available');
+            input.focus();
+            input.select();
+            try { document.execCommand('copy'); } catch (_) { /* selection alone is still a usable fallback */ }
             setTokenCopied(true);
             setTimeout(() => setTokenCopied(false), 2000);
         } catch (e) {
-            setSnackbar({ open: true, message: 'Could not copy token.', severity: 'error' });
+            setSnackbar({ open: true, message: 'Could not copy token. Select the text and copy it manually.', severity: 'error' });
         }
     };
 
@@ -503,7 +536,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                                 <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
                                                     Version: {agent.agent_version || 'unknown'}
                                                 </Typography>
-                                                <Button variant="outlined" color="warning" onClick={handleRegenerateToken} disabled={agentActionLoading}
+                                                <Button variant="outlined" color="warning" onClick={() => setAgentRegenerateConfirmOpen(true)} disabled={agentActionLoading}
                                                     sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
                                                     {agentActionLoading ? 'Regenerating…' : 'Regenerate Token'}
                                                 </Button>
@@ -997,6 +1030,24 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 </DialogActions>
             </Dialog>
 
+            <Dialog open={agentRegenerateConfirmOpen} onClose={() => setAgentRegenerateConfirmOpen(false)}>
+                <DialogTitle>Regenerate the agent token?</DialogTitle>
+                <DialogContent>
+                    <DialogContentText>
+                        This invalidates the current token immediately -- the on-prem agent authenticating with it
+                        will stop working and go offline right away. It will stay offline until the new token is
+                        pasted into <code>agent.toml</code> on the on-prem box and the agent is restarted. This
+                        can't be undone.
+                    </DialogContentText>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setAgentRegenerateConfirmOpen(false)} disabled={agentActionLoading}>Cancel</Button>
+                    <Button onClick={handleRegenerateToken} color="warning" variant="contained" disabled={agentActionLoading}>
+                        {agentActionLoading ? 'Regenerating…' : 'Regenerate'}
+                    </Button>
+                </DialogActions>
+            </Dialog>
+
             {/* Agent token reveal -- shown exactly once, on create or regenerate.
                 revealedToken is cleared the moment this dialog closes (see
                 handleCloseTokenDialog); there is no way to see this value again
@@ -1012,6 +1063,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                     <TextField
                         fullWidth
                         value={revealedToken || ''}
+                        inputRef={tokenInputRef}
                         InputProps={{ readOnly: true, sx: { fontFamily: 'monospace' } }}
                         sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}
                     />
