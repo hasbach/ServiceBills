@@ -7,8 +7,6 @@ authorization entries left behind when an ONU was moved between PON ports).
 See docs/superpowers/specs/2026-09-01-network-topology-tree-design.md."""
 import types
 
-import pytest
-
 import vsol_olt
 
 
@@ -111,6 +109,56 @@ def test_dedupe_all_offline_and_unlabelled_prefers_lowest_pon(monkeypatch):
     ok, onus = vsol_olt.get_olt_status(make_device())
     assert len(onus) == 1
     assert onus[0]["pon_port"] == "PON3"
+
+
+def test_dedupe_online_beats_description_and_pon(monkeypatch):
+    """Isolates preference term 1 (online). The online row has NO
+    description and sits on the HIGHER PON port; the offline row HAS a
+    description and sits on the LOWER PON port. Only the online term can
+    pick the correct winner -- description or PON alone would pick the
+    offline row."""
+    patch_walk(monkeypatch, cells_from([
+        ("5", "1", "1", "aa:11:11:11:11:11", "unknow", "NULL",   "0"),
+        ("2", "9", "0", "aa:11:11:11:11:11", "unknow", "Golden", "0"),
+    ]))
+    ok, onus = vsol_olt.get_olt_status(make_device())
+    assert ok is True
+    assert len(onus) == 1
+    assert onus[0]["status"] == "online"
+    assert onus[0]["pon_port"] == "PON5"
+    assert onus[0]["description"] is None
+
+
+def test_dedupe_description_beats_pon_when_both_offline(monkeypatch):
+    """Isolates preference term 2 (description). Both rows are offline
+    (tied on term 1) and at equal distance (tied on term 3), but the
+    labelled row sits on a HIGHER PON port than the NULL one -- PON alone
+    would pick the wrong, unlabelled row."""
+    patch_walk(monkeypatch, cells_from([
+        ("8", "5", "0", "aa:22:22:22:22:22", "unknow", "Golden", "50"),
+        ("3", "9", "0", "aa:22:22:22:22:22", "unknow", "NULL",   "50"),
+    ]))
+    ok, onus = vsol_olt.get_olt_status(make_device())
+    assert ok is True
+    assert len(onus) == 1
+    assert onus[0]["pon_port"] == "PON8"
+    assert onus[0]["description"] == "Golden"
+
+
+def test_dedupe_distance_beats_pon_when_description_ties(monkeypatch):
+    """Isolates preference term 3 (distance). Both rows are offline and
+    unlabelled (tied on terms 1-2), but the greater-distance row sits on a
+    HIGHER PON port than the shorter-distance one -- PON alone would pick
+    the wrong, shorter-distance row."""
+    patch_walk(monkeypatch, cells_from([
+        ("7", "4", "0", "aa:33:33:33:33:33", "unknow", "NULL", "500"),
+        ("2", "6", "0", "aa:33:33:33:33:33", "unknow", "NULL", "100"),
+    ]))
+    ok, onus = vsol_olt.get_olt_status(make_device())
+    assert ok is True
+    assert len(onus) == 1
+    assert onus[0]["pon_port"] == "PON7"
+    assert onus[0]["distance_m"] == 500
 
 
 def test_result_is_sorted_by_pon_then_onu_numerically(monkeypatch):

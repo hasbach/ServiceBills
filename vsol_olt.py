@@ -76,6 +76,13 @@ def _mark_checked(server, status):
     server.last_status = status
 
 
+def _safe_close(engine):
+    try:
+        engine.close_dispatcher()
+    except Exception:
+        pass
+
+
 async def _walk_onu_table(host, port, community):
     """Walk the ONU table and return {(column, row): value}.
 
@@ -83,36 +90,39 @@ async def _walk_onu_table(host, port, community):
     (via pysnmp's errorIndication) if it never answers. Callers wrap this.
     """
     engine = SnmpEngine()
-    target = await UdpTransportTarget.create(
-        (host, port), timeout=_TIMEOUT_SECONDS, retries=_RETRIES,
-    )
-    prefix = ONU_TABLE_OID + "."
-    cells = {}
-    async for err_indication, err_status, _err_index, var_binds in bulk_walk_cmd(
-        engine,
-        CommunityData(community, mpModel=1),  # SNMPv2c
-        target,
-        ContextData(),
-        0, 25,
-        ObjectType(ObjectIdentity(ONU_TABLE_OID)),
-        lexicographicMode=False,
-    ):
-        if err_indication:
-            raise OSError(str(err_indication))
-        if err_status:
-            raise OltRejected(err_status.prettyPrint())
-        for name, value in var_binds:
-            oid = str(name.get_oid())
-            if not oid.startswith(prefix):
-                continue
-            parts = oid[len(prefix):].split(".")
-            if len(parts) != 2:
-                continue
-            cells[(parts[0], parts[1])] = value.prettyPrint()
-        if len(cells) >= _MAX_CELLS:
-            logger.warning("VSOL OLT walk hit the %s-cell ceiling at %s", _MAX_CELLS, host)
-            break
-    return cells
+    try:
+        target = await UdpTransportTarget.create(
+            (host, port), timeout=_TIMEOUT_SECONDS, retries=_RETRIES,
+        )
+        prefix = ONU_TABLE_OID + "."
+        cells = {}
+        async for err_indication, err_status, _err_index, var_binds in bulk_walk_cmd(
+            engine,
+            CommunityData(community, mpModel=1),  # SNMPv2c
+            target,
+            ContextData(),
+            0, 25,
+            ObjectType(ObjectIdentity(ONU_TABLE_OID)),
+            lexicographicMode=False,
+        ):
+            if err_indication:
+                raise OSError(str(err_indication))
+            if err_status:
+                raise OltRejected(err_status.prettyPrint())
+            for name, value in var_binds:
+                oid = str(name.get_oid())
+                if not oid.startswith(prefix):
+                    continue
+                parts = oid[len(prefix):].split(".")
+                if len(parts) != 2:
+                    continue
+                cells[(parts[0], parts[1])] = value.prettyPrint()
+            if len(cells) >= _MAX_CELLS:
+                logger.warning("VSOL OLT walk hit the %s-cell ceiling at %s", _MAX_CELLS, host)
+                break
+        return cells
+    finally:
+        _safe_close(engine)
 
 
 def _to_int(text, default=0):
@@ -161,6 +171,10 @@ def _preference_key(row):
     2. Then a real description beats the OLT's literal 'NULL'.
     3. Then the greater distance (a real ranging figure beats 0).
     4. Then the LOWEST PON port -- negated so 'higher key wins' still holds.
+    5. Then the LOWEST ONU index -- also negated, purely to make the key
+       genuinely total; an exact tie on 1-4 would otherwise fall through to
+       walk order, which is the OLT's flat row index and shifts as
+       authorization entries change.
 
     Every term is total and derived only from the row, so the winner is stable
     across checks and the tree does not flicker.
@@ -170,6 +184,7 @@ def _preference_key(row):
         1 if row["description"] else 0,
         row["distance_m"],
         -row["_pon"],
+        -row["_onu"],
     )
 
 
@@ -200,16 +215,16 @@ def get_olt_status(server):
     port = server.api_port or DEFAULT_SNMP_PORT
     try:
         cells = asyncio.run(_walk_onu_table(server.host, port, server.password))
+        onus = _dedupe_by_mac(_assemble_rows(cells))
     except OltRejected as exc:
         _mark_checked(server, "auth_failed")
         logger.warning("VSOL OLT rejected the walk for device %s: %s", server.id, exc)
         return False, "OLT rejected the SNMP request: {}".format(exc)
     except Exception as exc:  # noqa: BLE001 -- this module never raises out
         _mark_checked(server, "unreachable")
-        logger.warning("VSOL OLT walk failed for device %s: %s", server.id, exc)
+        logger.exception("VSOL OLT walk failed for device %s: %s", server.id, exc)
         return False, str(exc) or exc.__class__.__name__
 
-    onus = _dedupe_by_mac(_assemble_rows(cells))
     if not onus:
         # SNMPv2c answers a wrong community with silence, and a non-VSOL agent
         # answers this OID with nothing -- both land here. Reporting an empty
