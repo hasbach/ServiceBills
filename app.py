@@ -407,6 +407,83 @@ class NetworkDevice(db.Model):
             'interface_labels': self.interface_labels or {},
         }
 
+# The only operations the agent will ever relay. All five are reads.
+# mikrotik.set_secret_enabled is deliberately absent: it disables a customer's
+# PPPoE secret, and a cloud compromise must not be able to disconnect anyone.
+# See docs/superpowers/specs/2026-09-04-network-agent-layer-2-design.md.
+AGENT_OPERATIONS = (
+    'test_connection', 'device_health', 'secret_status',
+    'active_session', 'olt_status',
+)
+
+# An agent that hasn't polled within this window is treated as offline, and
+# jobs are refused rather than queued for something that will never run them.
+AGENT_ONLINE_WINDOW_SECONDS = 30
+
+
+class NetworkAgent(db.Model):
+    """A relay running on the tenant's own LAN. It polls for jobs outbound, so
+    nothing connects inbound to their network. One agent per tenant."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    name = db.Column(db.String(100), nullable=False)
+    # bcrypt hash of the token's secret half only. The token is shown once at
+    # creation and never stored. See _verify_agent_token for the format.
+    token_hash = db.Column(db.String(255), nullable=False)
+    last_seen_at = db.Column(db.DateTime, nullable=True)  # stamped on every poll
+    agent_version = db.Column(db.String(20), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def is_online(self):
+        if not self.last_seen_at:
+            return False
+        age = (datetime.utcnow() - self.last_seen_at).total_seconds()
+        return age <= AGENT_ONLINE_WINDOW_SECONDS
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'last_seen_at': self.last_seen_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_seen_at else None,
+            'agent_version': self.agent_version,
+            'is_online': self.is_online(),
+        }
+
+
+class NetworkAgentJob(db.Model):
+    """One relayed device call. Created by the cloud, claimed and completed by
+    the agent, polled by the browser. Expiry is computed lazily on read -- no
+    scheduled job, deliberately: the in-process scheduler fires during
+    `flask db upgrade` on deploy."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    device_id = db.Column(db.Integer, db.ForeignKey('network_device.id'), nullable=False)
+    operation = db.Column(db.String(30), nullable=False)  # one of AGENT_OPERATIONS
+    params = db.Column(db.JSON, nullable=True)   # e.g. {"pppoe_username": "..."}
+    status = db.Column(db.String(10), nullable=False, default='pending')
+    result = db.Column(db.JSON, nullable=True)   # the connector's success value
+    error = db.Column(db.Text, nullable=True)    # the connector's failure message
+    requested_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    claimed_at = db.Column(db.DateTime, nullable=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'device_id': self.device_id,
+            'operation': self.operation,
+            'status': self.status,
+            'result': self.result,
+            'error': self.error,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'finished_at': self.finished_at.strftime('%Y-%m-%d %H:%M:%S') if self.finished_at else None,
+        }
+
+
+db.Index('ix_network_agent_job_poll', NetworkAgentJob.tenant_id,
+         NetworkAgentJob.status, NetworkAgentJob.created_at)
+
 class Customer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -888,6 +965,11 @@ class BusinessSettings(db.Model):
     # of an upstream's RADIUS portal -- see UpstreamProvider), or
     # 'local_mikrotik' (tenant owns the edge -- see MikrotikServer).
     network_mode = db.Column(db.String(20), nullable=False, default='none')
+    # 'direct'  -- the cloud calls devices itself (today's behaviour, and the
+    #              only thing that works when ServiceBills runs on the LAN).
+    # 'agent'   -- calls are relayed through the tenant's NetworkAgent.
+    network_access_mode = db.Column(db.String(10), nullable=False, default='direct',
+                                    server_default='direct')
     # Phase 3: per-tenant opt-in for automated (scheduled) upstream RADIUS
     # status sync, instead of the staff-only manual "Refresh" button. Off by
     # default -- deliberately opt-in/beta per the product decision to roll
@@ -924,6 +1006,7 @@ class BusinessSettings(db.Model):
             'email': self.email,
             'website': self.website,
             'network_mode': self.network_mode or 'none',
+            'network_access_mode': self.network_access_mode or 'direct',
             'upstream_sync_automation_enabled': bool(self.upstream_sync_automation_enabled),
             'multi_currency_enabled': bool(self.multi_currency_enabled),
             'reporting_currency': self.reporting_currency or 'USD',
@@ -1256,7 +1339,7 @@ TENANT_OWNED_MODELS = (
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
-    ExchangeRate, NetworkDevice,
+    ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob,
     CustomerPaymentLink, CustomerWhishPaymentAttempt,
 )
 
@@ -2044,6 +2127,8 @@ _TENANT_DELETE_ORDER = [
     # enforce FKs, so the gap is invisible there). Position is unconstrained:
     # the only inbound FK is its own parent_device_id self-link, and one
     # DELETE removes parent and child rows in the same statement.
+    # Jobs reference network_device, so they must go before it.
+    NetworkAgentJob, NetworkAgent,
     NetworkDevice,
     # Phase 3 fix: MonthlyProfitEstimate was missing here entirely. SQLite
     # doesn't enforce FK constraints, so a tenant delete silently orphaned
@@ -4986,6 +5071,7 @@ def get_business_settings():
                 'email': "",
                 'website': "",
                 'network_mode': "none",
+                'network_access_mode': "direct",
                 'upstream_sync_automation_enabled': False,
                 'multi_currency_enabled': False,
                 'reporting_currency': 'USD'

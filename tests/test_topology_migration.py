@@ -30,7 +30,9 @@ import tempfile
 import sqlalchemy as sa
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
-from flask_migrate import Migrate, upgrade, downgrade
+from flask_migrate import Migrate, upgrade, downgrade, stamp
+
+import app as appmod
 
 MIGRATIONS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations")
@@ -55,6 +57,17 @@ TOPOLOGY_REVISION = "e675c91c8685"
 
 def _table_columns(engine, table_name):
     return {col["name"] for col in sa.inspect(engine).get_columns(table_name)}
+
+
+def _table_names(engine):
+    return set(sa.inspect(engine).get_table_names())
+
+
+# The Layer 2 network-agent migration (see
+# docs/superpowers/specs/2026-09-04-network-agent-layer-2-design.md), added on
+# top of the merge revision 6129b0fb0885 -- the current Alembic head at the
+# time this was written.
+NETWORK_AGENT_REVISION = "5f65a6fd6e8d"
 
 
 def test_migration_chain_adds_and_removes_topology_columns():
@@ -100,6 +113,76 @@ def test_migration_chain_adds_and_removes_topology_columns():
             assert "device_type" in device_cols
             assert "parent_device_id" in device_cols
             assert "onu_mac_address" in customer_cols
+
+            engine.dispose()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_network_agent_migration_adds_and_removes_its_tables_and_column():
+    """Proves NETWORK_AGENT_REVISION's upgrade()/downgrade() genuinely work,
+    the same way test_migration_chain_adds_and_removes_topology_columns()
+    does for the topology migration above -- but bootstrapped differently.
+
+    NETWORK_AGENT_REVISION's down_revision is 6129b0fb0885, the merge of the
+    topology and WhatsApp-template lines. Reaching that merge means walking
+    the WhatsApp/Whish branch too, and that branch contains bd054e2e7cf9,
+    which calls op.create_unique_constraint outside batch mode -- exactly
+    the SQLite incompatibility TOPOLOGY_REVISION above was pinned to avoid
+    (see its comment). Unlike that test, we can't dodge it by picking an
+    earlier revision: our migration's parent IS the merge revision, so any
+    real walk from base to NETWORK_AGENT_REVISION crosses it regardless
+    (confirmed empirically -- `upgrade(revision=NETWORK_AGENT_REVISION)`
+    from an empty db raises the same "No support for ALTER of constraints
+    in SQLite dialect" error).
+
+    So instead of walking history, this builds the pre-migration schema
+    directly from the current ORM models (db.metadata.create_all(), minus
+    the two tables and the one column this migration itself adds -- i.e.
+    exactly the schema shape at 6129b0fb0885), stamps the db at that
+    revision, and upgrades/downgrades/upgrades from there. Alembic still
+    executes this migration's real upgrade()/downgrade() through the real
+    SQLite engine; only the unrelated, pre-existing, Postgres-only ancestor
+    migration is skipped, matching the same "not this test's job" reasoning
+    as TOPOLOGY_REVISION's comment.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="network_agent_migration_test_")
+    db_path = os.path.join(tmpdir, "network_agent_migration.db")
+    mig_app = Flask("test_network_agent_migration")
+    mig_app.config["SQLALCHEMY_DATABASE_URI"] = (
+        "sqlite:///" + db_path.replace("\\", "/"))
+    mig_db = SQLAlchemy(mig_app)
+    Migrate(mig_app, mig_db, directory=MIGRATIONS_DIR, render_as_batch=True)
+
+    try:
+        with mig_app.app_context():
+            engine = mig_db.engine
+
+            # Build the schema as it stood at 6129b0fb0885: every current
+            # model's table except the two this migration adds, and without
+            # the one column it adds to business_settings.
+            pre_tables = [t for name, t in appmod.db.metadata.tables.items()
+                         if name not in ("network_agent", "network_agent_job")]
+            appmod.db.metadata.create_all(bind=engine, tables=pre_tables)
+            with engine.begin() as conn:
+                conn.execute(sa.text(
+                    "ALTER TABLE business_settings DROP COLUMN network_access_mode"))
+            stamp(directory=MIGRATIONS_DIR, revision="6129b0fb0885")
+
+            upgrade(directory=MIGRATIONS_DIR, revision=NETWORK_AGENT_REVISION)
+            assert "network_agent" in _table_names(engine)
+            assert "network_agent_job" in _table_names(engine)
+            assert "network_access_mode" in _table_columns(engine, "business_settings")
+
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            assert "network_agent" not in _table_names(engine)
+            assert "network_agent_job" not in _table_names(engine)
+            assert "network_access_mode" not in _table_columns(engine, "business_settings")
+
+            upgrade(directory=MIGRATIONS_DIR, revision=NETWORK_AGENT_REVISION)
+            assert "network_agent" in _table_names(engine)
+            assert "network_agent_job" in _table_names(engine)
+            assert "network_access_mode" in _table_columns(engine, "business_settings")
 
             engine.dispose()
     finally:
