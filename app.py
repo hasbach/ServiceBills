@@ -7941,13 +7941,22 @@ def refresh_olt_onus(device_id):
                     'device': device.to_dict()}), 200
 
 
-# Two labels count as the same person above this similarity. Tuned against the
-# real OLT's labels, which are mostly the customer's name with the spaces
-# squeezed out ("MoussaGhadir") and arbitrary capitalisation ("aLIhACHEM") --
-# both normalise to an exact match, so this threshold only has to catch
-# genuine near-misses (a missing initial, a doubled letter) without pairing
-# two unrelated names.
+# A match whose normalised label and name are exactly equal always proposes,
+# at any length, with confidence 1.0 -- that is the common case: real OLT
+# labels are mostly the customer's name with the spaces squeezed out
+# ("MoussaGhadir") and arbitrary capitalisation ("aLIhACHEM"), both of which
+# normalise to an exact match against "Moussa Ghadir" / "Ali Hachem".
+#
+# A non-exact match only proposes above this difflib.SequenceMatcher ratio,
+# and only once both normalised strings are at least _LABEL_FUZZY_MIN_LENGTH
+# characters long. difflib's ratio is NOT length-normalised, so short
+# unrelated names cross 0.82 on tiny absolute differences -- "ali" vs "alia"
+# and "sam" vs "sami" both score 0.857 -- which would falsely link two
+# different customers. The length gate keeps the threshold meaningful for the
+# genuine long near-misses (a missing initial, a doubled letter) it was tuned
+# for, without pairing short, ordinarily-distinct names.
 _LABEL_MATCH_THRESHOLD = 0.82
+_LABEL_FUZZY_MIN_LENGTH = 6
 
 
 def _normalize_label(text):
@@ -7972,9 +7981,16 @@ def _propose_label_matches(onus, customers):
             customer_key = _normalize_label(customer.name)
             if not customer_key:
                 continue
-            ratio = difflib.SequenceMatcher(None, onu_key, customer_key).ratio()
-            if ratio >= _LABEL_MATCH_THRESHOLD:
-                candidates.append((ratio, onu, customer))
+            if onu_key == customer_key:
+                ratio = 1.0
+            else:
+                if (len(onu_key) < _LABEL_FUZZY_MIN_LENGTH
+                        or len(customer_key) < _LABEL_FUZZY_MIN_LENGTH):
+                    continue
+                ratio = difflib.SequenceMatcher(None, onu_key, customer_key).ratio()
+                if ratio < _LABEL_MATCH_THRESHOLD:
+                    continue
+            candidates.append((ratio, onu, customer))
 
     candidates.sort(key=lambda row: (-row[0], row[1]['mac_address'], row[2].id))
     claimed_macs, claimed_customers, proposals = set(), set(), []
@@ -8020,8 +8036,11 @@ def get_onu_label_matches(device_id):
         for c in tenant_query(Customer).filter(Customer.onu_mac_address.isnot(None)).all()
     }
     # Only ever propose for work still to be done: ONUs nobody is linked to,
-    # and customers with no ONU yet.
-    onus = [o for o in result if o['mac_address'] not in linked]
+    # and customers with no ONU yet. Normalise the ONU side the same way the
+    # customer side already is, rather than trusting the connector to always
+    # hand back lowercase MACs.
+    onus = [o for o in result
+            if (o.get('mac_address') or '').strip().lower() not in linked]
     customers = tenant_query(Customer).filter(
         Customer.onu_mac_address.is_(None)).order_by(Customer.name).all()
 
@@ -8038,21 +8057,31 @@ def apply_onu_label_matches(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
         return jsonify({'message': 'Network device not found!'}), 404
+    if device.device_type != 'vsol_olt':
+        return jsonify({'error': 'That device is not an OLT'}), 400
     links = (request.json or {}).get('links') or []
+
+    # Validate every link before mutating anything. Returning a 400 partway
+    # through a mutate-as-you-go loop risked an autoflush pushing earlier
+    # in-memory mutations to the DB on the next SELECT even though we meant
+    # to reject the whole batch -- resolve and check everything first, so a
+    # bad entry anywhere in the list can never leave an earlier one applied.
+    resolved = []
+    for link in links:
+        mac = (link.get('mac_address') or '').strip().lower()
+        if not mac:
+            return jsonify({'error': 'Every link needs a mac_address'}), 400
+        customer = tenant_query(Customer).filter_by(id=link.get('customer_id')).first()
+        if not customer:
+            return jsonify({'error': 'customer_id {} is not in this tenant'.format(
+                link.get('customer_id'))}), 400
+        resolved.append((customer, mac))
+
     try:
-        applied = 0
-        for link in links:
-            mac = (link.get('mac_address') or '').strip().lower()
-            if not mac:
-                return jsonify({'error': 'Every link needs a mac_address'}), 400
-            customer = tenant_query(Customer).filter_by(id=link.get('customer_id')).first()
-            if not customer:
-                return jsonify({'error': 'customer_id {} is not in this tenant'.format(
-                    link.get('customer_id'))}), 400
+        for customer, mac in resolved:
             customer.onu_mac_address = mac
-            applied += 1
         db.session.commit()
-        return jsonify({'applied': applied}), 200
+        return jsonify({'applied': len(resolved)}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400

@@ -170,3 +170,102 @@ def test_apply_refuses_another_tenants_customer(app, client):
     assert r.status_code == 400
     with app.app_context():
         assert appmod.Customer.query.filter_by(id=victim).first().onu_mac_address is None
+
+
+# --- Short-name false positives (difflib's ratio is not length-normalised) ---
+
+def test_short_names_below_length_gate_do_not_propose(app, client, monkeypatch):
+    """'ali' vs 'alia' scores 0.857 on the raw difflib ratio -- comfortably
+    above _LABEL_MATCH_THRESHOLD -- but these are two different people and
+    both normalised strings are under _LABEL_FUZZY_MIN_LENGTH, so no
+    proposal should be made."""
+    hdr = make_tenant(client, "Match K", "match_k_admin")
+    olt = setup_devices(client, hdr)
+    add_customer(app, "Match K", "Ali")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
+                        lambda d: (True, [onu("aa:bb:cc:dd:ee:01", "alia")]))
+    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                      headers=hdr).get_json()
+    assert body["proposals"] == []
+
+
+def test_short_names_below_length_gate_do_not_propose_2(app, client, monkeypatch):
+    """Same false-positive shape as 'ali'/'alia': 'sam' vs 'sami' also scores
+    0.857 on the raw ratio."""
+    hdr = make_tenant(client, "Match L", "match_l_admin")
+    olt = setup_devices(client, hdr)
+    add_customer(app, "Match L", "Sam")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
+                        lambda d: (True, [onu("aa:bb:cc:dd:ee:02", "sami")]))
+    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                      headers=hdr).get_json()
+    assert body["proposals"] == []
+
+
+def test_exact_short_match_still_proposes_despite_length_gate(app, client, monkeypatch):
+    """The length gate must only apply to *non-exact* matches -- an exact
+    match at any length (even 3 characters) still proposes at confidence
+    1.0."""
+    hdr = make_tenant(client, "Match M", "match_m_admin")
+    olt = setup_devices(client, hdr)
+    cid = add_customer(app, "Match M", "Ali")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
+                        lambda d: (True, [onu("aa:bb:cc:dd:ee:03", "aLI")]))
+    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                      headers=hdr).get_json()
+    assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["customer"]["id"] == cid
+    assert body["proposals"][0]["confidence"] == 1.0
+
+
+def test_long_near_miss_still_proposes(app, client, monkeypatch):
+    """Genuine long near-misses (a doubled letter) must survive the length
+    gate: both normalised strings are 10+ characters, well past
+    _LABEL_FUZZY_MIN_LENGTH, and the ratio still clears the threshold."""
+    hdr = make_tenant(client, "Match N", "match_n_admin")
+    olt = setup_devices(client, hdr)
+    cid = add_customer(app, "Match N", "Taleb Caffe")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
+                        lambda d: (True, [onu("aa:bb:cc:dd:ee:04", "TalebCaffee")]))
+    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                      headers=hdr).get_json()
+    assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["customer"]["id"] == cid
+    assert 0.82 <= body["proposals"][0]["confidence"] < 1.0
+
+
+# --- /apply must be all-or-nothing ---
+
+def test_apply_does_not_partially_persist_on_a_later_bad_link(app, client, monkeypatch):
+    """A links list whose first entry is valid and whose second entry names
+    a customer from another tenant must reject the whole batch, and the
+    first (valid) customer's onu_mac_address must remain untouched -- not
+    just uncommitted this request, but genuinely never written."""
+    hdr_outsider = make_tenant(client, "Match O1", "match_o1_admin")
+    outsider = add_customer(app, "Match O1", "Outsider")
+    hdr = make_tenant(client, "Match O2", "match_o2_admin")
+    olt = setup_devices(client, hdr)
+    valid = add_customer(app, "Match O2", "Valid Customer")
+    r = client.post(f"/api/network-tree/olt/{olt['id']}/label-matches/apply",
+                    headers=hdr,
+                    json={"links": [
+                        {"customer_id": valid, "mac_address": "aa:bb:cc:dd:ee:10"},
+                        {"customer_id": outsider, "mac_address": "aa:bb:cc:dd:ee:11"},
+                    ]})
+    assert r.status_code == 400
+    with app.app_context():
+        assert appmod.Customer.query.filter_by(id=valid).first().onu_mac_address is None
+        assert appmod.Customer.query.filter_by(id=outsider).first().onu_mac_address is None
+
+
+# --- Minor: /apply must gate on device_type like the GET route does ---
+
+def test_apply_refuses_non_olt_device(app, client):
+    hdr = make_tenant(client, "Match P", "match_p_admin")
+    ccr = client.post("/api/network-devices", headers=hdr, json={
+        "name": "Core CCR", "host": "10.0.0.2", "username": "admin",
+        "password": "secret", "device_type": "mikrotik_ccr",
+    }).get_json()["device"]
+    r = client.post(f"/api/network-tree/olt/{ccr['id']}/label-matches/apply",
+                    headers=hdr, json={"links": []})
+    assert r.status_code == 400
