@@ -19,4 +19,5 @@ itsdangerous
 boto3
 librouteros
 playwright
+pysnmp
 sentry-sdk[flask]==2.19.0
