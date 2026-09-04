@@ -9368,6 +9368,34 @@ def _create_device_job(device, operation, params=None):
     return job, None
 
 
+def _with_interface_labels(job, payload):
+    """Merge staff-assigned interface labels onto a device_health job's result,
+    at read time rather than write time. Labels are cloud-side data staff can
+    edit between the check running and the result being viewed, and the
+    on-prem agent has no access to them at all -- reading them here always
+    reflects the current labels, whether the job ran in-process or on an
+    agent's box.
+
+    Deliberately defensive: this runs on a polling endpoint hit repeatedly by
+    the browser, so a missing 'interfaces' key or a since-deleted device row
+    must fall through cleanly rather than raise.
+    """
+    if job.operation != 'device_health' or job.status != 'done':
+        return payload
+    result = payload.get('result')
+    interfaces = result.get('interfaces') if isinstance(result, dict) else None
+    if not isinstance(interfaces, list):
+        return payload
+    device = tenant_query(NetworkDevice).filter_by(id=job.device_id).first()
+    labels = (device.interface_labels or {}) if device else {}
+    payload = dict(payload)
+    payload['result'] = dict(result)
+    payload['result']['interfaces'] = [
+        {**iface, 'label': labels.get(iface['name'])} for iface in interfaces
+    ]
+    return payload
+
+
 @app.route('/api/network-jobs/<int:job_id>', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
@@ -9375,7 +9403,9 @@ def get_network_job(job_id):
     job = tenant_query(NetworkAgentJob).filter_by(id=job_id).first()
     if not job:
         return jsonify({'message': 'Job not found'}), 404
-    return jsonify(_expire_job_if_stale(job).to_dict()), 200
+    job = _expire_job_if_stale(job)
+    payload = _with_interface_labels(job, job.to_dict())
+    return jsonify(payload), 200
 
 
 @app.route('/api/network-tree', methods=['GET'])

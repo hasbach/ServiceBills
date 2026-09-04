@@ -102,12 +102,11 @@ def test_check_now_failure_surfaces_message(client, monkeypatch):
 
 
 def test_set_interface_label_persists_on_the_device(client, monkeypatch):
-    """NOTE: check-now's job result is now the connector's raw output (it may
-    run on the agent's box, not this process), so it no longer merges in
-    device.interface_labels the way the old inline endpoint did -- see
-    task-3-report.md for this flagged as a follow-up. This test now only
-    covers what the PATCH endpoint itself still guarantees: the label persists
-    on the device."""
+    """The PATCH endpoint persists the label on the device, and the label is
+    merged back onto the interface at read time when the job is polled --
+    device.interface_labels is cloud-side data, joined in by get_network_job,
+    since the connector (possibly running on an on-prem agent) has no access
+    to it."""
     hdr = make_tenant(client, "Biz I", "i_admin")
     device_id = _create_device(client, hdr)
 
@@ -123,3 +122,37 @@ def test_set_interface_label_persists_on_the_device(client, monkeypatch):
     r = client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr)
     polled = client.get(f"/api/network-jobs/{r.get_json()['job_id']}", headers=hdr).get_json()
     assert polled["result"]["interfaces"][0]["name"] == "ether1"
+    assert polled["result"]["interfaces"][0]["label"] == "thglobal"
+
+
+def test_interface_without_a_configured_label_comes_back_as_none(client, monkeypatch):
+    """An interface nobody has labeled yet must come back with label: None --
+    not missing, not a KeyError -- so the frontend's label-editing UI can
+    always read iface.label."""
+    hdr = make_tenant(client, "Biz J", "j_admin")
+    device_id = _create_device(client, hdr)
+
+    monkeypatch.setattr(appmod.mikrotik, "get_device_health", lambda server: (True, {
+        "identity": "ccr-router", "uptime": "1w2d",
+        "interfaces": [{"name": "ether2", "running": True, "disabled": False}],
+    }))
+    r = client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr)
+    polled = client.get(f"/api/network-jobs/{r.get_json()['job_id']}", headers=hdr).get_json()
+    assert polled["result"]["interfaces"][0]["label"] is None
+
+
+def test_get_network_job_device_health_missing_interfaces_key_does_not_raise(client, monkeypatch):
+    """A device_health result with no 'interfaces' key at all (malformed or
+    from a connector variant that omits it) must be returned as-is, not 500."""
+    hdr = make_tenant(client, "Biz K", "k_admin")
+    device_id = _create_device(client, hdr)
+
+    monkeypatch.setattr(appmod.mikrotik, "get_device_health", lambda server: (True, {
+        "identity": "ccr-router", "uptime": "1w2d",
+    }))
+    r = client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr)
+    resp = client.get(f"/api/network-jobs/{r.get_json()['job_id']}", headers=hdr)
+    assert resp.status_code == 200
+    polled = resp.get_json()
+    assert polled["result"]["identity"] == "ccr-router"
+    assert "interfaces" not in polled["result"]
