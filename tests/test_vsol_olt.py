@@ -5,7 +5,10 @@ V1600D on 2026-09-04, including two genuine duplicate-MAC pairs (stale
 authorization entries left behind when an ONU was moved between PON ports).
 
 See docs/superpowers/specs/2026-09-01-network-topology-tree-design.md."""
+import asyncio
 import types
+
+import pytest
 
 import vsol_olt
 
@@ -219,3 +222,56 @@ def test_rows_without_a_mac_are_skipped(monkeypatch):
     ok, onus = vsol_olt.get_olt_status(make_device())
     assert ok is True
     assert len(onus) == 1
+
+
+def test_dedupe_onu_index_breaks_the_final_tie(monkeypatch):
+    """Isolates preference term 5 (the -_onu totality term). Both rows share
+    the same MAC and PON port, are both offline, both unlabelled (NULL), and
+    tied on distance -- terms 1-4 are all tied. Only the ONU index can break
+    the tie; without it, the winner falls through to walk order instead of
+    being decided by the row data, and the lower ONU index would not
+    reliably win. Realistic on a device that leaves a stale authorization
+    entry with a different ONU index on the same PON port."""
+    patch_walk(monkeypatch, cells_from([
+        ("6", "9", "0", "aa:44:44:44:44:44", "unknow", "NULL", "200"),
+        ("6", "3", "0", "aa:44:44:44:44:44", "unknow", "NULL", "200"),
+    ]))
+    ok, onus = vsol_olt.get_olt_status(make_device())
+    assert ok is True
+    assert len(onus) == 1
+    assert onus[0]["onu_id"] == "EPON0/6:3"
+
+
+def test_walk_onu_table_closes_engine_when_the_walk_raises_partway_through(monkeypatch):
+    """Pins the try/finally in _walk_onu_table: the SNMP engine must be
+    released even when the walk raises after already yielding data. Every
+    other test in this file patches _walk_onu_table wholesale, so nothing
+    else would notice if that finally block (and its _safe_close call) were
+    removed."""
+
+    class FakeEngine:
+        def __init__(self):
+            self.closed = False
+
+        def close_dispatcher(self):
+            self.closed = True
+
+    class FakeTransportTarget:
+        @staticmethod
+        async def create(*args, **kwargs):
+            return object()
+
+    fake_engine = FakeEngine()
+
+    async def fake_bulk_walk_cmd(*args, **kwargs):
+        yield (None, None, None, [])  # one clean chunk, no error
+        raise RuntimeError("simulated failure mid-walk")
+
+    monkeypatch.setattr(vsol_olt, "SnmpEngine", lambda: fake_engine)
+    monkeypatch.setattr(vsol_olt, "UdpTransportTarget", FakeTransportTarget)
+    monkeypatch.setattr(vsol_olt, "bulk_walk_cmd", fake_bulk_walk_cmd)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(vsol_olt._walk_onu_table("192.168.8.100", 161, "public"))
+
+    assert fake_engine.closed is True

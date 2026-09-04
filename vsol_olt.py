@@ -222,7 +222,13 @@ def get_olt_status(server):
         return False, "OLT rejected the SNMP request: {}".format(exc)
     except Exception as exc:  # noqa: BLE001 -- this module never raises out
         _mark_checked(server, "unreachable")
-        logger.exception("VSOL OLT walk failed for device %s: %s", server.id, exc)
+        # WARNING, not exception/error: Sentry's LoggingIntegration (active
+        # whenever SENTRY_DSN is set -- see app.py) captures ERROR-level log
+        # records as events WITH frame locals, and _walk_onu_table's locals
+        # include the decrypted SNMP community string. At WARNING it becomes
+        # a breadcrumb instead, which carries no frame locals. exc_info=True
+        # still puts the full traceback in the application log.
+        logger.warning("VSOL OLT walk failed for device %s: %s", server.id, exc, exc_info=True)
         return False, str(exc) or exc.__class__.__name__
 
     if not onus:
