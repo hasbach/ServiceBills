@@ -10,7 +10,7 @@ import uuid
 import secrets
 import requests
 import traceback
-from flask import Flask, jsonify, request, redirect
+from flask import Flask, jsonify, request, redirect, g
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from datetime import datetime, timedelta, timezone
@@ -9172,6 +9172,125 @@ def _resolve_onu_customers(onus):
         {**onu, 'customers': matches.get(normalize_mac(onu['mac_address']), [])}
         for onu in onus
     ]
+
+
+# Agent tokens are "<agent_id>.<secret>". The id half makes the lookup O(1)
+# (a bcrypt hash can't be searched for), the secret half is what's verified.
+# Only the secret's hash is stored; the full token is shown once at creation.
+def _issue_agent_token(agent):
+    """Generate a fresh token for this agent and store its hash. Returns the
+    token -- the only time it is ever available in plaintext. The caller
+    commits."""
+    secret = secrets.token_urlsafe(32)
+    agent.token_hash = bcrypt.generate_password_hash(secret).decode('utf8')
+    return '{}.{}'.format(agent.id, secret)
+
+
+def _authenticate_agent():
+    """Resolve the NetworkAgent from the Authorization header, or None."""
+    header = request.headers.get('Authorization', '')
+    if not header.startswith('Bearer '):
+        return None
+    raw = header[len('Bearer '):].strip()
+    agent_id, _, secret = raw.partition('.')
+    if not agent_id.isdigit() or not secret:
+        return None
+    agent = db.session.get(NetworkAgent, int(agent_id))
+    if not agent:
+        return None
+    try:
+        if not bcrypt.check_password_hash(agent.token_hash, secret):
+            return None
+    except ValueError:
+        return None  # stored hash is malformed -- treat as no match
+    return agent
+
+
+def agent_token_required():
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            agent = _authenticate_agent()
+            if not agent:
+                return jsonify({'error': 'Invalid agent token'}), 401
+            g.network_agent = agent
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+@app.route('/api/agent/jobs', methods=['GET'])
+@agent_token_required()
+def agent_poll_job():
+    """The agent's short-poll. Returns one pending job or 204.
+
+    The agent MUST poll, not long-poll: production runs a single sync gunicorn
+    worker, so holding this request open would freeze the whole application.
+    """
+    agent = g.network_agent
+    agent.last_seen_at = datetime.utcnow()
+    version = (request.headers.get('X-Agent-Version') or '')[:20]
+    if version:
+        agent.agent_version = version
+
+    job = (NetworkAgentJob.query
+           .filter_by(tenant_id=agent.tenant_id, status='pending')
+           .order_by(NetworkAgentJob.created_at)
+           .first())
+    if not job:
+        db.session.commit()  # still persist the heartbeat
+        return '', 204
+
+    device = db.session.get(NetworkDevice, job.device_id)
+    if not device or device.tenant_id != agent.tenant_id:
+        # The device vanished under the job. Fail it rather than hand out a
+        # job the agent can't act on.
+        job.status = 'failed'
+        job.error = 'Device no longer exists'
+        job.finished_at = datetime.utcnow()
+        db.session.commit()
+        return '', 204
+
+    job.status = 'claimed'
+    job.claimed_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({
+        'job_id': job.id,
+        'device_id': device.id,
+        'operation': job.operation,
+        # Sent so the agent can VERIFY these against its own config, not so it
+        # can trust them -- see the agent's host allowlist.
+        'host': device.host,
+        'api_port': device.api_port,
+        'params': job.params or {},
+    }), 200
+
+
+@app.route('/api/agent/jobs/<int:job_id>/result', methods=['POST'])
+@agent_token_required()
+def agent_post_result(job_id):
+    agent = g.network_agent
+    agent.last_seen_at = datetime.utcnow()
+    job = NetworkAgentJob.query.filter_by(
+        id=job_id, tenant_id=agent.tenant_id).first()
+    if not job:
+        db.session.commit()
+        return jsonify({'message': 'Job not found'}), 404
+    if job.status != 'claimed':
+        db.session.commit()
+        return jsonify({'error': 'Job is {}, not claimed'.format(job.status)}), 409
+
+    data = request.json or {}
+    job.status = 'done'
+    job.finished_at = datetime.utcnow()
+    if data.get('ok'):
+        job.result = data.get('result')
+        job.error = None
+    else:
+        job.result = None
+        job.error = data.get('error') or 'The agent reported a failure'
+    db.session.commit()
+    return jsonify({'message': 'Recorded'}), 200
 
 
 @app.route('/api/network-tree', methods=['GET'])
