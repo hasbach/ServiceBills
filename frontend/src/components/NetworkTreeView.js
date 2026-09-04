@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     Box, Typography, Button, Paper, Chip, CircularProgress, Alert,
-    Collapse, IconButton, Stack, Divider,
+    Collapse, IconButton, Stack, Divider, Tooltip,
 } from '@mui/material';
 import {
     ExpandMore as ExpandMoreIcon, ChevronRight as ChevronRightIcon,
@@ -36,29 +36,71 @@ const NetworkTreeView = () => {
     const [expanded, setExpanded] = useState({});
     const [matcherDevice, setMatcherDevice] = useState(null);
 
+    // Tenant-wide access mode ('direct' | 'agent') and, in agent mode, the
+    // tenant's single on-prem agent (or null if none has been created yet).
+    // Fetched independently of the device tree itself -- see the effects
+    // below -- since neither lives on a NetworkDevice row.
+    const [accessMode, setAccessMode] = useState('direct');
+    const [agent, setAgent] = useState(null);
+
     // Per-device request sequence numbers, used to discard a stale
     // refreshOlt response that resolves after a newer one for the same
     // device (out-of-order network responses). Not component state --
     // updating it must never itself trigger a render.
     const refreshSeqRef = useRef({});
 
+    // Sequence counter for loadTree itself, independent of refreshSeqRef
+    // above (which is scoped per-device to refreshOlt). Task 7 multiplied
+    // loadTree's call sites -- it now also runs quietly after every
+    // completed OLT check, not just on mount and the manual Reload button --
+    // so two loadTree calls can be in flight at once with no ordering
+    // guarantee on which resolves first. If the older one's response
+    // arrives last, applying it would revert the very status chip the
+    // quiet resync exists to keep fresh. Same bump-then-compare idiom as
+    // refreshSeqRef: increment on entry, capture the value, and only touch
+    // state if this call is still the latest -- kept as a ref, not state,
+    // so bumping it never itself triggers a render.
+    const treeSeqRef = useRef(0);
+
     // showSpinner distinguishes the genuine first load (full-page spinner is
     // fine, there's nothing on screen yet) from a background resync after an
     // OLT refresh or a label-match apply, which must update state quietly
     // without blanking anything already on screen.
     const loadTree = useCallback(async (showSpinner = true) => {
+        const seq = ++treeSeqRef.current;
         if (showSpinner) setLoading(true);
         try {
             const res = await apiService.fetchNetworkTree();
-            setTree(res.data.tree || []);
+            if (treeSeqRef.current === seq) setTree(res.data.tree || []);
         } catch (e) {
-            setSnackbar({ open: true, message: 'Failed to load the network tree', severity: 'error' });
+            if (treeSeqRef.current === seq) {
+                setSnackbar({ open: true, message: 'Failed to load the network tree', severity: 'error' });
+            }
         } finally {
-            if (showSpinner) setLoading(false);
+            if (showSpinner && treeSeqRef.current === seq) setLoading(false);
         }
     }, [setSnackbar]);
 
     useEffect(() => { loadTree(); }, [loadTree]);
+
+    useEffect(() => {
+        apiService.fetchBusinessSettings()
+            .then((res) => setAccessMode(res.data?.settings?.network_access_mode || 'direct'))
+            .catch(() => {}); // Defaults to 'direct' (today's behaviour) if this fails.
+    }, []);
+
+    useEffect(() => {
+        if (accessMode !== 'agent') return;
+        apiService.fetchNetworkAgents()
+            .then((res) => setAgent((res.data || [])[0] || null))
+            .catch(() => {}); // Advisory only -- a failed fetch just leaves the chip/buttons as if no agent exists.
+    }, [accessMode]);
+
+    const agentOnline = !!(agent && agent.is_online);
+    const agentOffline = accessMode === 'agent' && !agentOnline;
+    const agentOfflineReason = agent?.last_seen_at
+        ? `Agent offline (last seen ${agent.last_seen_at}). Start the agent on your network and try again.`
+        : 'Agent offline (never connected). Start the agent on your network and try again.';
 
     const refreshOlt = async (device) => {
         const seq = (refreshSeqRef.current[device.id] || 0) + 1;
@@ -177,15 +219,24 @@ const NetworkTreeView = () => {
                         <Box sx={{ flexGrow: 1 }} />
                         {isOlt && (
                             <>
-                                <Button size="small" startIcon={<LinkIcon />}
-                                    onClick={() => setMatcherDevice(device)}>
-                                    Match Labels
-                                </Button>
-                                <Button size="small" variant="outlined" startIcon={<RefreshIcon />}
-                                    disabled={isRefreshing}
-                                    onClick={() => refreshOlt(device)}>
-                                    {isRefreshing ? 'Checking…' : 'Load ONUs'}
-                                </Button>
+                                <Tooltip title={agentOffline ? agentOfflineReason : ''}>
+                                    <span>
+                                        <Button size="small" startIcon={<LinkIcon />}
+                                            disabled={agentOffline}
+                                            onClick={() => setMatcherDevice(device)}>
+                                            Match Labels
+                                        </Button>
+                                    </span>
+                                </Tooltip>
+                                <Tooltip title={agentOffline ? agentOfflineReason : ''}>
+                                    <span>
+                                        <Button size="small" variant="outlined" startIcon={<RefreshIcon />}
+                                            disabled={isRefreshing || agentOffline}
+                                            onClick={() => refreshOlt(device)}>
+                                            {isRefreshing ? 'Checking…' : 'Load ONUs'}
+                                        </Button>
+                                    </span>
+                                </Tooltip>
                             </>
                         )}
                     </Stack>
@@ -219,6 +270,17 @@ const NetworkTreeView = () => {
                 <Box sx={{ flexGrow: 1 }} />
                 <Button startIcon={<RefreshIcon />} onClick={() => loadTree()}>Reload</Button>
             </Stack>
+
+            {/* No agent in 'direct' mode -- rendering this would just be noise. */}
+            {accessMode === 'agent' && (
+                <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
+                    <Chip size="small" color={agentOnline ? 'success' : 'error'}
+                        label={agentOnline ? 'Agent online' : 'Agent offline'} />
+                    <Typography variant="caption" color="text.secondary">
+                        {agent?.last_seen_at ? `last seen ${agent.last_seen_at}` : 'never connected'}
+                    </Typography>
+                </Stack>
+            )}
 
             {tree.length === 0 ? (
                 <Alert severity="info">

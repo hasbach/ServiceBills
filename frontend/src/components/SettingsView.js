@@ -5,7 +5,7 @@ import {
     Alert, Collapse, InputAdornment, IconButton, MenuItem,
     ToggleButton, ToggleButtonGroup, Tab, Tabs,
     Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
-    Autocomplete,
+    Autocomplete, Stack, Chip,
 } from '@mui/material';
 import {
     Business as BusinessIcon,
@@ -95,6 +95,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     // ── Business form state ───────────────────────────────────────────────────
     const [bizForm, setBizForm] = useState({
         business_name: '', address: '', mobile: '', email: '', website: '', network_mode: 'none',
+        network_access_mode: 'direct',
         upstream_sync_automation_enabled: false
     });
     const [logoFile, setLogoFile] = useState(null);
@@ -110,6 +111,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 email: businessSettings.email || '',
                 website: businessSettings.website || '',
                 network_mode: businessSettings.network_mode || 'none',
+                network_access_mode: businessSettings.network_access_mode || 'direct',
                 upstream_sync_automation_enabled: !!businessSettings.upstream_sync_automation_enabled
             });
             if (businessSettings.logo_url) {
@@ -135,6 +137,90 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
         } finally {
             setBizLoading(false);
         }
+    };
+
+    // ── Network agent management (agent-mode device access) ────────────────────
+    // At most one agent per tenant (enforced server-side) -- `agents[0]` (or
+    // null) is the whole picture. Fetched only while the form's current
+    // access-mode selection is 'agent' -- see the effect below -- so nothing
+    // hits this endpoint for a tenant that has never touched agent mode.
+    const [agents, setAgents] = useState([]);
+    const [agentsFetching, setAgentsFetching] = useState(false);
+    const [agentActionLoading, setAgentActionLoading] = useState(false);
+    const agent = agents[0] || null;
+
+    const fetchAgents = useCallback(async () => {
+        setAgentsFetching(true);
+        try {
+            const res = await apiService.fetchNetworkAgents();
+            setAgents(res.data || []);
+        } catch (e) {
+            console.error('Failed to load network agents', e);
+        } finally {
+            setAgentsFetching(false);
+        }
+    }, [apiService]);
+
+    useEffect(() => {
+        if (bizForm.network_access_mode === 'agent') fetchAgents();
+    }, [bizForm.network_access_mode, fetchAgents]);
+
+    // The token dialog is the ONLY place the plaintext token is ever held.
+    // It lives in this one piece of state, cleared the moment the dialog
+    // closes (see handleCloseTokenDialog) -- there is no way to recover it
+    // afterwards, by design (the backend never stores or re-returns it).
+    const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
+    const [revealedToken, setRevealedToken] = useState(null);
+    const [tokenCopied, setTokenCopied] = useState(false);
+
+    const handleCreateAgent = async () => {
+        setAgentActionLoading(true);
+        try {
+            const res = await apiService.createNetworkAgent({ name: 'Network Agent' });
+            setAgents([res.data.agent]);
+            setRevealedToken(res.data.token);
+            setTokenDialogOpen(true);
+        } catch (err) {
+            const detail = err?.response?.data?.error || 'Failed to create agent';
+            setSnackbar({ open: true, message: detail, severity: 'error' });
+        } finally {
+            setAgentActionLoading(false);
+        }
+    };
+
+    const handleRegenerateToken = async () => {
+        if (!agent) return;
+        setAgentActionLoading(true);
+        try {
+            const res = await apiService.regenerateNetworkAgentToken(agent.id);
+            setAgents([res.data.agent]);
+            setRevealedToken(res.data.token);
+            setTokenDialogOpen(true);
+        } catch (err) {
+            const detail = err?.response?.data?.error || 'Failed to regenerate token';
+            setSnackbar({ open: true, message: detail, severity: 'error' });
+        } finally {
+            setAgentActionLoading(false);
+        }
+    };
+
+    const handleCopyToken = async () => {
+        if (!revealedToken) return;
+        try {
+            await navigator.clipboard.writeText(revealedToken);
+            setTokenCopied(true);
+            setTimeout(() => setTokenCopied(false), 2000);
+        } catch (e) {
+            setSnackbar({ open: true, message: 'Could not copy token.', severity: 'error' });
+        }
+    };
+
+    // The only place the token is deliberately forgotten -- once this dialog
+    // closes there is no way, anywhere in the app, to see this token again.
+    const handleCloseTokenDialog = () => {
+        setTokenDialogOpen(false);
+        setRevealedToken(null);
+        setTokenCopied(false);
     };
 
     // ── WhatsApp state ────────────────────────────────────────────────────────
@@ -387,6 +473,58 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                             ServiceBills up to date. Off by default while this rolls out.
                                         </Typography>
                                     </Alert>
+                                </Collapse>
+                            </Grid>
+                            <Grid item xs={12}>
+                                <TextField fullWidth select label="Network Device Access" value={bizForm.network_access_mode}
+                                    onChange={e => setBizForm(f => ({ ...f, network_access_mode: e.target.value }))}
+                                    helperText="How ServiceBills reaches your own network hardware (Network Devices / Network Tree pages) for health checks."
+                                    sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
+                                    <MenuItem value="direct">Direct — this app can reach your devices itself</MenuItem>
+                                    <MenuItem value="agent">Via on-prem agent — devices sit on a private LAN this app can't reach</MenuItem>
+                                </TextField>
+                            </Grid>
+                            <Grid item xs={12}>
+                                <Collapse in={bizForm.network_access_mode === 'agent'}>
+                                    <Paper variant="outlined" sx={{ p: 2.5, borderRadius: '12px' }}>
+                                        <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5 }}>On-prem Agent</Typography>
+                                        {agentsFetching ? (
+                                            <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}><CircularProgress size={24} /></Box>
+                                        ) : agent ? (
+                                            <Box>
+                                                <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }} flexWrap="wrap">
+                                                    <Chip size="small" color={agent.is_online ? 'success' : 'error'}
+                                                        label={agent.is_online ? 'Online' : 'Offline'} />
+                                                    <Typography variant="body1" sx={{ fontWeight: 600 }}>{agent.name}</Typography>
+                                                </Stack>
+                                                <Typography variant="body2" color="text.secondary">
+                                                    Last seen: {agent.last_seen_at || 'never connected'}
+                                                </Typography>
+                                                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                                                    Version: {agent.agent_version || 'unknown'}
+                                                </Typography>
+                                                <Button variant="outlined" color="warning" onClick={handleRegenerateToken} disabled={agentActionLoading}
+                                                    sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
+                                                    {agentActionLoading ? 'Regenerating…' : 'Regenerate Token'}
+                                                </Button>
+                                                <Alert severity="info" sx={{ mt: 2, borderRadius: '12px' }}>
+                                                    Regenerating invalidates the current token immediately — the running agent will
+                                                    stop authenticating until <code>agent.toml</code> is updated with the new one.
+                                                </Alert>
+                                            </Box>
+                                        ) : (
+                                            <Box>
+                                                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                                                    No agent has been created for this tenant yet. Create one to get a token to
+                                                    paste into <code>agent.toml</code> on the on-prem box that can reach your devices.
+                                                </Typography>
+                                                <Button variant="contained" onClick={handleCreateAgent} disabled={agentActionLoading}
+                                                    sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
+                                                    {agentActionLoading ? 'Creating…' : 'Create Agent'}
+                                                </Button>
+                                            </Box>
+                                        )}
+                                    </Paper>
                                 </Collapse>
                             </Grid>
                         </Grid>
@@ -856,6 +994,33 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                     <Button onClick={generateOrRegeneratePublicPayLink} color="warning" variant="contained" disabled={publicPayLinkLoading}>
                         {publicPayLinkLoading ? 'Regenerating…' : 'Regenerate'}
                     </Button>
+                </DialogActions>
+            </Dialog>
+
+            {/* Agent token reveal -- shown exactly once, on create or regenerate.
+                revealedToken is cleared the moment this dialog closes (see
+                handleCloseTokenDialog); there is no way to see this value again
+                anywhere in the app afterwards. */}
+            <Dialog open={tokenDialogOpen} onClose={handleCloseTokenDialog} fullWidth maxWidth="sm">
+                <DialogTitle>Agent Token</DialogTitle>
+                <DialogContent>
+                    <Alert severity="warning" sx={{ mb: 2, borderRadius: '12px' }}>
+                        This token will not be shown again. Copy it now and paste it into <code>agent.toml</code> on
+                        the on-prem box that runs the agent. If it's lost, the only recovery is to regenerate a new
+                        one, which immediately invalidates this one.
+                    </Alert>
+                    <TextField
+                        fullWidth
+                        value={revealedToken || ''}
+                        InputProps={{ readOnly: true, sx: { fontFamily: 'monospace' } }}
+                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}
+                    />
+                </DialogContent>
+                <DialogActions>
+                    <Button startIcon={<ContentCopyIcon />} onClick={handleCopyToken}>
+                        {tokenCopied ? 'Copied!' : 'Copy Token'}
+                    </Button>
+                    <Button variant="contained" onClick={handleCloseTokenDialog}>Done</Button>
                 </DialogActions>
             </Dialog>
 

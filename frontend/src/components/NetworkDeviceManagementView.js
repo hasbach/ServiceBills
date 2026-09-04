@@ -3,7 +3,8 @@ import {
     Box, Typography, Button, TextField, Dialog, DialogTitle,
     DialogContent, DialogActions, Grid, Paper, TableContainer,
     Table, TableHead, TableRow, TableCell, TableBody, MenuItem,
-    IconButton, Tooltip, Chip, CircularProgress, Switch, FormControlLabel, Stack
+    IconButton, Tooltip, Chip, CircularProgress, Switch, FormControlLabel, Stack,
+    Alert,
 } from '@mui/material';
 import {
     Add as AddIcon,
@@ -60,9 +61,34 @@ const NetworkDeviceManagementView = () => {
     const checkSeqRef = useRef({});
     const activeDeviceIdRef = useRef(null);
 
+    // Tenant-wide access mode ('direct' | 'agent') and, in agent mode, the
+    // tenant's single on-prem agent (or null if none exists yet). Neither
+    // lives on a NetworkDevice row, so both are fetched independently below.
+    const [accessMode, setAccessMode] = useState('direct');
+    const [agent, setAgent] = useState(null);
+
     useEffect(() => {
         loadDevices();
     }, []);
+
+    useEffect(() => {
+        apiService.fetchBusinessSettings()
+            .then((res) => setAccessMode(res.data?.settings?.network_access_mode || 'direct'))
+            .catch(() => {}); // Defaults to 'direct' (today's behaviour) if this fails.
+    }, []);
+
+    useEffect(() => {
+        if (accessMode !== 'agent') return;
+        apiService.fetchNetworkAgents()
+            .then((res) => setAgent((res.data || [])[0] || null))
+            .catch(() => {}); // Advisory only -- a failed fetch just leaves the chip/buttons as if no agent exists.
+    }, [accessMode]);
+
+    const agentOnline = !!(agent && agent.is_online);
+    const agentOffline = accessMode === 'agent' && !agentOnline;
+    const agentOfflineReason = agent?.last_seen_at
+        ? `Agent offline (last seen ${agent.last_seen_at}). Start the agent on your network and try again.`
+        : 'Agent offline (never connected). Start the agent on your network and try again.';
 
     const loadDevices = async () => {
         setLoading(true);
@@ -77,16 +103,26 @@ const NetworkDeviceManagementView = () => {
     };
 
     const handleSaveDevice = async () => {
-        if (!editingDevice.id && !editingDevice.password) {
+        // In agent mode the password/community field is hidden entirely (the
+        // credential lives in agent.toml on the on-prem box, not here), so
+        // it's never required there -- only in direct mode, where the cloud
+        // still calls the device itself.
+        if (accessMode !== 'agent' && !editingDevice.id && !editingDevice.password) {
             setSnackbar({ open: true, message: 'Password is required', severity: 'warning' });
             return;
         }
+        // Never send a `password` key while the field is hidden -- the
+        // backend rejects a supplied password in agent mode with a 400, and
+        // sending an empty string would be worse than sending nothing (it
+        // would read as "clear the value the user never saw").
+        const { password, ...deviceWithoutPassword } = editingDevice;
+        const payload = accessMode === 'agent' ? deviceWithoutPassword : editingDevice;
         try {
             if (editingDevice.id) {
-                await apiService.updateNetworkDevice(editingDevice.id, editingDevice);
+                await apiService.updateNetworkDevice(editingDevice.id, payload);
                 setSnackbar({ open: true, message: 'Network device updated', severity: 'success' });
             } else {
-                await apiService.addNetworkDevice(editingDevice);
+                await apiService.addNetworkDevice(payload);
                 setSnackbar({ open: true, message: 'Network device added', severity: 'success' });
             }
             setEditDialogOpen(false);
@@ -198,6 +234,17 @@ const NetworkDeviceManagementView = () => {
                 </Button>
             </Box>
 
+            {/* No agent in 'direct' mode -- rendering this would just be noise. */}
+            {accessMode === 'agent' && (
+                <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 3 }}>
+                    <Chip size="small" color={agentOnline ? 'success' : 'error'}
+                        label={agentOnline ? 'Agent online' : 'Agent offline'} />
+                    <Typography variant="caption" color="text.secondary">
+                        {agent?.last_seen_at ? `last seen ${agent.last_seen_at}` : 'never connected'}
+                    </Typography>
+                </Stack>
+            )}
+
             {loading ? (
                 <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress /></Box>
             ) : (
@@ -225,10 +272,12 @@ const NetworkDeviceManagementView = () => {
                                         </Tooltip>
                                     </TableCell>
                                     <TableCell align="right">
-                                        <Tooltip title="Check Now">
-                                            <IconButton color="info" onClick={() => handleCheckNow(d)} disabled={checkingId === d.id}>
-                                                {checkingId === d.id ? <CircularProgress size={18} /> : <CheckNowIcon fontSize="small" />}
-                                            </IconButton>
+                                        <Tooltip title={agentOffline ? agentOfflineReason : 'Check Now'}>
+                                            <span>
+                                                <IconButton color="info" onClick={() => handleCheckNow(d)} disabled={checkingId === d.id || agentOffline}>
+                                                    {checkingId === d.id ? <CircularProgress size={18} /> : <CheckNowIcon fontSize="small" />}
+                                                </IconButton>
+                                            </span>
                                         </Tooltip>
                                         <Tooltip title="Edit">
                                             <IconButton onClick={() => { setEditingDevice({ ...d, password: '' }); setEditDialogOpen(true); }}>
@@ -315,15 +364,29 @@ const NetworkDeviceManagementView = () => {
                                     onChange={(e) => setEditingDevice({ ...editingDevice, username: e.target.value })} />
                             </Grid>
                         )}
-                        <Grid item xs={12} sm={6}>
-                            <TextField fullWidth type="password"
-                                label={editingDevice?.device_type === 'vsol_olt' ? 'SNMP Community' : 'Password'}
-                                helperText={editingDevice?.id
-                                    ? (editingDevice?.device_type === 'vsol_olt' ? 'Leave blank to keep the current community string' : 'Leave blank to keep the current password')
-                                    : 'Required'}
-                                value={editingDevice?.password || ''}
-                                onChange={(e) => setEditingDevice({ ...editingDevice, password: e.target.value })} />
-                        </Grid>
+                        {accessMode === 'agent' ? (
+                            // The cloud never holds a device credential in agent mode -- the
+                            // backend rejects a supplied password outright (see
+                            // handleSaveDevice, which strips this key from the payload).
+                            // The field is hidden entirely rather than shown-and-disabled so
+                            // there's no empty password box inviting a keystroke.
+                            <Grid item xs={12} sm={6}>
+                                <Alert severity="info" sx={{ height: '100%', alignItems: 'center' }}>
+                                    {editingDevice?.device_type === 'vsol_olt' ? 'The SNMP community string' : 'The password'} lives
+                                    in <code>agent.toml</code> on the on-prem box, not here.
+                                </Alert>
+                            </Grid>
+                        ) : (
+                            <Grid item xs={12} sm={6}>
+                                <TextField fullWidth type="password"
+                                    label={editingDevice?.device_type === 'vsol_olt' ? 'SNMP Community' : 'Password'}
+                                    helperText={editingDevice?.id
+                                        ? (editingDevice?.device_type === 'vsol_olt' ? 'Leave blank to keep the current community string' : 'Leave blank to keep the current password')
+                                        : 'Required'}
+                                    value={editingDevice?.password || ''}
+                                    onChange={(e) => setEditingDevice({ ...editingDevice, password: e.target.value })} />
+                            </Grid>
+                        )}
                         <Grid item xs={12}>
                             <TextField fullWidth select label="Status" value={editingDevice?.status || 'active'}
                                 onChange={(e) => setEditingDevice({ ...editingDevice, status: e.target.value })}>
