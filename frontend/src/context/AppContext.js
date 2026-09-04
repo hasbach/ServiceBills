@@ -149,6 +149,13 @@ const rawApiService = {
     checkNetworkDeviceNow: (id) => api.post(`/network-devices/${id}/check-now`),
     setNetworkDeviceInterfaceLabel: (id, data) => api.patch(`/network-devices/${id}/interface-labels`, data),
 
+    // Network Tree (CCR -> OLT -> ONU -> customer) -- see
+    // docs/superpowers/specs/2026-09-01-network-topology-tree-design.md
+    fetchNetworkTree: () => api.get('/network-tree'),
+    refreshOltOnus: (id) => api.post(`/network-tree/olt/${id}/refresh`),
+    fetchOnuLabelMatches: (id) => api.get(`/network-tree/olt/${id}/label-matches`),
+    applyOnuLabelMatches: (id, links) => api.post(`/network-tree/olt/${id}/label-matches/apply`, { links }),
+
     // Customer <-> Mikrotik live actions (staff-confirmed only, see spec)
     fetchCustomerMikrotikStatus: (customerId) => api.get(`/customers/${customerId}/mikrotik-status`),
     suspendCustomerMikrotik: (customerId) => api.post(`/customers/${customerId}/mikrotik-suspend`),

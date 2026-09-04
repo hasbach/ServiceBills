@@ -135,7 +135,7 @@ const NetworkDeviceManagementView = () => {
                 <Button
                     variant="contained"
                     startIcon={<AddIcon />}
-                    onClick={() => { setEditingDevice({ name: '', host: '', api_port: 8728, use_tls: false, username: '', password: '', status: 'active' }); setEditDialogOpen(true); }}
+                    onClick={() => { setEditingDevice({ name: '', host: '', device_type: 'mikrotik_ccr', parent_device_id: '', api_port: 8728, use_tls: false, username: '', password: '', status: 'active' }); setEditDialogOpen(true); }}
                     sx={{ width: { xs: '100%', sm: 'auto' } }}
                 >
                     Add Device
@@ -159,7 +159,10 @@ const NetworkDeviceManagementView = () => {
                             {devices.map((d) => (
                                 <TableRow key={d.id}>
                                     <TableCell sx={{ fontWeight: 600 }}>{d.name}</TableCell>
-                                    <TableCell>{d.host}:{d.api_port}{d.use_tls ? ' (TLS)' : ''}</TableCell>
+                                    <TableCell>
+                                        {d.host}:{d.api_port}{d.use_tls ? ' (TLS)' : ''}
+                                        {d.device_type === 'vsol_olt' ? ' — OLT (SNMP)' : ' — CCR (RouterOS)'}
+                                    </TableCell>
                                     <TableCell>
                                         {d.last_status ? (
                                             <Tooltip title={d.last_checked_at || ''}>
@@ -203,6 +206,34 @@ const NetworkDeviceManagementView = () => {
                 <DialogTitle>{editingDevice?.id ? 'Edit Network Device' : 'Add Network Device'}</DialogTitle>
                 <DialogContent dividers>
                     <Grid container spacing={2}>
+                        <Grid item xs={12} sm={6}>
+                            <TextField fullWidth select label="Device Type"
+                                value={editingDevice?.device_type || 'mikrotik_ccr'}
+                                onChange={(e) => {
+                                    const device_type = e.target.value;
+                                    setEditingDevice({
+                                        ...editingDevice,
+                                        device_type,
+                                        api_port: device_type === 'vsol_olt' ? 161 : (editingDevice?.use_tls ? 8729 : 8728),
+                                    });
+                                }}
+                                SelectProps={{ native: true }}>
+                                <option value="mikrotik_ccr">Mikrotik CCR (RouterOS)</option>
+                                <option value="vsol_olt">V-SOL OLT (SNMP)</option>
+                            </TextField>
+                        </Grid>
+                        <Grid item xs={12} sm={6}>
+                            <TextField fullWidth select label="Connected To (upstream device)"
+                                value={editingDevice?.parent_device_id ?? ''}
+                                helperText="Leave as 'None' for the root device"
+                                onChange={(e) => setEditingDevice({ ...editingDevice, parent_device_id: e.target.value })}
+                                SelectProps={{ native: true }}>
+                                <option value="">None (root)</option>
+                                {devices
+                                    .filter((d) => d.id !== editingDevice?.id)
+                                    .map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+                            </TextField>
+                        </Grid>
                         <Grid item xs={12}>
                             <TextField fullWidth label="Name" value={editingDevice?.name || ''}
                                 onChange={(e) => setEditingDevice({ ...editingDevice, name: e.target.value })} />
@@ -211,24 +242,31 @@ const NetworkDeviceManagementView = () => {
                             <TextField fullWidth label="Host (IP or hostname)" value={editingDevice?.host || ''}
                                 onChange={(e) => setEditingDevice({ ...editingDevice, host: e.target.value })} />
                         </Grid>
-                        <Grid item xs={12} md={4}>
-                            <TextField fullWidth type="number" label="API Port" value={editingDevice?.api_port ?? 8728}
+                        <Grid item xs={12} sm={6}>
+                            <TextField fullWidth type="number"
+                                label={editingDevice?.device_type === 'vsol_olt' ? 'SNMP Port' : 'API Port'}
+                                value={editingDevice?.api_port ?? (editingDevice?.device_type === 'vsol_olt' ? 161 : 8728)}
                                 onChange={(e) => setEditingDevice({ ...editingDevice, api_port: e.target.value })} />
                         </Grid>
-                        <Grid item xs={12}>
-                            <FormControlLabel
-                                control={<Switch checked={!!editingDevice?.use_tls}
-                                    onChange={(e) => setEditingDevice({ ...editingDevice, use_tls: e.target.checked, api_port: e.target.checked ? 8729 : 8728 })} />}
-                                label="Use TLS (RouterOS API-SSL, port 8729)"
-                            />
-                        </Grid>
-                        <Grid item xs={12} md={6}>
-                            <TextField fullWidth label="Username" value={editingDevice?.username || ''}
-                                onChange={(e) => setEditingDevice({ ...editingDevice, username: e.target.value })} />
-                        </Grid>
-                        <Grid item xs={12} md={6}>
-                            <TextField fullWidth type="password" label="Password"
-                                helperText={editingDevice?.id ? 'Leave blank to keep the current password' : 'Required'}
+                        {editingDevice?.device_type !== 'vsol_olt' && (
+                            <Grid item xs={12} sm={6}>
+                                <FormControlLabel label="Use TLS (API-SSL)"
+                                    control={<Switch checked={!!editingDevice?.use_tls}
+                                        onChange={(e) => setEditingDevice({ ...editingDevice, use_tls: e.target.checked, api_port: e.target.checked ? 8729 : 8728 })} />} />
+                            </Grid>
+                        )}
+                        {editingDevice?.device_type !== 'vsol_olt' && (
+                            <Grid item xs={12} sm={6}>
+                                <TextField fullWidth label="Username" value={editingDevice?.username || ''}
+                                    onChange={(e) => setEditingDevice({ ...editingDevice, username: e.target.value })} />
+                            </Grid>
+                        )}
+                        <Grid item xs={12} sm={6}>
+                            <TextField fullWidth type="password"
+                                label={editingDevice?.device_type === 'vsol_olt' ? 'SNMP Community' : 'Password'}
+                                helperText={editingDevice?.id
+                                    ? (editingDevice?.device_type === 'vsol_olt' ? 'Leave blank to keep the current community string' : 'Leave blank to keep the current password')
+                                    : 'Required'}
                                 value={editingDevice?.password || ''}
                                 onChange={(e) => setEditingDevice({ ...editingDevice, password: e.target.value })} />
                         </Grid>
