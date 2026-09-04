@@ -97,6 +97,17 @@ migrate = Migrate(app, db, render_as_batch=True)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+# Shared rate-limiting infrastructure -- see
+# docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 1
+# (Resolved product decision #8 in the sibling spec). In-memory storage
+# (single-gunicorn-worker deployment per render.yaml/Dockerfile today). No
+# default_limits: existing authenticated routes are unaffected by this --
+# only routes that opt in with @limiter.limit(...) are throttled.
+limiter = Limiter(key_func=get_remote_address, app=app, storage_uri="memory://", default_limits=[])
+
 # Multi-tenancy scoping helpers (Phase 2). tenancy.py imports `db` lazily inside
 # functions, so importing it here does not create a circular import.
 from tenancy import (
@@ -176,6 +187,9 @@ class Tenant(db.Model):
     # scheduler job sends it once per expiry cycle, not once per tick.
     plan_expiry_reminder_sent_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # The tenant-wide self-service Whish payment page's URL slug (2026-08-27
+    # plan amendment) -- null until staff first generate it (Task 20).
+    public_pay_slug = db.Column(db.String(32), nullable=True, unique=True, index=True)
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "slug": self.slug,
@@ -744,6 +758,14 @@ class Payment(db.Model):
     refund_reason = db.Column(db.Text, nullable=True)
     refunded_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     refunded_at = db.Column(db.DateTime, nullable=True)
+    # Set by either Whish-collection flow (the per-Payment CustomerPaymentLink
+    # success callback, or the tenant-wide self-service page's checkout) --
+    # neither sets received_by_id (no staff current_user to attribute it to),
+    # so collected_via is how the frontend shows "via Whish" instead of
+    # nothing. None means staff-collected/legacy. See the 2026-08-27 plan
+    # amendment's investigation note.
+    collected_via = db.Column(db.String(20), nullable=True)  # None | 'whish'
+    whish_transaction_number = db.Column(db.String(64), nullable=True)
     addon_purchases = db.relationship('AddonPurchase', backref='payment', lazy=True)
 
     collected_by = db.relationship('User', foreign_keys=[collected_by_id])
@@ -763,6 +785,80 @@ class GeneratedReceipt(db.Model):
     last_printed_date = db.Column(db.DateTime)
     receipt_data = db.Column(db.Text, nullable=False) # Stores a JSON snapshot of the receipt
     customer = db.relationship('Customer', back_populates='generated_receipts')
+
+
+class CustomerPaymentLink(db.Model):
+    """One Whish payment link generated for a specific customer Payment. The
+    single-use, signed-token security boundary for the public payment page
+    and Whish callback. Parallel to BillingPaymentAttempt (platform billing)
+    but scoped to Payment/Customer, not Tenant. See
+    docs/superpowers/specs/2026-08-27-tenant-whish-customer-payments-design.md
+    (Data model, Security model sections) for the full rationale, including
+    why there are two tokens (view_token: repeatable, read-only;
+    callback_token: single-use, can flip Payment.paid)."""
+    __tablename__ = "customer_payment_link"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False, index=True)
+    payment_id = db.Column(db.Integer, db.ForeignKey('payment.id'), nullable=False, index=True)
+    # Snapshotted at creation, NOT re-read from Payment at checkout/callback
+    # time -- see the staleness guard below for what happens if Payment.amount
+    # changes after this snapshot.
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False)
+    view_token = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    callback_token = db.Column(db.String(64), nullable=False)
+    whish_external_id = db.Column(db.String(64), unique=True, nullable=True, index=True)
+    whish_transaction_number = db.Column(db.String(64), nullable=True)
+    status = db.Column(db.String(10), nullable=False, default='pending', index=True)  # pending, succeeded, failed, expired, stale
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    completed_at = db.Column(db.DateTime, nullable=True)
+
+    payment = db.relationship('Payment')
+    customer = db.relationship('Customer')
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'customer_id': self.customer_id, 'payment_id': self.payment_id,
+            'amount': float(self.amount), 'currency': self.currency,
+            'whish_transaction_number': self.whish_transaction_number,
+            'status': self.status,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+            'expires_at': self.expires_at.strftime('%Y-%m-%d %H:%M:%S'),
+            'completed_at': self.completed_at.strftime('%Y-%m-%d %H:%M:%S') if self.completed_at else None,
+        }
+
+
+class CustomerWhishPaymentAttempt(db.Model):
+    """One row per checkout attempt from the tenant-wide self-service Whish
+    payment page (2026-08-27 plan amendment). Not addressed by its own
+    view_token, unlike CustomerPaymentLink -- that model is shaped around
+    exactly one known Payment/amount (its staleness guard exists to
+    invalidate the link when that Payment changes); this page's whole point
+    is an amount the customer decides, potentially applied across several
+    Payment rows, so a failed attempt just means the customer fills the form
+    again on the same static tenant page. Exists to carry a callback_token
+    through the Whish redirect round-trip and to record, after the fact, how
+    a successful payment was applied (support/debugging, Task 13's report)."""
+    __tablename__ = "customer_whish_payment_attempt"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False, index=True)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
+    callback_token = db.Column(db.String(64), nullable=False)
+    whish_external_id = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    whish_transaction_number = db.Column(db.String(64), nullable=True)  # same TBD-real-param-name caveat as CustomerPaymentLink's (Task 9) -- see Task 18
+    status = db.Column(db.String(20), nullable=False, default='pending')  # pending | succeeded | failed
+    applied_to_debt = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
+    applied_as_prepayment = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
+    prepayment_id = db.Column(db.Integer, db.ForeignKey('payment.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+
+    customer = db.relationship('Customer')
+    prepayment = db.relationship('Payment', foreign_keys=[prepayment_id])
 
 
 class AddonPurchase(db.Model):
@@ -859,6 +955,11 @@ class WhatsAppSettings(db.Model):
     template_bulk_maintenance = db.Column(db.String(200), nullable=True, default='maintenance_alert')
     template_bulk_feature = db.Column(db.String(200), nullable=True, default='feature_update')
     template_bulk_offer = db.Column(db.String(200), nullable=True, default='special_offer')
+    # Sent automatically when a CustomerPaymentLink is created (see
+    # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md,
+    # Task 11) -- BODY has zero {{n}} placeholders by design, a URL button's
+    # {{1}} is filled from the link's view_token instead.
+    template_payment_link = db.Column(db.String(200), nullable=True, default='payment_link')
     # Template language code
     template_language = db.Column(db.String(20), nullable=True, default='en')
     # Deep-link message templates (plain text for wa.me links)
@@ -866,6 +967,8 @@ class WhatsAppSettings(db.Model):
         default='Dear {customer_name}, your payment of ${amount} has been received. Thank you!')
     deeplink_msg_renewal = db.Column(db.Text, nullable=True,
         default='Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!')
+    deeplink_msg_payment_link = db.Column(db.Text, nullable=True,
+        default='Hi {customer_name}, here is your payment link: {pay_url}')
     forwarding_mobile = db.Column(db.String(50), nullable=True)
     webhook_verify_token = db.Column(db.String(100), nullable=True, default='delta_net_whatsapp_secret')
     auto_reply_enabled = db.Column(db.Boolean, default=True)
@@ -902,15 +1005,81 @@ class WhatsAppSettings(db.Model):
             'template_bulk_maintenance': self.template_bulk_maintenance or 'maintenance_alert',
             'template_bulk_feature': self.template_bulk_feature or 'feature_update',
             'template_bulk_offer': self.template_bulk_offer or 'special_offer',
+            'template_payment_link': self.template_payment_link or 'payment_link',
             'template_language': self.template_language or 'en',
             'deeplink_msg_payment': self.deeplink_msg_payment or 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
             'deeplink_msg_renewal': self.deeplink_msg_renewal or 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
+            'deeplink_msg_payment_link': self.deeplink_msg_payment_link or 'Hi {customer_name}, here is your payment link: {pay_url}',
             'forwarding_mobile': self.forwarding_mobile or '',
             'webhook_verify_token': self.webhook_verify_token or 'delta_net_whatsapp_secret',
             'auto_reply_enabled': True if self.auto_reply_enabled is None else self.auto_reply_enabled,
             'auto_reply_message': self.auto_reply_message or "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\nسيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم",
             'template_forward_keepalive': self.template_forward_keepalive or 'daily_checkin',
             'last_forwarding_keepalive_sent_at': self.last_forwarding_keepalive_sent_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_forwarding_keepalive_sent_at else None,
+        }
+
+class WhatsAppTemplate(db.Model):
+    """Local cache of a tenant's Meta WhatsApp message templates. Meta is the
+    source of truth; this table exists for fast list rendering and as the
+    target of the message_template_status_update webhook. Reconciled against
+    Meta's live GET on manual refresh (POST /api/whatsapp/templates/sync).
+    See docs/superpowers/specs/2026-08-28-whatsapp-template-management-design.md."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    name = db.Column(db.String(200), nullable=False)
+    language = db.Column(db.String(10), nullable=False)
+    category = db.Column(db.String(20), nullable=False)  # 'MARKETING' | 'UTILITY'
+    status = db.Column(db.String(20), nullable=False, default='PENDING')  # PENDING, APPROVED, REJECTED, PAUSED, DISABLED
+    rejected_reason = db.Column(db.String(500), nullable=True)
+    components = db.Column(db.JSON, nullable=False)
+    meta_template_id = db.Column(db.String(64), nullable=True, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'language': self.language,
+            'category': self.category,
+            'status': self.status,
+            'rejected_reason': self.rejected_reason,
+            'components': self.components,
+            'meta_template_id': self.meta_template_id,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
+        }
+
+class TenantWhishSettings(db.Model):
+    """A tenant's own Whish merchant credentials, for accepting payments from
+    THEIR customers -- distinct from the platform-wide WHISH_CHANNEL/WHISH_SECRET
+    env vars used for Pro-plan billing (see
+    docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md).
+    Mirrors WhatsAppSettings' encrypted-credential pattern. See
+    docs/superpowers/specs/2026-08-27-tenant-whish-customer-payments-design.md."""
+    __tablename__ = "tenant_whish_settings"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    enabled = db.Column(db.Boolean, nullable=False, default=False)
+    whish_channel = db.Column(EncryptedString, nullable=True)  # encrypted at rest
+    whish_secret = db.Column(EncryptedString, nullable=True)   # encrypted at rest
+    # Shown on the public payment page in place of BusinessSettings.business_name,
+    # if a tenant wants a different display name there than internally. NOTE:
+    # per Resolved product decision #7 (neutral ServiceBills branding on the
+    # public page in v1), this field is captured now but NOT yet rendered
+    # anywhere -- see Task 7's public view route for exactly what IS shown.
+    display_name_override = db.Column(db.String(200), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'enabled': self.enabled,
+            'whish_channel': self.whish_channel or '',
+            'whish_secret': self.whish_secret or '',
+            'display_name_override': self.display_name_override or '',
+            'configured': bool(self.whish_channel and self.whish_secret),
         }
 
 class ServiceStatus(db.Model):
@@ -1081,13 +1250,14 @@ class ExchangeRate(db.Model):
 TENANT_OWNED_MODELS = (
     Reseller, ResellerPayment, Customer, SubscriptionPlan, Sector, Supplier,
     SupplierPayment, ExpenseCategory, Expense, Payment, GeneratedReceipt,
-    AddonPurchase, BusinessSettings, WhatsAppSettings,
+    AddonPurchase, BusinessSettings, WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings,
     ServiceStatus, SupportTicket, TicketLog, PushSubscription, ServiceOutage,
     CustomerFeedback, PaymentReminder, UpgradeRequest, BillingPaymentAttempt,
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
     ExchangeRate, NetworkDevice,
+    CustomerPaymentLink, CustomerWhishPaymentAttempt,
 )
 
 from sqlalchemy import event as _sa_event
@@ -1102,6 +1272,99 @@ def _stamp_tenant_id(session, flush_context, instances):
     for obj in session.new:
         if isinstance(obj, TENANT_OWNED_MODELS) and getattr(obj, "tenant_id", None) is None:
             obj.tenant_id = tid
+
+
+@_sa_event.listens_for(db.session, "before_flush")
+def _stale_customer_payment_links_on_payment_mutation(session, flush_context, instances):
+    """If a Payment this session is about to update has amount/paid/is_refund/
+    reverted_at changed, and it has a still-pending CustomerPaymentLink, mark
+    that link 'stale' in the same flush -- see the spec's Data model section
+    ("Link invalidation on Payment mutation"). Only inspects session.dirty
+    (updates), not session.deleted -- a Payment being deleted outright is
+    handled by the ORM's normal FK behavior for existing links and by this
+    app's existing tenant-delete cascade, not by this listener.
+
+    Deliberately filters on link.status in Python, NOT `status='pending'` in
+    the SQL query: this listener runs mid-flush, before any pending UPDATE
+    (including one this same flush is about to make to the link itself, e.g.
+    Task 9's success callback setting link.status='succeeded' right before
+    its own commit) has reached the database -- a SQL-side filter would still
+    see the OLD, not-yet-flushed 'pending' value and wrongly clobber that
+    legitimate transition back to 'stale'. Reading link.status in Python
+    picks up any in-memory change already made earlier in this same flush."""
+    watched_fields = ('amount', 'paid', 'is_refund', 'reverted_at')
+    for obj in session.dirty:
+        if not isinstance(obj, Payment):
+            continue
+        state = db.inspect(obj)
+        if not any(state.attrs[f].history.has_changes() for f in watched_fields):
+            continue
+        links = CustomerPaymentLink.query.filter_by(payment_id=obj.id).all()
+        for link in links:
+            if link.status == 'pending':
+                link.status = 'stale'
+
+
+def _maybe_create_customer_payment_link(payment, customer):
+    """If the given (already-`db.session.add`ed, not-yet-committed, paid=False)
+    Payment's tenant has TenantWhishSettings.enabled (which already implies
+    Pro-plan, since Task 3 gates enabling it) and the Payment's currency is
+    Whish-supported, create a pending CustomerPaymentLink for it. Silently
+    no-ops (does NOT raise, does NOT block the caller's own commit) for every
+    other case -- generating a payment link is a value-add on top of Payment
+    creation, never a precondition for it. See
+    docs/superpowers/specs/2026-08-27-tenant-whish-customer-payments-design.md,
+    Payment flow step 1.
+
+    Call this AFTER db.session.add(payment) and BEFORE the caller's own
+    db.session.commit() -- payment.id is not required (SQLAlchemy resolves
+    the relationship via the pending object itself at flush time), but
+    payment.currency/amount must already be set. Deliberately reads
+    tenant_id from `customer`, NOT `payment` -- most call sites never set
+    Payment.tenant_id explicitly, relying on the _stamp_tenant_id before_flush
+    listener, which has not run yet at this point; `customer` is always
+    already a real, tenant-scoped object here (either an existing persisted
+    row, or freshly built via new_for_tenant(), which sets tenant_id eagerly
+    at construction) -- confirmed at every one of this task's 10 call sites,
+    not assumed."""
+    try:
+        whish_settings = TenantWhishSettings.query.filter_by(tenant_id=customer.tenant_id, enabled=True).first()
+        if not whish_settings:
+            return None
+        # Several call sites never set Payment.currency explicitly, relying on
+        # the column's Python-side default='USD' -- which SQLAlchemy applies
+        # during flush, not necessarily by the time this runs. Read the
+        # eventual effective value directly rather than depend on ORM
+        # flush-timing: 'USD' matches Payment.currency's own column default.
+        effective_currency = payment.currency or 'USD'
+        if effective_currency not in ('USD', 'LBP'):
+            logging.info(f"Skipping Whish customer-payment-link for payment (tenant {customer.tenant_id}): "
+                         f"currency {effective_currency} not Whish-supported.")
+            return None
+        link = CustomerPaymentLink(
+            tenant_id=customer.tenant_id,
+            customer_id=customer.id,
+            payment=payment,  # relationship assignment -- resolves payment_id at flush even pre-commit
+            amount=payment.amount,
+            currency=effective_currency,
+            view_token=secrets.token_urlsafe(32),
+            callback_token=secrets.token_urlsafe(32),
+            status='pending',
+            expires_at=datetime.utcnow() + timedelta(days=7),
+        )
+        db.session.add(link)
+        try:
+            send_whatsapp_message(customer, 'payment_link', context={'view_token': link.view_token})
+        except Exception as wa_error:
+            logging.warning(f"payment_link WhatsApp auto-send failed for CustomerPaymentLink (tenant {customer.tenant_id}): {wa_error}")
+        return link
+    except Exception as e:
+        # Never let link generation break the underlying Payment creation --
+        # matches this file's established pattern for send_whatsapp_message's
+        # own try/except (a notification/delivery side effect must not abort
+        # the primary financial transaction it's attached to).
+        logging.error(f"Failed to create CustomerPaymentLink for payment (tenant {customer.tenant_id}): {e}")
+        return None
 
 
 # Schema is owned by Alembic (flask db upgrade). No import-time create_all or
@@ -1221,7 +1484,8 @@ def apply_customer_balance_to_unpaid_payments(customer):
                     pre_payment=payment.pre_payment
                 )
                 db.session.add(remaining_payment)
-            
+                _maybe_create_customer_payment_link(remaining_payment, customer)
+
             # Mark original payment as paid
             # (This is the established logic from mark_payment_as_paid)
             payment.paid = True
@@ -1770,9 +2034,9 @@ def tenant_export():
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
     UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
-    CustomerFeedback, ServiceStatus, Payment, ResellerPayment, SupplierPayment,
+    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment,
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
-    WhatsAppSettings, ExpenseCategory, Sector,
+    WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
     # Phase 3 fix: MonthlyProfitEstimate was missing here entirely. SQLite
     # doesn't enforce FK constraints, so a tenant delete silently orphaned
@@ -1995,6 +2259,7 @@ def generate_missing_payments(tenant_id):
                             pre_payment=False
                         )
                         db.session.add(new_payment)
+                        _maybe_create_customer_payment_link(new_payment, customer)
                         customer.balance -= amount_due
 
                 # Move to the next billing cycle
@@ -2679,6 +2944,7 @@ def add_customer():
                         pre_payment=False
                     )
                     db.session.add(new_payment)
+                    _maybe_create_customer_payment_link(new_payment, new_customer)
                     total_due += amount_due
 
             # Move to the next billing cycle
@@ -2703,6 +2969,7 @@ def add_customer():
                 pre_payment=False,
             )
             db.session.add(addon_payment)
+            _maybe_create_customer_payment_link(addon_payment, new_customer)
             new_customer.balance -= addon_amount
         # --- ADDED: Reconcile balance after creating customer and all initial charges ---
         apply_customer_balance_to_unpaid_payments(new_customer)
@@ -2843,11 +3110,13 @@ def update_customer(customer_id):
                     # Going to Independent: put debt back on customer
                     customer.balance -= net_debt
                     if net_debt > 0:
-                        db.session.add(Payment(
+                        debt_payment = Payment(
                             customer_id=customer.id, amount=net_debt, paid=False,
                             date=datetime.now(timezone.utc), pre_payment=False,
                             reason="Assumed accumulated debt from previous reseller"
-                        ))
+                        )
+                        db.session.add(debt_payment)
+                        _maybe_create_customer_payment_link(debt_payment, customer)
 
             customer.reseller_id = new_reseller_id
 
@@ -3173,6 +3442,7 @@ def generate_future_payments():
                         pre_payment=False
                     )
                     db.session.add(new_payment)
+                    _maybe_create_customer_payment_link(new_payment, customer)
                     customer.balance -= amount_due
                     payments_created_count += 1
 
@@ -3382,7 +3652,9 @@ def add_payment():
             paid_at=datetime.utcnow() if is_paid else None
         )
         db.session.add(new_payment)
-        
+        if not is_paid:
+            _maybe_create_customer_payment_link(new_payment, customer)
+
         # Update customer balance based on payment status
         if is_paid: # If payment is received, increase balance (less owed, or more credit)
             customer.balance += payment_amount
@@ -3486,6 +3758,8 @@ def get_payments():
             'collected_amount': float(p.collected_amount) if p.collected_amount is not None else None,
             'collected_by': p.collected_by.username if p.collected_by else None,
             'received_by': p.received_by.username if p.received_by else None,
+            'collected_via': p.collected_via,
+            'whish_transaction_number': p.whish_transaction_number,
             'pre_payment': p.pre_payment,
             'reason': p.reason,
             'is_gratis': p.is_gratis,
@@ -3577,7 +3851,8 @@ def get_total_sales():
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.is_gratis == False,
-        Payment.pre_payment == False,
+        # Prepayments count as revenue -- see
+        # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
         Payment.is_refund == False
     ).group_by('month').all()
 
@@ -3602,6 +3877,33 @@ def get_unpaid_payments():
         'value': float(payment.unpaid or 0.0)
     } for payment in unpaid_payments])
 
+@app.route('/api/reports/customer-whish-payments', methods=['GET'])
+@jwt_required()
+def customer_whish_payments_report():
+    query = tenant_query(CustomerPaymentLink).join(Customer)
+    status = request.args.get('status')
+    start_date_str = request.args.get('start_date')
+    end_date_str = request.args.get('end_date')
+    # Frontend sends full ISO-8601 datetimes (toISOString()), not plain
+    # 'YYYY-MM-DD' -- parse the same way get_financial_report/get_revenue_report do.
+    start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if start_date_str else None
+    end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if end_date_str else None
+    if status:
+        query = query.filter(CustomerPaymentLink.status == status)
+    if start_date:
+        query = query.filter(CustomerPaymentLink.created_at >= start_date)
+    if end_date:
+        query = query.filter(CustomerPaymentLink.created_at <= end_date)
+    query = query.order_by(CustomerPaymentLink.created_at.desc())
+
+    rows = []
+    for link in query.all():
+        d = link.to_dict()
+        d['customer_name'] = link.customer.name
+        d['customer_phone'] = link.customer.phone
+        rows.append(d)
+    return jsonify({"links": rows}), 200
+
 @app.route('/api/reports/customer-numbers', methods=['GET'])
 @jwt_required()
 def get_customer_numbers():
@@ -3617,15 +3919,20 @@ def get_customer_numbers():
         'value': num.customers
     } for num in customer_numbers])
 
-def _mark_payment_fully_paid(payment, customer, current_user):
+def _mark_payment_fully_paid(payment, customer, current_user=None):
     """Mutate payment+customer to record a full (non-partial) payment. Caller
     commits. Returns the amount received in this transaction. Shared by the
-    single-item and bulk mark_paid endpoints so the logic lives in one place."""
+    single-item and bulk mark_paid endpoints so the logic lives in one place.
+    current_user is optional so a customer-initiated Whish callback (no staff
+    involved) can call this too -- see
+    docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, the
+    amendment note at the end of Task 9."""
     amount_received = payment.amount
     customer.balance += payment.amount
     payment.paid = True
     payment.paid_at = datetime.utcnow()
-    payment.received_by_id = current_user.id
+    if current_user:
+        payment.received_by_id = current_user.id
     # DON'T set amount to 0 - keep original amount
     return amount_received
 
@@ -3811,6 +4118,7 @@ def mark_payment_as_paid(payment_id):
                             pre_payment=payment.pre_payment
                         )
                         db.session.add(remaining_payment)
+                        _maybe_create_customer_payment_link(remaining_payment, customer)
 
         else: # Full payment
             if not payment.paid:
@@ -4173,6 +4481,7 @@ def activate_subscription(customer_id):
                         pre_payment=False
                     )
                     db.session.add(new_payment)
+                    _maybe_create_customer_payment_link(new_payment, customer)
                     customer.balance -= amount_due
 
         db.session.commit()
@@ -4547,7 +4856,8 @@ def get_monthly_revenue():
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.is_gratis == False,
-        Payment.pre_payment == False,
+        # Prepayments count as revenue -- see
+        # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
         Payment.is_refund == False
     ).group_by('month').all()
 
@@ -4749,9 +5059,11 @@ def get_whatsapp_settings():
         'template_bulk_maintenance': 'maintenance_alert',
         'template_bulk_feature': 'feature_update',
         'template_bulk_offer': 'special_offer',
+        'template_payment_link': 'payment_link',
         'template_language': 'en',
         'deeplink_msg_payment': 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
         'deeplink_msg_renewal': 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
+        'deeplink_msg_payment_link': 'Hi {customer_name}, here is your payment link: {pay_url}',
         'forwarding_mobile': '', 'webhook_verify_token': 'delta_net_whatsapp_secret',
         'auto_reply_enabled': True,
         'auto_reply_message': "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\nسيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم",
@@ -4776,7 +5088,9 @@ def save_whatsapp_settings():
                   'app_secret','access_token','api_version','template_payment_paid',
                   'template_subscription_created', 'template_subscription_renewed','template_payment_reminder', 'template_current_balance',
                   'template_forward_alert', 'template_bulk_outage', 'template_bulk_maintenance', 'template_bulk_feature', 'template_bulk_offer',
-                  'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message',
+                  'template_payment_link',
+                  'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'deeplink_msg_payment_link',
+                  'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message',
                   'template_forward_keepalive']
         for f in fields:
             if f in data:
@@ -4800,6 +5114,552 @@ def save_whatsapp_settings():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/tenant-whish-settings', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_tenant_whish_settings():
+    settings = tenant_query(TenantWhishSettings).first()
+    if settings:
+        return jsonify({'settings': settings.to_dict()}), 200
+    return jsonify({'settings': {
+        'enabled': False, 'whish_channel': '', 'whish_secret': '',
+        'display_name_override': '', 'configured': False,
+    }}), 200
+
+
+@app.route('/api/tenant-whish-settings', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def save_tenant_whish_settings():
+    data = request.json or {}
+    tenant = current_tenant()
+    # Plan-gating: this whole feature is Pro-only -- see the spec's Resolved
+    # product decision #2. Mirrors the exact pattern save_whatsapp_settings
+    # already uses for whatsapp_api mode.
+    if not plans.limits(tenant.plan)["whish_customer_payments"]:
+        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
+    try:
+        settings = tenant_query(TenantWhishSettings).first()
+        if not settings:
+            settings = TenantWhishSettings()
+            db.session.add(settings)
+        for f in ('whish_channel', 'whish_secret', 'display_name_override'):
+            if f in data:
+                setattr(settings, f, data[f])
+        # 'enabled' only meaningfully flips true once both credentials are
+        # actually present -- server-side, not trusting the client's flag --
+        # matching the spec's Data model note ("enabled only flips to
+        # meaningfully-true once both credential fields are populated").
+        requested_enabled = bool(data.get('enabled'))
+        settings.enabled = requested_enabled and bool(settings.whish_channel) and bool(settings.whish_secret)
+        settings.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'message': 'Whish settings saved!', 'settings': settings.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/tenant/whish/public-pay-link', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_public_pay_link():
+    """Staff-facing: the tenant-wide self-service Whish payment page's
+    current link, if one has been generated yet (Task 20). slug is None
+    until the frontend lazily generates it on first load of the settings
+    card, or a reviewer chooses to build a "generate" step in explicitly."""
+    tenant = current_tenant()
+    slug = tenant.public_pay_slug
+    return jsonify({
+        'slug': slug,
+        'url': f"{Config.APP_BASE_URL}/pay-business?slug={slug}" if slug else None,
+    }), 200
+
+
+@app.route('/api/tenant/whish/public-pay-link/regenerate', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def regenerate_public_pay_link():
+    """Staff-facing: (re)generate the tenant-wide self-service Whish payment
+    page's slug (Task 20). Same Pro-plan gate as Task 3's settings save --
+    this whole feature is Pro-only. Regenerating deliberately invalidates
+    the old link (a new random slug replaces it) -- unlike a one-time
+    secret, this link is meant to be long-lived and handed out broadly, so
+    regeneration is a deliberate "burn the old one" action (e.g. if it
+    leaked somewhere unwanted), not something to do casually. The frontend
+    must warn staff of that before calling this."""
+    tenant = current_tenant()
+    if not plans.limits(tenant.plan)["whish_customer_payments"]:
+        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
+    tenant.public_pay_slug = secrets.token_urlsafe(12)
+    db.session.commit()
+    return jsonify({
+        'slug': tenant.public_pay_slug,
+        'url': f"{Config.APP_BASE_URL}/pay-business?slug={tenant.public_pay_slug}",
+    }), 200
+
+
+@app.route('/api/pay/t/<slug>', methods=['GET'])
+@limiter.limit("60 per minute")
+def public_tenant_pay_branding(slug):
+    """Public: branding for the tenant-wide self-service Whish payment page
+    (2026-08-27 plan amendment). Logo only -- no brand color, per the
+    amendment's explicit decision (no such field exists in this codebase,
+    and it was decided not to add one). Low-risk info (name/logo, nothing
+    customer-specific) so the limit here is generous compared to the lookup
+    route below."""
+    tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
+    if not tenant:
+        return jsonify({"error": "not found"}), 404
+    bs = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+    return jsonify({
+        "business_name": bs.business_name if bs else tenant.name,
+        "logo_url": bs.to_dict()['logo_url'] if bs else DEFAULT_LOGO_URL,
+    })
+
+
+@app.route('/api/pay/t/<slug>/lookup', methods=['POST'])
+@limiter.limit("10 per minute")
+@limiter.limit("50 per hour", key_func=lambda: request.view_args.get("slug", ""))
+def public_tenant_pay_lookup(slug):
+    """Public: phone -> name lookup so the customer can confirm they're
+    paying against the right subscription before entering an amount. Two
+    stacked limits: per-IP (10/min, catches a single attacker) and
+    per-tenant-slug (50/hr across all IPs, catches distributed enumeration
+    against one tenant's customer list) -- there is no existing lockout
+    precedent in this codebase to reuse (see the plan amendment's
+    investigation), so both are new. Returns every phone match rather than
+    guessing which one the customer means -- Customer.phone has no
+    uniqueness constraint (e.g. a household sharing one number across two
+    family members' subscriptions); see Task 17's Judgment call."""
+    tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
+    if not tenant:
+        return jsonify({"error": "not found"}), 404
+
+    phone = (request.get_json(silent=True) or {}).get('phone', '').strip()
+    if not phone:
+        return jsonify({"error": "phone required"}), 400
+
+    # Explicit tenant_id filter, not tenant_query -- this is a public route
+    # with no request-context tenant, same convention as Tasks 7-9's routes.
+    matches = Customer.query.filter_by(tenant_id=tenant.id, phone=phone).all()
+
+    if not matches:
+        return jsonify({"error": "not found"}), 404
+
+    return jsonify({"customers": [{"customer_id": c.id, "name": c.name} for c in matches]})
+
+
+def _apply_whish_debt_then_prepayment(customer, attempt):
+    """Applies a successful self-service Whish payment: pays down the
+    customer's oldest unpaid, non-prepayment Payment rows in full (never
+    partial -- mirrors apply_customer_balance_to_unpaid_payments's existing
+    all-or-nothing-per-row behavior, app.py's Payment.date.asc() ordering),
+    then records any remainder as a new pre_payment=True Payment row,
+    matching the existing manual-add-payment pattern.
+
+    Also credits Customer.balance, exactly like every other money-moving
+    path in this app does: paying off an unpaid Payment credits its amount
+    (matching _mark_payment_fully_paid), and a new paid prepayment credits
+    its amount too (matching add_payment's pre_payment branch). Customer.balance
+    is not a display convenience -- it's an eagerly-maintained running ledger
+    (decremented the moment an unpaid Payment is created at every such call
+    site, credited the moment one is confirmed paid) read directly by the
+    dashboard, customer detail view, receipts, and every other WhatsApp
+    message. An earlier version of this helper deliberately skipped it,
+    which was wrong: skipping it here would leave Customer.balance stale
+    everywhere else it's read after a self-service Whish payment, even
+    though the underlying Payment rows are correctly updated. Ends by
+    calling apply_customer_balance_to_unpaid_payments, matching
+    add_payment's own pattern, so any pre-existing credit combines with
+    this payment to settle anything else newly payable. Caller commits."""
+    remaining = float(attempt.amount)
+    applied_to_debt = 0.0
+    unpaid = Payment.query.filter_by(
+        customer_id=customer.id, tenant_id=customer.tenant_id, paid=False, pre_payment=False
+    ).order_by(Payment.date.asc()).all()
+
+    for payment in unpaid:
+        if remaining <= 0:
+            break
+        if remaining >= payment.amount:
+            payment.paid = True
+            payment.paid_at = datetime.utcnow()
+            payment.collected_via = 'whish'
+            payment.whish_transaction_number = attempt.whish_transaction_number
+            customer.balance += payment.amount
+            remaining -= payment.amount
+            applied_to_debt += payment.amount
+        # else: leave this and every later (ordered oldest-first) payment
+        # untouched -- a partial amount is never applied against a single due.
+
+    prepayment = None
+    if remaining > 0:
+        prepayment = Payment(
+            tenant_id=customer.tenant_id, customer_id=customer.id,
+            amount=remaining, currency=attempt.currency,
+            paid=True, paid_at=datetime.utcnow(), pre_payment=True,
+            collected_via='whish',
+            whish_transaction_number=attempt.whish_transaction_number,
+            reason='Prepayment via self-service Whish payment page',
+        )
+        db.session.add(prepayment)
+        customer.balance += remaining
+
+    attempt.applied_to_debt = applied_to_debt
+    attempt.applied_as_prepayment = remaining
+    if prepayment:
+        db.session.flush()  # get prepayment.id before assigning the FK
+        attempt.prepayment_id = prepayment.id
+    apply_customer_balance_to_unpaid_payments(customer)
+    return applied_to_debt, remaining, prepayment
+
+
+@app.route('/api/pay/t/<slug>/checkout', methods=['POST'])
+@limiter.limit("10 per minute")
+def public_tenant_pay_checkout(slug):
+    tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
+    if not tenant:
+        return jsonify({"error": "not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    customer_id = body.get('customer_id')
+    amount = body.get('amount')
+    customer = Customer.query.filter_by(id=customer_id, tenant_id=tenant.id).first()
+    if not customer or not amount:
+        return jsonify({"error": "not found"}), 404  # generic, not a leaky 400 that confirms customer_id validity
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return jsonify({"error": "not found"}), 404
+    if amount <= 0:
+        return jsonify({"error": "not found"}), 404
+
+    settings = TenantWhishSettings.query.filter_by(tenant_id=tenant.id, enabled=True).first()
+    if not settings or not settings.whish_channel or not settings.whish_secret:
+        return jsonify({"msg": "Whish payments are not currently available for this business."}), 503
+
+    bs = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+    # The generic page has no single Payment to inherit a currency from --
+    # use the tenant's own reporting currency, matching the original
+    # per-link flow's Whish-supported-currency guard (Task 6).
+    currency = bs.reporting_currency if bs else 'USD'
+    if currency not in ('USD', 'LBP'):
+        return jsonify({"msg": "Online payment isn't available in this business's currency."}), 400
+
+    attempt = CustomerWhishPaymentAttempt(
+        tenant_id=tenant.id, customer_id=customer.id,
+        amount=amount, currency=currency,
+        callback_token=secrets.token_urlsafe(32),
+    )
+    db.session.add(attempt)
+    db.session.flush()  # assign attempt.id before building external_id
+
+    external_id = f"cwpa-{attempt.id}-{secrets.token_hex(4)}"
+    requestee = settings.display_name_override or (bs.business_name if bs else tenant.name)
+    target = (bs.mobile if bs else '') or ''
+
+    try:
+        collect_url = whish_billing.create_payment(
+            external_id=external_id,
+            amount=amount,
+            currency=currency,
+            callback_token=attempt.callback_token,
+            requestee=requestee,
+            target=target,
+            email="",  # same resolved decision as Task 8's per-link checkout
+            invoice=f"{customer.name} - {customer.phone}",
+            # This feature's own callback routes, not platform billing's or
+            # the per-link flow's -- see whish_billing.create_payment's own
+            # docstring for why this parameter exists at all.
+            success_path='/api/pay-attempt/success',
+            failure_path='/api/pay-attempt/failure',
+        )
+    except whish_billing.WhishAPIError as e:
+        logging.error(f"Whish checkout failed for CustomerWhishPaymentAttempt {attempt.id}: {e}")
+        return jsonify({"msg": "Could not start the Whish checkout. Please try again shortly."}), 502
+
+    attempt.whish_external_id = external_id
+    db.session.commit()
+    return jsonify({"redirect": collect_url}), 200
+
+
+@app.route('/api/pay-attempt/success', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_attempt_success():
+    """Public: Whish redirects the customer's browser here after payment on
+    the tenant-wide self-service page. Same token-match security model as
+    Task 9's per-link success callback -- see that route's docstring."""
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    attempt = CustomerWhishPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+
+    if (not attempt or attempt.status != 'pending'
+            or not secrets.compare_digest(attempt.callback_token, token)):
+        logging.warning(f"Customer-Whish attempt success callback rejected: order={external_id}")
+        tenant = db.session.get(Tenant, attempt.tenant_id) if attempt else None
+        slug = tenant.public_pay_slug if tenant else 'invalid'
+        return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={slug}&status=error")
+
+    # TBD: exact query-param name Whish's real success callback uses for the
+    # transaction number -- same unresolved-fact caveat as Task 9's callback
+    # (app.py's customer_whish_success), not re-guessed here.
+    attempt.whish_transaction_number = request.args.get('transactionNumber') or request.args.get('transaction_id')
+    customer = db.session.get(Customer, attempt.customer_id)
+    _apply_whish_debt_then_prepayment(customer, attempt)
+    attempt.status = 'succeeded'
+    attempt.completed_at = datetime.utcnow()
+    db.session.commit()
+
+    try:
+        # customer.balance is now correctly moved by _apply_whish_debt_then_prepayment
+        # (see its docstring) -- same context shape Task 9's per-link callback
+        # and the manual mark-paid flow already use.
+        send_whatsapp_message(customer, 'payment_paid', context={
+            'amount': float(attempt.amount),
+            'balance': float(customer.balance),
+        })
+    except Exception as e:
+        logging.warning(f"payment_paid WhatsApp notification failed after self-service Whish success (attempt {attempt.id}): {e}")
+
+    tenant = db.session.get(Tenant, attempt.tenant_id)
+    return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={tenant.public_pay_slug}&status=success")
+
+
+@app.route('/api/pay-attempt/failure', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_attempt_failure():
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    attempt = CustomerWhishPaymentAttempt.query.filter_by(whish_external_id=external_id).first()
+    if attempt and attempt.status == 'pending' and secrets.compare_digest(attempt.callback_token, token):
+        attempt.status = 'failed'
+        db.session.commit()
+    tenant = db.session.get(Tenant, attempt.tenant_id) if attempt else None
+    slug = tenant.public_pay_slug if tenant else 'invalid'
+    return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={slug}&status=failed")
+
+
+@app.route('/api/pay/<view_token>', methods=['GET'])
+@limiter.limit("30 per minute")
+def public_pay_view(view_token):
+    """Public, unauthenticated: a customer opens this from a WhatsApp/email
+    link, possibly days after it was sent. Never distinguishes *why* a token
+    is invalid (never-existed vs. expired vs. stale vs. wrong) -- same shape,
+    same status, regardless of reason. See the spec's Security model,
+    "No enumeration surface". Rate-limited (Task 1) since this is a public,
+    token-guessing-adjacent surface."""
+    link = CustomerPaymentLink.query.filter_by(view_token=view_token).first()
+    invalid_response = {
+        "valid": False,
+        "message": "This payment link is no longer valid. Please contact the business that sent it to you.",
+    }
+    if not link:
+        return jsonify(invalid_response), 200
+    if link.status == 'stale' or link.status == 'expired':
+        return jsonify(invalid_response), 200
+    if link.status == 'pending' and link.expires_at < datetime.utcnow():
+        link.status = 'expired'
+        db.session.commit()
+        return jsonify(invalid_response), 200
+    # 'pending', 'succeeded', 'failed' are all viewable -- see spec's Testing
+    # approach ("already-succeeded link's view page still renders").
+    return jsonify({
+        "valid": True,
+        "amount": float(link.amount),
+        "currency": link.currency,
+        "customer_name": link.customer.name,
+        "status": link.status,
+    }), 200
+
+
+@app.route('/api/pay/<view_token>/checkout', methods=['POST'])
+@limiter.limit("10 per minute")
+def public_pay_checkout(view_token):
+    link = CustomerPaymentLink.query.filter_by(view_token=view_token).first()
+    if not link:
+        return jsonify({"msg": "Payment link not found."}), 404
+    if link.status != 'pending' or link.expires_at < datetime.utcnow():
+        return jsonify({"msg": "This payment link is no longer valid."}), 409
+
+    tenant_whish = TenantWhishSettings.query.filter_by(tenant_id=link.tenant_id, enabled=True).first()
+    if not tenant_whish or not tenant_whish.whish_channel or not tenant_whish.whish_secret:
+        logging.error(f"Checkout attempted on link {link.id} but tenant {link.tenant_id} has no active Whish settings.")
+        return jsonify({"msg": "Whish payments are not currently available for this business."}), 503
+
+    business_settings = BusinessSettings.query.filter_by(tenant_id=link.tenant_id).first()
+    customer = link.customer
+    requestee = tenant_whish.display_name_override or (business_settings.business_name if business_settings else "ServiceBills")
+    target = (business_settings.mobile if business_settings else '') or ''
+    # Customer.phone identifies the payer on the tenant's own Whish dashboard --
+    # see Resolved product decision #5. No Customer.email column exists or is
+    # being added; email="" is passed to the shared whish_billing client (see
+    # this task's judgment-call note in the plan for why that's safe).
+    invoice = f"{customer.name} - {customer.phone}"
+    external_id = f"cpl-{link.id}-{secrets.token_hex(4)}"
+
+    try:
+        collect_url = whish_billing.create_payment(
+            external_id=external_id,
+            amount=float(link.amount),
+            currency=link.currency,
+            callback_token=link.callback_token,
+            requestee=requestee,
+            target=target,
+            email="",
+            invoice=invoice,
+            # This feature's own callback routes (Task 9), not platform
+            # billing's -- see whish_billing.create_payment's own docstring
+            # for why this parameter exists at all.
+            success_path='/api/customer-whish/success',
+            failure_path='/api/customer-whish/failure',
+        )
+    except whish_billing.WhishAPIError as e:
+        logging.error(f"Whish checkout failed for CustomerPaymentLink {link.id}: {e}")
+        return jsonify({"msg": "Could not start the Whish checkout. Please try again shortly."}), 502
+
+    link.whish_external_id = external_id
+    db.session.commit()
+    return jsonify({"redirect": collect_url}), 200
+
+
+@app.route('/api/customer-whish/success', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_success():
+    """Public: Whish redirects the customer's browser here after payment.
+    See the spec's Security model for why this is a token-match model (same
+    as platform billing) rather than a signed webhook, and why the stakes
+    are higher here (a forged callback here defrauds the TENANT's customer
+    relationship, not just the tenant's own account -- see Security model)."""
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    link = CustomerPaymentLink.query.filter_by(whish_external_id=external_id).first()
+
+    if (not link or link.status != 'pending'
+            or not secrets.compare_digest(link.callback_token, token)
+            or link.expires_at < datetime.utcnow()):
+        logging.warning(f"Customer-Whish success callback rejected: order={external_id}")
+        return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token if link else 'invalid'}&status=error")
+
+    payment = db.session.get(Payment, link.payment_id)
+    customer = db.session.get(Customer, link.customer_id)
+    # Reuses the exact same state transition the manual "mark paid" path
+    # already produces -- not a duplicated balance-adjustment implementation.
+    # current_user=None: no staff involved, the customer paid directly (see
+    # _mark_payment_fully_paid's own docstring for why that's a safe default).
+    _mark_payment_fully_paid(payment, customer, current_user=None)
+
+    link.status = 'succeeded'
+    link.completed_at = datetime.utcnow()
+    # TBD: exact query-param name Whish's real success callback uses for the
+    # transaction number -- unconfirmed, no real Whish credentials exist in
+    # any environment for this codebase today (same caveat the platform-
+    # billing callback already carries). Degrades safely: None here doesn't
+    # block payment.paid/balance from updating, it only leaves Task 13's
+    # report column empty until this is confirmed against a real payload.
+    link.whish_transaction_number = request.args.get('transactionNumber') or request.args.get('transaction_id')
+    # Task 15's amendment: set the same two signals the tenant-wide
+    # self-service page (Task 18) sets, so Task 13's report and the
+    # PaymentsView.js "collected by" display don't have to special-case
+    # which of the two Whish flows collected a given payment.
+    payment.collected_via = 'whish'
+    payment.whish_transaction_number = link.whish_transaction_number
+    db.session.commit()
+
+    try:
+        send_whatsapp_message(customer, 'payment_paid', context={'amount': float(payment.amount), 'balance': float(customer.balance)})
+    except Exception as e:
+        logging.warning(f"payment_paid WhatsApp notification failed after Whish success (link {link.id}): {e}")
+
+    return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token}&status=success")
+
+
+@app.route('/api/customer-whish/failure', methods=['GET'])
+@limiter.limit("30 per minute")
+def customer_whish_failure():
+    external_id = request.args.get('order')
+    token = request.args.get('token') or ''
+    link = CustomerPaymentLink.query.filter_by(whish_external_id=external_id).first()
+    if link and link.status == 'pending' and secrets.compare_digest(link.callback_token, token):
+        link.status = 'failed'
+        db.session.commit()
+    return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token if link else 'invalid'}&status=failed")
+
+
+@app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/resend', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def resend_customer_payment_link(customer_id, payment_id):
+    """Generate a fresh CustomerPaymentLink for an existing pending Payment.
+    Leaves any prior link for that Payment alone -- the old link is left to
+    expire/go stale naturally rather than being explicitly revoked, per the
+    spec. Unlike Task 6's auto-generation helper (which only checks
+    TenantWhishSettings.enabled), this re-checks the plan limit directly --
+    a staff member is actively clicking this right now and deserves an
+    accurate "you need to upgrade" message, not a silent no-op."""
+    payment = tenant_query(Payment).filter_by(id=payment_id, customer_id=customer_id).first()
+    if not payment:
+        return jsonify({"msg": "Payment not found."}), 404
+    if payment.paid:
+        return jsonify({"msg": "This payment is already paid -- nothing to send a link for."}), 409
+
+    tenant = current_tenant()
+    if not plans.limits(tenant.plan)["whish_customer_payments"]:
+        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
+    whish_settings = tenant_query(TenantWhishSettings).filter_by(enabled=True).first()
+    if not whish_settings:
+        return jsonify({"msg": "Whish customer payments are not configured for this business yet."}), 402
+
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
+    link = new_for_tenant(
+        CustomerPaymentLink,
+        customer_id=customer_id, payment_id=payment_id,
+        amount=payment.amount, currency=payment.currency or 'USD',
+        view_token=secrets.token_urlsafe(32), callback_token=secrets.token_urlsafe(32),
+        status='pending', expires_at=datetime.utcnow() + timedelta(days=7),
+    )
+    db.session.add(link)
+    db.session.commit()
+
+    # Query-string token, not a path segment -- see PublicPaymentView.js's
+    # own note (Task 10) for why /pay/<token> breaks this build's relative
+    # asset paths (needed for the Electron packaging).
+    pay_url = f"{Config.APP_BASE_URL}/pay?token={link.view_token}"
+    return jsonify({"view_token": link.view_token, "pay_url": pay_url}), 200
+
+
+@app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/email', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def email_customer_payment_link(customer_id, payment_id):
+    """Send a payment link to a staff-typed, ad-hoc email address -- this
+    codebase has no persisted Customer.email column and isn't adding one
+    (Resolved product decision #5), so the address is never stored."""
+    data = request.json or {}
+    to_email = (data.get('email') or '').strip()
+    pay_url = (data.get('pay_url') or '').strip()
+    if not to_email or not pay_url:
+        return jsonify({"msg": "email and pay_url are required."}), 400
+
+    payment = tenant_query(Payment).filter_by(id=payment_id, customer_id=customer_id).first()
+    if not payment:
+        return jsonify({"msg": "Payment not found."}), 404
+
+    business_settings = tenant_query(BusinessSettings).first()
+    business_name = business_settings.business_name if business_settings else "ServiceBills"
+    try:
+        email_util.send(
+            to=to_email,
+            subject=f"Payment link from {business_name}",
+            body=f"Here is your payment link: {pay_url}",
+        )
+    except Exception as e:
+        logging.error(f"Failed to email payment link (payment {payment_id}): {e}")
+        return jsonify({"msg": "Could not send the email. Please try again."}), 502
+    return jsonify({"message": "Email sent."}), 200
+
+
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
 @jwt_required()
 def subscribe_waba():
@@ -4818,58 +5678,259 @@ def subscribe_waba():
         return jsonify({'error': str(e)}), 500
 
 
+def _parse_meta_error(resp):
+    """Meta's template-management errors carry the actionable message under
+    error.error_user_msg (shown to end users) or error.message (developer-
+    facing) -- surface it verbatim rather than a generic failure, matching
+    the pattern already used for Whish checkout rejections."""
+    try:
+        err = resp.json().get('error', {})
+        return err.get('error_user_msg') or err.get('message') or resp.text
+    except Exception:
+        return resp.text
+
+
 @app.route('/api/whatsapp/templates', methods=['GET'])
 @jwt_required()
-def get_meta_templates():
-    try:
-        settings = tenant_query(WhatsAppSettings).first()
-        meta_templates = []
-        if settings and settings.access_token and settings.business_account_id:
-            try:
-                api_version = settings.api_version or 'v19.0'
-                url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates?limit=100'
-                headers = {'Authorization': f'Bearer {settings.access_token}'}
-                resp = requests.get(url, headers=headers, timeout=10)
-                if resp.ok:
-                    data = resp.json().get('data', [])
-                    for t in data:
-                        if t.get('status') == 'APPROVED':
-                            if settings.business_account_id:
-                                _template_def_cache[(settings.business_account_id, t.get('name'))] = (time.time(), t)
-                            if settings.phone_number_id:
-                                _template_def_cache[(settings.phone_number_id, t.get('name'))] = (time.time(), t)
-                            meta_templates.append({
-                                'name': t.get('name'),
-                                'language': t.get('language', 'en'),
-                                'category': t.get('category', 'MARKETING'),
-                                'components': t.get('components', [])
-                            })
-            except Exception as ex:
-                logging.error(f"Failed fetching Meta templates: {ex}")
+def get_whatsapp_templates():
+    templates = tenant_query(WhatsAppTemplate).order_by(WhatsAppTemplate.created_at.desc()).all()
+    return jsonify({'templates': [t.to_dict() for t in templates]}), 200
 
-        if not meta_templates:
-            if settings:
-                for attr in ['template_bulk_offer', 'template_bulk_feature', 'template_bulk_outage', 'template_bulk_maintenance', 'template_payment_paid', 'template_subscription_renewed']:
-                    val = getattr(settings, attr, None)
-                    if val and val not in [m['name'] for m in meta_templates]:
-                        meta_templates.append({
-                            'name': val,
-                            'language': settings.template_language or 'en',
-                            'category': 'MARKETING',
-                            'components': [{'type': 'BODY', 'text': f'Configured template: {val}'}]
-                        })
-            if not meta_templates:
-                meta_templates = [
-                    {'name': 'special_offer', 'language': 'en', 'category': 'MARKETING', 'components': [{'type': 'BODY', 'text': 'Special offer notification template'}]},
-                    {'name': 'feature_update', 'language': 'en', 'category': 'MARKETING', 'components': [{'type': 'BODY', 'text': 'Feature update notification template'}]},
-                    {'name': 'marketing_promo', 'language': 'en', 'category': 'MARKETING', 'components': [{'type': 'BODY', 'text': 'Promotional marketing message template'}]}
-                ]
-        return jsonify({'templates': meta_templates}), 200
+
+@app.route('/api/whatsapp/templates/sync', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def sync_whatsapp_templates():
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    if not settings.access_token or not settings.business_account_id:
+        return jsonify({'error': 'Please configure your WABA ID and Access Token first.'}), 400
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates?limit=100'
+        headers = {'Authorization': f'Bearer {settings.access_token}'}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if not resp.ok:
+            return jsonify({'error': _parse_meta_error(resp)}), 400
+        remote = resp.json().get('data', [])
+        synced = 0
+        for t in remote:
+            name = t.get('name')
+            language = t.get('language', 'en')
+            if not name:
+                continue
+            row = tenant_query(WhatsAppTemplate).filter_by(name=name, language=language).first()
+            if not row:
+                row = new_for_tenant(WhatsAppTemplate, name=name, language=language, components=t.get('components', []))
+                db.session.add(row)
+            row.category = t.get('category', 'MARKETING')
+            row.status = t.get('status', 'PENDING')
+            row.components = t.get('components', [])
+            row.meta_template_id = t.get('id')
+            row.updated_at = datetime.utcnow()
+            synced += 1
+        db.session.commit()
+        return jsonify({'message': f'Synced {synced} template(s) from Meta.',
+                         'templates': [t.to_dict() for t in tenant_query(WhatsAppTemplate).all()]}), 200
     except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
+_ALLOWED_TEMPLATE_CATEGORIES = {'MARKETING', 'UTILITY'}
 
+
+def _validate_template_components(components):
+    """Server-side shape validation before ever calling Meta -- catches the
+    cheap mistakes locally so a tenant isn't waiting on a round-trip to Meta
+    just to learn BODY was missing. Meta's own API remains the final word on
+    anything more subtle (policy, wording, button-count limits)."""
+    has_body = False
+    for c in components or []:
+        if not isinstance(c, dict):
+            return "Each component must be an object with a 'type' field."
+        ctype = c.get('type') or ''
+        if not isinstance(ctype, str):
+            return "Each component's 'type' must be a string."
+        if ctype.upper() == 'BODY':
+            has_body = True
+            text = c.get('text', '')
+            var_count = len(re.findall(r'\{\{(\d+)\}\}', text))
+            example = (c.get('example') or {}).get('body_text')
+            if var_count > 0 and not example:
+                return f"BODY has {var_count} variable(s) but no sample values were provided."
+    if not has_body:
+        return "A template must have a BODY component."
+    return None
+
+
+@app.route('/api/whatsapp/templates', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def create_whatsapp_template():
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    if not settings.access_token or not settings.business_account_id:
+        return jsonify({'error': 'Please configure your WABA ID and Access Token first.'}), 400
+
+    data = request.json or {}
+    name = (data.get('name') or '').strip()
+    language = (data.get('language') or '').strip()
+    category = (data.get('category') or '').strip().upper()
+    components = data.get('components') or []
+
+    if not name or not language:
+        return jsonify({'error': 'Name and language are required.'}), 400
+    if category not in _ALLOWED_TEMPLATE_CATEGORIES:
+        return jsonify({'error': f"Category must be one of {sorted(_ALLOWED_TEMPLATE_CATEGORIES)}."}), 400
+    error = _validate_template_components(components)
+    if error:
+        return jsonify({'error': error}), 400
+
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates'
+        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+        payload = {'name': name, 'language': language, 'category': category, 'components': components}
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if not resp.ok:
+            return jsonify({'error': _parse_meta_error(resp)}), 400
+        body = resp.json()
+        row = new_for_tenant(WhatsAppTemplate, name=name, language=language, category=category,
+                              status=body.get('status', 'PENDING'), components=components,
+                              meta_template_id=body.get('id'))
+        db.session.add(row)
+        db.session.commit()
+        return jsonify({'message': 'Template submitted to Meta for review.', 'template': row.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/whatsapp/templates/<int:template_id>', methods=['PUT'])
+@jwt_required()
+@admin_or_finance_required()
+def update_whatsapp_template(template_id):
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    row = tenant_query(WhatsAppTemplate).filter_by(id=template_id).first()
+    if not row:
+        return jsonify({'error': 'Template not found.'}), 404
+    if row.status == 'APPROVED':
+        return jsonify({'error': 'An approved template cannot be edited -- create a new template instead.'}), 400
+    if not row.meta_template_id:
+        return jsonify({'error': 'This template has no known Meta template ID to edit.'}), 400
+
+    data = request.json or {}
+    components = data.get('components') or row.components
+    error = _validate_template_components(components)
+    if error:
+        return jsonify({'error': error}), 400
+
+    try:
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{row.meta_template_id}'
+        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+        resp = requests.post(url, headers=headers, json={'components': components}, timeout=15)
+        if not resp.ok:
+            return jsonify({'error': _parse_meta_error(resp)}), 400
+        row.components = components
+        row.status = 'PENDING'
+        row.rejected_reason = None
+        row.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'message': 'Template updated and resubmitted for review.', 'template': row.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/whatsapp/templates/<int:template_id>', methods=['DELETE'])
+@jwt_required()
+@admin_or_finance_required()
+def delete_whatsapp_template(template_id):
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    row = tenant_query(WhatsAppTemplate).filter_by(id=template_id).first()
+    if not row:
+        return jsonify({'error': 'Template not found.'}), 404
+    try:
+        if settings.access_token and settings.business_account_id:
+            api_version = settings.api_version or 'v19.0'
+            url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates?name={row.name}'
+            headers = {'Authorization': f'Bearer {settings.access_token}'}
+            resp = requests.delete(url, headers=headers, timeout=10)
+            if not resp.ok:
+                return jsonify({'error': _parse_meta_error(resp)}), 400
+        db.session.delete(row)
+        db.session.commit()
+        return jsonify({'message': 'Template deleted.'}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/whatsapp/templates/upload-sample', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def upload_whatsapp_template_sample():
+    """Uploads a sample media file for a media (image/video/document) HEADER
+    component via Meta's resumable-upload API, returning the 'handle' Meta
+    requires in the template's example.header_handle at submission time.
+    Two-step flow: create an upload session, then upload the file bytes."""
+    settings = tenant_query(WhatsAppSettings).first()
+    if not settings or settings.mode != 'api':
+        return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
+    if not plans.limits(current_tenant().plan)["whatsapp_api"]:
+        return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
+    if not settings.access_token or not settings.app_id:
+        return jsonify({'error': 'Please configure your App ID and Access Token first.'}), 400
+
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'No file provided.'}), 400
+    file_bytes = file.read()
+
+    try:
+        api_version = settings.api_version or 'v19.0'
+        session_url = f'https://graph.facebook.com/{api_version}/{settings.app_id}/uploads'
+        session_resp = requests.post(session_url, params={
+            'file_length': len(file_bytes),
+            'file_type': file.mimetype or 'application/octet-stream',
+            'access_token': settings.access_token,
+        }, timeout=15)
+        if not session_resp.ok:
+            return jsonify({'error': _parse_meta_error(session_resp)}), 400
+        upload_session_id = session_resp.json().get('id')
+        if not upload_session_id:
+            return jsonify({'error': 'Meta did not return an upload session ID.'}), 400
+
+        upload_url = f'https://graph.facebook.com/{api_version}/{upload_session_id}'
+        upload_headers = {'Authorization': f'OAuth {settings.access_token}'}
+        upload_resp = requests.post(upload_url, headers=upload_headers, data=file_bytes, timeout=30)
+        if not upload_resp.ok:
+            return jsonify({'error': _parse_meta_error(upload_resp)}), 400
+        handle = upload_resp.json().get('h')
+        if not handle:
+            return jsonify({'error': 'Meta did not return an upload handle.'}), 400
+        return jsonify({'header_handle': handle}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 _template_def_cache = {}
@@ -5115,6 +6176,8 @@ def send_whatsapp_message(customer, event_type, context=None):
             template_name = settings.template_payment_reminder or 'payment_reminder'
         elif event_type == 'current_balance':
             template_name = getattr(settings, 'template_current_balance', None) or 'current_balance'
+        elif event_type == 'payment_link':
+            template_name = getattr(settings, 'template_payment_link', None) or 'payment_link'
         elif event_type == 'reseller_credit_added':
             template_name = 'reseller_credit_added'
         elif event_type == 'reseller_discount_applied':
@@ -5154,6 +6217,13 @@ def send_whatsapp_message(customer, event_type, context=None):
             balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
             expiry_date = str(context.get('expiry_date', customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else 'N/A'))
             user_body_params = [customer.name, balance_str, expiry_date]
+        elif event_type == 'payment_link':
+            # Deliberately the link's view_token ALONE, no other params -- see
+            # this task's design note on why the payment_link template's BODY
+            # component must have zero {{n}} placeholders (so
+            # user_body_params[0] is free for the URL button's {{1}} without
+            # colliding with a body placeholder consuming the same value).
+            user_body_params = [context.get('view_token', '')]
         elif event_type == 'bulk_outage':
             user_body_params = [context.get('message', 'an outage occured from the isp , will be repaired soon')]
         elif event_type == 'bulk_maintenance':
@@ -5238,7 +6308,9 @@ def get_dashboard_metrics():
     total_customers = tenant_query(Customer).count()
     active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).count()
 
-    revenue_query = tenant_query(Payment).filter_by(paid=True, pre_payment=False)  # Only actual revenue, not pre-payments
+    # Prepayments count as revenue -- see
+    # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
+    revenue_query = tenant_query(Payment).filter_by(paid=True)
     if start_date:
         revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
     if end_date:
@@ -5910,6 +6982,43 @@ def whatsapp_webhook():
             for entry in data.get('entry', []):
                 for change in entry.get('changes', []):
                     val = change.get('value', {})
+
+                    if change.get('field') == 'message_template_status_update':
+                        waba_id = entry.get('id')
+                        tpl_matches = WhatsAppSettings.query.filter_by(business_account_id=waba_id).all() if waba_id else []
+                        tpl_settings = tpl_matches[0] if tpl_matches else None
+                        if not tpl_settings:
+                            logging.warning(f"WhatsApp template status webhook: no tenant for business_account_id={waba_id}; skipping.")
+                            continue
+                        if len(tpl_matches) > 1:
+                            logging.warning(f"WhatsApp template status webhook: {len(tpl_matches)} settings rows share business_account_id={waba_id} "
+                                             f"(tenant_ids={[m.tenant_id for m in tpl_matches]}); using settings.id={tpl_settings.id} tenant_id={tpl_settings.tenant_id}.")
+                        if not tpl_settings.app_secret or not signature_header.startswith('sha256='):
+                            logging.warning(f"WhatsApp template status webhook: missing app_secret/signature for tenant_id={tpl_settings.tenant_id}; rejecting.")
+                            return jsonify({'error': 'Invalid signature'}), 401
+                        tpl_expected_sig = hmac.new(tpl_settings.app_secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+                        tpl_provided_sig = signature_header[len('sha256='):]
+                        if not hmac.compare_digest(tpl_expected_sig, tpl_provided_sig):
+                            logging.warning(f"WhatsApp template status webhook: signature mismatch for tenant_id={tpl_settings.tenant_id}; rejecting.")
+                            return jsonify({'error': 'Invalid signature'}), 401
+
+                        tpl_name = val.get('message_template_name')
+                        tpl_language = val.get('message_template_language')
+                        tpl_new_status = val.get('event')
+                        tpl_reason = val.get('reason')
+                        if tpl_name and tpl_new_status:
+                            tpl_row = WhatsAppTemplate.query.filter_by(
+                                tenant_id=tpl_settings.tenant_id, name=tpl_name, language=tpl_language).first()
+                            if tpl_row:
+                                tpl_row.status = tpl_new_status
+                                tpl_row.rejected_reason = tpl_reason
+                                tpl_row.updated_at = datetime.utcnow()
+                                db.session.commit()
+                                logging.info(f"WhatsApp template status webhook: tenant_id={tpl_settings.tenant_id} name={tpl_name} -> {tpl_new_status}")
+                            else:
+                                logging.warning(f"WhatsApp template status webhook: no local WhatsAppTemplate for tenant_id={tpl_settings.tenant_id} name={tpl_name} language={tpl_language}; skipping.")
+                        continue
+
                     messages = val.get('messages', [])
                     contacts = val.get('contacts', [])
 
@@ -6283,6 +7392,7 @@ def _renew_subscription_core(customer):
                 pre_payment=False
             )
             db.session.add(new_payment)
+            _maybe_create_customer_payment_link(new_payment, customer)
 
             customer.balance -= renewal_amount
             db.session.commit()

@@ -117,3 +117,94 @@ def test_webhook_verifies_token_against_any_tenant(app, client):
     assert ok.status_code == 200 and ok.get_data(as_text=True) == "123"
     bad = client.get("/api/whatsapp/webhook?hub.mode=subscribe&hub.verify_token=nope&hub.challenge=123")
     assert bad.status_code == 403
+
+
+def test_template_status_update_updates_local_row(app, client):
+    a = make_tenant(client, "Biz TE", "te_admin")
+    with app.app_context():
+        a_tid = appmod.Tenant.query.filter_by(slug="biz-te").first().id
+        appmod.db.session.add(appmod.WhatsAppSettings(
+            tenant_id=a_tid, business_account_id="WABA_TE", enabled=True, mode="api",
+            app_secret="shh-te-secret"))
+        appmod.db.session.add(appmod.WhatsAppTemplate(
+            tenant_id=a_tid, name="greeting", language="en", category="UTILITY",
+            status="PENDING", components=[{"type": "BODY", "text": "Hi"}]))
+        appmod.db.session.commit()
+
+    payload = {"entry": [{"id": "WABA_TE", "changes": [{
+        "field": "message_template_status_update",
+        "value": {"message_template_name": "greeting", "message_template_language": "en",
+                  "event": "APPROVED"},
+    }]}]}
+    r = _signed_post(client, payload, "shh-te-secret")
+    assert r.status_code == 200
+
+    with app.app_context():
+        row = appmod.WhatsAppTemplate.query.filter_by(tenant_id=a_tid, name="greeting").first()
+        assert row.status == "APPROVED"
+
+
+def test_template_status_update_rejects_bad_signature(app, client):
+    a = make_tenant(client, "Biz TF", "tf_admin")
+    with app.app_context():
+        a_tid = appmod.Tenant.query.filter_by(slug="biz-tf").first().id
+        appmod.db.session.add(appmod.WhatsAppSettings(
+            tenant_id=a_tid, business_account_id="WABA_TF", enabled=True, mode="api",
+            app_secret="shh-tf-secret"))
+        appmod.db.session.add(appmod.WhatsAppTemplate(
+            tenant_id=a_tid, name="greeting", language="en", category="UTILITY",
+            status="PENDING", components=[{"type": "BODY", "text": "Hi"}]))
+        appmod.db.session.commit()
+
+    payload = {"entry": [{"id": "WABA_TF", "changes": [{
+        "field": "message_template_status_update",
+        "value": {"message_template_name": "greeting", "message_template_language": "en",
+                  "event": "APPROVED"},
+    }]}]}
+    r = _signed_post(client, payload, "wrong-secret")
+    assert r.status_code == 401
+    with app.app_context():
+        row = appmod.WhatsAppTemplate.query.filter_by(tenant_id=a_tid, name="greeting").first()
+        assert row.status == "PENDING"  # untouched
+
+
+def test_template_status_update_unmatched_waba_is_a_noop(app, client):
+    payload = {"entry": [{"id": "NO_SUCH_WABA", "changes": [{
+        "field": "message_template_status_update",
+        "value": {"message_template_name": "greeting", "message_template_language": "en",
+                  "event": "APPROVED"},
+    }]}]}
+    # No signature needed to reach the "no tenant found" branch -- it's checked
+    # before signature verification, mirroring the existing phone_number_id path.
+    r = client.post("/api/whatsapp/webhook", json=payload)
+    assert r.status_code == 200
+
+
+def test_template_status_update_rejects_when_app_secret_unset(app, client):
+    a = make_tenant(client, "Biz TG", "tg_admin")
+    with app.app_context():
+        a_tid = appmod.Tenant.query.filter_by(slug="biz-tg").first().id
+        appmod.db.session.add(appmod.WhatsAppSettings(
+            tenant_id=a_tid, business_account_id="WABA_TG", enabled=True, mode="api",
+            app_secret=None))  # no secret configured yet
+        appmod.db.session.add(appmod.WhatsAppTemplate(
+            tenant_id=a_tid, name="greeting", language="en", category="UTILITY",
+            status="PENDING", components=[{"type": "BODY", "text": "Hi"}]))
+        appmod.db.session.commit()
+
+    payload = {"entry": [{"id": "WABA_TG", "changes": [{
+        "field": "message_template_status_update",
+        "value": {"message_template_name": "greeting", "message_template_language": "en",
+                  "event": "APPROVED"},
+    }]}]}
+    body = json.dumps(payload).encode("utf-8")
+    r = client.post(
+        "/api/whatsapp/webhook",
+        data=body,
+        content_type="application/json",
+        headers={"X-Hub-Signature-256": "sha256=irrelevant"},
+    )
+    assert r.status_code == 401
+    with app.app_context():
+        row = appmod.WhatsAppTemplate.query.filter_by(tenant_id=a_tid, name="greeting").first()
+        assert row.status == "PENDING"  # untouched

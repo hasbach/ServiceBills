@@ -5,6 +5,7 @@ APScheduler
 python-dateutil
 Flask-Bcrypt
 Flask-JWT-Extended
+Flask-Limiter
 Werkzeug
 gunicorn
 waitress

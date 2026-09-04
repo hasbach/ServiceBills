@@ -222,6 +222,12 @@ const rawApiService = {
     fetchWhatsAppSettings: () => api.get('/whatsapp-settings'),
     saveWhatsAppSettings: (data) => api.post('/whatsapp-settings', data),
     subscribeWaba: () => api.post('/whatsapp/subscribe-waba'),
+    tenantWhishSettings: () => api.get('/tenant-whish-settings'),
+    saveTenantWhishSettings: (payload) => api.post('/tenant-whish-settings', payload),
+    getPublicPayLink: () => api.get('/tenant/whish/public-pay-link'),
+    regeneratePublicPayLink: () => api.post('/tenant/whish/public-pay-link/regenerate'),
+    resendWhishPaymentLink: (customerId, paymentId) => api.post(`/customers/${customerId}/payments/${paymentId}/whish-link/resend`),
+    emailWhishPaymentLink: (customerId, paymentId, email, payUrl) => api.post(`/customers/${customerId}/payments/${paymentId}/whish-link/email`, { email, pay_url: payUrl }),
     sendWhatsappReminder: (customerId, templateType = 'payment_reminder') => api.post(`/customers/${customerId}/send-whatsapp-reminder`, { template_type: templateType }),
     fetchReceipt: (paymentId) => api.get(`/receipt/${paymentId}`),
     addCustomerPayment: (paymentData) => api.post(`/payments`, paymentData),
@@ -280,6 +286,13 @@ const rawApiService = {
     // Bulk Messaging
     sendBulkMessage: (payload) => api.post('/messages/bulk_send', payload),
     fetchMetaTemplates: () => api.get('/whatsapp/templates'),
+    fetchWhatsAppTemplates: () => api.get('/whatsapp/templates'),
+    syncWhatsAppTemplates: () => api.post('/whatsapp/templates/sync'),
+    createWhatsAppTemplate: (data) => api.post('/whatsapp/templates', data),
+    updateWhatsAppTemplate: (id, data) => api.put(`/whatsapp/templates/${id}`, data),
+    deleteWhatsAppTemplate: (id) => api.delete(`/whatsapp/templates/${id}`),
+    uploadWhatsAppTemplateSample: (formData) => api.post('/whatsapp/templates/upload-sample', formData,
+        { headers: { 'Content-Type': 'multipart/form-data' } }),
 };
 
 export const apiService = Object.fromEntries(

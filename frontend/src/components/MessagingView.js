@@ -45,11 +45,30 @@ const MessagingView = () => {
         }
     }, [apiService]);
 
+    // Mount-time, passive load: reads the local template cache (no live Meta
+    // call, no plan/mode gating), so it's safe for every tenant regardless of
+    // plan or sending mode. Failures are logged only -- the Marketing Campaign
+    // tab's dropdown just shows "No templates loaded" until the user hits Sync.
+    const handleFetchTemplates = useCallback(async () => {
+        try {
+            const res = await apiService.fetchWhatsAppTemplates();
+            const loaded = (res.data.templates || []).filter(t => t.status === 'APPROVED');
+            setMetaTemplates(loaded);
+            if (loaded.length > 0 && !selectedTemplate) {
+                setSelectedTemplate(loaded[0].name);
+            }
+        } catch (error) {
+            console.error("Failed to load WhatsApp templates:", error);
+        }
+    }, [apiService, selectedTemplate]);
+
+    // Explicit user action (Sync button): a live Meta API call, gated on
+    // mode == 'api' + the whatsapp_api plan feature -- only triggered by a click.
     const handleSyncTemplates = useCallback(async () => {
         setSyncing(true);
         try {
-            const res = await apiService.fetchMetaTemplates();
-            const loaded = res.data.templates || [];
+            const res = await apiService.syncWhatsAppTemplates();
+            const loaded = (res.data.templates || []).filter(t => t.status === 'APPROVED');
             setMetaTemplates(loaded);
             if (loaded.length > 0 && !selectedTemplate) {
                 setSelectedTemplate(loaded[0].name);
@@ -57,7 +76,7 @@ const MessagingView = () => {
             setSnackbar({ open: true, message: `Synchronized ${loaded.length} approved templates from Meta.`, severity: 'success' });
         } catch (error) {
             console.error("Failed to sync Meta templates:", error);
-            setSnackbar({ open: true, message: 'Failed to synchronize templates from Meta.', severity: 'error' });
+            setSnackbar({ open: true, message: error.response?.data?.error || 'Failed to synchronize templates from Meta.', severity: 'error' });
         } finally {
             setSyncing(false);
         }
@@ -65,7 +84,7 @@ const MessagingView = () => {
 
     useEffect(() => {
         fetchSectorsData();
-        handleSyncTemplates();
+        handleFetchTemplates();
     }, [fetchSectorsData]);
 
     const handleEventTypeChange = (e) => {

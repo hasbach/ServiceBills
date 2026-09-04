@@ -3,7 +3,9 @@ import {
     Box, Typography, Paper, Button, TextField, CircularProgress,
     Avatar, Grid, Divider, Switch, alpha, useTheme, FormControlLabel,
     Alert, Collapse, InputAdornment, IconButton, MenuItem,
-    ToggleButton, ToggleButtonGroup, Tab, Tabs
+    ToggleButton, ToggleButtonGroup, Tab, Tabs,
+    Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
+    Autocomplete,
 } from '@mui/material';
 import {
     Business as BusinessIcon,
@@ -19,11 +21,15 @@ import {
     LocationOn as LocationOnIcon,
     Edit as EditIcon,
     Lock as LockIcon,
+    Payments as PaymentsIcon,
+    ContentCopy as ContentCopyIcon,
+    Autorenew as AutorenewIcon,
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import ExpenseCategoryManager from './ExpenseCategoryManager.js';
 import UserManagement from './UserManagement.js';
 import SectorManager from './SectorManager.js';
+import WhatsAppTemplatesManager from './WhatsAppTemplatesManager.js';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
 
@@ -142,6 +148,13 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     // Edit to unlock, and it re-locks after every save.
     const [waCredsEditing, setWaCredsEditing] = useState(false);
 
+    const [approvedTemplates, setApprovedTemplates] = useState([]);
+    useEffect(() => {
+        apiService.fetchWhatsAppTemplates()
+            .then(res => setApprovedTemplates((res.data.templates || []).filter(t => t.status === 'APPROVED')))
+            .catch(() => {}); // Settings page still works with free-text fallback if this fails
+    }, [apiService]);
+
     const fetchWASettings = useCallback(async () => {
         setWaFetching(true);
         try {
@@ -188,6 +201,110 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
 
     const waField = (key) => ({ value: waForm[key], onChange: (e) => setWaForm(f => ({ ...f, [key]: e.target.value })) });
 
+    // ── Tenant plan (for the Pro-gated Whish Payments tab below) ────────────────
+    const [tenant, setTenant] = useState(null);
+    useEffect(() => {
+        apiService.tenantMe().then((r) => setTenant(r.data)).catch(() => setTenant({ plan: 'free' }));
+    }, [apiService]);
+    const isPro = tenant?.plan === 'pro';
+
+    // ── Tenant Whish (customer payments) settings state ─────────────────────────
+    const DEFAULT_TWS = { enabled: false, whish_channel: '', whish_secret: '', display_name_override: '', configured: false };
+    const [twsForm, setTwsForm] = useState(DEFAULT_TWS);
+    const [twsLoading, setTwsLoading] = useState(false);
+    const [twsFetching, setTwsFetching] = useState(true);
+    const [showTwsSecret, setShowTwsSecret] = useState(false);
+    // Locked by default, same rationale as waCredsEditing above -- must click
+    // Edit to unlock, re-locks after every save.
+    const [twsCredsEditing, setTwsCredsEditing] = useState(false);
+
+    const fetchTwsSettings = useCallback(async () => {
+        setTwsFetching(true);
+        try {
+            const res = await apiService.tenantWhishSettings();
+            if (res.data?.settings) setTwsForm(prev => ({ ...DEFAULT_TWS, ...res.data.settings }));
+        } catch (e) {
+            console.error('Failed to load Whish payment settings', e);
+        } finally {
+            setTwsFetching(false);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [apiService]);
+
+    useEffect(() => { fetchTwsSettings(); }, [fetchTwsSettings]);
+
+    const handleTwsSave = async () => {
+        setTwsLoading(true);
+        try {
+            const res = await apiService.saveTenantWhishSettings(twsForm);
+            if (res.data?.settings) setTwsForm(prev => ({ ...DEFAULT_TWS, ...res.data.settings }));
+            setSnackbar({ open: true, message: 'Whish payment settings saved!', severity: 'success' });
+            setTwsCredsEditing(false);
+        } catch (err) {
+            const detail = err?.response?.data?.msg || err?.response?.data?.error || err?.message || 'Unknown error';
+            console.error('Whish settings save error:', err?.response || err);
+            setSnackbar({ open: true, message: `Failed to save: ${detail}`, severity: 'error' });
+        } finally {
+            setTwsLoading(false);
+        }
+    };
+
+    const twsField = (key) => ({ value: twsForm[key], onChange: (e) => setTwsForm(f => ({ ...f, [key]: e.target.value })) });
+
+    // ── Tenant-wide public payment page link (Task 20) ──────────────────────────
+    const [publicPayLink, setPublicPayLink] = useState(null); // { slug, url } | null while loading
+    const [publicPayLinkLoading, setPublicPayLinkLoading] = useState(false);
+    const [regenerateConfirmOpen, setRegenerateConfirmOpen] = useState(false);
+    const [copied, setCopied] = useState(false);
+
+    const fetchPublicPayLink = useCallback(async () => {
+        try {
+            const res = await apiService.getPublicPayLink();
+            if (res.data?.slug) {
+                setPublicPayLink(res.data);
+            } else {
+                // Lazily generate on first load -- staff shouldn't need an
+                // extra manual step just to get a working link the first
+                // time they open this tab. Never auto-regenerates an
+                // EXISTING slug (that's the explicit, confirmed action
+                // below) -- only fires when none has been generated yet.
+                const gen = await apiService.regeneratePublicPayLink();
+                setPublicPayLink(gen.data);
+            }
+        } catch (e) {
+            console.error('Failed to load public payment page link', e);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [apiService]);
+
+    useEffect(() => { if (isPro) fetchPublicPayLink(); }, [isPro, fetchPublicPayLink]);
+
+    const generateOrRegeneratePublicPayLink = async () => {
+        setPublicPayLinkLoading(true);
+        try {
+            const res = await apiService.regeneratePublicPayLink();
+            setPublicPayLink(res.data);
+            setSnackbar({ open: true, message: 'Public payment page link generated!', severity: 'success' });
+        } catch (err) {
+            const detail = err?.response?.data?.msg || err?.message || 'Unknown error';
+            setSnackbar({ open: true, message: `Failed to generate link: ${detail}`, severity: 'error' });
+        } finally {
+            setPublicPayLinkLoading(false);
+            setRegenerateConfirmOpen(false);
+        }
+    };
+
+    const copyPublicPayLink = async () => {
+        if (!publicPayLink?.url) return;
+        try {
+            await navigator.clipboard.writeText(publicPayLink.url);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+        } catch (e) {
+            setSnackbar({ open: true, message: 'Could not copy link.', severity: 'error' });
+        }
+    };
+
     // ── Render ────────────────────────────────────────────────────────────────
     return (
         <Box sx={{ p: { xs: 1.5, sm: 2, md: 3 }, background: 'linear-gradient(135deg, #f6f9fc 0%, #ffffff 100%)', minHeight: '100vh' }}>
@@ -206,6 +323,8 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ px: 2, '& .MuiTab-root': { textTransform: 'none', fontWeight: 600 } }}>
                     <Tab icon={<BusinessIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Business Details" />
                     <Tab icon={<WhatsAppIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="WhatsApp Notifications" />
+                    <Tab icon={<WhatsAppIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="WhatsApp Templates" />
+                    <Tab icon={<PaymentsIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Whish Payments" />
                     <Tab icon={<MessageIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Expense Categories" />
                     <Tab icon={<PeopleIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="User Management" />
                     <Tab icon={<LocationOnIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Sectors" />
@@ -407,49 +526,139 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                     <Divider sx={{ my: 3 }} />
                                     <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 2 }}>Approved Template Names</Typography>
                                     <Alert severity="info" sx={{ mb: 2, borderRadius: '12px' }}>
-                                        These must exactly match the template names you approved in Meta Business Manager → WhatsApp → Message Templates.
+                                        Pick from your templates approved via the <strong>WhatsApp Templates</strong> tab above (use its Refresh button to pull in anything approved directly in Meta), or type a template name directly if you haven't synced yet.
                                     </Alert>
                                     <Grid container spacing={2}>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Payment Received Template" placeholder="payment_confirmation" {...waField('template_payment_paid')}
-                                                helperText="Triggered when a payment is marked as paid"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_payment_paid}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_payment_paid: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_payment_paid: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Payment Received Template"
+                                                        helperText="Triggered when a payment is marked as paid"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Subscription Renewed Template" placeholder="subscription_renewal" {...waField('template_subscription_renewed')}
-                                                helperText="Triggered when subscription is renewed"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_subscription_renewed}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_subscription_renewed: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_subscription_renewed: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Subscription Renewed Template"
+                                                        helperText="Triggered when subscription is renewed"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Payment Reminder Template" placeholder="payment_reminder" {...waField('template_payment_reminder')}
-                                                helperText="For future manual or scheduled reminders"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_payment_reminder}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_payment_reminder: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_payment_reminder: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Payment Reminder Template"
+                                                        helperText="For future manual or scheduled reminders"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Current Balance Template" placeholder="current_balance" {...waField('template_current_balance')}
-                                                helperText="For balance & expiry reminders"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_current_balance}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_current_balance: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_current_balance: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Current Balance Template"
+                                                        helperText="For balance & expiry reminders"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Forwarding Alert Template (unused)" placeholder="customer_reply_alert" {...waField('template_forward_alert')}
-                                                helperText="Not sent by the current forwarding flow (see Daily Keep-Alive Template below) — kept only in case you revert to template-only alerts"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_forward_alert}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_forward_alert: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_forward_alert: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Forwarding Alert Template (unused)"
+                                                        helperText="Not sent by the current forwarding flow (see Daily Keep-Alive Template below) — kept only in case you revert to template-only alerts"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Outage Template" placeholder="outage_alert" {...waField('template_bulk_outage')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_outage}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_outage: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_outage: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Outage Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Maintenance Template" placeholder="maintenance_alert" {...waField('template_bulk_maintenance')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_maintenance}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_maintenance: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_maintenance: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Maintenance Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Feature Template" placeholder="feature_update" {...waField('template_bulk_feature')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_feature}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_feature: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_feature: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Feature Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                         <Grid item xs={12} md={3}>
-                                            <TextField fullWidth label="Offer Template" placeholder="special_offer" {...waField('template_bulk_offer')}
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                            <Autocomplete
+                                                freeSolo
+                                                fullWidth
+                                                options={approvedTemplates.map(t => t.name)}
+                                                value={waForm.template_bulk_offer}
+                                                onChange={(_, newValue) => setWaForm(f => ({ ...f, template_bulk_offer: newValue || '' }))}
+                                                onInputChange={(_, newInputValue) => setWaForm(f => ({ ...f, template_bulk_offer: newInputValue }))}
+                                                renderInput={(params) => (
+                                                    <TextField {...params} fullWidth label="Offer Template"
+                                                        sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                                )}
+                                            />
                                         </Grid>
                                     </Grid>
 
@@ -515,9 +724,10 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                         <Typography variant="caption" color="text.secondary">
                                             1. Go to <strong>developers.facebook.com</strong> → Create App → Business type<br />
                                             2. Add <strong>WhatsApp</strong> product → Get Phone Number ID + WABA ID<br />
-                                            3. Create a <strong>System User</strong> in Business Settings → Generate token with whatsapp_business_messaging permission<br />
-                                            4. Submit message templates for approval in <strong>Meta Business Manager</strong><br />
-                                            5. Paste credentials above and save
+                                            3. Create a <strong>System User</strong> in Business Settings → Generate a token with both <strong>whatsapp_business_messaging</strong> and <strong>whatsapp_business_management</strong> permissions (the second is required to create/edit/delete templates from this app)<br />
+                                            4. Create and manage your message templates directly in the <strong>WhatsApp Templates</strong> tab above — no need to go to Meta Business Manager for template creation or approval status anymore, only to obtain your account/App ID/credentials<br />
+                                            5. Paste credentials above and save<br />
+                                            6. For real-time approval-status updates, enable <strong>message_template_status_update</strong> as a subscribed webhook field in your Meta App Dashboard (App configuration on Meta's side — this app's UI can't set it for you)
                                         </Typography>
                                     </Box>
                                 </Section>
@@ -534,20 +744,135 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 </Box>
             )}
 
-            {/* ── Tab 2: Expense Categories ── */}
-            {tab === 2 && (
+            {/* ── Tab 2: WhatsApp Templates ── */}
+            {tab === 2 && <WhatsAppTemplatesManager />}
+
+            {/* ── Tab 3: Whish Payments (tenant-facing customer payments) ── */}
+            {tab === 3 && (
+                <Box>
+                    {twsFetching || !tenant ? (
+                        <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}><CircularProgress /></Box>
+                    ) : !isPro ? (
+                        <Section icon={<PaymentsIcon />} title="Whish Payments" subtitle="Let your customers pay you directly via Whish" color={theme.palette.warning.main}>
+                            <Alert severity="warning" icon={<LockIcon />} sx={{ borderRadius: '12px' }}>
+                                This feature requires the <strong>Pro</strong> plan. Upgrade from the Billing page to let your
+                                customers pay their invoices directly via Whish, using your own Whish merchant account.
+                            </Alert>
+                        </Section>
+                    ) : (
+                        <>
+                            <Section icon={<PaymentsIcon />} title="Whish Payments" subtitle="Accept payments from your own customers via Whish" color={theme.palette.primary.main}
+                                action={
+                                    <Button
+                                        size="small"
+                                        variant={twsCredsEditing ? 'contained' : 'outlined'}
+                                        color={twsCredsEditing ? 'warning' : 'primary'}
+                                        startIcon={twsCredsEditing ? <LockIcon /> : <EditIcon />}
+                                        onClick={() => setTwsCredsEditing(e => !e)}
+                                        sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}
+                                    >
+                                        {twsCredsEditing ? 'Lock' : 'Edit'}
+                                    </Button>
+                                }>
+                                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 2, mb: 3 }}>
+                                    <Box>
+                                        <Typography variant="body1" sx={{ fontWeight: 600 }}>Enable Whish Payments</Typography>
+                                        <Typography variant="body2" color="text.secondary">Let customers pay you directly using the credentials below</Typography>
+                                    </Box>
+                                    <Switch checked={twsForm.enabled} onChange={e => setTwsForm(f => ({ ...f, enabled: e.target.checked }))} />
+                                </Box>
+                                <Alert severity="warning" sx={{ mb: 3, borderRadius: '12px' }}>
+                                    ⚠️ This section stores your own Whish merchant credentials. Keep these secret — never share them.
+                                    {!twsCredsEditing && ' Fields are locked — click Edit above to change them.'}
+                                </Alert>
+                                <Grid container spacing={2}>
+                                    <Grid item xs={12} md={6}>
+                                        <TextField fullWidth label="Whish Channel" type={showTwsSecret ? 'text' : 'password'} placeholder="Your Whish channel ID"
+                                            {...twsField('whish_channel')} disabled={!twsCredsEditing}
+                                            InputProps={{ endAdornment: <InputAdornment position="end"><IconButton size="small" onClick={() => setShowTwsSecret(s => !s)}>{showTwsSecret ? <VisibilityOffIcon /> : <VisibilityIcon />}</IconButton></InputAdornment> }}
+                                            sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                    </Grid>
+                                    <Grid item xs={12} md={6}>
+                                        <TextField fullWidth label="Whish Secret" type={showTwsSecret ? 'text' : 'password'} placeholder="Your Whish secret"
+                                            {...twsField('whish_secret')} disabled={!twsCredsEditing}
+                                            sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                    </Grid>
+                                    <Grid item xs={12}>
+                                        <TextField fullWidth label="Display Name (optional)" placeholder="Shown to your customers instead of your internal business name"
+                                            {...twsField('display_name_override')} disabled={!twsCredsEditing}
+                                            helperText="Not shown on the payment page yet — captured for future use"
+                                            sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                    </Grid>
+                                </Grid>
+                            </Section>
+                            <Button variant="contained" startIcon={twsLoading ? <CircularProgress size={18} color="inherit" /> : <SaveIcon />}
+                                onClick={handleTwsSave} disabled={twsLoading}
+                                sx={{ borderRadius: '12px', textTransform: 'none', fontWeight: 600, px: 4, py: 1.5 }}>
+                                {twsLoading ? 'Saving…' : 'Save Whish Payment Settings'}
+                            </Button>
+
+                            <Box sx={{ mt: 3 }} />
+                            <Section icon={<LinkIcon />} title="Public Payment Page" subtitle="One link, safe to hand out to anyone -- customers self-identify by phone and pay whatever they owe" color={theme.palette.secondary.main}>
+                                {!publicPayLink ? (
+                                    <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}><CircularProgress size={24} /></Box>
+                                ) : (
+                                    <>
+                                        <TextField
+                                            fullWidth label="Payment page link" value={publicPayLink.url || ''} InputProps={{ readOnly: true }}
+                                            sx={{ mb: 2, '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}
+                                        />
+                                        <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
+                                            <Button variant="outlined" startIcon={<ContentCopyIcon />} onClick={copyPublicPayLink}
+                                                sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
+                                                {copied ? 'Copied!' : 'Copy Link'}
+                                            </Button>
+                                            <Button variant="outlined" color="warning" startIcon={<AutorenewIcon />}
+                                                onClick={() => setRegenerateConfirmOpen(true)} disabled={publicPayLinkLoading}
+                                                sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
+                                                Regenerate Link
+                                            </Button>
+                                        </Box>
+                                        <Alert severity="info" sx={{ mt: 2, borderRadius: '12px' }}>
+                                            Regenerating breaks the current link -- anyone who saved or bookmarked it will no longer be able to pay through it.
+                                        </Alert>
+                                    </>
+                                )}
+                            </Section>
+                        </>
+                    )}
+                </Box>
+            )}
+
+            <Dialog open={regenerateConfirmOpen} onClose={() => setRegenerateConfirmOpen(false)}>
+                <DialogTitle>Regenerate the public payment link?</DialogTitle>
+                <DialogContent>
+                    <DialogContentText>
+                        This replaces your current public payment page link with a brand-new one. The old link will stop
+                        working immediately for anyone who has it saved, bookmarked, or shared. This can't be undone.
+                    </DialogContentText>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setRegenerateConfirmOpen(false)} disabled={publicPayLinkLoading}>Cancel</Button>
+                    <Button onClick={generateOrRegeneratePublicPayLink} color="warning" variant="contained" disabled={publicPayLinkLoading}>
+                        {publicPayLinkLoading ? 'Regenerating…' : 'Regenerate'}
+                    </Button>
+                </DialogActions>
+            </Dialog>
+
+            {/* ── Tab 4: Expense Categories ── */}
+            {tab === 4 && (
                 <Section icon={<MessageIcon />} title="Expense Categories" subtitle="Manage the categories used to classify expenses" color={theme.palette.warning.main}>
                     <ExpenseCategoryManager />
                 </Section>
             )}
 
-            {/* ── Tab 3: User Management ── */}
-            {tab === 3 && (
+            {/* ── Tab 5: User Management ── */}
+            {tab === 5 && (
                 <UserManagement />
             )}
 
-            {/* Tab 4: Sectors */}
-            {tab === 4 && (
+            {/* Tab 6: Sectors */}
+            {tab === 6 && (
                 <SectorManager />
             )}
 
