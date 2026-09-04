@@ -211,10 +211,12 @@ const NetworkDeviceManagementView = () => {
                                 value={editingDevice?.device_type || 'mikrotik_ccr'}
                                 onChange={(e) => {
                                     const device_type = e.target.value;
+                                    const isOlt = device_type === 'vsol_olt';
                                     setEditingDevice({
                                         ...editingDevice,
                                         device_type,
-                                        api_port: device_type === 'vsol_olt' ? 161 : (editingDevice?.use_tls ? 8729 : 8728),
+                                        api_port: isOlt ? 161 : (editingDevice?.use_tls ? 8729 : 8728),
+                                        ...(isOlt ? { use_tls: false, username: '' } : {}),
                                     });
                                 }}
                                 SelectProps={{ native: true }}>
