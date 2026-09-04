@@ -2412,6 +2412,39 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
 
 
 
+# Shared by the customer create/update endpoints and the ONU-label /apply
+# endpoint (see apply_onu_label_matches below) so the accepted MAC shape can
+# never drift between the two call sites.
+_MAC_ADDRESS_RE = re.compile(r'^[0-9a-f]{2}(:[0-9a-f]{2}){5}$')
+
+
+def _validate_mac_address(raw, allow_empty):
+    """Normalize (strip + lowercase) and validate a MAC address string.
+
+    Returns (mac_or_None, error_or_None) -- exactly one is ever set.
+
+    `allow_empty` controls what a blank value means: on the customer
+    endpoints an empty/null value clears the link, so allow_empty=True makes
+    that normalize to (None, None); /apply requires a non-empty MAC for every
+    link, so it passes allow_empty=False and gets an error instead. A `raw`
+    that isn't a string at all (e.g. a bare int from a malformed request)
+    fails validation with a clean message rather than raising AttributeError
+    from .strip().
+    """
+    if raw is None:
+        raw = ''
+    if not isinstance(raw, str):
+        return None, f"'{raw}' is not a valid MAC address (expected form aa:bb:cc:dd:ee:ff)."
+    mac = raw.strip().lower()
+    if not mac:
+        if allow_empty:
+            return None, None
+        return None, 'Every link needs a mac_address'
+    if not _MAC_ADDRESS_RE.match(mac):
+        return None, f"'{raw}' is not a valid MAC address (expected form aa:bb:cc:dd:ee:ff)."
+    return mac, None
+
+
 def _check_network_link_conflict(exclude_customer_id, mikrotik_server_id, pppoe_username,
                                   upstream_provider_id, upstream_username):
     """A given (server, username) pair identifies exactly one live network
@@ -2511,6 +2544,7 @@ def get_customers():
                 'upstream_drift': _compute_upstream_drift(c),
                 'mikrotik_server_id': c.mikrotik_server_id,
                 'pppoe_username': c.pppoe_username,
+                'onu_mac_address': c.onu_mac_address,
                 'subscription_plan': c.subscription_plan.to_dict() if c.subscription_plan else None
             }
             customers_with_plans.append(customer_dict)
@@ -2574,6 +2608,16 @@ def add_customer():
         if conflict_error:
             return jsonify({'error': conflict_error}), 400
 
+        # onu_mac_address is manually editable from the start (see
+        # docs/superpowers/specs/2026-09-01-network-topology-tree-design.md) --
+        # not just written once by the label-matcher /apply endpoint -- so it
+        # needs the same shape validation as that endpoint applies. An empty
+        # value is fine here (no link yet), normalized to None.
+        onu_mac_address, mac_error = _validate_mac_address(
+            data.get('onu_mac_address'), allow_empty=True)
+        if mac_error:
+            return jsonify({'error': mac_error}), 400
+
         # Create new customer first
         new_customer = new_for_tenant(
             Customer,
@@ -2593,7 +2637,8 @@ def add_customer():
             upstream_provider_id=data.get('upstream_provider_id') or None,
             upstream_username=data.get('upstream_username') or None,
             mikrotik_server_id=data.get('mikrotik_server_id') or None,
-            pppoe_username=data.get('pppoe_username') or None
+            pppoe_username=data.get('pppoe_username') or None,
+            onu_mac_address=onu_mac_address
         )
         db.session.add(new_customer)
         db.session.flush() # Flush to get new_customer.id
@@ -2836,6 +2881,20 @@ def update_customer(customer_id):
         if 'pppoe_username' in data:
             customer.pppoe_username = effective_pppoe_username
 
+        # onu_mac_address: same "manually editable afterwards" contract as
+        # pppoe_username above -- the label-matcher /apply endpoint is a
+        # convenience for the initial backfill, not the only way to write
+        # this field, so staff must be able to fix or clear a bad link here.
+        # No conflict check (unlike mikrotik/upstream above): many customers
+        # can legitimately share one ONU (see the Customer.onu_mac_address
+        # column comment), so there is nothing to collide on.
+        if 'onu_mac_address' in data:
+            onu_mac_address, mac_error = _validate_mac_address(
+                data['onu_mac_address'], allow_empty=True)
+            if mac_error:
+                return jsonify({'error': mac_error}), 400
+            customer.onu_mac_address = onu_mac_address
+
         # Handle subscription plan change
         if 'subscription_plan_id' in data and data['subscription_plan_id'] != customer.subscription_plan_id:
             new_plan = tenant_query(SubscriptionPlan).filter_by(id=data['subscription_plan_id']).first()
@@ -2897,7 +2956,8 @@ def update_customer(customer_id):
                 'upstream_provider_id': customer.upstream_provider_id,
                 'upstream_username': customer.upstream_username,
                 'mikrotik_server_id': customer.mikrotik_server_id,
-                'pppoe_username': customer.pppoe_username
+                'pppoe_username': customer.pppoe_username,
+                'onu_mac_address': customer.onu_mac_address
             }
         }), 200
 
@@ -8073,9 +8133,9 @@ def apply_onu_label_matches(device_id):
     try:
         resolved = []
         for link in links:
-            mac = (link.get('mac_address') or '').strip().lower()
-            if not mac:
-                return jsonify({'error': 'Every link needs a mac_address'}), 400
+            mac, mac_error = _validate_mac_address(link.get('mac_address'), allow_empty=False)
+            if mac_error:
+                return jsonify({'error': mac_error}), 400
             customer = tenant_query(Customer).filter_by(id=link.get('customer_id')).first()
             if not customer:
                 return jsonify({'error': 'customer_id {} is not in this tenant'.format(

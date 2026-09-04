@@ -129,6 +129,30 @@ def test_one_customer_is_proposed_at_most_once(app, client, monkeypatch):
     assert len(body["unmatched_onus"]) == 1
 
 
+def test_one_onu_label_colliding_with_two_customers_proposes_only_the_stronger_match(
+        app, client, monkeypatch):
+    """Mirror of test_one_customer_is_proposed_at_most_once: one ONU label
+    that resembles two different customer names must not match both. The
+    design spec calls this shape out explicitly (see Testing section of
+    docs/superpowers/specs/2026-09-01-network-topology-tree-design.md). The
+    greedy pairing in _propose_label_matches processes candidates by
+    descending confidence, so the exact match wins the ONU and the weaker
+    (fuzzy) match is left unmatched rather than also being proposed."""
+    hdr = make_tenant(client, "Match F2", "match_f2_admin")
+    olt = setup_devices(client, hdr)
+    winner = add_customer(app, "Match F2", "Taleb Caffe")
+    loser = add_customer(app, "Match F2", "Taleb Caffee")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
+                        lambda d: (True, [onu("aa:00:00:00:00:03", "TalebCaffe")]))
+    body = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                      headers=hdr).get_json()
+    assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["customer"]["id"] == winner
+    assert body["proposals"][0]["confidence"] == 1.0
+    assert len(body["unmatched_customers"]) == 1
+    assert body["unmatched_customers"][0]["id"] == loser
+
+
 def test_get_writes_nothing(app, client, monkeypatch):
     hdr = make_tenant(client, "Match G", "match_g_admin")
     olt = setup_devices(client, hdr)
@@ -317,3 +341,121 @@ def test_apply_rejects_non_string_mac_address(app, client):
     assert r.status_code == 400
     with app.app_context():
         assert appmod.Customer.query.filter_by(id=customer).first().onu_mac_address is None
+
+
+def test_apply_rejects_malformed_mac_address(app, client):
+    """A mac_address that is a non-empty string but not shaped like a MAC
+    (e.g. missing colons, wrong segment count, or just plain garbage) must
+    400 naming the offending value -- not be persisted as-is. Before this
+    fix, apply_onu_label_matches only rejected an empty string; anything
+    else up to 20 chars was written straight to the database, and anything
+    longer raised a raw, unvalidated database error back to the client."""
+    hdr = make_tenant(client, "Match T", "match_t_admin")
+    olt = setup_devices(client, hdr)
+    customer = add_customer(app, "Match T", "Someone Else")
+    r = client.post(f"/api/network-tree/olt/{olt['id']}/label-matches/apply",
+                    headers=hdr,
+                    json={"links": [{"customer_id": customer,
+                                     "mac_address": "not-a-real-mac-address"}]})
+    assert r.status_code == 400
+    assert "not-a-real-mac-address" in r.get_json()["error"]
+    with app.app_context():
+        assert appmod.Customer.query.filter_by(id=customer).first().onu_mac_address is None
+
+
+# --- Critical 1 fix: onu_mac_address must stay editable outside of /apply ---
+# (an applied link could previously never be corrected or removed -- the
+# field was written in exactly one place and excluded from every customer
+# read/write endpoint). Important 4 fix: the same MAC-shape validation
+# /apply enforces must also cover these endpoints, via the shared
+# _validate_mac_address helper. See
+# docs/superpowers/specs/2026-09-01-network-topology-tree-design.md
+# ("The field stays manually editable afterwards...").
+
+def _create_plan(client, hdr):
+    return client.post("/api/subscription_plans", headers=hdr, json={
+        "name": "Basic", "price": 10, "billing_cycle": "monthly",
+    }).get_json()["plan"]["id"]
+
+
+def test_customer_post_accepts_and_normalizes_onu_mac_address(client):
+    hdr = make_tenant(client, "Cust MAC A", "cust_mac_a_admin")
+    plan_id = _create_plan(client, hdr)
+    r = client.post("/api/customers", headers=hdr, json={
+        "name": "New Cust", "phone": "1", "address": "a",
+        "subscription_plan_id": plan_id,
+        "onu_mac_address": "B4:64:15:3F:C1:94",
+    })
+    assert r.status_code == 201
+    customer_id = r.get_json()["customer_id"]
+    listed = client.get("/api/customers", headers=hdr).get_json()["customers"]
+    row = next(c for c in listed if c["id"] == customer_id)
+    assert row["onu_mac_address"] == "b4:64:15:3f:c1:94"
+
+
+def test_customer_post_rejects_malformed_onu_mac_address(client):
+    hdr = make_tenant(client, "Cust MAC B", "cust_mac_b_admin")
+    plan_id = _create_plan(client, hdr)
+    r = client.post("/api/customers", headers=hdr, json={
+        "name": "New Cust", "phone": "1", "address": "a",
+        "subscription_plan_id": plan_id,
+        "onu_mac_address": "garbage",
+    })
+    assert r.status_code == 400
+    assert "garbage" in r.get_json()["error"]
+
+
+def test_customer_put_can_correct_a_previously_applied_onu_link(app, client, monkeypatch):
+    """The exact scenario the finding describes: a customer gets wrongly
+    linked via the label-matcher /apply endpoint, then disappears from
+    get_onu_label_matches (which excludes already-linked customers) -- but
+    must still be reachable and correctable through a plain PUT."""
+    hdr = make_tenant(client, "Cust MAC C", "cust_mac_c_admin")
+    olt = setup_devices(client, hdr)
+    customer_id = add_customer(app, "Cust MAC C", "Some Customer")
+    apply_resp = client.post(
+        f"/api/network-tree/olt/{olt['id']}/label-matches/apply", headers=hdr,
+        json={"links": [{"customer_id": customer_id,
+                         "mac_address": "aa:bb:cc:dd:ee:01"}]})
+    assert apply_resp.status_code == 200
+
+    # Confirm the finding's premise: the now-linked customer is excluded from
+    # the only endpoint that could previously write this field.
+    matches = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                         headers=hdr).get_json()
+    assert all(c["id"] != customer_id for c in matches["unmatched_customers"])
+
+    # The wrong link must still be correctable directly.
+    r = client.put(f"/api/customers/{customer_id}", headers=hdr,
+                   json={"onu_mac_address": "AA:BB:CC:DD:EE:02"})
+    assert r.status_code == 200
+    assert r.get_json()["customer"]["onu_mac_address"] == "aa:bb:cc:dd:ee:02"
+    with app.app_context():
+        assert appmod.Customer.query.filter_by(id=customer_id).first().onu_mac_address == \
+            "aa:bb:cc:dd:ee:02"
+
+
+def test_customer_put_can_clear_onu_mac_address(app, client):
+    hdr = make_tenant(client, "Cust MAC D", "cust_mac_d_admin")
+    customer_id = add_customer(app, "Cust MAC D", "Linked Customer",
+                               mac="aa:bb:cc:dd:ee:03")
+    r = client.put(f"/api/customers/{customer_id}", headers=hdr,
+                   json={"onu_mac_address": ""})
+    assert r.status_code == 200
+    assert r.get_json()["customer"]["onu_mac_address"] is None
+    with app.app_context():
+        assert appmod.Customer.query.filter_by(id=customer_id).first().onu_mac_address is None
+
+
+def test_customer_put_rejects_malformed_onu_mac_address(app, client):
+    hdr = make_tenant(client, "Cust MAC E", "cust_mac_e_admin")
+    customer_id = add_customer(app, "Cust MAC E", "Some Customer",
+                               mac="aa:bb:cc:dd:ee:04")
+    r = client.put(f"/api/customers/{customer_id}", headers=hdr,
+                   json={"onu_mac_address": "aa:bb:cc:dd:ee:zz"})
+    assert r.status_code == 400
+    assert "aa:bb:cc:dd:ee:zz" in r.get_json()["error"]
+    with app.app_context():
+        # Rejected input must not overwrite the existing valid value.
+        assert appmod.Customer.query.filter_by(id=customer_id).first().onu_mac_address == \
+            "aa:bb:cc:dd:ee:04"
