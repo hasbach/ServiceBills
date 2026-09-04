@@ -81,6 +81,21 @@ const NetworkTreeView = () => {
                     } else {
                         setErrorByDevice((prev) => ({ ...prev, [device.id]: job.error }));
                     }
+                    // In direct mode (every non-agent tenant today),
+                    // _create_device_job just ran the connector inline and
+                    // it already stamped last_status/last_checked_at on the
+                    // NetworkDevice row -- on every path, success or
+                    // failure (see vsol_olt.get_olt_status's _mark_checked
+                    // calls). The OLT's status chip and "checked ..."
+                    // caption above are rendered from `tree`, not from
+                    // onusByDevice/errorByDevice, so without this quiet
+                    // resync they'd stay stale until an unrelated "Reload"
+                    // or a remount. Guarded by the same sequence check as
+                    // the rest of this function so a superseded poll can't
+                    // clobber a newer request's view with a stale reload;
+                    // showSpinner=false keeps it from blanking the tree
+                    // already on screen.
+                    loadTree(false);
                 }
             }
         } catch (e) {

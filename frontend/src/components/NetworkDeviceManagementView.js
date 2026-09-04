@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
     Box, Typography, Button, TextField, Dialog, DialogTitle,
     DialogContent, DialogActions, Grid, Paper, TableContainer,
@@ -38,6 +38,27 @@ const NetworkDeviceManagementView = () => {
     const [onuResult, setOnuResult] = useState(null);
     const [healthError, setHealthError] = useState(null);
     const [labelDrafts, setLabelDrafts] = useState({});
+
+    // checkingId/health/onuResult/healthError above are scalars shared by
+    // whichever single device's "Check Now" dialog is open -- unlike
+    // NetworkTreeView's onusByDevice/errorByDevice/refreshingIds, which are
+    // objects keyed by device id and so can hold several devices' results
+    // at once without collision. A poll now runs for up to 180s (see
+    // pollNetworkJob), so it's entirely realistic to check device A, close
+    // the dialog, check device B, and have A's poll resolve after B's is
+    // already on screen. These two refs (mutable, so updating them never
+    // itself triggers a render -- same reasoning as NetworkTreeView's
+    // refreshSeqRef) together answer "is this resolving check still the
+    // one whose result belongs in the shared state right now":
+    // - checkSeqRef is a per-device request counter, same idea as
+    //   refreshSeqRef, so a second check on the SAME device supersedes a
+    //   first one still in flight.
+    // - activeDeviceIdRef is the device the shared scalar state currently
+    //   belongs to, so a check for a device the user has since navigated
+    //   away from is dropped even though it was never superseded by
+    //   another check on that same device.
+    const checkSeqRef = useRef({});
+    const activeDeviceIdRef = useRef(null);
 
     useEffect(() => {
         loadDevices();
@@ -87,6 +108,14 @@ const NetworkDeviceManagementView = () => {
     };
 
     const handleCheckNow = async (device) => {
+        const seq = (checkSeqRef.current[device.id] || 0) + 1;
+        checkSeqRef.current[device.id] = seq;
+        activeDeviceIdRef.current = device.id;
+        // True only while no newer check (on this device or any other) has
+        // started since this one did -- see the refs' declaration above.
+        const isCurrent = () => activeDeviceIdRef.current === device.id
+            && checkSeqRef.current[device.id] === seq;
+
         setCheckingId(device.id);
         setHealthDevice(device);
         setHealth(null);
@@ -96,12 +125,16 @@ const NetworkDeviceManagementView = () => {
         try {
             const response = await apiService.checkNetworkDeviceNow(device.id);
             const { ok, message, job_id, device: updatedDevice } = response.data;
+            // Keyed by device id already, so this is safe to apply
+            // regardless of which check is "current" -- it can never
+            // clobber another device's row.
             setDevices(prev => prev.map(d => d.id === device.id ? updatedDevice : d));
             if (!ok) {
-                setHealthError(message);
+                if (isCurrent()) setHealthError(message);
                 return;
             }
             const job = await pollNetworkJob(job_id);
+            if (!isCurrent()) return;
             if (job.status !== 'done' || job.error) {
                 setHealthError(job.error || 'Check failed');
                 return;
@@ -120,9 +153,13 @@ const NetworkDeviceManagementView = () => {
                 setLabelDrafts(drafts);
             }
         } catch (err) {
-            setHealthError(err.response?.data?.message || 'Check failed');
+            if (isCurrent()) setHealthError(err.response?.data?.message || 'Check failed');
         } finally {
-            setCheckingId(null);
+            // Only clear the spinner if no newer check has superseded this
+            // one -- otherwise a slow, superseded check's finally would
+            // clear the spinner for the check that's actually still
+            // running (the bug this whole guard exists to prevent).
+            if (isCurrent()) setCheckingId(null);
         }
     };
 
