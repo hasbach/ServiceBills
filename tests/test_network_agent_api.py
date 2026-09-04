@@ -161,6 +161,104 @@ def test_result_is_refused_for_a_job_that_was_never_claimed(app, client):
     assert r.status_code == 409
 
 
+# --- Fix round 2: agent_post_result validates the result's shape against
+# its operation's contract before storing it, instead of trusting whatever
+# JSON the agent posted. A malformed result must never be stored -- the job
+# ends 'done' with an error and result=None, and the agent gets a 400 so a
+# broken build surfaces in its own logs. ---
+
+def test_olt_status_result_that_is_not_a_list_is_rejected(app, client):
+    make_tenant(client, "Api K", "api_k_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api K")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": 1, "error": None})
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error and "olt_status" in job.error
+
+
+def test_olt_status_entry_missing_mac_address_is_rejected(app, client):
+    make_tenant(client, "Api L", "api_l_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api L")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": [{"description": "no mac here"}],
+                          "error": None})
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error and "olt_status" in job.error
+
+
+def test_olt_status_entry_with_a_non_string_mac_address_is_rejected(app, client):
+    """A plausible agent bug: a colon-less MAC parsed as a number rather than
+    a string."""
+    make_tenant(client, "Api M", "api_m_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api M")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": [{"mac_address": 123456789012}],
+                          "error": None})
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error and "olt_status" in job.error
+
+
+def test_device_health_result_with_non_list_interfaces_is_rejected(app, client):
+    make_tenant(client, "Api N", "api_n_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api N")
+    job_id = make_job(app, tenant_id, device_id, operation="device_health")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": {"interfaces": "not-a-list"},
+                          "error": None})
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error and "device_health" in job.error
+
+
+def test_a_well_formed_olt_status_result_is_still_accepted(app, client):
+    """Proves the validation added above doesn't reject valid data -- same
+    shape as test_posting_a_success_result_completes_the_job, kept as its
+    own test so this fix round's coverage doesn't depend on that pre-existing
+    test never changing."""
+    make_tenant(client, "Api O", "api_o_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api O")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    onus = [{"pon_port": "PON1", "onu_id": "EPON0/1:2", "status": "online",
+             "mac_address": "b4:64:15:3f:c1:94", "description": "MoussaGhadir",
+             "model": "V2801D", "distance_m": 531}]
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": onus, "error": None})
+    assert r.status_code == 200
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.error is None
+        assert job.result == onus
+
+
 def test_a_regenerated_token_invalidates_the_old_one(app, client):
     make_tenant(client, "Api J", "api_j_admin")
     old_token, _, tenant_id = make_agent_and_device(app, "Api J")

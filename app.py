@@ -9125,6 +9125,19 @@ def _find_cycle_member(device, by_id):
     return current
 
 
+def _normalize_mac(mac):
+    """Normalize a MAC for case/whitespace-insensitive comparison.
+
+    A value that isn't a string -- e.g. an int, from a malformed agent
+    payload where a colon-less MAC got parsed as a number (see
+    agent_post_result and _validate_agent_result, which now reject this at
+    the boundary for new results, but pre-existing stored rows can still
+    carry it) -- normalizes to '' rather than reaching str.strip(), so it
+    never matches a real MAC and never raises.
+    """
+    return mac.strip().lower() if isinstance(mac, str) else ''
+
+
 def _resolve_onu_customers(onus):
     """Attach the customers sitting behind each ONU, matched on MAC.
 
@@ -9139,21 +9152,25 @@ def _resolve_onu_customers(onus):
     runs on a polling endpoint hit repeatedly by the browser, and agent-mode
     results are whatever JSON the on-prem agent posted (see
     agent_post_result), not something this endpoint can assume is
-    well-formed. A malformed entry -- not a dict, or a dict missing
+    well-formed even though results are now validated at the boundary --
+    this is defence in depth for rows stored before that validation existed.
+    A non-list `onus` (the whole stored result, not one entry) is handed
+    back unchanged: there's nothing to enrich, and iterating it would raise.
+    A malformed entry -- not a dict, or a dict with a missing or non-string
     'mac_address' -- is passed through rather than dropped or raising: it's
     still real hardware the tree should show the operator, it just can't be
     matched to a customer. A bad entry here must never turn every
     subsequent poll of that job into a 500.
     """
-    def normalize_mac(mac):
-        return (mac or '').strip().lower()
+    if not isinstance(onus, list):
+        return onus
 
-    wanted = {normalize_mac(onu.get('mac_address')) for onu in onus if isinstance(onu, dict)}
+    wanted = {_normalize_mac(onu.get('mac_address')) for onu in onus if isinstance(onu, dict)}
     matches = {}
     if wanted:
         rows = tenant_query(Customer).filter(Customer.onu_mac_address.isnot(None)).all()
         for customer in rows:
-            key = normalize_mac(customer.onu_mac_address)
+            key = _normalize_mac(customer.onu_mac_address)
             if key in wanted:
                 matches.setdefault(key, []).append({
                     'id': customer.id,
@@ -9164,7 +9181,7 @@ def _resolve_onu_customers(onus):
         # Display keeps onu['mac_address'] exactly as reported; only the
         # lookup key is normalized. A non-dict entry is handed back verbatim,
         # exactly as _with_interface_labels does for a non-dict interface.
-        {**onu, 'customers': matches.get(normalize_mac(onu.get('mac_address')), [])}
+        {**onu, 'customers': matches.get(_normalize_mac(onu.get('mac_address')), [])}
         if isinstance(onu, dict) else onu
         for onu in onus
     ]
@@ -9262,6 +9279,52 @@ def agent_poll_job():
     }), 200
 
 
+def _validate_agent_result(operation, result):
+    """Check a posted result matches the shape its operation is contracted
+    to return, before agent_post_result ever stores it.
+
+    The on-prem agent is outside this application's trust boundary: it's a
+    separate process, on hardware this app doesn't control, posting
+    arbitrary JSON over HTTPS. Three separate review rounds have found the
+    same bug in this area -- job.result gets stored with no shape check, a
+    downstream consumer (the tree view, the interface-label merge, the ONU
+    label matcher) subscripts it, and raises. Because a job is terminal
+    once this endpoint marks it 'done', that single malformed payload turns
+    every future poll of that job into a 500, forever, with nothing to
+    self-heal it. Rejecting the bad shape here, before it's ever stored,
+    means a broken agent build shows up as a 400 in its own logs instead of
+    permanently wedging some customer's tree view.
+
+    Returns None when `result` matches the contract for `operation`, or a
+    short string describing what's wrong (never raises). Only the two
+    operations whose results this codebase actually parses into fields
+    (olt_status's ONU list, device_health's optional interface list) have a
+    contract worth enforcing here; test_connection/secret_status/
+    active_session results are consumed as opaque blobs, so there's nothing
+    to validate.
+    """
+    if operation == 'olt_status':
+        if not isinstance(result, list):
+            return 'result must be a list of ONU objects'
+        for entry in result:
+            if not isinstance(entry, dict):
+                return 'every ONU entry must be an object'
+            mac = entry.get('mac_address')
+            if not isinstance(mac, str) or not mac:
+                return 'every ONU entry must have a non-empty string mac_address'
+        return None
+    if operation == 'device_health':
+        if not isinstance(result, dict):
+            return 'result must be an object'
+        interfaces = result.get('interfaces')
+        if interfaces is not None and (
+                not isinstance(interfaces, list)
+                or not all(isinstance(i, dict) for i in interfaces)):
+            return 'interfaces must be a list of objects'
+        return None
+    return None
+
+
 @app.route('/api/agent/jobs/<int:job_id>/result', methods=['POST'])
 @agent_token_required()
 def agent_post_result(job_id):
@@ -9280,7 +9343,19 @@ def agent_post_result(job_id):
     job.status = 'done'
     job.finished_at = datetime.utcnow()
     if data.get('ok'):
-        job.result = data.get('result')
+        result = data.get('result')
+        problem = _validate_agent_result(job.operation, result)
+        if problem:
+            # Do not store the malformed payload. Mark the job terminal with
+            # a clear error so the browser's poll ends cleanly (see
+            # get_network_job) instead of hanging until the claimed-job
+            # timeout, and 400 the agent so a broken build surfaces in its
+            # own logs rather than failing silently.
+            job.result = None
+            job.error = 'Malformed {} result from agent: {}'.format(job.operation, problem)
+            db.session.commit()
+            return jsonify({'error': job.error}), 400
+        job.result = result
         job.error = None
     else:
         job.result = None
@@ -9490,13 +9565,18 @@ def _propose_label_matches(onus, customers):
     Returns (proposals, unmatched_onus, unmatched_customers).
 
     `onus` comes (transitively) from a job's stored result -- whatever JSON
-    an on-prem agent posted, with no shape validation (see
-    agent_post_result). Matching happens by MAC, so an entry that isn't a
-    dict, or has no 'mac_address', can't be matched to a customer by
-    definition; it's dropped here rather than raising, before any of the
-    matching logic below (which is unchanged) ever sees it.
+    an on-prem agent posted. Results are now validated at the boundary (see
+    agent_post_result / _validate_agent_result), but rows stored before that
+    validation existed can still be malformed, so this stays defensive.
+    Matching happens by MAC, so an entry that isn't a dict, has no
+    'mac_address', or whose 'mac_address' isn't a string (e.g. a colon-less
+    MAC parsed as an int) can't be matched to a customer by definition; it's
+    dropped here rather than raising, before any of the matching logic below
+    (which is unchanged) ever sees it -- in particular before the tie-break
+    sort below ever has to compare a 'mac_address' value against another,
+    which would raise if the two were of different types.
     """
-    onus = [o for o in onus if isinstance(o, dict) and o.get('mac_address')]
+    onus = [o for o in onus if isinstance(o, dict) and _normalize_mac(o.get('mac_address'))]
     candidates = []
     for onu in onus:
         onu_key = _normalize_label(onu.get('description'))
@@ -9593,15 +9673,16 @@ def get_onu_label_matches(device_id):
     }
     # Only ever propose for work still to be done: ONUs nobody is linked to,
     # and customers with no ONU yet. Normalise the ONU side the same way the
-    # customer side already is, rather than trusting the connector to always
-    # hand back lowercase MACs. The isinstance guard matters because
-    # job.result is whatever JSON an agent posted, with no shape validation
-    # (see agent_post_result) -- a non-dict entry would otherwise blow up on
-    # .get() here, before _propose_label_matches even gets a chance to skip
-    # it.
-    onus = [o for o in (job.result or [])
-            if isinstance(o, dict)
-            and (o.get('mac_address') or '').strip().lower() not in linked]
+    # customer side already is (via _normalize_mac, which also tolerates a
+    # non-string mac_address), rather than trusting the connector to always
+    # hand back lowercase string MACs. Results are validated at the boundary
+    # now (see agent_post_result), but this stays defensive for rows stored
+    # before that validation existed: a non-list job.result is treated as no
+    # ONUs at all rather than iterated, and a non-dict entry is dropped
+    # before .get() is called on it -- both would otherwise raise before
+    # _propose_label_matches even gets a chance to skip the entry itself.
+    onus = [o for o in (job.result if isinstance(job.result, list) else [])
+            if isinstance(o, dict) and _normalize_mac(o.get('mac_address')) not in linked]
     customers = tenant_query(Customer).filter(
         Customer.onu_mac_address.is_(None)).order_by(Customer.name).all()
 

@@ -208,6 +208,65 @@ def test_onu_entry_that_is_not_a_dict_survives_untouched(app, client, monkeypatc
     assert polled["result"][0] == "onu1"
 
 
+# --- Fix round 2: agent_post_result now validates a result's shape before
+# storing it (see _validate_agent_result), but pre-existing rows stored
+# before that validation existed can still carry the two newly-found
+# malformed shapes -- job.result itself not being a list, and a
+# mac_address that isn't a string. The read-path guards in
+# _resolve_onu_customers must degrade on both rather than raising. These
+# write the malformed value directly to job.result, bypassing validation,
+# exactly as a pre-existing row would look. ---
+
+def test_non_list_job_result_still_polls_cleanly(app, client, monkeypatch):
+    """job.result itself (not one entry) can be a non-list -- e.g. a stray
+    int -- on a row stored before validation existed. `for onu in
+    job.result` would raise TypeError; _resolve_onu_customers must treat
+    this as nothing to enrich and hand it back unchanged instead."""
+    hdr = make_tenant(client, "Tree P", "tree_p_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+
+    started = client.post(f"/api/network-tree/olt/{olt['id']}/refresh", headers=hdr).get_json()
+    job_id = started["job_id"]
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = 1  # not a list at all
+        appmod.db.session.commit()
+
+    resp = client.get(f"/api/network-jobs/{job_id}", headers=hdr)
+    assert resp.status_code == 200
+    assert resp.get_json()["result"] == 1
+
+
+def test_onu_entry_with_a_non_string_mac_address_still_polls_and_shows_the_onu(
+        app, client, monkeypatch):
+    """A plausible agent bug: a colon-less MAC parsed as a number. normalize_
+    mac's old (mac or '').strip() raised AttributeError on an int; it must
+    now treat a non-string mac_address the same as a missing one (empty
+    'customers', entry otherwise shown unchanged)."""
+    hdr = make_tenant(client, "Tree Q", "tree_q_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+
+    started = client.post(f"/api/network-tree/olt/{olt['id']}/refresh", headers=hdr).get_json()
+    job_id = started["job_id"]
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = [{"pon_port": "PON1", "description": "IntMac",
+                       "mac_address": 123456789012}]
+        appmod.db.session.commit()
+
+    resp = client.get(f"/api/network-jobs/{job_id}", headers=hdr)
+    assert resp.status_code == 200
+    polled = resp.get_json()
+    assert polled["result"][0]["customers"] == []
+    assert polled["result"][0]["description"] == "IntMac"
+
+
 def _walk_ids(nodes):
     """Flatten a tree's node ids (depth-first), duplicates and all -- used to
     assert both presence and uniqueness across the whole returned structure."""

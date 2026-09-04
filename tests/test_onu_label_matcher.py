@@ -536,3 +536,39 @@ def test_label_matches_job_id_for_a_non_olt_status_job_is_not_found(app, client)
         f"/api/network-tree/olt/{olt['id']}/label-matches?job_id={job_id}",
         headers=hdr)
     assert resp.status_code == 404
+
+
+# --- Fix round 2: a pre-existing row (stored before agent_post_result
+# validated shapes) can carry a mac_address that isn't a string at all --
+# e.g. a colon-less MAC parsed as an int. The old inline `(o.get(
+# 'mac_address') or '').strip()` in get_onu_label_matches, and
+# _propose_label_matches's own tie-break sort, both assumed a string. ---
+
+def test_label_matches_skips_an_onu_with_a_non_string_mac_address(app, client, monkeypatch):
+    hdr = make_tenant(client, "Match Z3", "match_z3_admin")
+    olt = setup_devices(client, hdr)
+    add_customer(app, "Match Z3", "Moussa Ghadir")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status",
+                        lambda d: (True, [onu("b4:64:15:3f:c1:94", "MoussaGhadir")]))
+
+    started = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                         headers=hdr).get_json()
+    job_id = started["job_id"]
+    assert job_id
+
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.result = [
+            {"description": "IntMac", "mac_address": 123456789012},  # non-string
+            onu("b4:64:15:3f:c1:94", "MoussaGhadir"),                  # well-formed
+        ]
+        appmod.db.session.commit()
+
+    resp = client.get(
+        f"/api/network-tree/olt/{olt['id']}/label-matches?job_id={job_id}",
+        headers=hdr)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["customer"]["name"] == "Moussa Ghadir"
