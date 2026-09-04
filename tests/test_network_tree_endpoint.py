@@ -223,3 +223,57 @@ def test_every_device_appears_exactly_once_despite_a_cycle(app, client):
     expected = [ccr["id"], olt["id"], cycle_a["id"], cycle_b["id"], healthy_leaf["id"]]
     assert sorted(ids) == sorted(expected)
     assert len(ids) == len(set(ids))
+
+
+def test_healthy_device_with_lower_id_nests_under_its_cycle_parent(app, client):
+    """Fix-round-2 regression: the second pass used to promote the lowest-id
+    *unvisited device* as a new root, without checking whether that device
+    was itself a cycle member or just a healthy device hanging off one. When
+    a healthy device's id is lower than its cycle-member parent's id, it got
+    promoted first and detached from its real parent -- reproduced here with
+    exactly the reviewer's counter-example: healthy id 1, cycle members with
+    higher ids. The healthy device must show up nested under its real parent
+    (a cycle member), never as a top-level root."""
+    hdr = make_tenant(client, "Tree L", "tree_l_admin")
+    healthy = make_ccr(client, hdr)   # lowest id
+    cycle_a = make_ccr(client, hdr)
+    cycle_b = make_ccr(client, hdr)   # highest id
+    with app.app_context():
+        h = appmod.NetworkDevice.query.filter_by(id=healthy["id"]).first()
+        a = appmod.NetworkDevice.query.filter_by(id=cycle_a["id"]).first()
+        b = appmod.NetworkDevice.query.filter_by(id=cycle_b["id"]).first()
+        h.parent_device_id = a.id
+        a.parent_device_id = b.id
+        b.parent_device_id = a.id
+        appmod.db.session.commit()
+
+    tree = client.get("/api/network-tree", headers=hdr).get_json()["tree"]
+    root_ids = [n["id"] for n in tree]
+    assert healthy["id"] not in root_ids, "healthy device must not be a spurious root"
+    a_node = next(n for n in tree if n["id"] == cycle_a["id"])
+    assert healthy["id"] in [c["id"] for c in a_node["children"]]
+
+
+def test_healthy_device_with_higher_id_nests_under_its_cycle_parent(app, client):
+    """Mirror of the test above with ids reversed -- the healthy device's id
+    is now higher than both cycle members'. Pins the nesting behaviour
+    independent of id ordering, rather than letting the suite accidentally
+    pass only because of which arrangement happened to be tested."""
+    hdr = make_tenant(client, "Tree M", "tree_m_admin")
+    cycle_a = make_ccr(client, hdr)   # lowest id
+    cycle_b = make_ccr(client, hdr)
+    healthy = make_ccr(client, hdr)   # highest id
+    with app.app_context():
+        a = appmod.NetworkDevice.query.filter_by(id=cycle_a["id"]).first()
+        b = appmod.NetworkDevice.query.filter_by(id=cycle_b["id"]).first()
+        h = appmod.NetworkDevice.query.filter_by(id=healthy["id"]).first()
+        a.parent_device_id = b.id
+        b.parent_device_id = a.id
+        h.parent_device_id = a.id
+        appmod.db.session.commit()
+
+    tree = client.get("/api/network-tree", headers=hdr).get_json()["tree"]
+    root_ids = [n["id"] for n in tree]
+    assert healthy["id"] not in root_ids, "healthy device must not be a spurious root"
+    a_node = next(n for n in tree if n["id"] == cycle_a["id"])
+    assert healthy["id"] in [c["id"] for c in a_node["children"]]

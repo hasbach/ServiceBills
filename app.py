@@ -7783,8 +7783,23 @@ def _build_device_tree(devices):
     (this is what makes a cycle terminate instead of being walked
     forever); and afterwards, any device the walk never reached --
     necessarily a cycle member, or hanging off one -- is promoted to an
-    additional root, in ascending id order so the result is deterministic
-    across runs regardless of set/dict iteration order.
+    additional root.
+
+    That promotion must promote a genuine cycle *member*, never merely an
+    unvisited device that happens to hang off one: a healthy device can
+    have a lower id than the cycle it's parented by (e.g. an older device
+    gets reparented onto a newer one via PUT), and naively promoting
+    "lowest unvisited id" would promote that healthy device first,
+    detaching it from its real parent -- it would render as a spurious
+    root instead of nesting where its own data says it belongs. So for
+    each still-unvisited device, in ascending id order, `_find_cycle_member`
+    walks up its parent chain to find the id that repeats -- a real cycle
+    member -- and that member is what gets promoted and rendered.
+    Rendering from a cycle member reaches everything hanging off it too
+    (via `children_of`), so the healthy device still ends up correctly
+    nested. The ascending-id iteration order (and the `sorted(...,
+    key=lambda d: d.id)` it uses) is what keeps the whole result
+    deterministic across runs regardless of set/dict iteration order.
     """
     by_id = {d.id: d for d in devices}
     children_of = {}
@@ -7809,16 +7824,57 @@ def _build_device_tree(devices):
     tree = [node(device) for device in roots]
 
     # Anything still unvisited only exists inside a same-tenant cycle (or
-    # hangs off one) -- promote it so it isn't lost. Recheck `visited` at
-    # each step (not a snapshot taken before this loop): rendering one
-    # promoted device walks and marks its whole cyclic component, so later
-    # members of that same component are skipped here rather than
-    # re-rendered as a second, duplicate root.
+    # hangs off one) -- promote the cycle member itself (see docstring),
+    # not the unvisited device as found. Recheck `visited` at each step
+    # (not a snapshot taken before this loop): rendering one promoted
+    # cycle member walks and marks its whole component -- cycle members
+    # and any healthy devices hanging off them alike -- so later members
+    # of that same component are skipped here rather than re-rendered as
+    # a second, duplicate root.
     for device in sorted(devices, key=lambda d: d.id):
-        if device.id not in visited:
-            tree.append(node(device))
+        if device.id in visited:
+            continue
+        cycle_member = _find_cycle_member(device, by_id)
+        if cycle_member.id not in visited:
+            tree.append(node(cycle_member))
 
     return tree
+
+
+def _find_cycle_member(device, by_id):
+    """Walk up `device`'s parent chain to find a genuine same-tenant cycle
+    member.
+
+    Only called from `_build_device_tree`'s second pass, on a device that
+    is still unvisited after the first pass has rendered every real root's
+    subtree. That chain can never reach a real root: if it did, rendering
+    that root in the first pass would already have walked down through
+    every link in the chain -- including this device -- via `children_of`,
+    marking it visited. So the chain must instead loop back on some node
+    already seen during *this* walk; that repeated id is a true cycle
+    member, and it's what the caller should render from so that this
+    device (and anything else hanging off the same cycle) ends up nested
+    under it correctly instead of being promoted as a spurious root.
+
+    Bounded to `len(by_id) + 1` steps so a bug elsewhere can never turn
+    this into an infinite loop: with that many distinct ids in play, the
+    walk must either repeat an id or fall off the map within that many
+    hops. The off-the-map checks mirror the first pass's root test
+    (`None` parent, self-parent, or a parent absent from `by_id`) and are
+    unreachable in practice given the invariant above -- they exist only
+    as a defensive fallback, not a path this function relies on.
+    """
+    seen = set()
+    current = device
+    for _ in range(len(by_id) + 1):
+        if current.id in seen:
+            return current
+        seen.add(current.id)
+        parent_id = current.parent_device_id
+        if parent_id is None or parent_id == current.id or parent_id not in by_id:
+            return current
+        current = by_id[parent_id]
+    return current
 
 
 def _resolve_onu_customers(onus):
