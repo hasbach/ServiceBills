@@ -8066,18 +8066,22 @@ def apply_onu_label_matches(device_id):
     # in-memory mutations to the DB on the next SELECT even though we meant
     # to reject the whole batch -- resolve and check everything first, so a
     # bad entry anywhere in the list can never leave an earlier one applied.
-    resolved = []
-    for link in links:
-        mac = (link.get('mac_address') or '').strip().lower()
-        if not mac:
-            return jsonify({'error': 'Every link needs a mac_address'}), 400
-        customer = tenant_query(Customer).filter_by(id=link.get('customer_id')).first()
-        if not customer:
-            return jsonify({'error': 'customer_id {} is not in this tenant'.format(
-                link.get('customer_id'))}), 400
-        resolved.append((customer, mac))
-
+    # Both the resolve pass and the mutate pass live under one try/except so
+    # a malformed entry (not a dict, a non-string mac_address, etc.) still
+    # gets caught and turned into a clean 400 instead of an unhandled 500 --
+    # it just does so before any Customer attribute has been touched.
     try:
+        resolved = []
+        for link in links:
+            mac = (link.get('mac_address') or '').strip().lower()
+            if not mac:
+                return jsonify({'error': 'Every link needs a mac_address'}), 400
+            customer = tenant_query(Customer).filter_by(id=link.get('customer_id')).first()
+            if not customer:
+                return jsonify({'error': 'customer_id {} is not in this tenant'.format(
+                    link.get('customer_id'))}), 400
+            resolved.append((customer, mac))
+
         for customer, mac in resolved:
             customer.onu_mac_address = mac
         db.session.commit()

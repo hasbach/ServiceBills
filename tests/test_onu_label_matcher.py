@@ -269,3 +269,51 @@ def test_apply_refuses_non_olt_device(app, client):
     r = client.post(f"/api/network-tree/olt/{ccr['id']}/label-matches/apply",
                     headers=hdr, json={"links": []})
     assert r.status_code == 400
+
+
+# --- /apply must 400 cleanly on a malformed link entry, not crash ---
+# (fix round 1 moved validation ahead of the mutation pass but outside the
+# try/except that used to catch exactly these shapes)
+
+def test_apply_rejects_non_dict_link_entry(app, client):
+    """A links list whose first entry is valid and whose second entry isn't
+    even a dict (e.g. a stray string) must 400 cleanly -- not raise an
+    unhandled AttributeError from calling .get() on a str -- and the valid
+    entry must not be applied."""
+    hdr = make_tenant(client, "Match Q", "match_q_admin")
+    olt = setup_devices(client, hdr)
+    valid = add_customer(app, "Match Q", "Valid Customer")
+    r = client.post(f"/api/network-tree/olt/{olt['id']}/label-matches/apply",
+                    headers=hdr,
+                    json={"links": [
+                        {"customer_id": valid, "mac_address": "aa:bb:cc:dd:ee:20"},
+                        "not-a-dict",
+                    ]})
+    assert r.status_code == 400
+    with app.app_context():
+        assert appmod.Customer.query.filter_by(id=valid).first().onu_mac_address is None
+
+
+def test_apply_rejects_null_link_entry(app, client):
+    """A links list containing a bare null must 400 cleanly -- not raise an
+    unhandled AttributeError from calling .get() on None."""
+    hdr = make_tenant(client, "Match R", "match_r_admin")
+    olt = setup_devices(client, hdr)
+    r = client.post(f"/api/network-tree/olt/{olt['id']}/label-matches/apply",
+                    headers=hdr, json={"links": [None]})
+    assert r.status_code == 400
+
+
+def test_apply_rejects_non_string_mac_address(app, client):
+    """A mac_address that isn't a string (e.g. a bare int) must 400 cleanly
+    -- not raise an unhandled AttributeError from calling .strip() on an
+    int -- and the targeted customer must not be linked."""
+    hdr = make_tenant(client, "Match S", "match_s_admin")
+    olt = setup_devices(client, hdr)
+    customer = add_customer(app, "Match S", "Someone")
+    r = client.post(f"/api/network-tree/olt/{olt['id']}/label-matches/apply",
+                    headers=hdr,
+                    json={"links": [{"customer_id": customer, "mac_address": 123}]})
+    assert r.status_code == 400
+    with app.app_context():
+        assert appmod.Customer.query.filter_by(id=customer).first().onu_mac_address is None
