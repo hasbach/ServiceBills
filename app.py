@@ -7759,6 +7759,86 @@ def set_network_device_interface_label(device_id):
     db.session.commit()
     return jsonify({'device': device.to_dict()}), 200
 
+def _build_device_tree(devices):
+    """Nest a flat device list by parent_device_id.
+
+    Any device whose parent is missing (deleted, or another tenant's) is
+    promoted to a root rather than dropped -- a broken link must not make
+    hardware silently vanish from the page.
+    """
+    by_id = {d.id: d for d in devices}
+    children_of = {}
+    roots = []
+    for device in devices:
+        parent_id = device.parent_device_id
+        if parent_id is None or parent_id not in by_id:
+            roots.append(device)
+        else:
+            children_of.setdefault(parent_id, []).append(device)
+
+    def node(device):
+        return {
+            **device.to_dict(),
+            'children': [node(child) for child in children_of.get(device.id, [])],
+        }
+
+    return [node(device) for device in roots]
+
+
+def _resolve_onu_customers(onus):
+    """Attach the customers sitting behind each ONU, matched on MAC.
+
+    Many customers can share one ONU (transparent bridges), so this is a
+    one-to-many attach, and an ONU with no match keeps an empty list rather
+    than being filtered out.
+    """
+    wanted = {onu['mac_address'] for onu in onus}
+    matches = {}
+    if wanted:
+        rows = tenant_query(Customer).filter(Customer.onu_mac_address.isnot(None)).all()
+        for customer in rows:
+            key = (customer.onu_mac_address or '').strip().lower()
+            if key in wanted:
+                matches.setdefault(key, []).append({
+                    'id': customer.id,
+                    'name': customer.name,
+                    'is_subscription_active': bool(customer.is_subscription_active),
+                })
+    return [
+        {**onu, 'customers': matches.get(onu['mac_address'], [])}
+        for onu in onus
+    ]
+
+
+@app.route('/api/network-tree', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_network_tree():
+    """The device skeleton only -- no device is contacted here. Live ONU data
+    is fetched per-OLT, on demand, via the refresh endpoint below."""
+    devices = tenant_query(NetworkDevice).order_by(NetworkDevice.name).all()
+    return jsonify({'tree': _build_device_tree(devices)}), 200
+
+
+@app.route('/api/network-tree/olt/<int:device_id>/refresh', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def refresh_olt_onus(device_id):
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Network device not found!'}), 404
+    if device.device_type != 'vsol_olt':
+        return jsonify({'error': 'That device is not an OLT'}), 400
+    ok, result = _get_olt_status_core(
+        device, block=True, timeout=_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS)
+    db.session.commit()  # persists last_checked_at/last_status
+    if not ok:
+        return jsonify({'ok': False, 'message': result, 'onus': None,
+                        'device': device.to_dict()}), 200
+    return jsonify({'ok': True, 'message': None,
+                    'onus': _resolve_onu_customers(result),
+                    'device': device.to_dict()}), 200
+
 # --- Live actions on a customer's PPPoE secret (Concept B). Staff-triggered
 # only -- nothing in the app calls these automatically off a billing rule. ---
 
