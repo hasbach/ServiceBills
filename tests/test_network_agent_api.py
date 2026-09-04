@@ -405,6 +405,110 @@ def test_a_non_dict_json_body_is_rejected(app, client):
         job = appmod.NetworkAgentJob.query.get(job_id)
         assert job.status == "done"
         assert job.result is None
+        assert job.error == (
+            "Malformed request body from agent: expected a JSON object")
+
+
+# --- Fix round 4: `data = request.json or {}` ran the `or {}` fallback
+# *before* the isinstance(dict) check ever saw the raw value, so a *falsy*
+# non-object body -- [], false, 0 -- was silently coerced to {}, passed the
+# check, and fell through to `data.get('ok')` (falsy) for a quiet 200 with
+# "The agent reported a failure" instead of the 400 every other malformed
+# body shape gets (see test_a_non_dict_json_body_is_rejected, above, whose
+# list body happens to be truthy and so was never affected). A missing body
+# (None) must still default to {} exactly as before. ---
+
+def test_an_empty_list_json_body_is_rejected(app, client):
+    make_tenant(client, "Api W", "api_w_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api W")
+    job_id = make_job(app, tenant_id, device_id)
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token), json=[])
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error == (
+            "Malformed request body from agent: expected a JSON object")
+
+
+def test_a_false_json_body_is_rejected(app, client):
+    make_tenant(client, "Api X", "api_x_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api X")
+    job_id = make_job(app, tenant_id, device_id)
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token), json=False)
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error == (
+            "Malformed request body from agent: expected a JSON object")
+
+
+def test_a_zero_json_body_is_rejected(app, client):
+    make_tenant(client, "Api Y", "api_y_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api Y")
+    job_id = make_job(app, tenant_id, device_id)
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token), json=0)
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error == (
+            "Malformed request body from agent: expected a JSON object")
+
+
+# --- Fix round 4: an unbounded olt_status description passed validation (it
+# is a str) and reached difflib.SequenceMatcher once per unlinked customer on
+# every GET .../label-matches?job_id= poll of this job. SequenceMatcher is
+# roughly O(len(a)*len(b)), and production runs a single synchronous gunicorn
+# worker, so a megabyte-scale description would block the whole app for the
+# duration of each such request, permanently, since the job is terminal --
+# the same "one payload wedges one job forever" shape as the crash cases
+# above, here as a CPU/timeout wedge instead of an exception. ---
+
+def test_olt_status_description_at_the_cap_is_accepted(app, client):
+    make_tenant(client, "Api Z", "api_z_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api Z")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    onus = [{"mac_address": "b4:64:15:3f:c1:94",
+             "description": "x" * appmod._MAX_OLT_DESCRIPTION_LENGTH}]
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": onus, "error": None})
+    assert r.status_code == 200
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.error is None
+        assert job.result == onus
+
+
+def test_olt_status_description_over_the_cap_is_rejected(app, client):
+    make_tenant(client, "Api AA", "api_aa_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api AA")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    onus = [{"mac_address": "b4:64:15:3f:c1:94",
+             "description": "x" * (appmod._MAX_OLT_DESCRIPTION_LENGTH + 1)}]
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": onus, "error": None})
+    assert r.status_code == 400
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result is None
+        assert job.error and "olt_status" in job.error
 
 
 def test_a_regenerated_token_invalidates_the_old_one(app, client):

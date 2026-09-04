@@ -9279,6 +9279,21 @@ def agent_poll_job():
     }), 200
 
 
+# Real OLT labels captured off actual devices are short, customer-name-
+# derived strings ("MoussaGhadir", "hezb_arabi_office") -- a few hundred
+# characters is far above anything legitimate. Bounding it here matters
+# because _propose_label_matches runs difflib.SequenceMatcher(onu_key,
+# customer_key) once per unlinked customer on every GET
+# .../label-matches?job_id= poll of this job (SequenceMatcher is roughly
+# O(len(a)*len(b))), and production runs a single synchronous gunicorn
+# worker. A megabyte-scale description would block the entire app for the
+# duration of each such request, permanently, since the job is terminal
+# and this never self-heals -- the same "one payload wedges one job
+# forever" shape fix round 3 closed for crashes, here as a CPU/timeout
+# wedge instead.
+_MAX_OLT_DESCRIPTION_LENGTH = 500
+
+
 def _validate_agent_result(operation, result):
     """Check a posted result matches the shape its operation is contracted
     to return, before agent_post_result ever stores it.
@@ -9323,6 +9338,12 @@ def _validate_agent_result(operation, result):
             description = entry.get('description')
             if description is not None and not isinstance(description, str):
                 return 'every ONU entry description must be a string or null'
+            # Fix round 4: an unbounded description is still a str, so it
+            # passed the check above and reached SequenceMatcher on every
+            # label-matches poll -- see _MAX_OLT_DESCRIPTION_LENGTH.
+            if description is not None and len(description) > _MAX_OLT_DESCRIPTION_LENGTH:
+                return 'every ONU entry description must be at most {} characters'.format(
+                    _MAX_OLT_DESCRIPTION_LENGTH)
         return None
     if operation == 'device_health':
         if not isinstance(result, dict):
@@ -9360,20 +9381,29 @@ def agent_post_result(job_id):
         db.session.commit()
         return jsonify({'error': 'Job is {}, not claimed'.format(job.status)}), 409
 
-    data = request.json or {}
+    data = request.json
     job.status = 'done'
     job.finished_at = datetime.utcnow()
-    if not isinstance(data, dict):
+    if data is not None and not isinstance(data, dict):
         # Fix round 3: valid JSON that isn't an object (e.g. a bare list)
         # made data.get('ok') below raise AttributeError -> 500, instead of
         # the 400 this boundary is supposed to return for any malformed
         # agent payload. Mirrors the malformed-result branch immediately
         # below: job goes terminal with no stored result and a descriptive
         # error, agent gets a 400 so a broken build surfaces in its own logs.
+        #
+        # Fix round 4: this check used to run against `request.json or {}`,
+        # so a *falsy* non-object body ([], 0, false, "") was coerced to {}
+        # before the isinstance check ever saw it, and fell through to a
+        # silent 200 "agent reported a failure" instead of the 400 every
+        # other malformed shape gets. Checking the raw value first, and only
+        # defaulting a genuinely absent body (None) to {} afterwards, closes
+        # that gap without changing behavior for a missing body.
         job.result = None
         job.error = 'Malformed request body from agent: expected a JSON object'
         db.session.commit()
         return jsonify({'error': job.error}), 400
+    data = data or {}
     if data.get('ok'):
         result = data.get('result')
         problem = _validate_agent_result(job.operation, result)
