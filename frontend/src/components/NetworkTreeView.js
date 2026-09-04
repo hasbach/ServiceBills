@@ -10,6 +10,7 @@ import {
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
 import OnuLabelMatcherDialog from './OnuLabelMatcherDialog';
+import pollNetworkJob from './pollNetworkJob';
 import { STATUS_COLOR, STATUS_LABEL, NOT_CHECKED } from './deviceStatus';
 
 // ONU-level status is only ever 'online'/'offline' (see vsol_olt.py
@@ -67,16 +68,21 @@ const NetworkTreeView = () => {
         setErrorByDevice((prev) => ({ ...prev, [device.id]: null }));
         try {
             const res = await apiService.refreshOltOnus(device.id);
-            // A newer refresh for this same device has started since this
-            // request went out -- this response is stale, discard it silently.
-            if (refreshSeqRef.current[device.id] !== seq) return;
-            if (res.data.ok) {
-                setOnusByDevice((prev) => ({ ...prev, [device.id]: res.data.onus }));
-                setExpanded((prev) => ({ ...prev, [device.id]: true }));
+            if (!res.data.ok) {
+                if (refreshSeqRef.current[device.id] === seq) {
+                    setErrorByDevice((prev) => ({ ...prev, [device.id]: res.data.message }));
+                }
             } else {
-                setErrorByDevice((prev) => ({ ...prev, [device.id]: res.data.message }));
+                const job = await pollNetworkJob(res.data.job_id);
+                if (refreshSeqRef.current[device.id] === seq) {
+                    if (job.status === 'done' && !job.error) {
+                        setOnusByDevice((prev) => ({ ...prev, [device.id]: job.result }));
+                        setExpanded((prev) => ({ ...prev, [device.id]: true }));
+                    } else {
+                        setErrorByDevice((prev) => ({ ...prev, [device.id]: job.error }));
+                    }
+                }
             }
-            loadTree(false);  // background sync to pick up the new last_status/last_checked_at
         } catch (e) {
             if (refreshSeqRef.current[device.id] !== seq) return;
             setErrorByDevice((prev) => ({ ...prev, [device.id]: 'Request failed' }));
@@ -108,7 +114,7 @@ const NetworkTreeView = () => {
                 )}
             </Stack>
             <Box sx={{ pl: 2, pt: 0.5 }}>
-                {onu.customers.length === 0 ? (
+                {(onu.customers || []).length === 0 ? (
                     <Typography variant="caption" color="text.secondary">
                         No customer linked to this ONU
                     </Typography>

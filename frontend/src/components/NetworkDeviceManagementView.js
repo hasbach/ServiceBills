@@ -12,6 +12,7 @@ import {
     NetworkCheck as CheckNowIcon
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
+import pollNetworkJob from './pollNetworkJob';
 import { STATUS_COLOR, STATUS_LABEL, NOT_CHECKED } from './deviceStatus';
 
 // A network device the tenant owns (starting with a core CCR), monitored for
@@ -94,25 +95,29 @@ const NetworkDeviceManagementView = () => {
         setHealthDialogOpen(true);
         try {
             const response = await apiService.checkNetworkDeviceNow(device.id);
-            const { ok, message, health: healthResult, onus, device: updatedDevice } = response.data;
+            const { ok, message, job_id, device: updatedDevice } = response.data;
             setDevices(prev => prev.map(d => d.id === device.id ? updatedDevice : d));
-            if (ok) {
-                if (device.device_type === 'vsol_olt') {
-                    // For a vsol_olt, check-now returns health: null and the
-                    // ONU list under `onus` instead -- there's no
-                    // interface-label workflow for this device type, so we
-                    // don't touch labelDrafts/health at all here.
-                    setOnuResult(onus || []);
-                } else {
-                    setHealth(healthResult);
-                    const drafts = {};
-                    // Defensive: degrade to no drafts rather than throwing if
-                    // a future response shape omits interfaces.
-                    healthResult?.interfaces?.forEach(iface => { drafts[iface.name] = iface.label || ''; });
-                    setLabelDrafts(drafts);
-                }
-            } else {
+            if (!ok) {
                 setHealthError(message);
+                return;
+            }
+            const job = await pollNetworkJob(job_id);
+            if (job.status !== 'done' || job.error) {
+                setHealthError(job.error || 'Check failed');
+                return;
+            }
+            if (device.device_type === 'vsol_olt') {
+                // For a vsol_olt, the job result is the ONU list itself --
+                // there's no interface-label workflow for this device type,
+                // so we don't touch labelDrafts/health at all here.
+                setOnuResult(job.result || []);
+            } else {
+                setHealth(job.result);
+                const drafts = {};
+                // Defensive: degrade to no drafts rather than throwing if the
+                // result shape omits interfaces.
+                job.result?.interfaces?.forEach(iface => { drafts[iface.name] = iface.label || ''; });
+                setLabelDrafts(drafts);
             }
         } catch (err) {
             setHealthError(err.response?.data?.message || 'Check failed');

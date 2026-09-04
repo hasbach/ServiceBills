@@ -5,6 +5,7 @@ import {
     Chip, CircularProgress, Alert, Paper,
 } from '@mui/material';
 import { apiService, useAppContext } from '../context/AppContext';
+import pollNetworkJob from './pollNetworkJob';
 
 const OnuLabelMatcherDialog = ({ device, onClose, onApplied }) => {
     const { setSnackbar } = useAppContext();
@@ -21,7 +22,22 @@ const OnuLabelMatcherDialog = ({ device, onClose, onApplied }) => {
         (async () => {
             setLoading(true);
             try {
-                const res = await apiService.fetchOnuLabelMatches(device.id);
+                const started = await apiService.fetchOnuLabelMatches(device.id);
+                if (cancelled) return;
+                if (!started.data.ok) {
+                    setError(started.data.message);
+                    return;
+                }
+                // The initial call only starts the walk (empty proposals) --
+                // poll the job it created, then re-fetch with ?job_id= to get
+                // the real proposals computed from that job's result.
+                const job = await pollNetworkJob(started.data.job_id);
+                if (cancelled) return;
+                if (job.status !== 'done' || job.error) {
+                    setError(job.error || 'Failed to load label matches');
+                    return;
+                }
+                const res = await apiService.fetchOnuLabelMatchesForJob(device.id, started.data.job_id);
                 if (cancelled) return;
                 if (!res.data.ok) {
                     setError(res.data.message);
