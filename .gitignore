@@ -66,3 +66,6 @@ frontend/build.zip
 
 # Local git worktrees (scratch, not tracked)
 .worktrees/
+
+# Subagent-driven-development scratch (progress ledger, task briefs, reports)
+.superpowers/
