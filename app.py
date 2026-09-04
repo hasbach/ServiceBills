@@ -8978,29 +8978,13 @@ def check_network_device_now(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
         return jsonify({'message': 'Network device not found!'}), 404
-
-    if device.device_type == 'vsol_olt':
-        ok, result = _get_olt_status_core(
-            device, block=True, timeout=_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS)
-        db.session.commit()  # persists last_checked_at/last_status
-        if not ok:
-            return jsonify({'ok': False, 'message': result, 'health': None,
-                            'onus': None, 'device': device.to_dict()}), 200
-        return jsonify({'ok': True, 'message': None, 'health': None,
-                        'onus': result, 'device': device.to_dict()}), 200
-
-    ok, result = mikrotik.get_device_health(device)
-    db.session.commit()  # persists last_checked_at/last_status set by get_device_health
-    if not ok:
-        return jsonify({'ok': False, 'message': result, 'health': None,
-                        'onus': None, 'device': device.to_dict()}), 200
-    labels = device.interface_labels or {}
-    health = dict(result)
-    health['interfaces'] = [
-        {**iface, 'label': labels.get(iface['name'])} for iface in result['interfaces']
-    ]
-    return jsonify({'ok': True, 'message': None, 'health': health,
-                    'onus': None, 'device': device.to_dict()}), 200
+    operation = 'olt_status' if device.device_type == 'vsol_olt' else 'device_health'
+    job, error = _create_device_job(device, operation)
+    if error:
+        return jsonify({'ok': False, 'message': error, 'job_id': None,
+                        'device': device.to_dict()}), 200
+    return jsonify({'ok': True, 'message': None, 'job_id': job.id,
+                    'device': device.to_dict()}), 200
 
 @app.route('/api/network-devices/<int:device_id>/interface-labels', methods=['PATCH'])
 @jwt_required()
@@ -9291,6 +9275,107 @@ def agent_post_result(job_id):
         job.error = data.get('error') or 'The agent reported a failure'
     db.session.commit()
     return jsonify({'message': 'Recorded'}), 200
+
+
+# A pending job nobody claimed within this window is expired; a claimed job
+# with no result within this one is failed (the agent probably died mid-walk).
+JOB_CLAIM_TIMEOUT_SECONDS = 30
+JOB_RESULT_TIMEOUT_SECONDS = 120
+
+
+def _expire_job_if_stale(job):
+    """Lazy expiry, evaluated when a job is read. Deliberately not a scheduled
+    task: the in-process APScheduler fires during `flask db upgrade` on deploy,
+    and this path must not depend on it."""
+    now = datetime.utcnow()
+    if job.status == 'pending' and job.created_at:
+        if (now - job.created_at).total_seconds() > JOB_CLAIM_TIMEOUT_SECONDS:
+            job.status = 'expired'
+            job.error = 'The agent did not pick this up. Is it still running?'
+            job.finished_at = now
+            db.session.commit()
+    elif job.status == 'claimed' and job.claimed_at:
+        if (now - job.claimed_at).total_seconds() > JOB_RESULT_TIMEOUT_SECONDS:
+            job.status = 'failed'
+            job.error = 'The agent claimed this check but never reported back.'
+            job.finished_at = now
+            db.session.commit()
+    return job
+
+
+def _run_device_operation_direct(device, operation, params):
+    """Run a connector in this process. Only reached in 'direct' mode, which is
+    how local development and every non-agent tenant work."""
+    params = params or {}
+    if operation == 'olt_status':
+        return _get_olt_status_core(
+            device, block=True, timeout=_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS)
+    if operation == 'device_health':
+        return mikrotik.get_device_health(device)
+    if operation == 'test_connection':
+        return mikrotik.test_connection(device)
+    if operation == 'secret_status':
+        return mikrotik.get_secret_status(device, params.get('pppoe_username'))
+    if operation == 'active_session':
+        return mikrotik.get_active_session(device, params.get('pppoe_username'))
+    return False, 'Unsupported operation: {}'.format(operation)
+
+
+def _tenant_access_mode():
+    settings = tenant_query(BusinessSettings).first()
+    return (settings.network_access_mode if settings else None) or 'direct'
+
+
+def _create_device_job(device, operation, params=None):
+    """Create a job for this device operation.
+
+    Returns (job, None) on success or (None, message) when the work cannot be
+    accepted. In 'direct' mode the connector runs inline and the returned job
+    is already terminal, so callers -- and the frontend -- have one shape.
+    """
+    if operation not in AGENT_OPERATIONS:
+        return None, 'Unsupported operation: {}'.format(operation)
+
+    # No current_user_obj() helper exists in this codebase; resolve the acting
+    # user the same way every other endpoint does. This field is informational
+    # only, so a lookup miss (e.g. no JWT in scope) must never block the job.
+    current_username = get_jwt_identity()
+    current_user = User.query.filter_by(username=current_username).first() if current_username else None
+
+    job = NetworkAgentJob(
+        tenant_id=device.tenant_id, device_id=device.id,
+        operation=operation, params=params or {},
+        requested_by_user_id=current_user.id if current_user else None,
+    )
+
+    if _tenant_access_mode() != 'agent':
+        ok, value = _run_device_operation_direct(device, operation, params)
+        job.status = 'done'
+        job.finished_at = datetime.utcnow()
+        job.result = value if ok else None
+        job.error = None if ok else value
+        db.session.add(job)
+        db.session.commit()
+        return job, None
+
+    agent = tenant_query(NetworkAgent).first()
+    if not agent or not agent.is_online():
+        last = agent.last_seen_at.strftime('%Y-%m-%d %H:%M:%S') if (agent and agent.last_seen_at) else 'never'
+        return None, 'Agent offline (last seen {}). Start the agent on your network and try again.'.format(last)
+
+    db.session.add(job)
+    db.session.commit()
+    return job, None
+
+
+@app.route('/api/network-jobs/<int:job_id>', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_network_job(job_id):
+    job = tenant_query(NetworkAgentJob).filter_by(id=job_id).first()
+    if not job:
+        return jsonify({'message': 'Job not found'}), 404
+    return jsonify(_expire_job_if_stale(job).to_dict()), 200
 
 
 @app.route('/api/network-tree', methods=['GET'])

@@ -103,6 +103,8 @@ def test_deleting_a_parent_reparents_its_children(app, client):
 
 
 def test_check_now_on_an_olt_returns_onus_not_health(app, client, monkeypatch):
+    """check-now now only returns a job_id; the OLT's onu list (not a health
+    payload) shows up as the job's result once polled."""
     hdr = make_tenant(client, "Api H", "api_h_admin")
     ccr = make_ccr(client, hdr)
     olt = make_olt(client, hdr, ccr["id"])
@@ -116,13 +118,17 @@ def test_check_now_on_an_olt_returns_onus_not_health(app, client, monkeypatch):
     assert r.status_code == 200
     body = r.get_json()
     assert body["ok"] is True
-    assert body["health"] is None
-    assert len(body["onus"]) == 2
-    assert body["onus"][0]["description"] == "MoussaGhadir"
     assert body["device"]["last_status"] == "online"
+
+    polled = client.get(f"/api/network-jobs/{body['job_id']}", headers=hdr).get_json()
+    assert polled["status"] == "done"
+    assert len(polled["result"]) == 2
+    assert polled["result"][0]["description"] == "MoussaGhadir"
 
 
 def test_check_now_on_an_olt_surfaces_failure_without_raising(app, client, monkeypatch):
+    """The connector failure is direct mode's job running inline -- check-now
+    itself still succeeds (a job was created); the failure lands in the job."""
     hdr = make_tenant(client, "Api I", "api_i_admin")
     ccr = make_ccr(client, hdr)
     olt = make_olt(client, hdr, ccr["id"])
@@ -131,9 +137,11 @@ def test_check_now_on_an_olt_surfaces_failure_without_raising(app, client, monke
     r = client.post(f"/api/network-devices/{olt['id']}/check-now", headers=hdr)
     assert r.status_code == 200
     body = r.get_json()
-    assert body["ok"] is False
-    assert body["onus"] is None
-    assert "timeout" in body["message"]
+    assert body["ok"] is True
+
+    polled = client.get(f"/api/network-jobs/{body['job_id']}", headers=hdr).get_json()
+    assert polled["status"] == "done"
+    assert "timeout" in polled["error"]
 
 
 def test_check_now_on_a_ccr_still_returns_health(app, client, monkeypatch):
@@ -147,8 +155,10 @@ def test_check_now_on_a_ccr_still_returns_health(app, client, monkeypatch):
     r = client.post(f"/api/network-devices/{ccr['id']}/check-now", headers=hdr)
     body = r.get_json()
     assert body["ok"] is True
-    assert body["onus"] is None
-    assert body["health"]["identity"] == "CCR"
+
+    polled = client.get(f"/api/network-jobs/{body['job_id']}", headers=hdr).get_json()
+    assert polled["status"] == "done"
+    assert polled["result"]["identity"] == "CCR"
 
 
 def test_olt_semaphore_returns_clear_error_when_exhausted(app, client, monkeypatch):
@@ -160,8 +170,11 @@ def test_olt_semaphore_returns_clear_error_when_exhausted(app, client, monkeypat
     try:
         r = client.post(f"/api/network-devices/{olt['id']}/check-now", headers=hdr)
         body = r.get_json()
-        assert body["ok"] is False
-        assert "Too many OLT checks" in body["message"]
+        assert body["ok"] is True  # job created; the semaphore failure is inside it
+
+        polled = client.get(f"/api/network-jobs/{body['job_id']}", headers=hdr).get_json()
+        assert polled["status"] == "done"
+        assert "Too many OLT checks" in polled["error"]
     finally:
         appmod._olt_check_semaphore.release()
 
