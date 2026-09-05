@@ -23,7 +23,15 @@ const onuStatusColor = (status) => (status === 'online' ? 'success' : 'error');
 const NetworkTreeView = () => {
     // apiService is a direct module export here, not part of the hook's value
     // -- same as NetworkDeviceManagementView.
-    const { setSnackbar } = useAppContext();
+    const { setSnackbar, user } = useAppContext();
+    // 'employee'/'collector' can read this page (see NAV_ITEMS in App.js) but
+    // must not reach the label matcher, which rewrites Customer.onu_mac_address.
+    // Same comma-separated role string App.js parses; the endpoints behind the
+    // matcher enforce this too, so this only avoids offering a button that
+    // would 403.
+    const canEditLinks = (user?.role || '').split(',')
+        .map((r) => r.trim().toLowerCase())
+        .some((r) => r === 'admin' || r === 'finance');
     const [tree, setTree] = useState([]);
     const [loading, setLoading] = useState(true);
     const [onusByDevice, setOnusByDevice] = useState({});
@@ -188,9 +196,20 @@ const NetworkTreeView = () => {
                         No customer linked to this ONU
                     </Typography>
                 ) : onu.customers.map((c) => (
-                    <Stack key={c.id} direction="row" spacing={0.5} alignItems="center">
+                    <Stack key={c.id} direction="row" spacing={0.5} alignItems="center" flexWrap="wrap">
                         <PersonIcon fontSize="inherit" color="action" />
                         <Typography variant="body2">{c.name}</Typography>
+                        {/* The MAC this customer is linked BY, as stored on
+                            the customer record. Usually identical to the
+                            ONU's own MAC above; when it isn't (different
+                            case or separators -- they only have to agree
+                            after normalization) this is what shows it. */}
+                        {c.onu_mac_address && (
+                            <Typography variant="caption" color="text.secondary"
+                                sx={{ fontFamily: 'monospace' }}>
+                                {c.onu_mac_address}
+                            </Typography>
+                        )}
                         {!c.is_subscription_active && (
                             <Chip size="small" color="warning" variant="outlined" label="inactive" />
                         )}
@@ -231,15 +250,17 @@ const NetworkTreeView = () => {
                         <Box sx={{ flexGrow: 1 }} />
                         {isOlt && (
                             <>
-                                <Tooltip title={agentOffline ? agentOfflineReason : ''}>
-                                    <span>
-                                        <Button size="small" startIcon={<LinkIcon />}
-                                            disabled={agentOffline}
-                                            onClick={() => setMatcherDevice(device)}>
-                                            Match Labels
-                                        </Button>
-                                    </span>
-                                </Tooltip>
+                                {canEditLinks && (
+                                    <Tooltip title={agentOffline ? agentOfflineReason : ''}>
+                                        <span>
+                                            <Button size="small" startIcon={<LinkIcon />}
+                                                disabled={agentOffline}
+                                                onClick={() => setMatcherDevice(device)}>
+                                                Match Labels
+                                            </Button>
+                                        </span>
+                                    </Tooltip>
+                                )}
                                 <Tooltip title={agentOffline ? agentOfflineReason : ''}>
                                     <span>
                                         <Button size="small" variant="outlined" startIcon={<RefreshIcon />}

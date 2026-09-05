@@ -1473,25 +1473,55 @@ def admin_required():
     return wrapper
 
 
+def _jwt_roles():
+    """The caller's roles, lowercased. `role` is a comma-separated string
+    (e.g. 'admin,finance'), unlike admin_required()'s strict equality check
+    above -- split and check membership, not equality."""
+    return [r.strip().lower() for r in (get_jwt().get('role') or '').split(',')]
+
+
 def admin_or_finance_required():
     """Same admin/finance boundary already enforced (via a duplicated inline
     check) on the payment endpoints -- applied here to the subscription-
     mutating actions (renew/cancel/activate/delete) so that giving
     'employee' users read access to the Subscriptions page doesn't also
     silently hand them the ability to call these directly, bypassing a
-    frontend that merely hides the buttons. role is a comma-separated
-    string (e.g. 'admin,finance'), unlike admin_required()'s strict
-    equality check above -- split and check membership, not equality."""
+    frontend that merely hides the buttons."""
     def wrapper(fn):
         @wraps(fn)
         def decorator(*args, **kwargs):
             verify_jwt_in_request()
-            claims = get_jwt()
-            roles = [r.strip().lower() for r in (claims.get('role') or '').split(',')]
+            roles = _jwt_roles()
             if 'admin' in roles or 'finance' in roles:
                 return fn(*args, **kwargs)
             else:
                 return jsonify(msg="Admins or finance only!"), 403
+        return decorator
+    return wrapper
+
+
+NETWORK_VIEW_ROLES = ('admin', 'finance', 'employee', 'collector')
+
+
+def network_view_required():
+    """Read access to the Network Tree page, widened past admin/finance to the
+    two field-facing roles: an 'employee' taking the support call and a
+    'collector' standing at the door both need to see which ONU a customer
+    sits behind and whether it is down.
+
+    Read-only by construction: this gates the tree, the on-demand OLT/CCR
+    check and its job polling, and nothing else. The label matcher
+    (GET/POST .../label-matches[/apply]) writes Customer.onu_mac_address and
+    stays on admin_or_finance_required(), as does every device create/edit --
+    otherwise widening the page would quietly widen who can rewrite the
+    customer<->ONU mapping."""
+    def wrapper(fn):
+        @wraps(fn)
+        def decorator(*args, **kwargs):
+            verify_jwt_in_request()
+            if any(r in NETWORK_VIEW_ROLES for r in _jwt_roles()):
+                return fn(*args, **kwargs)
+            return jsonify(msg="Not authorized to view the network"), 403
         return decorator
     return wrapper
 
@@ -9216,6 +9246,12 @@ def _resolve_onu_customers(onus):
                     'id': customer.id,
                     'name': customer.name,
                     'is_subscription_active': bool(customer.is_subscription_active),
+                    # The MAC as STORED on the customer, not the normalized
+                    # lookup key and not the OLT's own spelling: showing the
+                    # stored value is what lets an operator spot a link made
+                    # against a badly formatted MAC, since the two only have
+                    # to agree after _normalize_mac.
+                    'onu_mac_address': customer.onu_mac_address,
                 })
     return [
         # Display keeps onu['mac_address'] exactly as reported; only the
@@ -9725,7 +9761,7 @@ def _with_interface_labels(job, payload):
 
 @app.route('/api/network-jobs/<int:job_id>', methods=['GET'])
 @jwt_required()
-@admin_or_finance_required()
+@network_view_required()
 def get_network_job(job_id):
     job = tenant_query(NetworkAgentJob).filter_by(id=job_id).first()
     if not job:
@@ -9743,7 +9779,7 @@ def get_network_job(job_id):
 
 @app.route('/api/network-agents', methods=['GET'])
 @jwt_required()
-@admin_or_finance_required()
+@network_view_required()
 def list_network_agents():
     agents = tenant_query(NetworkAgent).order_by(NetworkAgent.name).all()
     return jsonify([a.to_dict() for a in agents]), 200
@@ -9788,7 +9824,7 @@ def regenerate_network_agent_token(agent_id):
 
 @app.route('/api/network-tree', methods=['GET'])
 @jwt_required()
-@admin_or_finance_required()
+@network_view_required()
 def get_network_tree():
     """The device skeleton only -- no device is contacted here. Live ONU data
     is fetched per-OLT, on demand, via the refresh endpoint below."""
@@ -9798,7 +9834,7 @@ def get_network_tree():
 
 @app.route('/api/network-tree/olt/<int:device_id>/refresh', methods=['POST'])
 @jwt_required()
-@admin_or_finance_required()
+@network_view_required()
 def refresh_olt_onus(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:

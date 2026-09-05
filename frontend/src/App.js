@@ -77,7 +77,11 @@ const NAV_ITEMS = [
     { key: 'upstream-providers',  label: 'Upstream Providers',  icon: <UpstreamProviderIcon />, group: 'main',    allowedRoles: ['admin', 'finance'], visibleWhen: (bs) => bs?.network_mode === 'upstream_bridge' },
     { key: 'mikrotik-servers',    label: 'Mikrotik Servers',    icon: <MikrotikIcon />,         group: 'main',    allowedRoles: ['admin', 'finance'], visibleWhen: (bs) => bs?.network_mode === 'local_mikrotik' },
     { key: 'network-devices',    label: 'Network Devices',    icon: <NetworkDeviceIcon />,    group: 'main',    allowedRoles: ['admin', 'finance'] },
-    { key: 'network-tree',       label: 'Network Tree',       icon: <NetworkTreeIcon />,      group: 'main',    allowedRoles: ['admin', 'finance'] },
+    // 'employee'/'collector' get the tree read-only: they need to see which
+    // ONU a customer sits behind and whether it's down. The write action on
+    // the page (Match Labels) is hidden from them in NetworkTreeView.js and
+    // refused by admin_or_finance_required() on the endpoints behind it.
+    { key: 'network-tree',       label: 'Network Tree',       icon: <NetworkTreeIcon />,      group: 'main',    allowedRoles: ['admin', 'finance', 'employee', 'collector'] },
     { key: 'employees',          label: 'Payroll',            icon: <PayrollIcon />,             group: 'main',      allowedRoles: ['admin'] },
     { key: 'payments',           label: 'Payments',           icon: <PaymentIcon />,         group: 'main',      allowedRoles: ['admin', 'finance', 'collector'] },
     { key: 'receipts',           label: 'Receipts',           icon: <ReceiptIcon />,         group: 'main',      allowedRoles: ['admin', 'finance'] },

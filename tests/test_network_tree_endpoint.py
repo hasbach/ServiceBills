@@ -127,7 +127,14 @@ def test_refresh_matches_mac_case_insensitively(app, client, monkeypatch):
     add_customer(app, "Tree E", "Upper Mac", "B4:64:15:3F:C1:94")
     monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
     polled = refresh_and_poll(client, hdr, olt["id"])
-    assert [c["name"] for c in polled["result"][0]["customers"]] == ["Upper Mac"]
+    customer = polled["result"][0]["customers"][0]
+    assert customer["name"] == "Upper Mac"
+    # The customer carries the MAC it is linked BY, in the spelling stored on
+    # the customer row -- not the normalized lookup key and not the OLT's own
+    # lowercase spelling (the ONU here reports 'b4:64:15:3f:c1:94'). That is
+    # what makes a link made against an oddly formatted MAC visible on the page.
+    assert customer["onu_mac_address"] == "B4:64:15:3F:C1:94"
+    assert polled["result"][0]["mac_address"] == "b4:64:15:3f:c1:94"
 
 
 def test_refresh_on_a_non_olt_is_rejected(app, client):
