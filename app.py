@@ -9094,7 +9094,49 @@ def set_network_device_interface_label(device_id):
     db.session.commit()
     return jsonify({'device': device.to_dict()}), 200
 
-def _build_device_tree(devices):
+def _latest_results_by_device(devices):
+    """The newest completed job result for each device, enriched for display.
+
+    The tree page renders this the moment it opens, so it never starts empty.
+    Completed jobs already persist their full result and are retained for
+    NETWORK_AGENT_JOB_RETENTION_DAYS, so this reads data that already exists
+    rather than adding storage.
+
+    Enrichment goes through the same helpers the job-poll endpoint uses --
+    _resolve_onu_customers and _with_interface_labels -- so the shapes the
+    page receives here and from polling a live job are identical, and both
+    inherit those helpers' tolerance of malformed stored results.
+    """
+    if not devices:
+        return {}
+    jobs = (tenant_query(NetworkAgentJob)
+            .filter(NetworkAgentJob.device_id.in_([d.id for d in devices]),
+                    NetworkAgentJob.status == 'done')
+            .order_by(NetworkAgentJob.device_id,
+                      NetworkAgentJob.created_at.desc(),
+                      NetworkAgentJob.id.desc())
+            .all())
+    newest = {}
+    for job in jobs:
+        # Ordered newest-first per device, so the first one wins.
+        newest.setdefault(job.device_id, job)
+
+    out = {}
+    for device_id, job in newest.items():
+        result = job.result
+        if job.operation == 'olt_status' and result:
+            result = _resolve_onu_customers(result)
+        elif job.operation == 'device_health':
+            result = _with_interface_labels(job, {'result': result}).get('result')
+        out[device_id] = {
+            'operation': job.operation,
+            'result': result,
+            'at': job.finished_at.strftime('%Y-%m-%d %H:%M:%S') if job.finished_at else None,
+        }
+    return out
+
+
+def _build_device_tree(devices, latest_results=None):
     """Nest a flat device list by parent_device_id.
 
     Any device whose parent is missing (deleted, or another tenant's) is
@@ -9154,7 +9196,12 @@ def _build_device_tree(devices):
             node(child) for child in children_of.get(device.id, [])
             if child.id not in visited
         ]
-        return {**device.to_dict(), 'children': children}
+        latest = (latest_results or {}).get(device.id) or {}
+        return {**device.to_dict(),
+                'last_result': latest.get('result'),
+                'last_result_at': latest.get('at'),
+                'last_result_operation': latest.get('operation'),
+                'children': children}
 
     tree = [node(device) for device in roots]
 
@@ -9849,10 +9896,13 @@ def regenerate_network_agent_token(agent_id):
 @jwt_required()
 @network_view_required()
 def get_network_tree():
-    """The device skeleton only -- no device is contacted here. Live ONU data
-    is fetched per-OLT, on demand, via the refresh endpoint below."""
+    """The device skeleton plus each device's last known result -- no device is
+    contacted here. Live data is refreshed per-device, on demand, via the
+    refresh endpoints; this is what lets the page render before any of that
+    completes."""
     devices = tenant_query(NetworkDevice).order_by(NetworkDevice.name).all()
-    return jsonify({'tree': _build_device_tree(devices)}), 200
+    return jsonify({'tree': _build_device_tree(
+        devices, _latest_results_by_device(devices))}), 200
 
 
 @app.route('/api/network-tree/olt/<int:device_id>/refresh', methods=['POST'])

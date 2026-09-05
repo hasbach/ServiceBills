@@ -414,3 +414,87 @@ def test_healthy_device_with_higher_id_nests_under_its_cycle_parent(app, client)
     assert healthy["id"] not in root_ids, "healthy device must not be a spurious root"
     a_node = next(n for n in tree if n["id"] == cycle_a["id"])
     assert healthy["id"] in [c["id"] for c in a_node["children"]]
+
+
+# --- Tree v2: the page renders from the last known result, so the endpoint
+# carries it. Jobs already store results for 7 days; this is a read, not new
+# storage. See docs/superpowers/specs/2026-09-05-network-tree-v2-design.md.
+
+def _tree_by_id(client, hdr):
+    def walk(nodes, out):
+        for n in nodes:
+            out[n["id"]] = n
+            walk(n.get("children") or [], out)
+        return out
+    return walk(client.get("/api/network-tree", headers=hdr).get_json()["tree"], {})
+
+
+def test_tree_carries_the_newest_completed_olt_result(app, client, monkeypatch):
+    hdr = make_tenant(client, "Tree P", "tree_p_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+    add_customer(app, "Tree P", "Moussa Ghadir", "b4:64:15:3f:c1:94")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+    refresh_and_poll(client, hdr, olt["id"])
+
+    node = _tree_by_id(client, hdr)[olt["id"]]
+    assert node["last_result_operation"] == "olt_status"
+    assert node["last_result_at"]
+    macs = [o["mac_address"] for o in node["last_result"]]
+    assert "b4:64:15:3f:c1:94" in macs
+    # Enriched at read time, exactly as the job-poll endpoint does it.
+    first = node["last_result"][0]
+    assert [c["name"] for c in first["customers"]] == ["Moussa Ghadir"]
+
+
+def test_tree_carries_the_ccr_result_with_interface_labels_applied(app, client, monkeypatch):
+    hdr = make_tenant(client, "Tree Q", "tree_q_admin")
+    ccr = make_ccr(client, hdr)
+    monkeypatch.setattr(appmod.mikrotik, "get_device_health", lambda d: (
+        True, {"identity": "CCR", "uptime": "1d",
+               "interfaces": [{"name": "ether1", "running": True, "disabled": False}]}))
+    client.patch(f"/api/network-devices/{ccr['id']}/interface-labels", headers=hdr,
+                 json={"interface_name": "ether1", "label": "MYISP"})
+    started = client.post(f"/api/network-devices/{ccr['id']}/check-now", headers=hdr).get_json()
+    assert started["ok"] is True
+
+    node = _tree_by_id(client, hdr)[ccr["id"]]
+    assert node["last_result_operation"] == "device_health"
+    assert node["last_result"]["interfaces"][0]["label"] == "MYISP"
+
+
+def test_tree_reports_no_result_for_a_device_that_has_never_been_checked(app, client):
+    hdr = make_tenant(client, "Tree R", "tree_r_admin")
+    ccr = make_ccr(client, hdr)
+    node = _tree_by_id(client, hdr)[ccr["id"]]
+    assert node["last_result"] is None
+    assert node["last_result_at"] is None
+    assert node["last_result_operation"] is None
+
+
+def test_tree_ignores_jobs_that_are_not_done(app, client, monkeypatch):
+    """A pending or failed job must not be mistaken for a result."""
+    hdr = make_tenant(client, "Tree S", "tree_s_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+    started = client.post(f"/api/network-tree/olt/{olt['id']}/refresh", headers=hdr).get_json()
+    with app.app_context():
+        job = appmod.db.session.get(appmod.NetworkAgentJob, started["job_id"])
+        job.status = "failed"
+        appmod.db.session.commit()
+
+    assert _tree_by_id(client, hdr)[olt["id"]]["last_result"] is None
+
+
+def test_tree_results_stay_tenant_scoped(app, client, monkeypatch):
+    hdr_one = make_tenant(client, "Tree T1", "tree_t1_admin")
+    ccr_one = make_ccr(client, hdr_one)
+    olt_one = make_olt(client, hdr_one, ccr_one["id"])
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+    refresh_and_poll(client, hdr_one, olt_one["id"])
+
+    hdr_two = make_tenant(client, "Tree T2", "tree_t2_admin")
+    ccr_two = make_ccr(client, hdr_two)
+    olt_two = make_olt(client, hdr_two, ccr_two["id"])
+    assert _tree_by_id(client, hdr_two)[olt_two["id"]]["last_result"] is None
