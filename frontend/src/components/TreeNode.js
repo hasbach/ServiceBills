@@ -37,7 +37,18 @@ export default function TreeNode({ node, expanded, onToggle, liveLinks, actions 
                 {node.sublabel && <div className="nt-sub-line nt-mono">{node.sublabel}</div>}
                 {node.meta && <div className="nt-meta">{node.meta}</div>}
                 {node.kind === 'device' && actions && (
-                    <div className="nt-actions" onClick={(e) => e.stopPropagation()}>{actions(node)}</div>
+                    // Stopped for both click AND keydown: the card's own
+                    // onKeyDown above toggles on Enter/Space and sits on an
+                    // ancestor of these nested MUI buttons, and ButtonBase
+                    // does not stop keydown from bubbling on its own -- so a
+                    // keyboard user tabbing to a button and pressing
+                    // Enter/Space would toggle the card at the same instant
+                    // the button activates. Keydown that originates on the
+                    // card itself (the card is focused, not a descendant
+                    // button) never passes through this div, so the card's
+                    // own Enter/Space-to-toggle keeps working.
+                    <div className="nt-actions" onClick={(e) => e.stopPropagation()}
+                         onKeyDown={(e) => e.stopPropagation()}>{actions(node)}</div>
                 )}
             </div>
 

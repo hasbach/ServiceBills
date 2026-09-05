@@ -37,18 +37,43 @@
 .nt-children { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;
                border-top: 1px solid var(--nt-link); padding-top: var(--nt-gap);
                position: relative; }
-.nt-children > .nt-sub::before {
-    content: ""; position: absolute; top: 0; width: 0; height: var(--nt-gap);
-    border-left: 1px solid var(--nt-link);
-}
 .nt-children > .nt-sub { position: relative; }
-.nt-children > .nt-sub::before { left: 50%; }
+.nt-children > .nt-sub::before {
+    /* Tick from the rail down to this child's card. Anchored at
+       calc(-1 * gap) -- the top of .nt-children's own border box, above its
+       padding-top -- not at 0, which is the top of THIS box (the same point
+       where the child's own card already starts, since padding-top already
+       pushed it down by --nt-gap) and would draw the tick behind the opaque
+       card, invisible. */
+    content: ""; position: absolute; top: calc(-1 * var(--nt-gap)); left: 50%;
+    width: 0; height: var(--nt-gap); border-left: 1px solid var(--nt-link);
+}
 
 /* A wide level (many ONUs under one PON) wraps into rows rather than growing
-   sideways; below 900px every level becomes one card per row. */
-.nt-children--wide { max-width: 940px; }
+   sideways. The rail-and-tick treatment above only reads correctly for a
+   single row: border-top renders once, at the container's top edge, so row
+   two onward would get a tick pointing up at nothing. Wrapped levels drop
+   the per-row rail in favour of one bounded block: a single frame around
+   the whole group, with the parent's one incoming .nt-stem landing on its
+   top edge, and no per-child ticks. */
+.nt-children--wide {
+    max-width: 940px;
+    border: 1px solid var(--nt-link); border-radius: 8px;
+    padding: var(--nt-gap) 12px 12px;
+}
+.nt-children--wide > .nt-sub::before { display: none; }
+
+/* Below 900px every level (wide or not) becomes one card per row via
+   flex-direction: column, which is the same "more than one row" situation
+   as .nt-children--wide above -- so it gets the same bounded-block
+   treatment instead of a rail that would only line up with the first card. */
 @media (max-width: 900px) {
-    .nt-children, .nt-children--wide { flex-direction: column; align-items: center; }
+    .nt-children, .nt-children--wide {
+        flex-direction: column; align-items: center;
+        border: 1px solid var(--nt-link); border-radius: 8px;
+        padding: var(--nt-gap) 12px 12px;
+    }
+    .nt-children > .nt-sub::before, .nt-children--wide > .nt-sub::before { display: none; }
 }
 
 .nt-count { font-size: 11px; opacity: 0.7; margin-left: 4px; }

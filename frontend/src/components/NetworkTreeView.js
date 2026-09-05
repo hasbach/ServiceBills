@@ -104,6 +104,30 @@ const NetworkTreeView = () => {
 
     useEffect(() => { loadTree(); }, [loadTree]);
 
+    // Splices a freshly-finished job's result straight into the in-memory
+    // `tree` for one device, keyed by device.id through the same nested
+    // `children` walk deviceById below uses to find a device. This is what
+    // restores Load ONUs' immediate feedback: buildTopologyTree reads
+    // device.last_result to build the PON/ONU nodes, and without this the
+    // OLT would sit expanded showing stale (or, on the very first check,
+    // empty) PON content until the quiet loadTree(false) resync below lands
+    // a second round trip later. That resync still runs afterwards and
+    // remains the source of truth (it also refreshes last_status/
+    // last_checked_at, which this does not touch) -- this only closes the
+    // gap before it arrives.
+    const mergeDeviceResult = useCallback((deviceId, result) => {
+        setTree((prev) => {
+            const update = (device) => {
+                if (device.id === deviceId) {
+                    return { ...device, last_result: result, last_result_operation: 'olt_status' };
+                }
+                if (!device.children || !device.children.length) return device;
+                return { ...device, children: device.children.map(update) };
+            };
+            return prev.map(update);
+        });
+    }, []);
+
     useEffect(() => {
         apiService.fetchBusinessSettings()
             .then((res) => setAccessMode(res.data?.settings?.network_access_mode || 'direct'))
@@ -139,12 +163,17 @@ const NetworkTreeView = () => {
                 const job = await pollNetworkJob(res.data.job_id);
                 if (refreshSeqRef.current[device.id] === seq) {
                     if (job.status === 'done' && !job.error) {
-                        // The job's ONU/customer payload itself now reaches the
-                        // page through `tree` (loadTree(false) below re-fetches
-                        // it, since the backend persists last_result on the
-                        // device row) -- buildTopologyTree turns that straight
-                        // into PON/ONU nodes. All that's left to do here is
-                        // open the OLT's own node so the freshly-loaded PONs
+                        // Merge the job's ONU/customer payload into `tree`
+                        // immediately -- buildTopologyTree turns that
+                        // straight into PON/ONU nodes -- rather than waiting
+                        // for loadTree(false) below to re-fetch the same
+                        // data a second round trip later. That resync still
+                        // runs (see loadTree(false) call below) and stays
+                        // the source of truth for last_status/
+                        // last_checked_at, but the ONU list itself must not
+                        // wait on it.
+                        mergeDeviceResult(device.id, job.result);
+                        // Open the OLT's own node so the freshly-loaded PONs
                         // are visible without an extra click.
                         setExpanded((prev) => {
                             const next = new Set(prev);
@@ -185,7 +214,7 @@ const NetworkTreeView = () => {
                 });
             }
         }
-    }, [loadTree]);
+    }, [loadTree, mergeDeviceResult]);
 
     // The node array from buildTopologyTree carries deviceId but not the raw
     // device row (device_type, host, ...) the action buttons below need --
