@@ -30,6 +30,9 @@ class FakeResponse:
     def __init__(self, status_code, payload=None):
         self.status_code = status_code
         self._payload = payload
+        # requests.Response.text is what run_once reads for its rejection
+        # warning; a plain str() of the payload is close enough for a fake.
+        self.text = "" if payload is None else str(payload)
 
     def json(self):
         return self._payload
@@ -37,16 +40,17 @@ class FakeResponse:
 
 class FakeSession:
     """Stands in for requests.Session. Records what was posted."""
-    def __init__(self, poll_responses):
+    def __init__(self, poll_responses, post_response=None):
         self._polls = list(poll_responses)
         self.posted = []
+        self._post_response = post_response or FakeResponse(200, {"message": "Recorded"})
 
     def get(self, url, timeout=None, headers=None):
         return self._polls.pop(0) if self._polls else FakeResponse(204)
 
     def post(self, url, json=None, timeout=None, headers=None):
         self.posted.append((url, json))
-        return FakeResponse(200, {"message": "Recorded"})
+        return self._post_response
 
 
 def test_unknown_device_id_is_refused_not_executed(monkeypatch):
@@ -84,7 +88,7 @@ def test_olt_job_dispatches_to_vsol_with_local_credentials(monkeypatch):
         return True, [{"mac_address": "aa:bb:cc:dd:ee:ff"}]
 
     monkeypatch.setattr(agent.vsol_olt, "get_olt_status", fake)
-    ok, result, error = agent.execute_job(job(), CONFIG)
+    ok, result, error, status = agent.execute_job(job(), CONFIG)
     assert ok is True and error is None
     assert result[0]["mac_address"] == "aa:bb:cc:dd:ee:ff"
     assert seen == {"host": "192.168.8.100", "password": "public", "api_port": 161}
@@ -97,7 +101,7 @@ def test_ccr_job_dispatches_to_mikrotik(monkeypatch):
     monkeypatch.setattr(agent.mikrotik, "get_device_health",
                         lambda s: (True, {"identity": "CCR", "uptime": "1d",
                                           "interfaces": []}))
-    ok, result, error = agent.execute_job(
+    ok, result, error, status = agent.execute_job(
         job(device_id=1, operation="device_health", host="192.168.8.1",
             api_port=8728), config)
     assert ok is True and result["identity"] == "CCR"
@@ -106,7 +110,7 @@ def test_ccr_job_dispatches_to_mikrotik(monkeypatch):
 def test_a_connector_failure_is_reported_not_raised(monkeypatch):
     monkeypatch.setattr(agent.vsol_olt, "get_olt_status",
                         lambda s: (False, "No SNMP response received before timeout"))
-    ok, result, error = agent.execute_job(job(), CONFIG)
+    ok, result, error, status = agent.execute_job(job(), CONFIG)
     assert ok is False and result is None and "timeout" in error
 
 
@@ -114,7 +118,7 @@ def test_a_connector_that_raises_does_not_kill_the_loop(monkeypatch):
     def boom(server):
         raise RuntimeError("unexpected")
     monkeypatch.setattr(agent.vsol_olt, "get_olt_status", boom)
-    ok, result, error = agent.execute_job(job(), CONFIG)
+    ok, result, error, status = agent.execute_job(job(), CONFIG)
     assert ok is False and "unexpected" in error
 
 
@@ -193,7 +197,7 @@ def test_secret_status_dispatches_to_mikrotik_and_service_name_defaults_to_none(
         return True, "enabled"
 
     monkeypatch.setattr(agent.mikrotik, "get_secret_status", fake)
-    ok, result, error = agent.execute_job(ccr_job(), CCR_CONFIG)
+    ok, result, error, status = agent.execute_job(ccr_job(), CCR_CONFIG)
     assert ok is True and error is None and result == "enabled"
     assert seen == {"host": "192.168.8.1", "username": "admin", "password": "pw",
                     "api_port": 8728, "service_name": None, "pppoe_username": "user1"}
@@ -212,7 +216,7 @@ def test_secret_status_passes_a_configured_service_name_to_mikrotik(monkeypatch)
         return True, "enabled"
 
     monkeypatch.setattr(agent.mikrotik, "get_secret_status", fake)
-    ok, result, error = agent.execute_job(ccr_job(), config)
+    ok, result, error, status = agent.execute_job(ccr_job(), config)
     assert ok is True
     assert seen["service_name"] == "isp-a"
 
@@ -229,7 +233,7 @@ def test_active_session_dispatches_to_mikrotik(monkeypatch):
         return True, {"address": "10.0.0.5"}
 
     monkeypatch.setattr(agent.mikrotik, "get_active_session", fake)
-    ok, result, error = agent.execute_job(
+    ok, result, error, status = agent.execute_job(
         ccr_job(operation="active_session"), CCR_CONFIG)
     assert ok is True and result == {"address": "10.0.0.5"}
     assert seen == {"host": "192.168.8.1", "username": "admin", "password": "pw",
@@ -248,7 +252,7 @@ def test_test_connection_dispatches_to_mikrotik(monkeypatch):
         return True, "Connected successfully."
 
     monkeypatch.setattr(agent.mikrotik, "test_connection", fake)
-    ok, result, error = agent.execute_job(
+    ok, result, error, status = agent.execute_job(
         ccr_job(operation="test_connection", params={}), CCR_CONFIG)
     assert ok is True and result == "Connected successfully."
     assert seen == {"host": "192.168.8.1", "username": "admin", "password": "pw",
@@ -334,7 +338,7 @@ def test_a_job_with_no_host_key_is_refused(monkeypatch):
     del j["host"]
     reason = agent.validate_job(j, CONFIG)
     assert reason is not None and "host" in reason.lower()
-    ok, result, error = agent.execute_job(j, CONFIG)
+    ok, result, error, status = agent.execute_job(j, CONFIG)
     assert ok is False
     assert called == []
 
@@ -345,6 +349,107 @@ def test_a_job_with_a_null_host_is_refused(monkeypatch):
                         lambda s: called.append(s) or (True, []))
     reason = agent.validate_job(job(host=None), CONFIG)
     assert reason is not None and "host" in reason.lower()
-    ok, result, error = agent.execute_job(job(host=None), CONFIG)
+    ok, result, error, status = agent.execute_job(job(host=None), CONFIG)
     assert ok is False
     assert called == []
+
+
+# --- Final review, Critical 1: copying only agent/ (the old README's
+# instruction) leaves mikrotik.py/vsol_olt.py unresolvable one directory up.
+# That must fail with a clear, actionable message -- not a bare
+# ModuleNotFoundError traceback that happens before logging is configured
+# and so never reaches agent.log. -------------------------------------------
+
+def test_missing_connectors_fails_with_an_actionable_message(tmp_path):
+    """Simulates the exact layout the old README told people to create:
+    only the agent/ directory, with mikrotik.py/vsol_olt.py absent from its
+    parent. Runs the real file in a subprocess (not just re-imports it in
+    this process) so the module-level import actually re-executes against a
+    directory that genuinely lacks the connectors."""
+    import shutil
+    import subprocess
+
+    real_agent_dir = os.path.dirname(os.path.abspath(agent.__file__))
+    fake_root = tmp_path / "ServiceBillsAgent"
+    fake_agent_dir = fake_root / "agent"
+    fake_agent_dir.mkdir(parents=True)
+    shutil.copy(os.path.join(real_agent_dir, "servicebills_agent.py"),
+               fake_agent_dir / "servicebills_agent.py")
+    # Deliberately no mikrotik.py / vsol_olt.py placed under fake_root.
+
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)  # don't let the real repo leak in via env
+    result = subprocess.run(
+        [sys.executable, str(fake_agent_dir / "servicebills_agent.py")],
+        capture_output=True, text=True, timeout=30, env=env,
+        cwd=str(tmp_path),
+    )
+    assert result.returncode != 0
+    assert "Traceback" not in result.stderr
+    assert "mikrotik.py" in result.stderr
+    assert "vsol_olt.py" in result.stderr
+
+
+# --- Final review, Important 3: the agent must report the connector's own
+# device classification (server.last_status) back to the cloud, so
+# NetworkDevice.last_status can be stamped in agent mode too. -------------
+
+def test_run_once_includes_the_connectors_status_when_it_sets_one(monkeypatch):
+    def fake(server):
+        server.last_status = "online"  # what _mark_checked would have done
+        return True, []
+
+    monkeypatch.setattr(agent.vsol_olt, "get_olt_status", fake)
+    session = FakeSession([FakeResponse(200, job())])
+    agent.run_once(session, CONFIG)
+    _, payload = session.posted[0]
+    assert payload["status"] == "online"
+
+
+def test_run_once_omits_status_when_the_connector_never_set_one(monkeypatch):
+    """secret_status/active_session never touch last_status -- see
+    execute_job's docstring. The field must be absent, not null, so an old
+    cloud that doesn't know about it sees exactly the payload it always has."""
+    monkeypatch.setattr(agent.mikrotik, "get_secret_status",
+                        lambda s, u: (True, "enabled"))
+    session = FakeSession([FakeResponse(200, ccr_job())])
+    agent.run_once(session, CCR_CONFIG)
+    _, payload = session.posted[0]
+    assert "status" not in payload
+
+
+# --- Final review, Important 4: the agent must not log a job as "-> ok"
+# when the cloud actually rejected the result it just posted. ---------------
+
+def test_run_once_warns_when_the_cloud_rejects_the_result(monkeypatch, caplog):
+    monkeypatch.setattr(agent.vsol_olt, "get_olt_status", lambda s: (True, []))
+    session = FakeSession(
+        [FakeResponse(200, job())],
+        post_response=FakeResponse(400, {"error": "Malformed olt_status result"}))
+    with caplog.at_level("INFO", logger="servicebills_agent"):
+        handled = agent.run_once(session, CONFIG)
+    assert handled is True
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("7" in m and "400" in m for m in messages)
+    assert not any(m.endswith("-> ok") for m in messages)
+
+
+def test_run_once_warns_on_a_409_job_not_claimed_response(monkeypatch, caplog):
+    monkeypatch.setattr(agent.vsol_olt, "get_olt_status", lambda s: (True, []))
+    session = FakeSession(
+        [FakeResponse(200, job())],
+        post_response=FakeResponse(409, {"error": "Job is done, not claimed"}))
+    with caplog.at_level("INFO", logger="servicebills_agent"):
+        agent.run_once(session, CONFIG)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("409" in m for m in messages)
+    assert not any(m.endswith("-> ok") for m in messages)
+
+
+def test_run_once_still_logs_success_on_a_2xx_response(monkeypatch, caplog):
+    monkeypatch.setattr(agent.vsol_olt, "get_olt_status", lambda s: (True, []))
+    session = FakeSession([FakeResponse(200, job())])
+    with caplog.at_level("INFO", logger="servicebills_agent"):
+        agent.run_once(session, CONFIG)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(m.endswith("-> ok") for m in messages)

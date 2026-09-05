@@ -2090,6 +2090,9 @@ def _block_suspended_tenants():
 # and a tenant has no legitimate need for either back via a data export.
 _EXPORT_COLUMN_DENYLIST = {
     BillingPaymentAttempt: {"callback_token", "whish_external_id"},
+    # token_hash is a bearer-secret hash, not tenant-visible data -- same
+    # class of secret as callback_token above, just for a different feature.
+    NetworkAgent: {"token_hash"},
 }
 
 
@@ -5001,6 +5004,17 @@ def save_business_settings():
             _requested_reporting_currency = request.form.get('reporting_currency')
             if not Currency.query.filter_by(code=_requested_reporting_currency, active=True).first():
                 return jsonify({'error': f"Unknown or inactive currency code '{_requested_reporting_currency}'."}), 400
+
+        if 'network_access_mode' in request.form:
+            # The column just accepts any string up to 10 chars; anything
+            # other than 'agent' silently reads back as direct mode (see
+            # _tenant_access_mode's `or 'direct'` fallback), which makes a
+            # typo here a silent no-op instead of a visible error.
+            _requested_network_access_mode = request.form.get('network_access_mode')
+            if _requested_network_access_mode not in ('direct', 'agent'):
+                return jsonify({'error': f"Invalid network_access_mode "
+                                         f"'{_requested_network_access_mode}'. "
+                                         f"Must be 'direct' or 'agent'."}), 400
 
         # Fetch existing settings or create new
         settings = tenant_query(BusinessSettings).first()
@@ -9211,14 +9225,32 @@ def _resolve_onu_customers(onus):
 
 
 # Agent tokens are "<agent_id>.<secret>". The id half makes the lookup O(1)
-# (a bcrypt hash can't be searched for), the secret half is what's verified.
-# Only the secret's hash is stored; the full token is shown once at creation.
+# (a hash can't be searched for), the secret half is what's verified. Only
+# the secret's hash is stored; the full token is shown once at creation.
+#
+# This is sha256, not bcrypt, and deliberately so -- do not "fix" it back.
+# bcrypt (and other deliberately slow KDFs) exist to make brute-forcing a
+# LOW-ENTROPY HUMAN PASSWORD expensive, by making each guess costly to check.
+# secret is secrets.token_urlsafe(32): 256 bits of high-entropy randomness
+# nobody is guessing character-by-character, so a slow KDF buys no security
+# here -- it only taxes every legitimate call. Measured at ~226ms/verification
+# at Flask-Bcrypt's default cost, that tax is severe: agent ids are small
+# sequential integers, so an unauthenticated `Bearer 1.x` loop against
+# /api/agent/jobs costs an attacker nothing per guess while saturating
+# production's single synchronous gunicorn worker at only ~4 req/s -- and the
+# legitimate agent's own 2s poll (see DEFAULT_POLL_SECONDS) would permanently
+# burn 12-35% of that one worker on token verification alone, before any real
+# work happens. A plain sha256 compared in constant time (hmac.compare_digest)
+# costs microseconds either way, closing both problems, with no loss of
+# security since the input is already uniformly random. User.password_hash
+# (a human password) correctly keeps using bcrypt -- see User.set_password --
+# this reasoning applies only to a high-entropy machine secret like this one.
 def _issue_agent_token(agent):
     """Generate a fresh token for this agent and store its hash. Returns the
     token -- the only time it is ever available in plaintext. The caller
     commits."""
     secret = secrets.token_urlsafe(32)
-    agent.token_hash = bcrypt.generate_password_hash(secret).decode('utf8')
+    agent.token_hash = hashlib.sha256(secret.encode('utf-8')).hexdigest()
     return '{}.{}'.format(agent.id, secret)
 
 
@@ -9234,10 +9266,11 @@ def _authenticate_agent():
     agent = db.session.get(NetworkAgent, int(agent_id))
     if not agent:
         return None
+    computed = hashlib.sha256(secret.encode('utf-8')).hexdigest()
     try:
-        if not bcrypt.check_password_hash(agent.token_hash, secret):
+        if not hmac.compare_digest(agent.token_hash, computed):
             return None
-    except ValueError:
+    except TypeError:
         return None  # stored hash is malformed -- treat as no match
     return agent
 
@@ -9256,12 +9289,21 @@ def agent_token_required():
 
 
 @app.route('/api/agent/jobs', methods=['GET'])
+@limiter.limit("120 per minute")
 @agent_token_required()
 def agent_poll_job():
     """The agent's short-poll. Returns one pending job or 204.
 
     The agent MUST poll, not long-poll: production runs a single sync gunicorn
     worker, so holding this request open would freeze the whole application.
+
+    Rate-limited (defence in depth, per IP): the real cost of an unauthorized
+    request here is the token check in agent_token_required, which now runs
+    at sha256 speed rather than bcrypt's -- see _issue_agent_token's comment
+    -- but there is no reason to let a hammering client run this endpoint's
+    query and commit on every request regardless. 120/min comfortably clears
+    the legitimate agent's own rate (one poll every DEFAULT_POLL_SECONDS=2s,
+    i.e. 30/min).
     """
     agent = g.network_agent
     agent.last_seen_at = datetime.utcnow()
@@ -9390,7 +9432,40 @@ def _validate_agent_result(operation, result):
     return None
 
 
+# The three classifications mikrotik.py/vsol_olt.py's _mark_checked ever sets
+# (see NetworkDevice.last_status's comment) -- the only values this endpoint
+# will ever use to stamp a device. Read back by the agent's execute_job and
+# posted alongside the result as an optional 'status' field; see that
+# function's docstring for when it's None.
+_AGENT_DEVICE_STATUSES = ('online', 'unreachable', 'auth_failed')
+
+
+def _stamp_device_status_from_agent(job, status):
+    """In direct mode, the connector mutates the live NetworkDevice in-process
+    and the caller's commit persists it -- see _run_device_operation_direct.
+    The on-prem agent has no such side channel: it runs in a different
+    process on hardware the cloud doesn't touch, so without this the status
+    chip and "Last Check" column would read 'never checked' forever in the
+    only mode this feature exists for, even right after a successful check.
+
+    A status outside _AGENT_DEVICE_STATUSES -- absent because the operation
+    doesn't classify a device (secret_status/active_session), or garbage from
+    a buggy agent build -- is silently ignored rather than rejected: the
+    result the agent just walked is still worth storing even if this one
+    extra field is unusable, and the job's own outcome already communicates
+    success/failure independently of this device-level classification.
+    """
+    if status not in _AGENT_DEVICE_STATUSES:
+        return
+    device = db.session.get(NetworkDevice, job.device_id)
+    if device is None:
+        return  # the device vanished under the job; nothing to stamp
+    device.last_status = status
+    device.last_checked_at = datetime.utcnow()
+
+
 @app.route('/api/agent/jobs/<int:job_id>/result', methods=['POST'])
+@limiter.limit("120 per minute")
 @agent_token_required()
 def agent_post_result(job_id):
     agent = g.network_agent
@@ -9427,6 +9502,7 @@ def agent_post_result(job_id):
         db.session.commit()
         return jsonify({'error': job.error}), 400
     data = data or {}
+    _stamp_device_status_from_agent(job, data.get('status'))
     if data.get('ok'):
         result = data.get('result')
         problem = _validate_agent_result(job.operation, result)
@@ -9453,6 +9529,26 @@ def agent_post_result(job_id):
 # with no result within this one is failed (the agent probably died mid-walk).
 JOB_CLAIM_TIMEOUT_SECONDS = 30
 JOB_RESULT_TIMEOUT_SECONDS = 120
+
+# NetworkAgentJob has no retention and (by design, see _expire_job_if_stale's
+# docstring) no scheduled job to add one -- the in-process APScheduler only
+# fires during `flask db upgrade` on deploy, so a cron-style prune can't be
+# relied on. Every check-now, OLT refresh, and label-matcher open writes a
+# permanent row, and an olt_status result stores the OLT's full ONU list
+# (~75 ONUs, roughly 15-20 KB of JSON each) -- this applies to direct-mode
+# tenants too, which previously wrote nothing at all for a check. Production
+# is Supabase free tier, capped at 500 MB total across every tenant's data.
+#
+# Rather than add a scheduler, this reuses the lazy pattern already
+# established for expiry above: prune opportunistically on the same path
+# that grows the table, right before the write that already commits (see
+# _create_device_job). 7 days is long enough that a tenant investigating an
+# issue from a few days back still finds the terminal job that recorded it,
+# but short enough that even a tenant polling label-matches or clicking
+# check-now repeatedly never accumulates more than a week's worth of terminal
+# rows -- keeping this table's growth bounded independent of how often any
+# one tenant triggers a check.
+NETWORK_AGENT_JOB_RETENTION_DAYS = 7
 
 
 def _expire_job_if_stale(job):
@@ -9498,6 +9594,22 @@ def _tenant_access_mode():
     return (settings.network_access_mode if settings else None) or 'direct'
 
 
+def _prune_stale_agent_jobs(tenant_id):
+    """Delete this tenant's own terminal jobs older than the retention
+    window. Terminal only ('done'/'failed'/'expired') -- a 'pending' or
+    'claimed' job is still live work in flight and must never be deleted out
+    from under a poll. Scoped to this one tenant (not a global sweep) since
+    it's called from a per-tenant request path; every tenant gets pruned the
+    next time any of them creates a job. See NETWORK_AGENT_JOB_RETENTION_DAYS
+    for why this exists instead of a scheduled cleanup."""
+    cutoff = datetime.utcnow() - timedelta(days=NETWORK_AGENT_JOB_RETENTION_DAYS)
+    NetworkAgentJob.query.filter(
+        NetworkAgentJob.tenant_id == tenant_id,
+        NetworkAgentJob.status.in_(('done', 'failed', 'expired')),
+        NetworkAgentJob.created_at < cutoff,
+    ).delete(synchronize_session=False)
+
+
 def _create_device_job(device, operation, params=None):
     """Create a job for this device operation.
 
@@ -9526,6 +9638,7 @@ def _create_device_job(device, operation, params=None):
         job.finished_at = datetime.utcnow()
         job.result = value if ok else None
         job.error = None if ok else value
+        _prune_stale_agent_jobs(device.tenant_id)
         db.session.add(job)
         db.session.commit()
         return job, None
@@ -9535,6 +9648,7 @@ def _create_device_job(device, operation, params=None):
         last = agent.last_seen_at.strftime('%Y-%m-%d %H:%M:%S') if (agent and agent.last_seen_at) else 'never'
         return None, 'Agent offline (last seen {}). Start the agent on your network and try again.'.format(last)
 
+    _prune_stale_agent_jobs(device.tenant_id)
     db.session.add(job)
     db.session.commit()
     return job, None

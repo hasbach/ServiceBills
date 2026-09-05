@@ -60,6 +60,26 @@ def test_export_redacts_whish_callback_token(app, client):
     assert "secret-ext-id" not in body
 
 
+def test_export_redacts_network_agent_token_hash(app, client):
+    # Final review, Also-fix: _EXPORT_COLUMN_DENYLIST exists precisely for
+    # secrets like this, and NetworkAgent was never added to it -- a tenant
+    # could read back the bearer-secret hash gating its own on-prem agent's
+    # access via its own data export.
+    hdr = make_tenant(client, "Biz Agent Export", "agent_export_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Agent Export").first()
+        agent = appmod.NetworkAgent(tenant_id=tenant.id, name="Box", token_hash="x")
+        appmod.db.session.add(agent)
+        appmod.db.session.commit()
+        appmod._issue_agent_token(agent)  # overwrites the "x" placeholder
+        appmod.db.session.commit()
+
+    export = client.get("/api/tenant/export", headers=hdr).get_json()
+    rows = export["network_agent"]
+    assert len(rows) == 1
+    assert "token_hash" not in rows[0]
+
+
 def test_superadmin_delete_removes_only_that_tenant(app, client):
     a = make_tenant(client, "Biz A", "a_admin")
     make_tenant(client, "Biz B", "b_admin")

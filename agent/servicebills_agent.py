@@ -35,10 +35,24 @@ except ModuleNotFoundError:  # pragma: no cover
 
 import requests
 
-# The connectors live at the repository root, one level up from agent/.
+# The connectors are expected one directory up from agent/ -- see README.md's
+# Install section for the deployed layout (mikrotik.py and vsol_olt.py sit
+# beside the agent/ directory, not inside it). Guarded explicitly because a
+# bare ModuleNotFoundError here happens before _configure_logging() runs, so
+# nothing would otherwise reach agent.log -- this turns that into a clear,
+# actionable SystemExit instead of an unexplained crash on a box nobody is
+# watching interactively.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import mikrotik      # noqa: E402
-import vsol_olt      # noqa: E402
+try:
+    import mikrotik      # noqa: E402
+    import vsol_olt      # noqa: E402
+except ImportError as exc:
+    raise SystemExit(
+        "Cannot start: {}. This agent expects mikrotik.py and vsol_olt.py "
+        "in the parent directory of agent/ (e.g. C:\\ServiceBills\\mikrotik.py, "
+        "C:\\ServiceBills\\vsol_olt.py, C:\\ServiceBills\\agent\\servicebills_agent.py) "
+        "-- see README.md's Install section. Copying only the agent/ "
+        "directory on its own is not enough.".format(exc))
 
 AGENT_VERSION = "1.0.0"
 
@@ -169,11 +183,23 @@ def build_server(device_cfg):
 
 
 def execute_job(job, config):
-    """Run one job. Returns (ok, result, error). Never raises."""
+    """Run one job. Returns (ok, result, error, status). Never raises.
+
+    status is the connector's own device classification -- 'online',
+    'unreachable', or 'auth_failed' -- read back from server.last_status
+    after the connector runs (mikrotik.py/vsol_olt.py's _mark_checked sets
+    it on both their success and failure paths). It is None when the
+    operation doesn't classify a device at all (secret_status, active_session
+    never touch last_status), when the job was refused before any connector
+    ran, or when the connector raised something its own try/except didn't
+    already turn into a classified failure. The cloud stamps
+    NetworkDevice.last_status from this so the tree's status chip reflects
+    agent-mode checks -- see agent_post_result.
+    """
     reason = validate_job(job, config)
     if reason:
         logger.warning("Refused job %s: %s", job.get("job_id"), reason)
-        return False, None, reason
+        return False, None, reason, None
 
     # validate_job (via _resolve_device_id) already proved this device_id
     # parses and resolves to a configured device, so this cannot KeyError or
@@ -199,9 +225,10 @@ def execute_job(job, config):
         # Never logger.exception here: the frame locals hold the device
         # credential, and a traceback in the log file would expose it.
         logger.warning("Job %s raised: %s", job.get("job_id"), exc)
-        return False, None, "{}: {}".format(exc.__class__.__name__, exc)
+        return False, None, "{}: {}".format(exc.__class__.__name__, exc), server.last_status
 
-    return (True, value, None) if ok else (False, None, value)
+    return ((True, value, None, server.last_status) if ok
+            else (False, None, value, server.last_status))
 
 
 def _headers(config):
@@ -238,14 +265,31 @@ def run_once(session, config):
                      job.get("operation"), job.get("device_id"))
         return False
 
-    ok, result, error = execute_job(job, config)
-    session.post(
+    ok, result, error, status = execute_job(job, config)
+    payload = {"ok": ok, "result": result, "error": error}
+    if status is not None:
+        payload["status"] = status
+    post_response = session.post(
         "{}/api/agent/jobs/{}/result".format(config["cloud_url"], job_id),
-        json={"ok": ok, "result": result, "error": error},
+        json=payload,
         timeout=HTTP_TIMEOUT_SECONDS, headers=_headers(config),
     )
-    logger.info("Job %s (%s) -> %s", job_id, job.get("operation"),
-                "ok" if ok else "error: {}".format(error))
+    if post_response.status_code >= 400:
+        # The cloud returns 4xx when it rejects a result outright -- a
+        # malformed shape (400, see agent_post_result/_validate_agent_result)
+        # or a job that's no longer claimed (409) -- specifically so a broken
+        # agent build or a race surfaces in its own logs instead of failing
+        # silently. Logging the connector's own ok/error unconditionally, as
+        # before, defeated that: a rejected POST looked identical in this log
+        # to a clean success. The body is the cloud's own short JSON error
+        # message, not attacker-controlled, but it's still truncated here --
+        # there's no reason to let an oversized response bloat the log.
+        body = getattr(post_response, "text", "") or ""
+        logger.warning("Cloud rejected result for job %s: HTTP %s %s",
+                       job_id, post_response.status_code, body[:200])
+    else:
+        logger.info("Job %s (%s) -> %s", job_id, job.get("operation"),
+                    "ok" if ok else "error: {}".format(error))
     return True
 
 

@@ -267,3 +267,102 @@ def test_label_matches_computes_proposals_from_a_completed_job(app, client, monk
     assert len(done["proposals"]) == 1
     assert done["proposals"][0]["customer"]["name"] == "Moussa Ghadir"
     assert done["proposals"][0]["confidence"] == 1.0
+
+
+# --- Final review, Important 5: network_agent_job has no retention and (by
+# design) no scheduled job to add one -- every check-now writes a permanent
+# row, in direct mode too, on a Supabase free tier capped at 500 MB. Fix
+# reuses the lazy-cleanup pattern: _create_device_job prunes this tenant's
+# own terminal jobs older than NETWORK_AGENT_JOB_RETENTION_DAYS right before
+# the insert it already commits. ---------------------------------------------
+
+def _seed_terminal_job(app, tenant_id, device_id, age_days, status="done"):
+    with app.app_context():
+        j = appmod.NetworkAgentJob(
+            tenant_id=tenant_id, device_id=device_id, operation="olt_status",
+            status=status,
+            created_at=datetime.utcnow() - timedelta(days=age_days),
+            finished_at=datetime.utcnow() - timedelta(days=age_days))
+        appmod.db.session.add(j)
+        appmod.db.session.commit()
+        return j.id
+
+
+def test_a_terminal_job_past_the_retention_window_is_pruned_on_the_next_job(app, client, monkeypatch):
+    hdr = make_tenant(client, "Job N", "job_n_admin")
+    set_mode(app, "Job N", "direct")
+    device_id = make_device(app, "Job N")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, []))
+    tenant_id = _tenant("Job N").id
+    _seed_terminal_job(
+        app, tenant_id, device_id,
+        age_days=appmod.NETWORK_AGENT_JOB_RETENTION_DAYS + 1)
+
+    client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr)
+
+    with app.app_context():
+        # Not asserting on the old row's id directly: SQLite reuses a
+        # deleted row's rowid for the very next insert when nothing else
+        # occupies it, so the pruned row and the job check-now just created
+        # can legitimately end up sharing an id in this test's in-memory DB
+        # (Postgres's real sequence never does this). Counting is what
+        # actually proves the stale row is gone: if pruning had done
+        # nothing, this tenant would have two rows, not one.
+        jobs = appmod.NetworkAgentJob.query.filter_by(tenant_id=tenant_id).all()
+        assert len(jobs) == 1
+        assert jobs[0].created_at > datetime.utcnow() - timedelta(minutes=1)
+
+
+def test_a_terminal_job_within_the_retention_window_is_kept(app, client, monkeypatch):
+    hdr = make_tenant(client, "Job O", "job_o_admin")
+    set_mode(app, "Job O", "direct")
+    device_id = make_device(app, "Job O")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, []))
+    tenant_id = _tenant("Job O").id
+    recent_id = _seed_terminal_job(
+        app, tenant_id, device_id,
+        age_days=appmod.NETWORK_AGENT_JOB_RETENTION_DAYS - 1)
+
+    client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr)
+
+    with app.app_context():
+        assert appmod.NetworkAgentJob.query.get(recent_id) is not None
+
+
+def test_pruning_only_touches_this_tenants_own_jobs(app, client, monkeypatch):
+    hdr = make_tenant(client, "Job P1", "job_p1_admin")
+    set_mode(app, "Job P1", "direct")
+    device_one = make_device(app, "Job P1")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, []))
+    tenant_one = _tenant("Job P1").id
+
+    make_tenant(client, "Job P2", "job_p2_admin")
+    set_mode(app, "Job P2", "direct")
+    device_two = make_device(app, "Job P2")
+    tenant_two = _tenant("Job P2").id
+    other_old_id = _seed_terminal_job(
+        app, tenant_two, device_two,
+        age_days=appmod.NETWORK_AGENT_JOB_RETENTION_DAYS + 1)
+
+    client.post(f"/api/network-devices/{device_one}/check-now", headers=hdr)
+
+    with app.app_context():
+        # Tenant P1's own job creation must never prune tenant P2's rows.
+        assert appmod.NetworkAgentJob.query.get(other_old_id) is not None
+
+
+def test_pending_or_claimed_jobs_are_never_pruned_regardless_of_age(app, client, monkeypatch):
+    hdr = make_tenant(client, "Job Q", "job_q_admin")
+    set_mode(app, "Job Q", "direct")
+    device_id = make_device(app, "Job Q")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, []))
+    tenant_id = _tenant("Job Q").id
+    stale_pending_id = _seed_terminal_job(
+        app, tenant_id, device_id,
+        age_days=appmod.NETWORK_AGENT_JOB_RETENTION_DAYS + 30, status="pending")
+
+    client.post(f"/api/network-devices/{device_id}/check-now", headers=hdr)
+
+    with app.app_context():
+        # Old, but never claimed/finished -- pruning must not touch live work.
+        assert appmod.NetworkAgentJob.query.get(stale_pending_id) is not None

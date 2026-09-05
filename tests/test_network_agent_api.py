@@ -102,6 +102,22 @@ def test_agent_never_sees_another_tenants_job(app, client):
     assert client.get("/api/agent/jobs", headers=auth(token_two)).status_code == 204
 
 
+def test_post_result_without_a_token_is_rejected(app, client):
+    """The GET poll endpoint has test_poll_without_a_token_is_rejected above;
+    nothing previously pinned that @agent_token_required() is also on the
+    POST result route. A malformed/unauthenticated result must be rejected
+    before it ever touches the job row."""
+    make_tenant(client, "Api AC", "api_ac_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api AC")
+    job_id = make_job(app, tenant_id, device_id)
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result",
+                    json={"ok": True, "result": [], "error": None})
+    assert r.status_code == 401
+    with app.app_context():
+        assert appmod.NetworkAgentJob.query.get(job_id).status == "pending"
+
+
 def test_agent_cannot_post_a_result_to_another_tenants_job(app, client):
     make_tenant(client, "Api F1", "api_f1_admin")
     _, device_one, tenant_one = make_agent_and_device(app, "Api F1")
@@ -150,6 +166,92 @@ def test_posting_a_failure_result_records_the_message(app, client):
         job = appmod.NetworkAgentJob.query.get(job_id)
         assert job.status == "done"
         assert "timeout" in job.error
+
+
+# --- Final review, Important 3: in agent mode nothing else stamps
+# NetworkDevice.last_status -- the connector mutates the live device
+# in-process only in direct mode. The agent reports its connector's own
+# classification (server.last_status, via execute_job) as an optional
+# 'status' field on the result POST; this endpoint must stamp the device
+# from it when it's one of the three recognised values, and otherwise leave
+# the device untouched without rejecting the result. ------------------------
+
+def test_an_online_status_stamps_the_device(app, client):
+    make_tenant(client, "Api AE", "api_ae_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api AE")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": [], "error": None, "status": "online"})
+    assert r.status_code == 200
+    with app.app_context():
+        device = appmod.NetworkDevice.query.get(device_id)
+        assert device.last_status == "online"
+        assert device.last_checked_at is not None
+
+
+def test_an_unreachable_status_stamps_the_device(app, client):
+    make_tenant(client, "Api AF", "api_af_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api AF")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": False, "result": None,
+                          "error": "OLT responded but reported no ONUs",
+                          "status": "unreachable"})
+    assert r.status_code == 200
+    with app.app_context():
+        device = appmod.NetworkDevice.query.get(device_id)
+        assert device.last_status == "unreachable"
+        assert device.last_checked_at is not None
+
+
+def test_an_absent_status_leaves_the_devices_previous_value_untouched(app, client):
+    make_tenant(client, "Api AG", "api_ag_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api AG")
+    with app.app_context():
+        device = appmod.NetworkDevice.query.get(device_id)
+        device.last_status = "auth_failed"
+        appmod.db.session.commit()
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    onus = [{"mac_address": "b4:64:15:3f:c1:94"}]
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": onus, "error": None})
+    assert r.status_code == 200
+    with app.app_context():
+        device = appmod.NetworkDevice.query.get(device_id)
+        # Untouched -- not overwritten with None or any other default.
+        assert device.last_status == "auth_failed"
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result == onus
+
+
+def test_a_garbage_status_leaves_the_device_untouched_and_still_stores_the_result(app, client):
+    make_tenant(client, "Api AH", "api_ah_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api AH")
+    with app.app_context():
+        device = appmod.NetworkDevice.query.get(device_id)
+        device.last_status = "online"
+        appmod.db.session.commit()
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    onus = [{"mac_address": "b4:64:15:3f:c1:94"}]
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token),
+                    json={"ok": True, "result": onus, "error": None,
+                          "status": "definitely-not-a-real-status"})
+    assert r.status_code == 200
+    with app.app_context():
+        device = appmod.NetworkDevice.query.get(device_id)
+        assert device.last_status == "online"
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        assert job.status == "done"
+        assert job.result == onus
 
 
 def test_result_is_refused_for_a_job_that_was_never_claimed(app, client):
@@ -520,3 +622,19 @@ def test_a_regenerated_token_invalidates_the_old_one(app, client):
         appmod.db.session.commit()
     assert client.get("/api/agent/jobs", headers=auth(old_token)).status_code == 401
     assert client.get("/api/agent/jobs", headers=auth(new_token)).status_code == 204
+
+
+def test_a_malformed_stored_token_hash_is_treated_as_no_match(app, client):
+    """_authenticate_agent's except branch for a malformed stored hash was
+    never exercised. hmac.compare_digest raises TypeError (not ValueError,
+    which was the relevant exception back when this compared bcrypt hashes)
+    when a stored value can't be compared at all -- e.g. non-ASCII characters
+    in a str comparand -- and that must degrade to an ordinary 401, not a
+    500, exactly like any other stored-data corruption."""
+    make_tenant(client, "Api AD", "api_ad_admin")
+    token, _, tenant_id = make_agent_and_device(app, "Api AD")
+    with app.app_context():
+        agent = appmod.NetworkAgent.query.filter_by(tenant_id=tenant_id).first()
+        agent.token_hash = "not-a-valid-héx-hash"  # non-ASCII -> TypeError
+        appmod.db.session.commit()
+    assert client.get("/api/agent/jobs", headers=auth(token)).status_code == 401

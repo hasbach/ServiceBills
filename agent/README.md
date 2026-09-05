@@ -19,12 +19,26 @@ the full design.
 
 1. Install Python 3.11+ if it isn't already present.
 
-2. Copy this `agent/` directory to the box, e.g. `C:\ServiceBillsAgent\`.
-
-3. Install dependencies:
+2. Copy **both** `mikrotik.py` and `vsol_olt.py` (from the repository root)
+   and this `agent/` directory to the box, keeping them siblings, e.g.:
 
    ```
-   pip install -r requirements-agent.txt
+   C:\ServiceBills\mikrotik.py
+   C:\ServiceBills\vsol_olt.py
+   C:\ServiceBills\agent\servicebills_agent.py
+   ```
+
+   The agent imports `mikrotik` and `vsol_olt` from the directory one level
+   above `agent\`, so it needs both files there -- copying only the `agent\`
+   directory on its own leaves those imports unresolvable and the agent will
+   refuse to start (see Troubleshooting below). Nothing else from the
+   repository is needed: `mikrotik.py` depends only on `librouteros`,
+   `vsol_olt.py` only on `pysnmp`, both installed in the next step.
+
+3. Install dependencies (`requirements-agent.txt` lives in `agent\`):
+
+   ```
+   pip install -r C:\ServiceBills\agent\requirements-agent.txt
    ```
 
 4. Copy `agent.example.toml` to `C:\ProgramData\ServiceBillsAgent\agent.toml`
@@ -55,7 +69,7 @@ the full design.
 6. Smoke-test before registering the scheduled task:
 
    ```
-   python servicebills_agent.py --config C:\ProgramData\ServiceBillsAgent\agent.toml --once
+   python C:\ServiceBills\agent\servicebills_agent.py --config C:\ProgramData\ServiceBillsAgent\agent.toml --once
    ```
 
    `--once` handles at most one poll and exits, so you can confirm the config
@@ -66,7 +80,7 @@ the full design.
 
    ```
    schtasks /Create /TN ServiceBillsAgent /SC ONSTART /RU SYSTEM /RL HIGHEST ^
-     /TR "\"C:\Program Files\Python311\python.exe\" C:\ServiceBillsAgent\servicebills_agent.py"
+     /TR "\"C:\Program Files\Python311\python.exe\" C:\ServiceBills\agent\servicebills_agent.py"
    ```
 
    Adjust the `python.exe` and script paths to match where you installed
@@ -103,4 +117,23 @@ exception's type and message instead.
 ## Updating
 
 There is no auto-update. To update the agent, stop the scheduled task, pull
-the new `agent/` contents, and start it again.
+the new `agent/` contents (and `mikrotik.py` / `vsol_olt.py`, if they
+changed) into the same layout as Install step 2, and start it again.
+
+## Troubleshooting
+
+**The scheduled task starts and immediately stops, or `agent.log` is empty
+even though the task shows as run.** This almost always means `mikrotik.py`
+and `vsol_olt.py` were not copied next to `agent\` (see Install step 2): the
+agent imports them before logging is configured, so a missing connector
+fails before anything reaches `agent.log`. Run the agent directly from a
+console to see the actual error:
+
+```
+python C:\ServiceBills\agent\servicebills_agent.py --config C:\ProgramData\ServiceBillsAgent\agent.toml --once
+```
+
+A missing-connector failure prints a message naming the expected layout
+(`C:\ServiceBills\mikrotik.py`, `C:\ServiceBills\vsol_olt.py`,
+`C:\ServiceBills\agent\servicebills_agent.py`) and exits instead of showing a
+bare traceback.

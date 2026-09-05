@@ -100,3 +100,29 @@ def test_network_access_mode_defaults_to_direct(app, client):
     # body["network_access_mode"], which the real endpoint has never returned.
     body = client.get("/api/business-settings", headers=hdr).get_json()
     assert body["settings"]["network_access_mode"] == "direct"
+
+
+def test_network_access_mode_rejects_an_unknown_value(app, client):
+    """Final review, Also-fix: the column just accepts any string up to 10
+    chars; anything other than 'agent' silently reads back as 'direct' (see
+    _tenant_access_mode), so a typo here used to be a silent no-op instead of
+    a visible error."""
+    hdr = make_tenant(client, "Agent F", "agent_f_admin")
+    r = client.post("/api/business-settings", headers=hdr, data={
+        "business_name": "Agent F", "address": "addr", "mobile": "123",
+        "network_access_mode": "bogus",
+    })
+    assert r.status_code == 400
+    body = client.get("/api/business-settings", headers=hdr).get_json()
+    assert body["settings"]["network_access_mode"] == "direct"
+
+
+def test_network_access_mode_accepts_agent(app, client):
+    hdr = make_tenant(client, "Agent G", "agent_g_admin")
+    r = client.post("/api/business-settings", headers=hdr, data={
+        "business_name": "Agent G", "address": "addr", "mobile": "123",
+        "network_access_mode": "agent",
+    })
+    assert r.status_code == 200
+    body = client.get("/api/business-settings", headers=hdr).get_json()
+    assert body["settings"]["network_access_mode"] == "agent"
