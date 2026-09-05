@@ -2811,32 +2811,49 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
 # Shared by the customer create/update endpoints and the ONU-label /apply
 # endpoint (see apply_onu_label_matches below) so the accepted MAC shape can
 # never drift between the two call sites.
-_MAC_ADDRESS_RE = re.compile(r'^[0-9a-f]{2}(:[0-9a-f]{2}){5}$')
+_MAC_HEX_RE = re.compile(r'^[0-9a-f]{12}$')
+_MAC_SEPARATOR_RE = re.compile(r'[\s:.\-]')
+
+
+def _canonical_mac(raw):
+    """The colon-lowercase form of a MAC, or '' if it isn't one.
+
+    Accepts every separator a MAC is realistically pasted with -- colons,
+    hyphens (Windows' display format, and what the OLT's own web UI shows in
+    places), dots, or none at all. Exactly one form is ever stored, so
+    comparison stays a plain string match rather than a fuzzy one.
+
+    A non-string (e.g. a bare int from a malformed request body) returns ''
+    rather than reaching .strip() and raising AttributeError.
+    """
+    if not isinstance(raw, str):
+        return ''
+    digits = _MAC_SEPARATOR_RE.sub('', raw).lower()
+    if not _MAC_HEX_RE.match(digits):
+        return ''
+    return ':'.join(digits[i:i + 2] for i in range(0, 12, 2))
 
 
 def _validate_mac_address(raw, allow_empty):
-    """Normalize (strip + lowercase) and validate a MAC address string.
+    """Normalize and validate a MAC address string.
 
     Returns (mac_or_None, error_or_None) -- exactly one is ever set.
 
     `allow_empty` controls what a blank value means: on the customer
     endpoints an empty/null value clears the link, so allow_empty=True makes
     that normalize to (None, None); /apply requires a non-empty MAC for every
-    link, so it passes allow_empty=False and gets an error instead. A `raw`
-    that isn't a string at all (e.g. a bare int from a malformed request)
-    fails validation with a clean message rather than raising AttributeError
-    from .strip().
+    link, so it passes allow_empty=False and gets an error instead.
     """
     if raw is None:
         raw = ''
     if not isinstance(raw, str):
         return None, f"'{raw}' is not a valid MAC address (expected form aa:bb:cc:dd:ee:ff)."
-    mac = raw.strip().lower()
-    if not mac:
+    if not raw.strip():
         if allow_empty:
             return None, None
         return None, 'Every link needs a mac_address'
-    if not _MAC_ADDRESS_RE.match(mac):
+    mac = _canonical_mac(raw)
+    if not mac:
         return None, f"'{raw}' is not a valid MAC address (expected form aa:bb:cc:dd:ee:ff)."
     return mac, None
 
@@ -9196,15 +9213,21 @@ def _find_cycle_member(device, by_id):
 
 
 def _normalize_mac(mac):
-    """Normalize a MAC for case/whitespace-insensitive comparison.
+    """Normalize a MAC for comparison, tolerant of separator style.
+
+    Canonical values collapse to the colon-lowercase form, so a customer
+    linked with hyphens still matches an ONU the OLT reports with colons.
+    Anything that isn't a MAC keeps the old behaviour -- stripped and
+    lowercased -- rather than collapsing to '', which would make two
+    different malformed values compare equal to each other.
 
     A value that isn't a string -- e.g. an int, from a malformed agent
-    payload where a colon-less MAC got parsed as a number (see
-    agent_post_result and _validate_agent_result, which now reject this at
-    the boundary for new results, but pre-existing stored rows can still
-    carry it) -- normalizes to '' rather than reaching str.strip(), so it
-    never matches a real MAC and never raises.
+    payload where a colon-less MAC got parsed as a number -- normalizes to
+    '' so it never matches a real MAC and never raises.
     """
+    canonical = _canonical_mac(mac)
+    if canonical:
+        return canonical
     return mac.strip().lower() if isinstance(mac, str) else ''
 
 
