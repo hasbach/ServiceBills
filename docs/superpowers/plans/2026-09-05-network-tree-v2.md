@@ -78,11 +78,9 @@ def _customer(client, hdr, plan_id, mac):
 
 
 def test_canonical_mac_accepts_every_common_separator():
-    for raw in ("dc:8e:8d:61:b0:61", "DC-8E-8D-61-B0-61",
-                "dc.8e.8d.61.b0.61", "DC8E8D61B061".lower() + "",
-                "  dc:8E:8d:61:B0:61  "):
+    for raw in ("dc:8e:8d:61:b0:61", "DC-8E-8D-61-B0-61", "dc.8e.8d.61.b0.61",
+                "dc8e8d61b061", "DC8E8D61B061", "  dc:8E:8d:61:B0:61  "):
         assert appmod._canonical_mac(raw) == "dc:8e:8d:61:b0:61", raw
-    assert appmod._canonical_mac("dc8e8d61b061") == "dc:8e:8d:61:b0:61"
 
 
 def test_canonical_mac_rejects_anything_that_is_not_twelve_hex_digits():
@@ -880,7 +878,7 @@ const DOT = { up: 'var(--nt-up)', down: 'var(--nt-down)', warn: 'var(--nt-warn)'
  * buildTopologyTree. This component knows only how to draw a card, a
  * connector, and a row of subtrees.
  */
-export default function TreeNode({ node, expanded, onToggle, liveLinks }) {
+export default function TreeNode({ node, expanded, onToggle, liveLinks, actions }) {
     const children = node.children || [];
     const canExpand = children.length > 0;
     const isOpen = canExpand && expanded.has(node.key);
@@ -914,7 +912,8 @@ export default function TreeNode({ node, expanded, onToggle, liveLinks }) {
                     <div className={`nt-children${wide ? ' nt-children--wide' : ''}`}>
                         {children.map((child) => (
                             <TreeNode key={child.key} node={child} expanded={expanded}
-                                      onToggle={onToggle} liveLinks={liveLinks} />
+                                      onToggle={onToggle} liveLinks={liveLinks}
+                                      actions={actions} />
                         ))}
                     </div>
                 </>
@@ -982,10 +981,49 @@ import { buildTopologyTree } from './buildTopologyTree';
 5. Delete the now-unused `renderOnu` and `renderDevice` functions and any imports
    they alone used (`Collapse`, `Divider`, `PersonIcon`, `ChevronRightIcon`,
    `ExpandMoreIcon`, `onuStatusColor`, `STATUS_LABEL`/`STATUS_COLOR` if nothing
-   else references them). Keep `Match Labels` and `Load ONUs`; move them into a
-   per-device action row rendered above the tree, keyed by the selected device —
-   see Task 6, which owns that row. For this task, render them exactly where they
-   are today so nothing regresses.
+   else references them).
+
+   **The per-device buttons must survive this deletion.** `renderDevice` is
+   where *Match Labels* and *Load ONUs* live today, so `TreeNode` takes an
+   `actions` render prop and calls it for device nodes only:
+
+```js
+                {node.kind === 'device' && actions && (
+                    <div className="nt-actions">{actions(node)}</div>
+                )}
+```
+
+   placed inside the card, after the meta line, with `actions` threaded through
+   the recursive call alongside `expanded`/`onToggle`/`liveLinks`. Add to
+   `networkTree.css`:
+
+```css
+.nt-actions { display: flex; gap: 4px; margin-top: 6px; }
+/* Buttons live inside a card that is itself a click target, so their clicks
+   must not also toggle the node. */
+.nt-actions > * { pointer-events: auto; }
+```
+
+   and stop the propagation in the handler, since the card is clickable:
+
+```js
+                    <div className="nt-actions" onClick={(e) => e.stopPropagation()}>
+```
+
+   `NetworkTreeView` supplies the render prop, moving today's JSX across
+   unchanged — same `agentOffline` disabling, same tooltips, same
+   `canEditLinks` gate on *Match Labels*:
+
+```js
+    const deviceActions = useCallback((node) => {
+        const device = deviceById.get(node.deviceId);
+        if (!device || device.device_type !== 'vsol_olt') return null;
+        return (<>{/* Match Labels + Load ONUs, exactly as rendered today */}</>);
+    }, [deviceById, agentOffline, agentOfflineReason, refreshingIds, canEditLinks]);
+```
+
+   where `deviceById` is a `useMemo` map built by walking the API `tree`, since
+   the node array carries `deviceId` but not the raw device row.
 
 - [ ] **Step 4: Verify in the browser**
 
@@ -1143,9 +1181,16 @@ fire while the agent is offline:
     }, [tree, accessMode, agentOnline]);
 ```
 
-Add `checkDevice` alongside the existing `refreshOlt`, following the same
-sequence-guard and `errorByDevice` pattern, calling
-`apiService.checkNetworkDeviceNow(device.id)` and polling with `pollNetworkJob`.
+**`checkDevice` does not exist yet — add it before this effect.** Model it
+directly on the existing `refreshOlt`: same `refreshSeqRef` per-device sequence
+guard, same `refreshingIds` in-flight map, same `errorByDevice` handling, same
+quiet `loadTree(false)` resync when the job completes. The only differences are
+the call — `apiService.checkNetworkDeviceNow(device.id)` instead of
+`apiService.refreshOltOnus(device.id)` — and that its result is a health object
+rather than an ONU list. Both still poll with `pollNetworkJob(res.data.job_id)`.
+
+Those sequence guards exist because a superseded response overwriting a newer
+one was a real bug on this page. Do not simplify them away.
 
 - [ ] **Step 3: Show the age on each device card**
 
@@ -1153,9 +1198,7 @@ In `buildTopologyTree.js`'s `deviceNode`, the node already carries
 `lastResultAt`. In `TreeNode.js`, render it under the sublabel when present:
 
 ```js
-                {node.kind === 'device' && node.lastResultAt !== undefined && (
-                    <div className="nt-meta">{node.ageLabel}</div>
-                )}
+                {node.ageLabel && <div className="nt-meta">{node.ageLabel}</div>}
 ```
 
 and in `NetworkTreeView.js`, decorate the built tree with a display label before
