@@ -109,6 +109,11 @@ Task Scheduler does not usefully capture stdout/stderr for a background task,
 so this file is the source of truth for whether the agent is polling,
 what jobs it's handling, and any refusals or connector failures.
 
+The directory is created if it doesn't exist, so `--log` can point anywhere.
+If the file itself cannot be opened (a denied ACL, a read-only volume), the
+agent says so on the console and keeps running with console logging only —
+it will still check devices, it just won't leave a record.
+
 Never expect a device password to appear in this log, even in a traceback:
 the agent deliberately avoids `logger.exception` (and any traceback dump) on
 paths whose frame locals hold a device credential, logging only the
@@ -137,3 +142,8 @@ A missing-connector failure prints a message naming the expected layout
 (`C:\ServiceBills\mikrotik.py`, `C:\ServiceBills\vsol_olt.py`,
 `C:\ServiceBills\agent\servicebills_agent.py`) and exits instead of showing a
 bare traceback.
+
+**The agent is clearly running — Settings shows it online — but `agent.log`
+never appears.** The log file could not be opened, so the agent fell back to
+console logging, which Task Scheduler discards. Run the same `--once` command
+above and look for a `Cannot open the log file` line naming the reason.

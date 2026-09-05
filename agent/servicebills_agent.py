@@ -294,13 +294,45 @@ def run_once(session, config):
 
 
 def _configure_logging(log_path):
-    handler = logging.handlers.RotatingFileHandler(
-        log_path, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    """Log to a rotating file, and to stdout for interactive runs.
+
+    The log's directory is created if it is missing. The install procedure
+    happens to create C:\\ProgramData\\ServiceBillsAgent\\ as a side effect of
+    copying agent.toml into it (README Install step 4), so a missing directory
+    only bit someone who pointed --log or --config elsewhere -- but it bit
+    hard: this handler is opened BEFORE any logging exists, so the
+    FileNotFoundError surfaced as a raw traceback with nothing in agent.log to
+    explain it. Exactly the failure shape the connector-import guard at the
+    top of this file exists to prevent.
+
+    If the file still cannot be opened -- a denied ACL, a read-only volume, a
+    directory sitting where the file should be -- the agent logs to stdout
+    only and keeps running. An agent that checks devices but cannot write its
+    log is much better than one that refuses to start, and the cloud's
+    Settings page still shows it as online; this is the same "degrade, don't
+    outage" call _warn_if_world_readable makes about the config's ACL.
+
+    The stdout handler goes on FIRST so that the warning below has somewhere
+    to go even when the file handler is what failed.
+    """
+    logger.addHandler(logging.StreamHandler(sys.stdout))
+    logger.setLevel(logging.INFO)
+    try:
+        # abspath first: a bare relative --log (e.g. "agent.log") has an empty
+        # dirname, and os.makedirs("") raises FileNotFoundError even with
+        # exist_ok -- resolving it to the working directory makes that a no-op.
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    except OSError as exc:
+        logger.warning(
+            "Cannot open the log file %s (%s). Continuing with console "
+            "logging only -- under Task Scheduler that means no persistent "
+            "log at all, so fix the path or its permissions.", log_path, exc)
+        return
     handler.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
-    logger.addHandler(logging.StreamHandler(sys.stdout))
-    logger.setLevel(logging.INFO)
 
 
 def _warn_if_world_readable(path):

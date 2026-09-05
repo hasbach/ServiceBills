@@ -1,6 +1,7 @@
 """Tests for the on-prem agent. No cloud, no device, no network: the HTTP
 session is a fake and the connectors are monkeypatched."""
 import sys, os, types
+import logging.handlers
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
@@ -453,3 +454,76 @@ def test_run_once_still_logs_success_on_a_2xx_response(monkeypatch, caplog):
         agent.run_once(session, CONFIG)
     messages = [r.getMessage() for r in caplog.records]
     assert any(m.endswith("-> ok") for m in messages)
+
+
+# --- Logging setup. _configure_logging runs before anything else can report a
+# problem, so a failure here is an unexplained traceback on an unattended box
+# -- the same class of failure the connector-import guard exists to prevent.
+
+@pytest.fixture
+def isolated_agent_logger():
+    """Swap the module logger's handlers out for the duration of a test.
+
+    _configure_logging appends to a module-level logger, so without this a
+    test would leak handlers into every later test, and on Windows an open
+    RotatingFileHandler holds a lock that stops pytest removing tmp_path.
+    """
+    saved_handlers, saved_level = agent.logger.handlers[:], agent.logger.level
+    agent.logger.handlers = []
+    try:
+        yield agent.logger
+    finally:
+        for handler in agent.logger.handlers:
+            handler.close()
+        agent.logger.handlers, agent.logger.level = saved_handlers, saved_level
+
+
+def test_configure_logging_creates_a_missing_log_directory(tmp_path, isolated_agent_logger):
+    """The regression: the agent died with FileNotFoundError before logging
+    existed whenever the log's directory wasn't already there. The install
+    procedure creates C:\\ProgramData\\ServiceBillsAgent\\ as a side effect of
+    copying agent.toml into it, which is why this survived review -- it only
+    bites when --log or --config point somewhere else."""
+    log_path = tmp_path / "not" / "created" / "yet" / "agent.log"
+    assert not log_path.parent.exists()
+
+    agent._configure_logging(str(log_path))
+    agent.logger.info("hello from the agent")
+    for handler in agent.logger.handlers:
+        handler.flush()
+
+    assert log_path.exists()
+    assert "hello from the agent" in log_path.read_text(encoding="utf-8")
+
+
+def test_configure_logging_accepts_a_bare_relative_log_path(tmp_path, monkeypatch,
+                                                            isolated_agent_logger):
+    """A relative --log with no directory part: os.path.dirname('agent.log')
+    is '', and os.makedirs('') raises FileNotFoundError even with exist_ok.
+    Resolving to an absolute path first makes it a no-op on the cwd."""
+    monkeypatch.chdir(tmp_path)
+    agent._configure_logging("agent.log")
+    agent.logger.info("relative path works")
+    for handler in agent.logger.handlers:
+        handler.flush()
+    assert (tmp_path / "agent.log").exists()
+
+
+def test_configure_logging_degrades_to_stdout_when_the_file_cannot_be_opened(
+        tmp_path, capsys, isolated_agent_logger):
+    """A path that cannot be opened as a file -- here a directory already sits
+    where the log should go, but a denied ACL or a read-only volume is the
+    same case. The agent must keep running and say why: one that checks
+    devices but cannot write its log beats one that refuses to start."""
+    log_path = tmp_path / "agent.log"
+    log_path.mkdir()  # not a file
+
+    agent._configure_logging(str(log_path))  # must not raise
+
+    agent.logger.info("still logging")
+    out = capsys.readouterr().out
+    assert "Cannot open the log file" in out
+    assert "still logging" in out
+    # Only the stdout handler survived; nothing holds a half-open file.
+    assert all(not isinstance(h, logging.handlers.RotatingFileHandler)
+               for h in agent.logger.handlers)
