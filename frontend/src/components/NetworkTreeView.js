@@ -1,24 +1,16 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
-    Box, Typography, Button, Paper, Chip, CircularProgress, Alert,
-    Collapse, IconButton, Stack, Divider, Tooltip,
+    Box, Typography, Button, Chip, CircularProgress, Alert,
+    Stack, Tooltip,
 } from '@mui/material';
 import {
-    ExpandMore as ExpandMoreIcon, ChevronRight as ChevronRightIcon,
-    Refresh as RefreshIcon, Router as CcrIcon, SettingsInputAntenna as OltIcon,
-    Person as PersonIcon, Link as LinkIcon,
+    Refresh as RefreshIcon, Link as LinkIcon,
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
 import OnuLabelMatcherDialog from './OnuLabelMatcherDialog';
 import pollNetworkJob from './pollNetworkJob';
-import { STATUS_COLOR, STATUS_LABEL, NOT_CHECKED } from './deviceStatus';
-
-// ONU-level status is only ever 'online'/'offline' (see vsol_olt.py
-// get_olt_status) -- a simpler two-state domain than NetworkDevice's
-// last_status, so it keeps its own local color helper rather than using the
-// shared STATUS_COLOR/STATUS_LABEL maps (those cover 'auth_failed' too,
-// which never applies to an individual ONU).
-const onuStatusColor = (status) => (status === 'online' ? 'success' : 'error');
+import TreeNode from './TreeNode';
+import { buildTopologyTree } from './buildTopologyTree';
 
 const NetworkTreeView = () => {
     // apiService is a direct module export here, not part of the hook's value
@@ -34,14 +26,23 @@ const NetworkTreeView = () => {
         .some((r) => r === 'admin' || r === 'finance');
     const [tree, setTree] = useState([]);
     const [loading, setLoading] = useState(true);
-    const [onusByDevice, setOnusByDevice] = useState({});
     const [errorByDevice, setErrorByDevice] = useState({});
     // Per-device in-flight indicator -- a plain object keyed by device.id
-    // (same keying convention as onusByDevice/errorByDevice), NOT a single
-    // scalar. A scalar would make one device's "Checking..." state get
-    // clobbered by a refresh started on a different device.
+    // (same keying convention as errorByDevice), NOT a single scalar. A
+    // scalar would make one device's "Checking..." state get clobbered by a
+    // refresh started on a different device.
     const [refreshingIds, setRefreshingIds] = useState({});
-    const [expanded, setExpanded] = useState({});
+    // Set of expanded node *keys* (buildTopologyTree's node.key, e.g.
+    // "dev-12" or "dev-12/pon-1/onu-aa:bb:...") -- not device ids, since a
+    // node here can be a PON, an ONU, or a customer as well as a device.
+    const [expanded, setExpanded] = useState(() => new Set());
+    const toggleNode = useCallback((key) => {
+        setExpanded((prev) => {
+            const next = new Set(prev);
+            if (next.has(key)) next.delete(key); else next.add(key);
+            return next;
+        });
+    }, []);
     const [matcherDevice, setMatcherDevice] = useState(null);
 
     // Tenant-wide access mode ('direct' | 'agent') and, in agent mode, the
@@ -122,7 +123,7 @@ const NetworkTreeView = () => {
         ? `Agent offline (last seen ${agent.last_seen_at}). Start the agent on your network and try again.`
         : 'Agent offline (never connected). Start the agent on your network and try again.';
 
-    const refreshOlt = async (device) => {
+    const refreshOlt = useCallback(async (device) => {
         const seq = (refreshSeqRef.current[device.id] || 0) + 1;
         refreshSeqRef.current[device.id] = seq;
 
@@ -138,8 +139,18 @@ const NetworkTreeView = () => {
                 const job = await pollNetworkJob(res.data.job_id);
                 if (refreshSeqRef.current[device.id] === seq) {
                     if (job.status === 'done' && !job.error) {
-                        setOnusByDevice((prev) => ({ ...prev, [device.id]: job.result }));
-                        setExpanded((prev) => ({ ...prev, [device.id]: true }));
+                        // The job's ONU/customer payload itself now reaches the
+                        // page through `tree` (loadTree(false) below re-fetches
+                        // it, since the backend persists last_result on the
+                        // device row) -- buildTopologyTree turns that straight
+                        // into PON/ONU nodes. All that's left to do here is
+                        // open the OLT's own node so the freshly-loaded PONs
+                        // are visible without an extra click.
+                        setExpanded((prev) => {
+                            const next = new Set(prev);
+                            next.add(`dev-${device.id}`);
+                            return next;
+                        });
                     } else {
                         setErrorByDevice((prev) => ({ ...prev, [device.id]: job.error }));
                     }
@@ -150,13 +161,12 @@ const NetworkTreeView = () => {
                     // failure (see vsol_olt.get_olt_status's _mark_checked
                     // calls). The OLT's status chip and "checked ..."
                     // caption above are rendered from `tree`, not from
-                    // onusByDevice/errorByDevice, so without this quiet
-                    // resync they'd stay stale until an unrelated "Reload"
-                    // or a remount. Guarded by the same sequence check as
-                    // the rest of this function so a superseded poll can't
-                    // clobber a newer request's view with a stale reload;
-                    // showSpinner=false keeps it from blanking the tree
-                    // already on screen.
+                    // local state, so without this quiet resync they'd stay
+                    // stale until an unrelated "Reload" or a remount.
+                    // Guarded by the same sequence check as the rest of this
+                    // function so a superseded poll can't clobber a newer
+                    // request's view with a stale reload; showSpinner=false
+                    // keeps it from blanking the tree already on screen.
                     loadTree(false);
                 }
             }
@@ -175,124 +185,61 @@ const NetworkTreeView = () => {
                 });
             }
         }
-    };
+    }, [loadTree]);
 
-    const renderOnu = (onu) => (
-        <Box key={onu.mac_address} sx={{ pl: 4, py: 0.75, borderLeft: '2px solid', borderColor: 'divider' }}>
-            <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-                <Chip size="small" label={onu.status} color={onuStatusColor(onu.status)} />
-                <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{onu.onu_id}</Typography>
-                <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
-                    {onu.mac_address}
-                </Typography>
-                {onu.description && <Chip size="small" variant="outlined" label={onu.description} />}
-                {onu.distance_m > 0 && (
-                    <Typography variant="caption" color="text.secondary">{onu.distance_m} m</Typography>
-                )}
-            </Stack>
-            <Box sx={{ pl: 2, pt: 0.5 }}>
-                {(onu.customers || []).length === 0 ? (
-                    <Typography variant="caption" color="text.secondary">
-                        No customer linked to this ONU
-                    </Typography>
-                ) : onu.customers.map((c) => (
-                    <Stack key={c.id} direction="row" spacing={0.5} alignItems="center" flexWrap="wrap">
-                        <PersonIcon fontSize="inherit" color="action" />
-                        <Typography variant="body2">{c.name}</Typography>
-                        {/* The MAC this customer is linked BY, as stored on
-                            the customer record. Usually identical to the
-                            ONU's own MAC above; when it isn't (different
-                            case or separators -- they only have to agree
-                            after normalization) this is what shows it. */}
-                        {c.onu_mac_address && (
-                            <Typography variant="caption" color="text.secondary"
-                                sx={{ fontFamily: 'monospace' }}>
-                                {c.onu_mac_address}
-                            </Typography>
-                        )}
-                        {!c.is_subscription_active && (
-                            <Chip size="small" color="warning" variant="outlined" label="inactive" />
-                        )}
-                    </Stack>
-                ))}
-            </Box>
-        </Box>
-    );
+    // The node array from buildTopologyTree carries deviceId but not the raw
+    // device row (device_type, host, ...) the action buttons below need --
+    // that only lives on the API tree's own device objects, which nest
+    // children rather than being a flat list. Walked once per tree fetch.
+    const deviceById = useMemo(() => {
+        const map = new Map();
+        const walk = (device) => {
+            map.set(device.id, device);
+            (device.children || []).forEach(walk);
+        };
+        tree.forEach(walk);
+        return map;
+    }, [tree]);
 
-    const renderDevice = (device, depth) => {
-        const isOlt = device.device_type === 'vsol_olt';
-        const onus = onusByDevice[device.id];
-        const isOpen = !!expanded[device.id];
+    const topology = useMemo(() => buildTopologyTree(tree), [tree]);
+
+    // Renders *Match Labels* and *Load ONUs* (OLT-only) into a device node's
+    // card -- moved here unchanged from the old renderDevice, including the
+    // agentOffline-driven disabling/tooltips and the canEditLinks gate on
+    // Match Labels. errorByDevice rides along in the same slot since it's
+    // the only per-device injection point TreeNode exposes.
+    const deviceActions = useCallback((node) => {
+        const device = deviceById.get(node.deviceId);
+        if (!device || device.device_type !== 'vsol_olt') return null;
         const isRefreshing = !!refreshingIds[device.id];
         return (
-            <Box key={device.id} sx={{ pl: depth * 3 }}>
-                <Paper variant="outlined" sx={{ p: 1.5, mb: 1 }}>
-                    <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-                        {isOlt && onus && (
-                            <IconButton size="small"
-                                onClick={() => setExpanded((p) => ({ ...p, [device.id]: !isOpen }))}>
-                                {isOpen ? <ExpandMoreIcon /> : <ChevronRightIcon />}
-                            </IconButton>
-                        )}
-                        {isOlt ? <OltIcon color="action" /> : <CcrIcon color="action" />}
-                        <Typography sx={{ fontWeight: 600 }}>{device.name}</Typography>
-                        <Typography variant="caption" color="text.secondary">
-                            {device.host}:{device.api_port}
-                        </Typography>
-                        <Chip size="small"
-                            label={STATUS_LABEL[device.last_status || NOT_CHECKED] || device.last_status}
-                            color={STATUS_COLOR[device.last_status || NOT_CHECKED] || 'default'} />
-                        {device.last_checked_at && (
-                            <Typography variant="caption" color="text.secondary">
-                                checked {device.last_checked_at}
-                            </Typography>
-                        )}
-                        <Box sx={{ flexGrow: 1 }} />
-                        {isOlt && (
-                            <>
-                                {canEditLinks && (
-                                    <Tooltip title={agentOffline ? agentOfflineReason : ''}>
-                                        <span>
-                                            <Button size="small" startIcon={<LinkIcon />}
-                                                disabled={agentOffline}
-                                                onClick={() => setMatcherDevice(device)}>
-                                                Match Labels
-                                            </Button>
-                                        </span>
-                                    </Tooltip>
-                                )}
-                                <Tooltip title={agentOffline ? agentOfflineReason : ''}>
-                                    <span>
-                                        <Button size="small" variant="outlined" startIcon={<RefreshIcon />}
-                                            disabled={isRefreshing || agentOffline}
-                                            onClick={() => refreshOlt(device)}>
-                                            {isRefreshing ? 'Checking…' : 'Load ONUs'}
-                                        </Button>
-                                    </span>
-                                </Tooltip>
-                            </>
-                        )}
-                    </Stack>
-
-                    {errorByDevice[device.id] && (
-                        <Alert severity="error" sx={{ mt: 1 }}>{errorByDevice[device.id]}</Alert>
-                    )}
-
-                    {isOlt && onus && (
-                        <Collapse in={isOpen}>
-                            <Divider sx={{ my: 1 }} />
-                            <Typography variant="caption" color="text.secondary">
-                                {onus.length} ONUs — {onus.filter((o) => o.status === 'online').length} online,
-                                {' '}{onus.filter((o) => o.status !== 'online').length} offline
-                            </Typography>
-                            <Box sx={{ mt: 1 }}>{onus.map(renderOnu)}</Box>
-                        </Collapse>
-                    )}
-                </Paper>
-                {device.children.map((child) => renderDevice(child, depth + 1))}
-            </Box>
+            <>
+                {canEditLinks && (
+                    <Tooltip title={agentOffline ? agentOfflineReason : ''}>
+                        <span>
+                            <Button size="small" startIcon={<LinkIcon />}
+                                disabled={agentOffline}
+                                onClick={() => setMatcherDevice(device)}>
+                                Match Labels
+                            </Button>
+                        </span>
+                    </Tooltip>
+                )}
+                <Tooltip title={agentOffline ? agentOfflineReason : ''}>
+                    <span>
+                        <Button size="small" variant="outlined" startIcon={<RefreshIcon />}
+                            disabled={isRefreshing || agentOffline}
+                            onClick={() => refreshOlt(device)}>
+                            {isRefreshing ? 'Checking…' : 'Load ONUs'}
+                        </Button>
+                    </span>
+                </Tooltip>
+                {errorByDevice[device.id] && (
+                    <Alert severity="error" className="nt-action-error">{errorByDevice[device.id]}</Alert>
+                )}
+            </>
         );
-    };
+    }, [deviceById, agentOffline, agentOfflineReason, refreshingIds, canEditLinks, errorByDevice, refreshOlt]);
 
     if (loading) return <Box sx={{ p: 4, textAlign: 'center' }}><CircularProgress /></Box>;
 
@@ -320,7 +267,27 @@ const NetworkTreeView = () => {
                     No network devices yet. Add a CCR and an OLT on the Network Devices page,
                     then set the OLT's "Connected To" to the CCR.
                 </Alert>
-            ) : tree.map((root) => renderDevice(root, 0))}
+            ) : (
+                <Box className="nt-root" sx={{
+                    '--nt-surface': (t) => t.palette.background.paper,
+                    '--nt-border': (t) => t.palette.divider,
+                    '--nt-border-strong': (t) => t.palette.text.secondary,
+                    '--nt-link': (t) => t.palette.divider,
+                    '--nt-up': (t) => t.palette.success.main,
+                    '--nt-down': (t) => t.palette.error.main,
+                    '--nt-down-bg': (t) => t.palette.error.light + '22',
+                    '--nt-warn': (t) => t.palette.warning.main,
+                    '--nt-muted': (t) => t.palette.text.disabled,
+                    '--nt-accent': (t) => t.palette.primary.main,
+                }}>
+                    <div className="nt-level">
+                        {topology.map((root) => (
+                            <TreeNode key={root.key} node={root} expanded={expanded}
+                                      onToggle={toggleNode} liveLinks actions={deviceActions} />
+                        ))}
+                    </div>
+                </Box>
+            )}
 
             {matcherDevice && (
                 <OnuLabelMatcherDialog
