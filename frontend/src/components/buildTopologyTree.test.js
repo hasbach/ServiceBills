@@ -199,6 +199,19 @@ test('an array entry in the interfaces list is skipped, not rendered as a phanto
     expect(ports.meta).toBe('1 of 1 up');
 });
 
+test('an array entry in the customers list is skipped, not rendered as a phantom customer', () => {
+    const tree = buildTopologyTree([ccr({ children: [olt({
+        last_result: [onu({ customers: [
+            { id: 7, name: 'Moussa Ghadir', is_subscription_active: true,
+              onu_mac_address: 'b4:64:15:3f:c1:94' },
+            [1, 2, 3],
+        ] })],
+    })] })]);
+    const onu_node = find(tree, 'onu');
+    expect(onu_node.children).toHaveLength(1);
+    expect(onu_node.children[0].kind).toBe('customer');
+});
+
 test('nodeMatches searches label, sublabel and meta case-insensitively', () => {
     const node = { label: 'MoussaGhadir', sublabel: 'b4:64:15:3f:c1:94', meta: '531 m' };
     expect(nodeMatches(node, 'moussa')).toBe(true);

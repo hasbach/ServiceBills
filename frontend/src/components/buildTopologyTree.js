@@ -75,7 +75,7 @@ function onuNode(onu, ponKey, index) {
         status: onuStatus(onu.status),
         searchText: searchTextOf(onu.description, onu.onu_id, mac),
         children: asArray(onu.customers)
-            .filter((c) => c && typeof c === 'object')
+            .filter((c) => c && typeof c === 'object' && !Array.isArray(c))
             .map((c) => customerNode(c, key)),
     };
 }
