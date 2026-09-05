@@ -59,7 +59,12 @@ function customerNode(customer, ponKey) {
 
 function onuNode(onu, ponKey, index) {
     const mac = typeof onu.mac_address === 'string' ? onu.mac_address : '';
-    const key = `${ponKey}/onu-${mac || index}`;
+    // The group-local index is included unconditionally (not just as a
+    // fallback) so two ONUs that happen to share a MAC -- this OLT is known
+    // to carry stale duplicate authorization entries -- still get distinct
+    // keys. The value stays in the key too: it aids debugging and keeps keys
+    // stable when order is stable, but position is what guarantees uniqueness.
+    const key = `${ponKey}/onu-${index}-${mac || 'na'}`;
     const distance = Number(onu.distance_m) > 0 ? `${onu.distance_m} m` : '';
     return {
         key,
@@ -77,7 +82,8 @@ function onuNode(onu, ponKey, index) {
 
 /** Group an OLT's ONU list into PON nodes. Order follows first appearance. */
 function ponNodes(device) {
-    const onus = asArray(device.last_result).filter((o) => o && typeof o === 'object');
+    const onus = asArray(device.last_result)
+        .filter((o) => o && typeof o === 'object' && !Array.isArray(o));
     const groups = new Map();
     onus.forEach((onu) => {
         // A pon_port that is missing, blank, or not a string cannot be trusted
@@ -111,7 +117,8 @@ function portsNode(device) {
     const result = device.last_result;
     if (device.last_result_operation !== 'device_health'
         || !result || typeof result !== 'object') return null;
-    const interfaces = asArray(result.interfaces).filter((i) => i && typeof i === 'object');
+    const interfaces = asArray(result.interfaces)
+        .filter((i) => i && typeof i === 'object' && !Array.isArray(i));
     if (!interfaces.length) return null;
 
     const key = `dev-${device.id}/ports`;
@@ -127,8 +134,11 @@ function portsNode(device) {
         children: interfaces.map((iface, i) => {
             const name = typeof iface.name === 'string' ? iface.name : '';
             const label = typeof iface.label === 'string' && iface.label ? iface.label : '';
+            // As above: the group-local index is unconditional so two
+            // interfaces sharing a name (e.g. two "ether1" entries) still
+            // get distinct keys; the name stays in the key for debugging.
             return {
-                key: `${key}/if-${name || i}`,
+                key: `${key}/if-${i}-${name || 'na'}`,
                 kind: 'interface',
                 label: label || name || 'interface',
                 sublabel: label ? name : '',

@@ -141,6 +141,64 @@ test('every node key is unique across the whole tree', () => {
     expect(new Set(keys).size).toBe(keys.length);
 });
 
+const allKeys = (tree) => {
+    const keys = [];
+    (function walk(nodes) {
+        nodes.forEach((n) => { keys.push(n.key); walk(n.children || []); });
+    })(tree);
+    return keys;
+};
+
+test('two ONUs sharing a MAC in the same PON group still get unique keys', () => {
+    const tree = buildTopologyTree([ccr({ children: [olt({
+        // Same pon_port AND same mac_address -- the documented duplicate
+        // authorization entry case. Without the index disambiguating,
+        // both would collide on `dev-2/pon-PON1/onu-b4:64:15:3f:c1:94`.
+        last_result: [onu(), onu()],
+    })] })]);
+    const keys = allKeys(tree);
+    expect(new Set(keys).size).toBe(keys.length);
+    const pon = find(tree, 'pon', 'PON1');
+    expect(pon.children).toHaveLength(2);
+    expect(pon.children[0].key).not.toBe(pon.children[1].key);
+});
+
+test('two device_health interfaces sharing a name still get unique keys', () => {
+    const tree = buildTopologyTree([ccr({
+        last_result_operation: 'device_health',
+        last_result: { interfaces: [
+            { name: 'ether1', running: true, disabled: false },
+            { name: 'ether1', running: false, disabled: false },
+        ] },
+    })]);
+    const keys = allKeys(tree);
+    expect(new Set(keys).size).toBe(keys.length);
+    const ports = find(tree, 'ports');
+    expect(ports.children).toHaveLength(2);
+    expect(ports.children[0].key).not.toBe(ports.children[1].key);
+});
+
+test('an array entry in the ONU result is skipped, not rendered as a phantom ONU', () => {
+    const tree = buildTopologyTree([ccr({ children: [olt({
+        last_result: [onu(), [1, 2, 3]],
+    })] })]);
+    expect(find(tree, 'pon', 'PON1').children).toHaveLength(1);
+    expect(find(tree, 'onu', 'ONU')).toBeNull();
+});
+
+test('an array entry in the interfaces list is skipped, not rendered as a phantom interface', () => {
+    const tree = buildTopologyTree([ccr({
+        last_result_operation: 'device_health',
+        last_result: { interfaces: [
+            { name: 'ether1', running: true, disabled: false },
+            [1, 2, 3],
+        ] },
+    })]);
+    const ports = find(tree, 'ports');
+    expect(ports.children).toHaveLength(1);
+    expect(ports.meta).toBe('1 of 1 up');
+});
+
 test('nodeMatches searches label, sublabel and meta case-insensitively', () => {
     const node = { label: 'MoussaGhadir', sublabel: 'b4:64:15:3f:c1:94', meta: '531 m' };
     expect(nodeMatches(node, 'moussa')).toBe(true);
