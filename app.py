@@ -9106,29 +9106,36 @@ def _latest_results_by_device(devices):
     _resolve_onu_customers and _with_interface_labels -- so the shapes the
     page receives here and from polling a live job are identical, and both
     inherit those helpers' tolerance of malformed stored results.
+
+    Issues one small query per device (ordered created_at desc, id desc,
+    limited to 1) instead of pulling every 'done' job -- full result JSON
+    included -- for the whole tenant across the retention window and
+    reducing to one-per-device in Python. A tenant has a handful of devices,
+    so a handful of single-row lookups beats loading a week of results to
+    discard nearly all of them. Each query still goes through tenant_query,
+    so tenant scoping stays doubly enforced (tenant_id filter plus the
+    per-device filter), and the id DESC tiebreak is preserved: two jobs for
+    one device can share a created_at at SQLite's resolution, and without it
+    "newest" would be arbitrary.
     """
     if not devices:
         return {}
-    jobs = (tenant_query(NetworkAgentJob)
-            .filter(NetworkAgentJob.device_id.in_([d.id for d in devices]),
-                    NetworkAgentJob.status == 'done')
-            .order_by(NetworkAgentJob.device_id,
-                      NetworkAgentJob.created_at.desc(),
-                      NetworkAgentJob.id.desc())
-            .all())
-    newest = {}
-    for job in jobs:
-        # Ordered newest-first per device, so the first one wins.
-        newest.setdefault(job.device_id, job)
-
     out = {}
-    for device_id, job in newest.items():
+    for device in devices:
+        job = (tenant_query(NetworkAgentJob)
+               .filter(NetworkAgentJob.device_id == device.id,
+                       NetworkAgentJob.status == 'done')
+               .order_by(NetworkAgentJob.created_at.desc(),
+                         NetworkAgentJob.id.desc())
+               .first())
+        if job is None:
+            continue
         result = job.result
         if job.operation == 'olt_status' and result:
             result = _resolve_onu_customers(result)
         elif job.operation == 'device_health':
             result = _with_interface_labels(job, {'result': result}).get('result')
-        out[device_id] = {
+        out[device.id] = {
             'operation': job.operation,
             'result': result,
             'at': job.finished_at.strftime('%Y-%m-%d %H:%M:%S') if job.finished_at else None,

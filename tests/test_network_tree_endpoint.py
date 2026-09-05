@@ -487,6 +487,42 @@ def test_tree_ignores_jobs_that_are_not_done(app, client, monkeypatch):
     assert _tree_by_id(client, hdr)[olt["id"]]["last_result"] is None
 
 
+def test_tree_carries_the_newer_of_two_completed_jobs_for_the_same_device(app, client, monkeypatch):
+    """Pins 'newest wins' for _latest_results_by_device: ORDER BY created_at
+    DESC with an id DESC tiebreak. Nothing else in the suite creates two
+    completed jobs for one device, so a regression that flipped .desc() to
+    .asc() (on either column), or broke the one-per-device reduction, would
+    otherwise pass the whole suite. The two jobs' created_at is forced equal
+    after the fact -- jobs for one device really can share a created_at at
+    SQLite's resolution -- so the assertion actually exercises the id DESC
+    tiebreak, not just created_at ordering."""
+    hdr = make_tenant(client, "Tree U", "tree_u_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+
+    older_onu = [{"pon_port": "PON1", "onu_id": "EPON0/1:9", "status": "online",
+                  "mac_address": "aa:aa:aa:aa:aa:01", "description": "OlderResult",
+                  "model": "V2801D", "distance_m": 100}]
+    newer_onu = [{"pon_port": "PON1", "onu_id": "EPON0/1:9", "status": "online",
+                  "mac_address": "bb:bb:bb:bb:bb:02", "description": "NewerResult",
+                  "model": "V2801D", "distance_m": 200}]
+
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, older_onu))
+    older = refresh_and_poll(client, hdr, olt["id"])
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, newer_onu))
+    newer = refresh_and_poll(client, hdr, olt["id"])
+    assert newer["id"] > older["id"]
+
+    with app.app_context():
+        older_job = appmod.db.session.get(appmod.NetworkAgentJob, older["id"])
+        newer_job = appmod.db.session.get(appmod.NetworkAgentJob, newer["id"])
+        newer_job.created_at = older_job.created_at
+        appmod.db.session.commit()
+
+    node = _tree_by_id(client, hdr)[olt["id"]]
+    assert node["last_result"][0]["description"] == "NewerResult"
+
+
 def test_tree_results_stay_tenant_scoped(app, client, monkeypatch):
     hdr_one = make_tenant(client, "Tree T1", "tree_t1_admin")
     ccr_one = make_ccr(client, hdr_one)
