@@ -46,6 +46,33 @@ def test_poll_with_a_garbage_token_is_rejected(app, client):
     assert client.get("/api/agent/jobs", headers=auth("9.abc")).status_code == 401
 
 
+def test_poll_with_a_non_ascii_unicode_digit_agent_id_is_rejected(app, client):
+    """'²' (superscript two) is a Unicode digit -- '²'.isdigit() is
+    True -- but int('²') raises ValueError, not str.isdigit()'s promise.
+    Werkzeug latin-1-decodes headers, so a raw 0xB2 byte in the Authorization
+    header reaches _authenticate_agent as this literal character. Before the
+    isascii() guard, this token crashed the request with an unauthenticated
+    500 instead of the usual 401 every other bad token gets."""
+    assert client.get("/api/agent/jobs", headers=auth("².x")).status_code == 401
+
+
+def test_poll_with_an_extremely_long_digit_agent_id_is_rejected(app, client):
+    """A 5000-digit agent id is pure ASCII and passes isdigit(), but int() on
+    a digit string that long raises ValueError (CPython's int-string
+    conversion length guard, 4300 digits) instead of just failing the lookup
+    like a plain bad id would."""
+    huge_id = "9" * 5000
+    assert client.get("/api/agent/jobs", headers=auth(huge_id + ".x")).status_code == 401
+
+
+def test_poll_with_an_agent_id_that_overflows_a_bigint_is_rejected(app, client):
+    """A 22-digit agent id parses fine as a Python int but is too big for the
+    SQLite driver to bind, raising OverflowError (Postgres would likely just
+    fail to match a row instead) -- another crafted-token 500 that must
+    degrade to the same 401 as any other unrecognized agent id."""
+    assert client.get("/api/agent/jobs", headers=auth("9999999999999999999999.x")).status_code == 401
+
+
 def test_poll_returns_204_when_no_work(app, client):
     make_tenant(client, "Api A", "api_a_admin")
     token, _, _ = make_agent_and_device(app, "Api A")
@@ -638,3 +665,37 @@ def test_a_malformed_stored_token_hash_is_treated_as_no_match(app, client):
         agent.token_hash = "not-a-valid-héx-hash"  # non-ASCII -> TypeError
         appmod.db.session.commit()
     assert client.get("/api/agent/jobs", headers=auth(token)).status_code == 401
+
+
+def test_polling_past_the_rate_limit_is_rejected(app, client):
+    """Regression pin for agent_poll_job's @limiter.limit("120 per minute").
+    Before this test, `grep 429 tests/test_network_agent_*.py` returned
+    nothing -- both agent routes' rate-limit decorators could be deleted
+    outright and the whole suite would stay green, silently reopening the
+    flood the last hardening round closed.
+
+    No valid token is needed: flask-limiter's check runs ahead of
+    agent_token_required (it fires in a before_request hook keyed on the
+    endpoint, before the view or its decorators execute), so an
+    unauthenticated request is counted and 429'd on request volume alone --
+    exactly like /api/pay/t/<slug>/lookup's rate-limit test in
+    test_tenant_wide_payment_page.py, whose pattern this follows.
+
+    130 requests clears the 120/min limit even from a cold bucket; this
+    file's other tests against this same route (~38 GETs) only make it trip
+    sooner, never later."""
+    try:
+        r = None
+        for _ in range(130):
+            r = client.get("/api/agent/jobs")
+        assert r.status_code == 429
+    finally:
+        # flask-limiter's in-memory storage is shared across the whole test
+        # session (the Limiter object is created once at app-module-import
+        # time, unlike the per-test in-memory DB -- see
+        # test_rate_limiting.py and test_tenant_wide_payment_page.py's
+        # test_phone_lookup_is_rate_limited for the same pattern). Reset it
+        # so tripping this route's per-IP limit doesn't leak into later
+        # tests hitting the same endpoint (test_network_agent_program.py, in
+        # particular, runs after this file alphabetically).
+        appmod.limiter.storage.reset()

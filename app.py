@@ -430,8 +430,11 @@ class NetworkAgent(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, unique=True)
     name = db.Column(db.String(100), nullable=False)
-    # bcrypt hash of the token's secret half only. The token is shown once at
-    # creation and never stored. See _verify_agent_token for the format.
+    # sha256 hash (hex digest) of the token's secret half only -- not bcrypt.
+    # The secret is already a high-entropy random value (see
+    # _issue_agent_token's comment for why a slow KDF buys nothing here and
+    # costs a lot). The token is shown once at creation and never stored.
+    # See _authenticate_agent for the format and the comparison.
     token_hash = db.Column(db.String(255), nullable=False)
     last_seen_at = db.Column(db.DateTime, nullable=True)  # stamped on every poll
     agent_version = db.Column(db.String(20), nullable=True)
@@ -9261,7 +9264,19 @@ def _authenticate_agent():
         return None
     raw = header[len('Bearer '):].strip()
     agent_id, _, secret = raw.partition('.')
-    if not agent_id.isdigit() or not secret:
+    # `agent_id.isdigit()` alone does not guarantee `int(agent_id)` succeeds:
+    # isdigit() is true for non-ASCII Unicode digits (e.g. superscript '²',
+    # which reaches here as a literal character because Werkzeug latin-1-
+    # decodes headers) that int() cannot parse, and it is also true for
+    # digit strings thousands of characters long, which trip CPython's
+    # int-string conversion length guard. Requiring isascii() alongside
+    # isdigit() restricts this to plain '0'-'9', and the length cap keeps the
+    # value comfortably inside a normal id column (well under both that
+    # CPython guard and the database driver's integer range) -- so a crafted
+    # token like "².x" or a 5000-digit id fails the same "no such agent"
+    # 401 as any other bad token instead of reaching int() and raising.
+    if (not agent_id or not agent_id.isascii() or not agent_id.isdigit()
+            or len(agent_id) > 15 or not secret):
         return None
     agent = db.session.get(NetworkAgent, int(agent_id))
     if not agent:
@@ -9454,12 +9469,21 @@ def _stamp_device_status_from_agent(job, status):
     result the agent just walked is still worth storing even if this one
     extra field is unusable, and the job's own outcome already communicates
     success/failure independently of this device-level classification.
+
+    The device lookup is filtered by the job's own tenant_id rather than
+    just its primary key. Today every job-creation path resolves its device
+    through tenant_query(NetworkDevice), so job.device_id always already
+    belongs to job.tenant_id -- but that is an invariant enforced three call
+    sites away, not here, and this filter makes it impossible for a future
+    job-creation path that skips tenant_query to make this function stamp
+    status onto a device belonging to a different tenant.
     """
     if status not in _AGENT_DEVICE_STATUSES:
         return
-    device = db.session.get(NetworkDevice, job.device_id)
+    device = NetworkDevice.query.filter_by(
+        id=job.device_id, tenant_id=job.tenant_id).first()
     if device is None:
-        return  # the device vanished under the job; nothing to stamp
+        return  # the device vanished under the job, or tenant mismatch; nothing to stamp
     device.last_status = status
     device.last_checked_at = datetime.utcnow()
 
