@@ -44,9 +44,32 @@ export function nodeMatches(node, query) {
     return text.includes(q);
 }
 
-function customerNode(customer, ponKey) {
+/**
+ * Compute the group-local part of a child's key that is BOTH unique across
+ * the group (a React key requirement) AND stable across rebuilds for the
+ * same real-world identity (a MAC address, an interface name, a customer
+ * id, ...) -- independent of where the walk happened to place it this time.
+ *
+ * Keys on `identity` alone when it is present, so re-polling the same
+ * hardware in a different order does not change its key. `seenCounts` is a
+ * Map shared across one group's iteration: occurrences of the same identity
+ * value are counted, and every occurrence after the first has `#n` appended,
+ * so real duplicates (a stale duplicate ONU authorization, two interfaces
+ * both literally named "ether1") still get distinct keys. With no usable
+ * identity there is nothing to be stable on, so this falls back to the
+ * group-local index, exactly as before this fix.
+ */
+function keyPart(identity, index, seenCounts) {
+    if (!identity) return `${index}-na`;
+    const seen = (seenCounts.get(identity) || 0) + 1;
+    seenCounts.set(identity, seen);
+    return seen === 1 ? identity : `${identity}#${seen}`;
+}
+
+function customerNode(customer, parentKey, index, seenIds) {
+    const id = customer.id !== undefined && customer.id !== null ? String(customer.id) : '';
     return {
-        key: `${ponKey}/cust-${customer.id}`,
+        key: `${parentKey}/cust-${keyPart(id, index, seenIds)}`,
         kind: 'customer',
         label: customer.name || 'Unnamed customer',
         sublabel: customer.onu_mac_address || '',
@@ -57,15 +80,11 @@ function customerNode(customer, ponKey) {
     };
 }
 
-function onuNode(onu, ponKey, index) {
+function onuNode(onu, ponKey, index, seenMacs) {
     const mac = typeof onu.mac_address === 'string' ? onu.mac_address : '';
-    // The group-local index is included unconditionally (not just as a
-    // fallback) so two ONUs that happen to share a MAC -- this OLT is known
-    // to carry stale duplicate authorization entries -- still get distinct
-    // keys. The value stays in the key too: it aids debugging and keeps keys
-    // stable when order is stable, but position is what guarantees uniqueness.
-    const key = `${ponKey}/onu-${index}-${mac || 'na'}`;
+    const key = `${ponKey}/onu-${keyPart(mac, index, seenMacs)}`;
     const distance = Number(onu.distance_m) > 0 ? `${onu.distance_m} m` : '';
+    const seenCustomerIds = new Map();
     return {
         key,
         kind: 'onu',
@@ -76,7 +95,7 @@ function onuNode(onu, ponKey, index) {
         searchText: searchTextOf(onu.description, onu.onu_id, mac),
         children: asArray(onu.customers)
             .filter((c) => c && typeof c === 'object' && !Array.isArray(c))
-            .map((c) => customerNode(c, key)),
+            .map((c, i) => customerNode(c, key, i, seenCustomerIds)),
     };
 }
 
@@ -99,6 +118,7 @@ function ponNodes(device) {
     return [...groups.entries()].map(([port, members]) => {
         const key = `dev-${device.id}/pon-${port}`;
         const up = members.filter((o) => o.status === 'online').length;
+        const seenMacs = new Map();
         return {
             key,
             kind: 'pon',
@@ -107,7 +127,7 @@ function ponNodes(device) {
             meta: `${members.length} ONU${members.length === 1 ? '' : 's'} · ${up} up`,
             status: up > 0 ? 'up' : 'down',
             searchText: searchTextOf(port),
-            children: members.map((onu, i) => onuNode(onu, key, i)),
+            children: members.map((onu, i) => onuNode(onu, key, i, seenMacs)),
         };
     });
 }
@@ -123,6 +143,7 @@ function portsNode(device) {
 
     const key = `dev-${device.id}/ports`;
     const up = interfaces.filter(interfaceStatus_isUp).length;
+    const seenNames = new Map();
     return {
         key,
         kind: 'ports',
@@ -134,11 +155,8 @@ function portsNode(device) {
         children: interfaces.map((iface, i) => {
             const name = typeof iface.name === 'string' ? iface.name : '';
             const label = typeof iface.label === 'string' && iface.label ? iface.label : '';
-            // As above: the group-local index is unconditional so two
-            // interfaces sharing a name (e.g. two "ether1" entries) still
-            // get distinct keys; the name stays in the key for debugging.
             return {
-                key: `${key}/if-${i}-${name || 'na'}`,
+                key: `${key}/if-${keyPart(name, i, seenNames)}`,
                 kind: 'interface',
                 label: label || name || 'interface',
                 sublabel: label ? name : '',

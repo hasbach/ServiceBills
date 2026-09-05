@@ -212,6 +212,53 @@ test('an array entry in the customers list is skipped, not rendered as a phantom
     expect(onu_node.children[0].kind).toBe('customer');
 });
 
+test('reordering an OLT\'s ONU list between polls produces the same key for the same MAC', () => {
+    const a = onu({ mac_address: 'aa:aa:aa:aa:aa:aa' });
+    const b = onu({ mac_address: 'bb:bb:bb:bb:bb:bb' });
+    const poll1 = buildTopologyTree([ccr({ children: [olt({ last_result: [a, b] })] })]);
+    const poll2 = buildTopologyTree([ccr({ children: [olt({ last_result: [b, a] })] })]);
+    const findByMac = (nodes, mac) => {
+        for (const n of nodes) {
+            if (n.kind === 'onu' && n.sublabel === mac) return n;
+            const hit = findByMac(n.children || [], mac);
+            if (hit) return hit;
+        }
+        return null;
+    };
+    const aKey1 = findByMac(poll1, 'aa:aa:aa:aa:aa:aa').key;
+    const aKey2 = findByMac(poll2, 'aa:aa:aa:aa:aa:aa').key;
+    expect(aKey1).toBe(aKey2);
+    const bKey1 = findByMac(poll1, 'bb:bb:bb:bb:bb:bb').key;
+    const bKey2 = findByMac(poll2, 'bb:bb:bb:bb:bb:bb').key;
+    expect(bKey1).toBe(bKey2);
+});
+
+test('reordering a CCR\'s interface list produces the same key for the same interface name', () => {
+    const findIface = (nodes, name) => {
+        for (const n of nodes) {
+            if (n.kind === 'interface' && n.sublabel === name) return n;
+            const hit = findIface(n.children || [], name);
+            if (hit) return hit;
+        }
+        return null;
+    };
+    const poll1 = buildTopologyTree([ccr({
+        last_result_operation: 'device_health',
+        last_result: { interfaces: [
+            { name: 'ether1', running: true, disabled: false, label: 'MYISP' },
+            { name: 'ether6', running: false, disabled: false, label: null },
+        ] },
+    })]);
+    const poll2 = buildTopologyTree([ccr({
+        last_result_operation: 'device_health',
+        last_result: { interfaces: [
+            { name: 'ether6', running: false, disabled: false, label: null },
+            { name: 'ether1', running: true, disabled: false, label: 'MYISP' },
+        ] },
+    })]);
+    expect(findIface(poll1, 'ether1').key).toBe(findIface(poll2, 'ether1').key);
+});
+
 test('nodeMatches searches label, sublabel and meta case-insensitively', () => {
     const node = { label: 'MoussaGhadir', sublabel: 'b4:64:15:3f:c1:94', meta: '531 m' };
     expect(nodeMatches(node, 'moussa')).toBe(true);
