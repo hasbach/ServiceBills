@@ -86,3 +86,41 @@
    per-device injection point TreeNode exposes) -- forced onto its own line
    so a long error doesn't squeeze the buttons beside it into unreadability. */
 .nt-actions .nt-action-error { flex-basis: 100%; margin-top: 4px; }
+
+/* A link carries light only when the thing at its far end is actually up, so a
+   dark branch reads as dark at a glance -- the motion states the status
+   rather than decorating the page. Animating background-position on a
+   gradient stays on the compositor: no layout, no paint of surrounding
+   content. This layers on top of the plain tick above (same selector plus
+   .nt-flow), so it inherits that rule's `top: calc(-1 * var(--nt-gap))`
+   anchor unchanged -- only colour, width and the gradient/animation are
+   overridden here.
+
+   The only element this can animate is the single-row rail's per-child tick
+   (.nt-children > .nt-sub::before). A wrapped level (.nt-children--wide) and
+   every level under the 900px breakpoint already force that same tick to
+   `display: none` above, because a wrapped group has no discrete per-child
+   connector left -- just one shared frame around the whole row of children,
+   and that one frame can't honestly carry a single up/down light for N
+   children who don't all share the same status. So light is deliberately not
+   reproduced there: a hidden tick can't animate (nothing is rendered, so
+   there is no stray or broken motion), and status for those children still
+   reads fully from each card's own ring colour and dot -- the same fallback
+   reduced motion relies on below. */
+.nt-children > .nt-sub.nt-flow::before {
+    border-left-color: transparent;
+    width: 1px;
+    background-image: linear-gradient(
+        var(--nt-up) 0 18%, transparent 18% 100%);
+    background-size: 100% 26px;
+    background-repeat: repeat-y;
+    animation: nt-travel 2.4s linear infinite;
+}
+
+@keyframes nt-travel { from { background-position: 0 -26px; } to { background-position: 0 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+    .nt-children > .nt-sub.nt-flow::before { animation: none; }
+    .nt-card { transition: none; }
+    .nt-card--interactive:hover, .nt-card--interactive:active { transform: none; }
+}

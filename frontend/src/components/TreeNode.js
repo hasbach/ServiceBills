@@ -15,9 +15,13 @@ export default function TreeNode({ node, expanded, onToggle, liveLinks, actions 
     const canExpand = children.length > 0;
     const isOpen = canExpand && expanded.has(node.key);
     const wide = children.length > 6;
+    // This node's own incoming connector (drawn by the parent's
+    // .nt-children > .nt-sub::before tick) carries light only when the far
+    // end -- this node -- is actually up.
+    const flowing = liveLinks && node.status === 'up';
 
     return (
-        <div className="nt-sub">
+        <div className={`nt-sub${flowing ? ' nt-flow' : ''}`}>
             <div
                 className={`nt-card nt-card--${node.status}${canExpand ? ' nt-card--interactive' : ''}`}
                 role={canExpand ? 'button' : undefined}
