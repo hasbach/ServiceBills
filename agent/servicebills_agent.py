@@ -54,7 +54,7 @@ except ImportError as exc:
         "-- see README.md's Install section. Copying only the agent/ "
         "directory on its own is not enough.".format(exc))
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 
 # Read-only, and deliberately so. mikrotik.set_secret_enabled disables a
 # customer's PPPoE secret; it is absent here so that even a compromised cloud

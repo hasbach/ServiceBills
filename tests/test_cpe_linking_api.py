@@ -1,6 +1,8 @@
 """The CPE MAC is the customer's own router, as the OLT learns it -- unique
 per customer, unlike the shared ONU MAC. See
 docs/superpowers/specs/2026-09-06-cpe-mac-linking-design.md."""
+from sqlalchemy.exc import IntegrityError
+
 import app as appmod
 from tests.conftest import make_tenant
 
@@ -121,6 +123,45 @@ def test_raced_cpe_mac_collision_degrades_the_same_way_on_create_and_update(app,
         assert "IntegrityError" not in error
 
 
+def _customer_insert_integrity_error(orig_message):
+    """Build an IntegrityError shaped like the ones add_customer and
+    update_customer actually catch: SQLAlchemy's own str(exc) embeds the
+    failing statement, and the customer INSERT/UPDATE lists
+    cpe_mac_address among its columns on every write -- regardless of what
+    actually failed. `orig_message` is the driver's own error text, as if
+    an unrelated column (e.g. a stale reseller_id's foreign key) were the
+    real cause, or a genuine CPE MAC collision were."""
+    statement = ("INSERT INTO customer (tenant_id, name, phone, address, "
+                "subscription_plan_id, reseller_id, cpe_mac_address) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)")
+    return IntegrityError(statement, {"reseller_id": 999}, Exception(orig_message))
+
+
+def test_an_unrelated_integrity_error_is_not_reported_as_a_cpe_mac_duplicate():
+    """A stale reseller_id violating its own foreign key still raises an
+    IntegrityError from the same customer INSERT that lists
+    cpe_mac_address among its columns. str(exc) -- the full wrapped
+    exception, embedding that statement -- contains 'cpe_mac' for this and
+    every other customer write, so the helper must look at the driver's own
+    message (exc.orig) instead, which names only the constraint that
+    actually fired."""
+    exc = _customer_insert_integrity_error("FOREIGN KEY constraint failed")
+    assert "cpe_mac" in str(exc).lower()  # sanity: the trap is real
+    assert appmod._cpe_mac_integrity_error(exc, "aa:bb:cc:dd:ee:ff") is False
+
+
+def test_a_genuine_cpe_mac_duplicate_is_still_detected():
+    """The fix must not overcorrect into never matching: Postgres names the
+    constraint, SQLite names the columns instead -- both must still be
+    recognised as the real thing."""
+    for orig_message in (
+        'duplicate key value violates unique constraint "uq_customer_tenant_cpe_mac"',
+        "UNIQUE constraint failed: customer.tenant_id, customer.cpe_mac_address",
+    ):
+        exc = _customer_insert_integrity_error(orig_message)
+        assert appmod._cpe_mac_integrity_error(exc, "aa:bb:cc:dd:ee:ff") is True
+
+
 import types
 
 ONUS = [
@@ -220,6 +261,75 @@ def test_a_cpe_recorded_with_hyphens_still_matches(app, client, monkeypatch):
     _locate_and_apply(client, hdr, olt["id"])
     with app.app_context():
         assert appmod.Customer.query.get(cid).onu_mac_address == "b4:64:15:3f:c1:94"
+
+
+def test_locate_canonicalises_a_hyphenated_onu_mac(app, client, monkeypatch):
+    """add_customer, update_customer and apply_onu_label_matches all
+    canonicalise before writing onu_mac_address; _apply_cpe_locations was the
+    one path that stored the device's string verbatim. Latent today because
+    the real OLT reports colon-lowercase, but nothing stops an agent from
+    ever reporting hyphens -- and a value this long is also the only way to
+    exceed String(20), which SQLite silently accepts and Postgres does not."""
+    hdr = make_tenant(client, "Loc L", "loc_l_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    cid = _customer(client, hdr, plan_id, "Hyphenated",
+                    cpe_mac_address="aa:bb:cc:00:00:01").get_json()["customer_id"]
+    hyphenated = {"aa:bb:cc:00:00:01": {"pon_port": "PON1", "onu_id": "EPON0/1:2",
+                                        "onu_mac": "B4-64-15-3F-C1-94"}}
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, hyphenated))
+    _locate_and_apply(client, hdr, olt["id"])
+    with app.app_context():
+        assert appmod.Customer.query.get(cid).onu_mac_address == "b4:64:15:3f:c1:94"
+
+
+def test_an_onu_mac_that_does_not_canonicalise_is_skipped(app, client, monkeypatch):
+    """A malformed onu_mac cannot correspond to real hardware -- it must be
+    dropped rather than stored, the same way a missing/non-string onu_mac
+    already was before this fix."""
+    hdr = make_tenant(client, "Loc M", "loc_m_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    cid = _customer(client, hdr, plan_id, "Garbage",
+                    cpe_mac_address="aa:bb:cc:00:00:01").get_json()["customer_id"]
+    garbage = {"aa:bb:cc:00:00:01": {"pon_port": "PON1", "onu_id": "EPON0/1:2",
+                                     "onu_mac": "not-a-mac"}}
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, garbage))
+    body = _locate_and_apply(client, hdr, olt["id"]).get_json()
+    assert body["located"] == 0
+    with app.app_context():
+        assert appmod.Customer.query.get(cid).onu_mac_address is None
+
+
+def test_a_located_onu_mac_stays_recognised_as_already_linked_despite_olt_hyphens(
+        app, client, monkeypatch):
+    """get_onu_label_matches's 'linked' set only strips and lowercases a
+    stored onu_mac_address -- it does not canonicalise separators. If
+    _apply_cpe_locations ever stored a value with hyphens (as the OLT
+    reported it here), the Match Labels dialog would offer this
+    already-linked ONU as unmatched. Canonicalising at write time is what
+    keeps the two comparisons agreeing."""
+    hdr = make_tenant(client, "Loc N", "loc_n_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    _customer(client, hdr, plan_id, "Linked", cpe_mac_address="aa:bb:cc:00:00:01")
+    hyphenated = {"aa:bb:cc:00:00:01": {"pon_port": "PON1", "onu_id": "EPON0/1:2",
+                                        "onu_mac": "B4-64-15-3F-C1-94"}}
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, hyphenated))
+    _locate_and_apply(client, hdr, olt["id"])
+
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, [
+        {"pon_port": "PON1", "onu_id": "EPON0/1:2", "status": "online",
+         "mac_address": "b4:64:15:3f:c1:94", "description": "Linked",
+         "model": "V2801D", "distance_m": 531},
+    ]))
+    started = client.get(f"/api/network-tree/olt/{olt['id']}/label-matches",
+                        headers=hdr).get_json()
+    body = client.get(
+        f"/api/network-tree/olt/{olt['id']}/label-matches?job_id={started['job_id']}",
+        headers=hdr).get_json()
+    assert body["unmatched_onus"] == []
+    assert body["proposals"] == []
 
 
 def test_applying_the_same_result_twice_is_harmless(app, client, monkeypatch):

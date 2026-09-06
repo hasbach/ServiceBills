@@ -3032,14 +3032,21 @@ def _check_cpe_mac_available(mac, customer_id=None):
 def _cpe_mac_integrity_error(exc, mac):
     """True if an IntegrityError is the uq_customer_tenant_cpe_mac backstop
     firing -- i.e. a concurrent request won the race between
-    _check_cpe_mac_available's read and this request's write. 'cpe_mac'
-    matches both the constraint name Postgres reports and the column name
-    SQLite reports, so this works against either backend without depending on
-    driver-specific structured error fields. Guarded on `mac` being truthy
-    because NULLs never collide on this constraint, so a falsy mac means
-    whatever fired is unrelated to CPE MAC.
+    _check_cpe_mac_available's read and this request's write.
+
+    Matches against exc.orig (the driver-level error), never str(exc):
+    SQLAlchemy's own __str__ embeds the failing statement, and the customer
+    INSERT/UPDATE lists cpe_mac_address among its columns on every write, so
+    matching the full wrapped exception would misattribute an unrelated
+    violation (e.g. a stale reseller_id's foreign key) as a CPE MAC
+    duplicate. exc.orig carries only the driver's own message, which names
+    'uq_customer_tenant_cpe_mac' on Postgres and the column
+    'cpe_mac_address' on SQLite, so 'cpe_mac' matches both without depending
+    on driver-specific structured error fields. Guarded on `mac` being
+    truthy because NULLs never collide on this constraint, so a falsy mac
+    means whatever fired is unrelated to CPE MAC.
     """
-    return bool(mac) and 'cpe_mac' in str(exc).lower()
+    return bool(mac) and 'cpe_mac' in str(getattr(exc, 'orig', exc)).lower()
 
 
 def _cpe_mac_conflict_message(mac, customer_id=None):
@@ -10368,6 +10375,14 @@ def _apply_cpe_locations(result):
     agent posted. _validate_agent_result rejects the worst shapes at the
     boundary, but rows stored before that check existed can still be odd, and
     a malformed entry must be skipped rather than abort the whole apply.
+
+    Canonicalises onu_mac before assigning, same as add_customer,
+    update_customer and apply_onu_label_matches -- this is otherwise the only
+    writer of onu_mac_address that would store a device's string verbatim.
+    An entry whose onu_mac does not canonicalise to a valid MAC is skipped:
+    it cannot correspond to real hardware, and storing it unnormalised would
+    both risk overflowing the column on a backend that enforces its length
+    and stop matching get_onu_label_matches's "already linked" check.
     """
     if not isinstance(result, dict):
         return {'located': 0, 'moved': 0, 'unmatched': 0}
@@ -10382,14 +10397,14 @@ def _apply_cpe_locations(result):
     for raw_mac, entry in result.items():
         if not isinstance(entry, dict):
             continue
-        onu_mac = entry.get('onu_mac')
-        if not isinstance(onu_mac, str) or not onu_mac:
+        onu_mac = _canonical_mac(entry.get('onu_mac'))
+        if not onu_mac:
             continue
         customer = by_cpe.get(_normalize_mac(raw_mac))
         if customer is None:
             unmatched += 1
             continue
-        if _normalize_mac(customer.onu_mac_address) != _normalize_mac(onu_mac):
+        if _normalize_mac(customer.onu_mac_address) != onu_mac:
             moved += 1
         customer.onu_mac_address = onu_mac
         customer.onu_last_seen_at = now
