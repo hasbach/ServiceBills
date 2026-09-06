@@ -12,6 +12,30 @@ import pollNetworkJob from './pollNetworkJob';
 import TreeNode from './TreeNode';
 import { buildTopologyTree } from './buildTopologyTree';
 
+// Auto-refresh a device only when its cached result is older than this. Without
+// a cap, every visit to the page would fire a fresh 13-second SNMP walk of the
+// OLT; with one, opening the page repeatedly is free.
+const STALE_AFTER_MS = 5 * 60 * 1000;
+
+/** '2026-09-05 12:00:00' (UTC, as the API emits it) -> "4 min ago". */
+export function describeAge(stamp, now = Date.now()) {
+    if (!stamp) return 'never checked';
+    const then = Date.parse(stamp.replace(' ', 'T') + 'Z');
+    if (Number.isNaN(then)) return '';
+    const mins = Math.floor((now - then) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours} h ago`;
+    return `${Math.floor(hours / 24)} d ago`;
+}
+
+function isStale(stamp, now = Date.now()) {
+    if (!stamp) return true;
+    const then = Date.parse(stamp.replace(' ', 'T') + 'Z');
+    return Number.isNaN(then) || (now - then) > STALE_AFTER_MS;
+}
+
 const NetworkTreeView = () => {
     // apiService is a direct module export here, not part of the hook's value
     // -- same as NetworkDeviceManagementView.
@@ -216,6 +240,77 @@ const NetworkTreeView = () => {
         }
     }, [loadTree, mergeDeviceResult]);
 
+    // Same shape as refreshOlt above (per-device refreshSeqRef guard,
+    // refreshingIds in-flight map, errorByDevice handling, quiet
+    // loadTree(false) resync) but for any non-OLT device -- the auto-refresh
+    // effect below is its only caller today. Deliberately does NOT splice
+    // its result into `tree` the way refreshOlt's mergeDeviceResult does:
+    // mergeDeviceResult hardcodes last_result_operation to 'olt_status',
+    // which would wrongly hide a CCR's Ports branch (buildTopologyTree's
+    // portsNode gates on last_result_operation === 'device_health') until
+    // the resync below lands. Nor does it auto-expand anything -- unlike
+    // "Load ONUs", this fires without the user asking for it, so popping a
+    // node open on its own would be a surprise. The quiet resync is the
+    // sole source of truth here.
+    const checkDevice = useCallback(async (device) => {
+        const seq = (refreshSeqRef.current[device.id] || 0) + 1;
+        refreshSeqRef.current[device.id] = seq;
+
+        setRefreshingIds((prev) => ({ ...prev, [device.id]: true }));
+        setErrorByDevice((prev) => ({ ...prev, [device.id]: null }));
+        try {
+            const res = await apiService.checkNetworkDeviceNow(device.id);
+            if (!res.data.ok) {
+                if (refreshSeqRef.current[device.id] === seq) {
+                    setErrorByDevice((prev) => ({ ...prev, [device.id]: res.data.message }));
+                }
+            } else {
+                const job = await pollNetworkJob(res.data.job_id);
+                if (refreshSeqRef.current[device.id] === seq) {
+                    if (job.status === 'done' && !job.error) {
+                        loadTree(false);
+                    } else {
+                        setErrorByDevice((prev) => ({ ...prev, [device.id]: job.error }));
+                    }
+                }
+            }
+        } catch (e) {
+            if (refreshSeqRef.current[device.id] !== seq) return;
+            setErrorByDevice((prev) => ({ ...prev, [device.id]: 'Request failed' }));
+        } finally {
+            if (refreshSeqRef.current[device.id] === seq) {
+                setRefreshingIds((prev) => {
+                    const next = { ...prev };
+                    delete next[device.id];
+                    return next;
+                });
+            }
+        }
+    }, [loadTree]);
+
+    // The tree already renders from each device's cached result, so this is a
+    // background top-up, not a load. It deliberately runs at most once per
+    // device per mount, and never when the agent is offline (in agent mode the
+    // job would just be refused).
+    const autoRefreshedRef = useRef(new Set());
+    useEffect(() => {
+        if (accessMode === 'agent' && !agentOnline) return;
+        tree.forEach((root) => {
+            const walk = (device) => {
+                if (!autoRefreshedRef.current.has(device.id)
+                        && isStale(device.last_result_at)) {
+                    autoRefreshedRef.current.add(device.id);
+                    if (device.device_type === 'vsol_olt') refreshOlt(device);
+                    else checkDevice(device);
+                }
+                (device.children || []).forEach(walk);
+            };
+            walk(root);
+        });
+        // refreshOlt/checkDevice are stable for a given device set.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tree, accessMode, agentOnline]);
+
     // The node array from buildTopologyTree carries deviceId but not the raw
     // device row (device_type, host, ...) the action buttons below need --
     // that only lives on the API tree's own device objects, which nest
@@ -230,7 +325,15 @@ const NetworkTreeView = () => {
         return map;
     }, [tree]);
 
-    const topology = useMemo(() => buildTopologyTree(tree), [tree]);
+    const topology = useMemo(() => {
+        const now = Date.now();
+        const decorate = (node) => ({
+            ...node,
+            ageLabel: node.kind === 'device' ? describeAge(node.lastResultAt, now) : undefined,
+            children: (node.children || []).map(decorate),
+        });
+        return buildTopologyTree(tree).map(decorate);
+    }, [tree]);
 
     // Renders *Match Labels* and *Load ONUs* (OLT-only) into a device node's
     // card -- moved here unchanged from the old renderDevice, including the

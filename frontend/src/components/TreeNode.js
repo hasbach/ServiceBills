@@ -40,6 +40,7 @@ export default function TreeNode({ node, expanded, onToggle, liveLinks, actions 
                 </div>
                 {node.sublabel && <div className="nt-sub-line nt-mono">{node.sublabel}</div>}
                 {node.meta && <div className="nt-meta">{node.meta}</div>}
+                {node.ageLabel && <div className="nt-meta">{node.ageLabel}</div>}
                 {node.kind === 'device' && actions && (
                     // Stopped for both click AND keydown: the card's own
                     // onKeyDown above toggles on Enter/Space and sits on an
