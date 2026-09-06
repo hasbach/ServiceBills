@@ -9290,7 +9290,44 @@ def _latest_results_by_device(devices):
     return out
 
 
-def _build_device_tree(devices, latest_results=None):
+def _latest_locate_at_by_device(devices):
+    """The finished_at of the newest completed 'cpe_locations' job per device --
+    what the tree page compares a customer's onu_last_seen_at against to tell
+    a placement confirmed in the most recent locate run from one merely
+    remembered from an older one (see the design doc's "What the operator
+    sees" section).
+
+    Deliberately a second, separate lookup rather than widening
+    _latest_results_by_device above: that function's operation/error/result
+    filter defines what counts as *the cached tree result* (olt_status /
+    device_health only, successful only), and a locate run is a different
+    operation with a different meaning entirely -- widening that filter to
+    admit it would blur what "the cached result" means for every other
+    caller of that function. Same success-only filtering here, though, and
+    for the same reason it matters there: a failed locate attempt didn't
+    actually walk the OLT, so its finished_at must not be mistaken for the
+    moment of a real (even if all-unmatched) locate.
+    """
+    if not devices:
+        return {}
+    out = {}
+    for device in devices:
+        job = (tenant_query(NetworkAgentJob)
+               .filter(NetworkAgentJob.device_id == device.id,
+                       NetworkAgentJob.status == 'done',
+                       NetworkAgentJob.error.is_(None),
+                       NetworkAgentJob.result.isnot(None),
+                       NetworkAgentJob.operation == 'cpe_locations')
+               .order_by(NetworkAgentJob.created_at.desc(),
+                         NetworkAgentJob.id.desc())
+               .first())
+        if job is None or not job.finished_at:
+            continue
+        out[device.id] = job.finished_at.strftime('%Y-%m-%d %H:%M:%S')
+    return out
+
+
+def _build_device_tree(devices, latest_results=None, latest_locate_at=None):
     """Nest a flat device list by parent_device_id.
 
     Any device whose parent is missing (deleted, or another tenant's) is
@@ -9355,6 +9392,13 @@ def _build_device_tree(devices, latest_results=None):
                 'last_result': latest.get('result'),
                 'last_result_at': latest.get('at'),
                 'last_result_operation': latest.get('operation'),
+                # camelCase on purpose (unlike every other key here): a
+                # frontend-only derived field with no DB column and no
+                # to_dict() counterpart, read directly off this raw device
+                # object by buildTopologyTree.js's deviceNode -- see that
+                # file for how it's threaded down to mark remembered
+                # placements.
+                'lastLocateAt': (latest_locate_at or {}).get(device.id),
                 'children': children}
 
     tree = [node(device) for device in roots]
@@ -9476,6 +9520,15 @@ def _resolve_onu_customers(onus):
                     # against a badly formatted MAC, since the two only have
                     # to agree after _normalize_mac.
                     'onu_mac_address': customer.onu_mac_address,
+                    # When this customer's CPE was last confirmed present by a
+                    # locate run (see _apply_cpe_locations) -- the tree page
+                    # compares this against the OLT's newest 'cpe_locations'
+                    # job's finished_at (the device payload's lastLocateAt,
+                    # see _build_device_tree) to tell a customer located in
+                    # the most recent run from one merely remembered from an
+                    # older one.
+                    'onu_last_seen_at': customer.onu_last_seen_at.strftime('%Y-%m-%d %H:%M:%S')
+                        if customer.onu_last_seen_at else None,
                 })
     return [
         # Display keeps onu['mac_address'] exactly as reported; only the
@@ -10068,7 +10121,8 @@ def get_network_tree():
     completes."""
     devices = tenant_query(NetworkDevice).order_by(NetworkDevice.name).all()
     return jsonify({'tree': _build_device_tree(
-        devices, _latest_results_by_device(devices))}), 200
+        devices, _latest_results_by_device(devices),
+        _latest_locate_at_by_device(devices))}), 200
 
 
 @app.route('/api/network-tree/olt/<int:device_id>/refresh', methods=['POST'])

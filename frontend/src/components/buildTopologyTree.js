@@ -12,6 +12,8 @@
  * a way that makes real hardware vanish from the page, and never thrown on.
  */
 
+import { parseUtc, formatStamp } from './formatStamp';
+
 export const PON_UNASSIGNED = 'Unassigned';
 
 const asArray = (value) => (Array.isArray(value) ? value : []);
@@ -66,21 +68,31 @@ function keyPart(identity, index, seenCounts) {
     return seen === 1 ? identity : `${identity}#${seen}`;
 }
 
-function customerNode(customer, parentKey, index, seenIds) {
+function customerNode(customer, parentKey, index, seenIds, lastLocateAt) {
+    // A customer located in the most recent run renders plainly. One whose
+    // CPE was not seen still shows under their last known ONU -- that is the
+    // memory -- but says so, because during an outage "here" and "here as of
+    // Thursday" are very different facts. A customer with no onu_last_seen_at
+    // at all has never been located -- a different fact from having been
+    // located and since gone quiet -- so they show nothing rather than being
+    // mistaken for stale.
     const id = customer.id !== undefined && customer.id !== null ? String(customer.id) : '';
+    const seen = parseUtc(customer.onu_last_seen_at);
+    const run = parseUtc(lastLocateAt);
+    const remembered = !Number.isNaN(seen) && !Number.isNaN(run) && seen < run;
     return {
         key: `${parentKey}/cust-${keyPart(id, index, seenIds)}`,
         kind: 'customer',
         label: customer.name || 'Unnamed customer',
         sublabel: customer.onu_mac_address || '',
-        meta: '',
+        meta: remembered ? `last seen ${formatStamp(customer.onu_last_seen_at)}` : '',
         status: customer.is_subscription_active ? 'up' : 'warn',
         searchText: searchTextOf(customer.name, customer.onu_mac_address),
         children: [],
     };
 }
 
-function onuNode(onu, ponKey, index, seenMacs) {
+function onuNode(onu, ponKey, index, seenMacs, lastLocateAt) {
     const mac = typeof onu.mac_address === 'string' ? onu.mac_address : '';
     const key = `${ponKey}/onu-${keyPart(mac, index, seenMacs)}`;
     const distance = Number(onu.distance_m) > 0 ? `${onu.distance_m} m` : '';
@@ -95,12 +107,12 @@ function onuNode(onu, ponKey, index, seenMacs) {
         searchText: searchTextOf(onu.description, onu.onu_id, mac),
         children: asArray(onu.customers)
             .filter((c) => c && typeof c === 'object' && !Array.isArray(c))
-            .map((c, i) => customerNode(c, key, i, seenCustomerIds)),
+            .map((c, i) => customerNode(c, key, i, seenCustomerIds, lastLocateAt)),
     };
 }
 
 /** Group an OLT's ONU list into PON nodes. Order follows first appearance. */
-function ponNodes(device) {
+function ponNodes(device, lastLocateAt) {
     const onus = asArray(device.last_result)
         .filter((o) => o && typeof o === 'object' && !Array.isArray(o));
     const groups = new Map();
@@ -127,7 +139,7 @@ function ponNodes(device) {
             meta: `${members.length} ONU${members.length === 1 ? '' : 's'} · ${up} up`,
             status: up > 0 ? 'up' : 'down',
             searchText: searchTextOf(port),
-            children: members.map((onu, i) => onuNode(onu, key, i, seenMacs)),
+            children: members.map((onu, i) => onuNode(onu, key, i, seenMacs, lastLocateAt)),
         };
     });
 }
@@ -173,7 +185,9 @@ function deviceNode(device) {
     const children = [];
     const ports = portsNode(device);
     if (ports) children.push(ports);           // Ports always precedes child devices
-    if (device.device_type === 'vsol_olt') children.push(...ponNodes(device));
+    if (device.device_type === 'vsol_olt') {
+        children.push(...ponNodes(device, device.lastLocateAt || null));
+    }
     asArray(device.children).forEach((child) => children.push(deviceNode(child)));
 
     return {

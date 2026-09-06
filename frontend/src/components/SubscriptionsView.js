@@ -223,6 +223,7 @@ const SubscriptionsView = ({
         mikrotik_server_id: '',
         pppoe_username: '',
         onu_mac_address: '',
+        cpe_mac_address: '',
         discount: 0.0,
         cost_override: '',
         subscription_start_date: new Date().toISOString().split('T')[0],
@@ -248,6 +249,14 @@ const SubscriptionsView = ({
     // touched it, instead of always sending it (which would silently unlink
     // the ONU whenever the snapshot predates an out-of-band Apply).
     const editingOnuMacSnapshotRef = React.useRef('');
+    // Same pattern, same reason, for cpe_mac_address: a concurrent Locate
+    // Customers run on the Network Tree page (or another admin's edit) can
+    // rewrite a customer's onu_mac_address/onu_last_seen_at between this
+    // dialog opening and being saved, but cpe_mac_address is a distinct
+    // field the operator types by hand here -- it needs its own snapshot so
+    // an untouched CPE field is never sent (and never silently clobbers a
+    // concurrent write to some other field on the same row).
+    const editingCpeMacSnapshotRef = React.useRef('');
 
     // --- NEW STATE ---
     const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'list'
@@ -686,6 +695,7 @@ const SubscriptionsView = ({
     // touched that field (see editingOnuMacSnapshotRef above).
     const openEditCustomerDialog = useCallback((customer) => {
         editingOnuMacSnapshotRef.current = customer.onu_mac_address || '';
+        editingCpeMacSnapshotRef.current = customer.cpe_mac_address || '';
         setEditingCustomer(customer);
         setEditDialogOpen(true);
     }, []);
@@ -719,6 +729,14 @@ const SubscriptionsView = ({
             const currentOnuMac = editingCustomer.onu_mac_address || '';
             if (currentOnuMac !== editingOnuMacSnapshotRef.current) {
                 payload.onu_mac_address = currentOnuMac;
+            }
+
+            // Same reasoning as onu_mac_address above, for the same reason:
+            // only send cpe_mac_address when the user actually changed it in
+            // this dialog session.
+            const currentCpeMac = editingCustomer.cpe_mac_address || '';
+            if (currentCpeMac !== editingCpeMacSnapshotRef.current) {
+                payload.cpe_mac_address = currentCpeMac;
             }
 
             const response = await apiService.updateCustomer(editingCustomer.id, payload);
@@ -756,7 +774,7 @@ const SubscriptionsView = ({
             await apiService.addCustomer(newCustomer);
             setSnackbar({ open: true, message: 'Customer added successfully!', severity: 'success' });
             setShowAddCustomerForm(false);
-            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', reseller_id: '', upstream_provider_id: '', upstream_username: '', mikrotik_server_id: '', pppoe_username: '', onu_mac_address: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
+            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', reseller_id: '', upstream_provider_id: '', upstream_username: '', mikrotik_server_id: '', pppoe_username: '', onu_mac_address: '', cpe_mac_address: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
             refetchCustomers(1, itemsPerPage, ''); // Go to first page after adding
         } catch (error) {
             console.error('Error adding customer:', error);
@@ -960,6 +978,12 @@ const SubscriptionsView = ({
                             <TextField fullWidth label="ONU MAC Address (Optional)" value={newCustomer.onu_mac_address || ''}
                                 onChange={(e) => setNewCustomer({ ...newCustomer, onu_mac_address: e.target.value })}
                                 helperText="Links this customer to the ONU serving them on the Network Tree. Leave blank if unknown; clearing it later unlinks the customer from their ONU." />
+                        </Grid>
+                        <Grid item xs={12} md={6}>
+                            <TextField fullWidth label="CPE MAC Address (router, optional)"
+                                value={newCustomer.cpe_mac_address || ''}
+                                onChange={(e) => setNewCustomer({ ...newCustomer, cpe_mac_address: e.target.value })}
+                                helperText="The customer's own router, as the OLT sees it. Used to place them on the network map." />
                         </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount (Fixed Amount)" value={newCustomer.discount} onChange={(e) => setNewCustomer({ ...newCustomer, discount: parseFloat(e.target.value) || 0.0 })} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={newCustomer.cost_override} onChange={(e) => setNewCustomer({ ...newCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
@@ -1334,6 +1358,12 @@ const SubscriptionsView = ({
                             <TextField fullWidth label="ONU MAC Address (Optional)" value={editingCustomer?.onu_mac_address || ''}
                                 onChange={(e) => setEditingCustomer({ ...editingCustomer, onu_mac_address: e.target.value })}
                                 helperText="Links this customer to the ONU serving them on the Network Tree. Clearing this unlinks the customer from their ONU." />
+                        </Grid>
+                        <Grid item xs={12} md={6}>
+                            <TextField fullWidth label="CPE MAC Address (router, optional)"
+                                value={editingCustomer?.cpe_mac_address || ''}
+                                onChange={(e) => setEditingCustomer({ ...editingCustomer, cpe_mac_address: e.target.value })}
+                                helperText="The customer's own router, as the OLT sees it. Used to place them on the network map." />
                         </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount ($)" value={editingCustomer?.discount || 0} onChange={(e) => setEditingCustomer({ ...editingCustomer, discount: parseFloat(e.target.value) || 0 })} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={editingCustomer?.cost_override ?? ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>

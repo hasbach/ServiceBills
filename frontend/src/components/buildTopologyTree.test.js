@@ -10,7 +10,7 @@ const olt = (over = {}) => ({
     id: 2, name: 'V-SOL OLT', host: '192.168.8.100', api_port: 161,
     device_type: 'vsol_olt', last_status: 'online', interface_labels: {},
     last_result_operation: 'olt_status', last_result_at: '2026-09-05 12:00:00',
-    last_result: [onu()], children: [], ...over,
+    last_result: [onu()], children: [], lastLocateAt: null, ...over,
 });
 
 const ccr = (over = {}) => ({
@@ -265,4 +265,24 @@ test('nodeMatches searches label, sublabel and meta case-insensitively', () => {
     expect(nodeMatches(node, 'C1:94')).toBe(true);
     expect(nodeMatches(node, '')).toBe(true);
     expect(nodeMatches(node, 'nothing')).toBe(false);
+});
+
+test('a customer not seen in the last locate is marked as remembered', () => {
+    const tree = buildTopologyTree([ccr({ children: [olt({
+        lastLocateAt: '2026-09-06 12:00:00',
+        last_result: [onu({ customers: [
+            { id: 1, name: 'Seen', is_subscription_active: true,
+              onu_mac_address: 'b4:64:15:3f:c1:94',
+              onu_last_seen_at: '2026-09-06 12:00:00' },
+            { id: 2, name: 'Remembered', is_subscription_active: true,
+              onu_mac_address: 'b4:64:15:3f:c1:94',
+              onu_last_seen_at: '2026-09-04 09:00:00' },
+            { id: 3, name: 'Never', is_subscription_active: true,
+              onu_mac_address: 'b4:64:15:3f:c1:94', onu_last_seen_at: null },
+        ] })],
+    })] })]);
+    const customers = find(tree, 'onu').children;
+    expect(customers[0].meta).toBe('');
+    expect(customers[1].meta).toMatch(/^last seen /);
+    expect(customers[2].meta).toBe('');
 });

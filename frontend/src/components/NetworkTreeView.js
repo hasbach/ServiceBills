@@ -4,7 +4,7 @@ import {
     Stack, Tooltip, TextField,
 } from '@mui/material';
 import {
-    Refresh as RefreshIcon, Link as LinkIcon,
+    Refresh as RefreshIcon, Link as LinkIcon, LocationOn as LocationOnIcon,
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
 import OnuLabelMatcherDialog from './OnuLabelMatcherDialog';
@@ -318,6 +318,72 @@ const NetworkTreeView = () => {
 
     // Same shape as refreshOlt above (per-device refreshSeqRef guard,
     // refreshingIds in-flight map, errorByDevice handling, quiet
+    // loadTree(false) resync at the end) -- sharing that same per-device
+    // guard/map with refreshOlt, not a separate one, is deliberate: Load ONUs
+    // and Locate Customers act on the same device and must not be allowed to
+    // race each other any more than two clicks of the same button should.
+    //
+    // Two calls instead of one (start the job, poll it, then a second call to
+    // actually apply it) because the job itself never touches a customer
+    // record -- see _apply_cpe_locations's docstring on the backend. Only a
+    // successful apply is worth a resync, so loadTree(false) sits inside that
+    // branch rather than unconditionally after the poll, unlike refreshOlt.
+    const locateCustomers = useCallback(async (device) => {
+        const seq = (refreshSeqRef.current[device.id] || 0) + 1;
+        refreshSeqRef.current[device.id] = seq;
+
+        setRefreshingIds((prev) => ({ ...prev, [device.id]: true }));
+        setErrorByDevice((prev) => ({ ...prev, [device.id]: null }));
+        try {
+            const res = await apiService.locateCustomers(device.id);
+            if (!res.data.ok) {
+                if (refreshSeqRef.current[device.id] === seq) {
+                    setErrorByDevice((prev) => ({ ...prev, [device.id]: res.data.message }));
+                }
+            } else {
+                const job = await pollNetworkJob(res.data.job_id);
+                if (refreshSeqRef.current[device.id] === seq) {
+                    if (job.status === 'done' && !job.error) {
+                        try {
+                            const applied = await apiService.applyCustomerLocations(device.id, res.data.job_id);
+                            setSnackbar({
+                                open: true, severity: 'success',
+                                message: `Located ${applied.data.located} customers `
+                                    + `(${applied.data.moved} moved). `
+                                    + `${applied.data.unmatched} devices matched no customer.`,
+                            });
+                            // Pulls the freshly-written onu_mac_address/
+                            // onu_last_seen_at placements back into the tree --
+                            // only reached on a successful apply, since a
+                            // failed one changed nothing worth resyncing.
+                            loadTree(false);
+                        } catch (e) {
+                            if (refreshSeqRef.current[device.id] === seq) {
+                                const message = e?.response?.data?.error || 'Failed to apply customer locations';
+                                setErrorByDevice((prev) => ({ ...prev, [device.id]: message }));
+                            }
+                        }
+                    } else {
+                        setErrorByDevice((prev) => ({ ...prev, [device.id]: job.error }));
+                    }
+                }
+            }
+        } catch (e) {
+            if (refreshSeqRef.current[device.id] !== seq) return;
+            setErrorByDevice((prev) => ({ ...prev, [device.id]: 'Request failed' }));
+        } finally {
+            if (refreshSeqRef.current[device.id] === seq) {
+                setRefreshingIds((prev) => {
+                    const next = { ...prev };
+                    delete next[device.id];
+                    return next;
+                });
+            }
+        }
+    }, [loadTree, setSnackbar]);
+
+    // Same shape as refreshOlt above (per-device refreshSeqRef guard,
+    // refreshingIds in-flight map, errorByDevice handling, quiet
     // loadTree(false) resync) but for any non-OLT device -- the auto-refresh
     // effect below is its only caller today. Deliberately does NOT splice
     // its result into `tree` the way refreshOlt's mergeDeviceResult does:
@@ -493,10 +559,12 @@ const NetworkTreeView = () => {
         () => computeEffectiveExpanded(expanded, searchExpanded, searchCollapsed),
         [expanded, searchExpanded, searchCollapsed]);
 
-    // Renders *Match Labels* and *Load ONUs* (OLT-only) into a device node's
-    // card -- moved here unchanged from the old renderDevice, including the
-    // agentOffline-driven disabling/tooltips and the canEditLinks gate on
-    // Match Labels. errorByDevice/refreshingIds are NOT OLT-only, though:
+    // Renders *Match Labels*, *Locate Customers* and *Load ONUs* (all
+    // OLT-only) into a device node's card -- moved here unchanged from the
+    // old renderDevice, including the agentOffline-driven disabling/tooltips
+    // and the canEditLinks gate on Match Labels (Locate Customers writes
+    // customer records too, so it carries the same gate). errorByDevice/
+    // refreshingIds are NOT OLT-only, though:
     // checkDevice (the auto-refresh path for every non-OLT device, e.g. a
     // CCR's device_health check) writes into both of those same maps, so a
     // failed or in-flight check on a CCR needs to be visible here too, or it
@@ -527,6 +595,17 @@ const NetworkTreeView = () => {
                         </span>
                     </Tooltip>
                 )}
+                {isOlt && canEditLinks && (
+                    <Tooltip title={agentOffline ? agentOfflineReason : ''}>
+                        <span>
+                            <Button size="small" startIcon={<LocationOnIcon />}
+                                disabled={isRefreshing || agentOffline}
+                                onClick={() => locateCustomers(device)}>
+                                {isRefreshing ? 'Locating…' : 'Locate Customers'}
+                            </Button>
+                        </span>
+                    </Tooltip>
+                )}
                 {isOlt && (
                     <Tooltip title={agentOffline ? agentOfflineReason : ''}>
                         <span>
@@ -549,7 +628,7 @@ const NetworkTreeView = () => {
                 )}
             </>
         );
-    }, [deviceById, agentOffline, agentOfflineReason, refreshingIds, canEditLinks, errorByDevice, refreshOlt]);
+    }, [deviceById, agentOffline, agentOfflineReason, refreshingIds, canEditLinks, errorByDevice, refreshOlt, locateCustomers]);
 
     if (loading) return <Box sx={{ p: 4, textAlign: 'center' }}><CircularProgress /></Box>;
 

@@ -160,6 +160,9 @@ const rawApiService = {
     createNetworkAgent: (data) => api.post('/network-agents', data),
     regenerateNetworkAgentToken: (id) => api.post(`/network-agents/${id}/regenerate-token`),
     fetchOnuLabelMatchesForJob: (id, jobId) => api.get(`/network-tree/olt/${id}/label-matches?job_id=${jobId}`),
+    locateCustomers: (id) => api.post(`/network-tree/olt/${id}/locate-customers`),
+    applyCustomerLocations: (id, jobId) =>
+        api.post(`/network-tree/olt/${id}/locate-customers/apply`, { job_id: jobId }),
 
     // Customer <-> Mikrotik live actions (staff-confirmed only, see spec)
     fetchCustomerMikrotikStatus: (customerId) => api.get(`/customers/${customerId}/mikrotik-status`),
