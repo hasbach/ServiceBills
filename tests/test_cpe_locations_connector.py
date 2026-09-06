@@ -118,3 +118,44 @@ def test_no_learned_macs_is_success_with_an_empty_map(monkeypatch):
     ok, value = vsol_olt.get_cpe_locations(_server())
     assert ok is True
     assert value == {}
+
+
+# Real dot1dTpFdbPort indices recorded from DeltaNet's V-SOL V1600D on
+# 2026-09-06: every one of the device's 311 entries carries a leading OCTET
+# STRING length ("6") before the six MAC octets, not the bare six-component
+# form the MIB nominally specifies. _walk_fdb_ports must parse both shapes
+# from the last six components of the index, and must skip -- never raise --
+# a malformed row.
+_FDB_INDEX_CELLS = {
+    # Length-prefixed (7 components), the real device's actual shape.
+    "6.0.12.66.219.81.190": "10",   # -> 00:0c:42:db:51:be
+    "6.0.20.120.84.197.79": "10",   # -> 00:14:78:54:c5:4f
+    "6.0.35.90.215.110.46": "10",   # -> 00:23:5a:d7:6e:2e
+    # Bare (6 components), the form the MIB nominally specifies.
+    "170.187.204.0.0.7": "26",      # -> aa:bb:cc:00:00:07
+    # Too few components -- not a MAC index at all.
+    "1.2.3.4": "10",
+    # A component above 255 -- not a valid octet.
+    "6.0.12.66.219.81.300": "10",
+    # A well-formed index, but the value (bridge port) isn't an integer.
+    "6.0.12.66.219.81.191": "not-a-number",
+}
+
+
+def test_walk_fdb_ports_parses_the_real_devices_length_prefixed_index(monkeypatch):
+    async def fake_walk_oid(host, port, community, oid):
+        assert oid == vsol_olt.FDB_PORT_OID
+        return _FDB_INDEX_CELLS
+
+    monkeypatch.setattr(vsol_olt, "_walk_oid", fake_walk_oid)
+
+    result = vsol_olt._walk_fdb_ports("192.168.8.100", 161, "public")
+
+    assert result == {
+        "00:0c:42:db:51:be": 10,
+        "00:14:78:54:c5:4f": 10,
+        "00:23:5a:d7:6e:2e": 10,
+        "aa:bb:cc:00:00:07": 26,
+    }
+    # The malformed rows must be skipped, not raise and not appear.
+    assert len(result) == 4

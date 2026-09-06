@@ -190,9 +190,15 @@ def _walk_fdb_ports(host, port, community):
     """dot1dTpFdbPort -> {mac: bridge_port}.
 
     The OID index is the MAC as six decimal octets -- ...1.2.0.12.66.219.81.190
-    means 00:0c:42:db:51:be. An index that is not six octets, or a value that
-    is not an integer, is skipped rather than raising: this table is read from
-    a device, not from something this code controls.
+    means 00:0c:42:db:51:be. The MIB nominally specifies that bare six-octet
+    form, but the real device instead prefixes it with the OCTET STRING
+    length -- a literal "6" -- giving a seven-component index such as
+    "6.0.12.66.219.81.190" for the same MAC. This takes the MAC from the LAST
+    six components either way, so both shapes resolve. An index that isn't
+    six or seven components, any of those last six not an integer in
+    0..255, or a value that is not an integer, is skipped rather than
+    raising: this table is read from a device, not from something this code
+    controls.
 
     Runs its own asyncio.run over the shared _walk_oid coroutine, the same
     way get_olt_status drives _walk_onu_table -- this stays a plain sync
@@ -202,13 +208,21 @@ def _walk_fdb_ports(host, port, community):
     out = {}
     for index, value in cells.items():
         parts = index.split(".")
-        if len(parts) != 6:
+        if len(parts) not in (6, 7):
             continue
+        octets = parts[-6:]
         try:
-            mac = ":".join("%02x" % int(part) for part in parts)
-            out[mac] = int(value)
+            octet_ints = [int(part) for part in octets]
         except (TypeError, ValueError):
             continue
+        if any(not (0 <= n <= 255) for n in octet_ints):
+            continue
+        try:
+            bridge_port = int(value)
+        except (TypeError, ValueError):
+            continue
+        mac = ":".join("%02x" % n for n in octet_ints)
+        out[mac] = bridge_port
     return out
 
 
