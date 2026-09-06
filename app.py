@@ -407,13 +407,13 @@ class NetworkDevice(db.Model):
             'interface_labels': self.interface_labels or {},
         }
 
-# The only operations the agent will ever relay. All five are reads.
+# The only operations the agent will ever relay. All six are reads.
 # mikrotik.set_secret_enabled is deliberately absent: it disables a customer's
 # PPPoE secret, and a cloud compromise must not be able to disconnect anyone.
 # See docs/superpowers/specs/2026-09-04-network-agent-layer-2-design.md.
 AGENT_OPERATIONS = (
     'test_connection', 'device_health', 'secret_status',
-    'active_session', 'olt_status',
+    'active_session', 'olt_status', 'cpe_locations',
 )
 
 # An agent that hasn't polled within this window is treated as offline, and
@@ -9635,12 +9635,12 @@ def _validate_agent_result(operation, result):
     permanently wedging some customer's tree view.
 
     Returns None when `result` matches the contract for `operation`, or a
-    short string describing what's wrong (never raises). Only the two
+    short string describing what's wrong (never raises). Only the three
     operations whose results this codebase actually parses into fields
-    (olt_status's ONU list, device_health's optional interface list) have a
-    contract worth enforcing here; test_connection/secret_status/
-    active_session results are consumed as opaque blobs, so there's nothing
-    to validate.
+    (olt_status's ONU list, device_health's optional interface list,
+    cpe_locations's CPE-MAC-to-ONU map) have a contract worth enforcing here;
+    test_connection/secret_status/active_session results are consumed as
+    opaque blobs, so there's nothing to validate.
     """
     if operation == 'olt_status':
         if not isinstance(result, list):
@@ -9688,6 +9688,15 @@ def _validate_agent_result(operation, result):
                 if name is not None and not isinstance(name, str):
                     return 'every interface name must be a string or null'
         return None
+    if operation == 'cpe_locations':
+        if not isinstance(result, dict):
+            return 'result must be an object mapping CPE MAC to its ONU'
+        for mac, entry in result.items():
+            if not isinstance(entry, dict):
+                return 'every CPE entry must be an object'
+            onu_mac = entry.get('onu_mac')
+            if not isinstance(onu_mac, str) or not onu_mac:
+                return 'every CPE entry must have a non-empty string onu_mac'
     return None
 
 

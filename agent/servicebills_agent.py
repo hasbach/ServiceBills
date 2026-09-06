@@ -61,7 +61,7 @@ AGENT_VERSION = "1.0.0"
 # cannot disconnect anyone through this agent.
 ALLOWED_OPERATIONS = (
     "test_connection", "device_health", "secret_status",
-    "active_session", "olt_status",
+    "active_session", "olt_status", "cpe_locations",
 )
 
 DEFAULT_CONFIG_PATH = r"C:\ProgramData\ServiceBillsAgent\agent.toml"
@@ -213,6 +213,8 @@ def execute_job(job, config):
     try:
         if operation == "olt_status":
             ok, value = vsol_olt.get_olt_status(server)
+        elif operation == "cpe_locations":
+            ok, value = vsol_olt.get_cpe_locations(server)
         elif operation == "device_health":
             ok, value = mikrotik.get_device_health(server)
         elif operation == "test_connection":

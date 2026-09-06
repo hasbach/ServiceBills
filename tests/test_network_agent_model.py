@@ -81,11 +81,11 @@ def test_job_defaults_to_pending_and_serializes(app, client):
         assert data["error"] is None
 
 
-def test_the_five_relayed_operations_are_read_only(app, client):
+def test_the_six_relayed_operations_are_read_only(app, client):
     """set_secret_enabled writes to the CCR and must never be relayable."""
     assert appmod.AGENT_OPERATIONS == (
         "test_connection", "device_health", "secret_status",
-        "active_session", "olt_status",
+        "active_session", "olt_status", "cpe_locations",
     )
     assert "set_secret_enabled" not in appmod.AGENT_OPERATIONS
 

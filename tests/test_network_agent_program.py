@@ -527,3 +527,24 @@ def test_configure_logging_degrades_to_stdout_when_the_file_cannot_be_opened(
     # Only the stdout handler survived; nothing holds a half-open file.
     assert all(not isinstance(h, logging.handlers.RotatingFileHandler)
                for h in agent.logger.handlers)
+
+
+def test_cpe_locations_dispatches_to_vsol(monkeypatch):
+    seen = {}
+
+    def fake(server):
+        seen["host"] = server.host
+        return True, {"aa:bb:cc:00:00:01": {"pon_port": "PON1",
+                                            "onu_id": "EPON0/1:2",
+                                            "onu_mac": "b4:64:15:3f:c1:94"}}
+
+    monkeypatch.setattr(agent.vsol_olt, "get_cpe_locations", fake)
+    ok, result, error, status = agent.execute_job(
+        job(operation="cpe_locations"), CONFIG)
+    assert ok is True and error is None
+    assert seen["host"] == "192.168.8.100"
+    assert result["aa:bb:cc:00:00:01"]["onu_mac"] == "b4:64:15:3f:c1:94"
+
+
+def test_cpe_locations_is_in_the_agent_allowlist():
+    assert "cpe_locations" in agent.ALLOWED_OPERATIONS

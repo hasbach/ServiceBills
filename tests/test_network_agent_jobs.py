@@ -366,3 +366,17 @@ def test_pending_or_claimed_jobs_are_never_pruned_regardless_of_age(app, client,
     with app.app_context():
         # Old, but never claimed/finished -- pruning must not touch live work.
         assert appmod.NetworkAgentJob.query.get(stale_pending_id) is not None
+
+
+def test_cpe_locations_result_must_be_an_object(app, client):
+    """The agent is outside the trust boundary; a malformed result must be
+    refused before it is stored, not discovered by a consumer later."""
+    assert appmod._validate_agent_result('cpe_locations', []) is not None
+    assert appmod._validate_agent_result('cpe_locations', 'nope') is not None
+    assert appmod._validate_agent_result(
+        'cpe_locations', {'aa:bb:cc:00:00:01': {'onu_mac': 'b4:64:15:3f:c1:94'}}) is None
+    assert appmod._validate_agent_result(
+        'cpe_locations', {'aa:bb:cc:00:00:01': 'not-an-object'}) is not None
+    assert appmod._validate_agent_result(
+        'cpe_locations', {'aa:bb:cc:00:00:01': {'onu_mac': 42}}) is not None
+    assert appmod._validate_agent_result('cpe_locations', {}) is None
