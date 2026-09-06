@@ -355,3 +355,49 @@ def test_cpe_linking_migration_upgrade_downgrade_upgrade():
             engine.dispose()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+CONNECTOR_FINGERPRINT_REVISION = "d9e2b7c4a815"
+
+
+def test_connector_fingerprint_migration_upgrade_downgrade_upgrade():
+    """Same bootstrap reasoning as the migration tests above: the real chain
+    cannot be walked on SQLite, so build the current schema, stamp at this
+    revision, and drive its real downgrade()/upgrade() from there.
+
+    Worth its own test despite being a single nullable column: NetworkAgent is
+    the one table the agent writes to on every poll, and a column that failed
+    to materialise would turn every poll into a 500 -- taking every device
+    check offline, not just the fingerprint display.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="connector_fingerprint_migration_test_")
+    db_path = os.path.join(tmpdir, "connector_fingerprint_migration.db")
+    mig_app = Flask("test_connector_fingerprint_migration")
+    mig_app.config["SQLALCHEMY_DATABASE_URI"] = (
+        "sqlite:///" + db_path.replace("\\", "/"))
+    mig_db = SQLAlchemy(mig_app)
+    Migrate(mig_app, mig_db, directory=MIGRATIONS_DIR, render_as_batch=True)
+
+    try:
+        with mig_app.app_context():
+            engine = mig_db.engine
+            appmod.db.metadata.create_all(bind=engine)
+            stamp(directory=MIGRATIONS_DIR, revision=CONNECTOR_FINGERPRINT_REVISION)
+
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            assert "connector_fingerprint" not in _table_columns(engine, "network_agent")
+            # Everything else on the table survives the rebuild batch mode
+            # performs to drop a column on SQLite.
+            assert "agent_version" in _table_columns(engine, "network_agent")
+            assert ('tenant_id',) in _unique_constraint_columns(engine, "network_agent")
+
+            upgrade(directory=MIGRATIONS_DIR, revision=CONNECTOR_FINGERPRINT_REVISION)
+            assert "connector_fingerprint" in _table_columns(engine, "network_agent")
+            assert ('tenant_id',) in _unique_constraint_columns(engine, "network_agent")
+
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            assert "connector_fingerprint" not in _table_columns(engine, "network_agent")
+
+            engine.dispose()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

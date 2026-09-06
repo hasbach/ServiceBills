@@ -21,6 +21,7 @@ the first connection.
 See docs/superpowers/specs/2026-09-04-network-agent-layer-2-design.md.
 """
 import argparse
+import hashlib
 import logging
 import logging.handlers
 import os
@@ -54,7 +55,13 @@ except ImportError as exc:
         "-- see README.md's Install section. Copying only the agent/ "
         "directory on its own is not enough.".format(exc))
 
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
+
+# How many hex characters of each file's sha256 are reported. This is a
+# diagnostic, not an attestation -- see connector_fingerprint() -- so 48 bits
+# is far more than enough to notice that two files differ, and short enough
+# that the whole header stays readable in a log line.
+FINGERPRINT_LENGTH = 12
 
 # Read-only, and deliberately so. mikrotik.set_secret_enabled disables a
 # customer's PPPoE secret; it is absent here so that even a compromised cloud
@@ -71,6 +78,70 @@ UNAUTHORIZED_BACKOFF_SECONDS = 30
 HTTP_TIMEOUT_SECONDS = 30
 
 logger = logging.getLogger("servicebills_agent")
+
+
+def _file_fingerprint(path):
+    """A short content hash of one source file, or None if it can't be read.
+
+    Line endings are normalised before hashing. These files reach the on-prem
+    box by hand -- a git checkout with core.autocrlf, a zip, an editor that
+    rewrites newlines -- and a CRLF/LF difference is a transport artefact, not
+    a stale file. Without this every correctly-updated Windows box would
+    report as stale, which is worse than having no check at all.
+    """
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()[:FINGERPRINT_LENGTH]
+
+
+def _fingerprint_sources():
+    """The source files this agent is actually running, by short name.
+
+    The connectors are resolved through their imported modules rather than by
+    rebuilding the expected path, so this reports the file Python really
+    loaded -- including the case where sys.path resolved it somewhere other
+    than the directory above this one.
+    """
+    return {
+        "agent": os.path.abspath(__file__),
+        "mikrotik": getattr(mikrotik, "__file__", "") or "",
+        "vsol_olt": getattr(vsol_olt, "__file__", "") or "",
+    }
+
+
+def compute_connector_fingerprint():
+    """`name=hash` pairs for the files this agent loaded, for the cloud.
+
+    The cloud hashes its own copies the same way, so Settings can say
+    "agent 1.2.0, vsol_olt.py out of date" instead of showing a green version
+    number beside a connector from three deploys ago. That exact trap cost two
+    round trips of debugging in a single day: AGENT_VERSION lives in THIS
+    file, so copying only this file over bumps the version the cloud displays
+    while leaving the connector that does the work untouched.
+
+    A file that cannot be read is simply left out. The cloud only compares
+    names present on both sides, so a missing entry reads as "not known",
+    never as "stale".
+
+    Diagnostic, not attestation: a compromised agent could report whatever it
+    liked. There is nothing to gain by doing so -- it already holds every
+    device credential in agent.toml.
+    """
+    parts = []
+    for name, path in sorted(_fingerprint_sources().items()):
+        digest = _file_fingerprint(path)
+        if digest:
+            parts.append("{}={}".format(name, digest))
+    return ",".join(parts)
+
+
+# Computed once at import: these files cannot change under a running process,
+# and _headers() would otherwise re-read all three on every poll.
+CONNECTOR_FINGERPRINT = compute_connector_fingerprint()
 
 
 class AgentConfigError(Exception):
@@ -234,10 +305,17 @@ def execute_job(job, config):
 
 
 def _headers(config):
-    return {
+    headers = {
         "Authorization": "Bearer " + config["token"],
         "X-Agent-Version": AGENT_VERSION,
     }
+    # Omitted rather than sent empty when not a single file could be hashed:
+    # the cloud only overwrites what it has stored when the header is present,
+    # so a transient read failure leaves the last good reading in place
+    # instead of blanking it.
+    if CONNECTOR_FINGERPRINT:
+        headers["X-Agent-Connectors"] = CONNECTOR_FINGERPRINT
+    return headers
 
 
 def run_once(session, config):
@@ -364,9 +442,10 @@ def main(argv=None):
     _configure_logging(args.log)
     config = load_config(args.config)
     _warn_if_world_readable(args.config)
-    logger.info("Agent %s starting: cloud=%s devices=%s poll=%ss",
+    logger.info("Agent %s starting: cloud=%s devices=%s poll=%ss connectors=%s",
                 AGENT_VERSION, config["cloud_url"],
-                sorted(config["devices"]), config["poll_seconds"])
+                sorted(config["devices"]), config["poll_seconds"],
+                CONNECTOR_FINGERPRINT or "unavailable")
 
     session = requests.Session()
     while True:

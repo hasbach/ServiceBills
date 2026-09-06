@@ -31,6 +31,7 @@ import UserManagement from './UserManagement.js';
 import SectorManager from './SectorManager.js';
 import WhatsAppTemplatesManager from './WhatsAppTemplatesManager.js';
 import { formatStamp } from './formatStamp';
+import { describeStaleConnectors } from './connectorFiles';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
 
@@ -534,9 +535,28 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                                 <Typography variant="body2" color="text.secondary">
                                                     Last seen: {agent.last_seen_at ? formatStamp(agent.last_seen_at) : 'never connected'}
                                                 </Typography>
-                                                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                                                <Typography variant="body2" color="text.secondary">
                                                     Version: {agent.agent_version || 'unknown'}
                                                 </Typography>
+                                                {/* The version above comes from servicebills_agent.py alone, so it
+                                                    can read as freshly bumped while a connector beside it is three
+                                                    deploys old -- and a stale connector fails by quietly returning
+                                                    nothing, not by erroring. This line is what makes that visible. */}
+                                                {agent.connectors_status === 'stale' ? (
+                                                    <Alert severity="warning" sx={{ mt: 1.5, mb: 2, borderRadius: '12px' }}>
+                                                        <strong>Out of date on the agent box: {describeStaleConnectors(agent.stale_connectors)}.</strong>{' '}
+                                                        The version above only covers <code>servicebills_agent.py</code>, so the agent
+                                                        can look current while running an old connector — checks may return nothing
+                                                        instead of failing. Copy {agent.stale_connectors?.length > 1 ? 'those files' : 'that file'} across
+                                                        again and restart the agent.
+                                                    </Alert>
+                                                ) : (
+                                                    <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                                                        Connector files: {agent.connectors_status === 'current'
+                                                            ? 'match this server'
+                                                            : 'not reported — restart the agent to check'}
+                                                    </Typography>
+                                                )}
                                                 <Button variant="outlined" color="warning" onClick={() => setAgentRegenerateConfirmOpen(true)} disabled={agentActionLoading}
                                                     sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
                                                     {agentActionLoading ? 'Regenerating…' : 'Regenerate Token'}

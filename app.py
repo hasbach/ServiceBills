@@ -420,6 +420,115 @@ AGENT_OPERATIONS = (
 # jobs are refused rather than queued for something that will never run them.
 AGENT_ONLINE_WINDOW_SECONDS = 30
 
+# --- Connector fingerprints -------------------------------------------------
+#
+# The agent runs three source files copied by hand onto a box on the tenant's
+# LAN: agent/servicebills_agent.py and the two connectors beside it. Only the
+# first of those carries AGENT_VERSION, so an owner who copies the agent script
+# but forgets a connector sees a freshly bumped version number in Settings
+# beside a connector from three deploys ago -- and the symptom is not an error,
+# it is a feature quietly returning nothing. That happened twice in one day
+# with a stale vsol_olt.py.
+#
+# So the agent reports a short content hash per file (see its
+# compute_connector_fingerprint) and this server hashes its own copies the same
+# way. A mismatch names the specific file, because "something is stale" would
+# not have shortened either of those debugging rounds -- "vsol_olt.py is stale"
+# would have ended them.
+#
+# Self-reported, and therefore not a security control. It does not need to be:
+# an agent that wanted to lie about this already holds every device credential
+# in agent.toml.
+
+# Must stay equal to the agent's FINGERPRINT_LENGTH, or nothing ever matches.
+AGENT_FINGERPRINT_LENGTH = 12
+
+# Bounds what gets stored from an untrusted header. Three names at twelve hex
+# characters is ~62 characters; the rest is headroom for a file added later.
+MAX_CONNECTOR_FINGERPRINT_LENGTH = 200
+
+
+def _file_fingerprint(path):
+    """A short content hash of one source file, or None if it can't be read.
+
+    Line endings are normalised first, exactly as the agent does it: these
+    files reach the on-prem box by hand -- a git checkout with core.autocrlf, a
+    zip, an editor that rewrites newlines -- so a CRLF/LF difference is a
+    transport artefact rather than a stale file. Skipping this would report
+    every correctly-updated Windows box as stale, which is worse than having
+    no check at all.
+    """
+    try:
+        with open(path, 'rb') as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()[:AGENT_FINGERPRINT_LENGTH]
+
+
+_expected_connector_fingerprints_cache = None
+
+
+def _expected_connector_fingerprints():
+    """The agent-side source files as THIS deploy ships them, by short name.
+
+    Computed once and cached: the files cannot change under a running process.
+    A file that cannot be read is left out of the mapping entirely, and an
+    absent name is never compared -- an unreadable file on this side must not
+    make every agent look stale.
+    """
+    global _expected_connector_fingerprints_cache
+    if _expected_connector_fingerprints_cache is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        sources = {
+            'agent': os.path.join(here, 'agent', 'servicebills_agent.py'),
+            # Resolved through the imported modules, the same way the agent
+            # resolves them, so both sides hash the file actually in use.
+            'mikrotik': getattr(mikrotik, '__file__', '') or '',
+            'vsol_olt': getattr(vsol_olt, '__file__', '') or '',
+        }
+        computed = {}
+        for name, path in sources.items():
+            digest = _file_fingerprint(path)
+            if digest:
+                computed[name] = digest
+        _expected_connector_fingerprints_cache = computed
+    return _expected_connector_fingerprints_cache
+
+
+def _parse_connector_fingerprint(raw):
+    """'a=1,b=2' -> {'a': '1', 'b': '2'}. Unparseable pairs are dropped.
+
+    The input is a header from the agent, so it is shape-checked rather than
+    trusted: anything without a name and a value on both sides of an '=' is
+    not a fingerprint and is skipped.
+    """
+    parsed = {}
+    for chunk in (raw or '').split(','):
+        name, separator, digest = chunk.partition('=')
+        if separator and name.strip() and digest.strip():
+            parsed[name.strip()] = digest.strip()
+    return parsed
+
+
+def _connector_status(reported_raw):
+    """(status, stale_names) for whatever an agent last reported.
+
+    status is 'unknown' when there is nothing to compare. An agent predating
+    this check sends no header at all, and that is NOT the same as a mismatch:
+    telling that owner their files are stale would send them to re-copy files
+    they may have copied ten minutes ago, when what actually produces an
+    answer is restarting the agent on a build that reports.
+    """
+    reported = _parse_connector_fingerprint(reported_raw)
+    expected = _expected_connector_fingerprints()
+    shared = sorted(set(reported) & set(expected))
+    if not shared:
+        return 'unknown', []
+    stale = [name for name in shared if reported[name] != expected[name]]
+    return ('stale' if stale else 'current'), stale
+
 
 class NetworkAgent(db.Model):
     """A relay running on the tenant's own LAN. It polls for jobs outbound, so
@@ -438,6 +547,12 @@ class NetworkAgent(db.Model):
     token_hash = db.Column(db.String(255), nullable=False)
     last_seen_at = db.Column(db.DateTime, nullable=True)  # stamped on every poll
     agent_version = db.Column(db.String(20), nullable=True)
+    # 'name=hash' pairs the agent reports for the source files it loaded, as
+    # sent verbatim in X-Agent-Connectors. Compared against this deploy's own
+    # copies so Settings can tell "agent 1.2.0" apart from "agent 1.2.0
+    # running a connector from three deploys ago" -- see the block above
+    # AGENT_FINGERPRINT_LENGTH for why that distinction earns a column.
+    connector_fingerprint = db.Column(db.String(200), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def is_online(self):
@@ -447,12 +562,17 @@ class NetworkAgent(db.Model):
         return age <= AGENT_ONLINE_WINDOW_SECONDS
 
     def to_dict(self):
+        # The raw fingerprint string is deliberately not exposed: on its own it
+        # is half a comparison, and the half the UI needs is the verdict.
+        connectors_status, stale_connectors = _connector_status(self.connector_fingerprint)
         return {
             'id': self.id,
             'name': self.name,
             'last_seen_at': self.last_seen_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_seen_at else None,
             'agent_version': self.agent_version,
             'is_online': self.is_online(),
+            'connectors_status': connectors_status,   # 'unknown' | 'current' | 'stale'
+            'stale_connectors': stale_connectors,     # short names, e.g. ['vsol_olt']
         }
 
 
@@ -9645,6 +9765,13 @@ def agent_poll_job():
     version = (request.headers.get('X-Agent-Version') or '')[:20]
     if version:
         agent.agent_version = version
+    # Only overwritten when the header is present, matching agent_version
+    # above. An agent that momentarily cannot read its own files sends nothing
+    # rather than an empty value, and blanking a good previous reading over a
+    # transient permissions problem would be worse than keeping it.
+    fingerprint = (request.headers.get('X-Agent-Connectors') or '')[:MAX_CONNECTOR_FINGERPRINT_LENGTH]
+    if fingerprint:
+        agent.connector_fingerprint = fingerprint
 
     job = (NetworkAgentJob.query
            .filter_by(tenant_id=agent.tenant_id, status='pending')

@@ -122,8 +122,31 @@ exception's type and message instead.
 ## Updating
 
 There is no auto-update. To update the agent, stop the scheduled task, pull
-the new `agent/` contents (and `mikrotik.py` / `vsol_olt.py`, if they
-changed) into the same layout as Install step 2, and start it again.
+the new `agent/` contents **and** `mikrotik.py` / `vsol_olt.py` into the same
+layout as Install step 2, and start it again.
+
+Copy all three files, not just the ones you think changed. The version number
+Settings displays comes from `servicebills_agent.py` alone, so copying only
+that one shows a freshly bumped version beside a connector that is several
+deploys old -- and a stale connector usually fails by quietly returning
+nothing rather than by erroring, which is a slow thing to notice.
+
+Settings checks this for you. Under **On-prem Agent** it reports the connector
+files as one of:
+
+- **match this server** -- the agent is running exactly the files this
+  deployment ships.
+- **a named file is out of date** -- copy that file across again and restart
+  the agent. The message names the file.
+- **not reported** -- the agent predates this check (before 1.2.0) or could
+  not read its own source files. Restart it on a current build to get an
+  answer.
+
+The agent computes a short content hash of each file it loads and sends it
+with every poll; line endings are normalised first, so copying through a
+Windows editor or a git checkout with `core.autocrlf` does not make a
+correctly-updated file look stale. The same hashes are written to `agent.log`
+on startup, next to the version.
 
 ## Troubleshooting
 
