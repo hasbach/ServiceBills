@@ -78,7 +78,13 @@
 
 .nt-count { font-size: 11px; opacity: 0.7; margin-left: 4px; }
 
-.nt-actions { display: flex; gap: 4px; margin-top: 6px; }
+/* Wraps, because the number of actions on a card is not fixed: an OLT now
+   carries three (Match Labels, Locate Customers, Load ONUs) and MUI buttons
+   will not shrink below their label, so without wrapping the third one
+   overflows the card's own border. Wrapping is also what makes the error
+   row below actually take a line of its own -- flex-basis: 100% does
+   nothing in a nowrap container. */
+.nt-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 /* errorByDevice's message rides along inside the same actions slot (the only
    per-device injection point TreeNode exposes) -- forced onto its own line
    so a long error doesn't squeeze the buttons beside it into unreadability. */
