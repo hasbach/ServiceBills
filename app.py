@@ -10374,11 +10374,16 @@ def apply_customer_locations(device_id):
         return jsonify({'message': 'Network device not found!'}), 404
     if device.device_type != 'vsol_olt':
         return jsonify({'error': 'That device is not an OLT'}), 400
-    job_id = (request.json or {}).get('job_id')
+    raw_job_id = (request.json or {}).get('job_id')
+    try:
+        job_id = int(raw_job_id)
+    except (TypeError, ValueError):
+        return jsonify({'message': 'Invalid job_id'}), 400
     job = tenant_query(NetworkAgentJob).filter_by(
         id=job_id, device_id=device.id, operation='cpe_locations').first()
     if not job:
         return jsonify({'message': 'Job not found'}), 404
+    _expire_job_if_stale(job)
     if job.status != 'done' or job.error:
         return jsonify({'error': job.error or 'The locate is still running.'}), 400
     return jsonify(_apply_cpe_locations(job.result)), 200

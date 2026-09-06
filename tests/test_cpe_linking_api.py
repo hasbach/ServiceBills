@@ -278,6 +278,22 @@ def test_employee_and_collector_cannot_locate_or_apply(app, client):
                            headers=hdr, json={"job_id": 1}).status_code == 403, role
 
 
+def test_apply_rejects_a_non_numeric_job_id(app, client):
+    """On SQLite, id='not-a-number' would just match nothing and 404 -- which
+    is exactly why a plain 404 assertion here wouldn't prove anything. On
+    Postgres (production), comparing the Integer id column to a non-numeric
+    string raises DataError before this endpoint's un-caught path, which
+    would hand Sentry a frame containing the decrypted device credential.
+    job_id must be parsed and rejected with a clean 400 before it ever
+    reaches the query."""
+    hdr = make_tenant(client, "Loc K", "loc_k_admin")
+    olt = _olt(client, hdr)
+    resp = client.post(f"/api/network-tree/olt/{olt['id']}/locate-customers/apply",
+                       headers=hdr, json={"job_id": "not-a-number"})
+    assert resp.status_code == 400
+    assert resp.get_json()["message"] == "Invalid job_id"
+
+
 def test_apply_is_tenant_scoped(app, client, monkeypatch):
     hdr_one = make_tenant(client, "Loc J1", "loc_j1_admin")
     olt_one = _olt(client, hdr_one)
