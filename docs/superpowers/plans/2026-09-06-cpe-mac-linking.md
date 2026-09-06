@@ -81,11 +81,22 @@ def test_cpe_linking_migration_upgrade_downgrade_upgrade():
     try:
         with mig_app.app_context():
             engine = mig_db.engine
+            # Start from the post-migration schema and go DOWN first, rather
+            # than hand-dropping the columns to fake the pre-migration state.
+            # `ALTER TABLE customer DROP COLUMN cpe_mac_address` cannot work
+            # here: the column participates in uq_customer_tenant_cpe_mac, and
+            # SQLite refuses to drop a column an index or constraint depends
+            # on. Downgrading first exercises the real downgrade() and leaves
+            # exactly the pre-migration shape for the upgrade to act on.
             appmod.db.metadata.create_all(bind=engine)
-            with engine.begin() as conn:
-                conn.execute(sa.text("ALTER TABLE customer DROP COLUMN cpe_mac_address"))
-                conn.execute(sa.text("ALTER TABLE customer DROP COLUMN onu_last_seen_at"))
-            stamp(directory=MIGRATIONS_DIR, revision="b71fe5010a39")
+            stamp(directory=MIGRATIONS_DIR, revision=CPE_LINKING_REVISION)
+
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            cols = _table_columns(engine, "customer")
+            assert "cpe_mac_address" not in cols
+            assert "onu_last_seen_at" not in cols
+            assert ("tenant_id", "cpe_mac_address") not in _unique_constraint_columns(
+                engine, "customer")
 
             upgrade(directory=MIGRATIONS_DIR, revision=CPE_LINKING_REVISION)
             cols = _table_columns(engine, "customer")
@@ -95,19 +106,18 @@ def test_cpe_linking_migration_upgrade_downgrade_upgrade():
                 engine, "customer")
 
             downgrade(directory=MIGRATIONS_DIR, revision="-1")
-            cols = _table_columns(engine, "customer")
-            assert "cpe_mac_address" not in cols
-            assert "onu_last_seen_at" not in cols
-
-            upgrade(directory=MIGRATIONS_DIR, revision=CPE_LINKING_REVISION)
-            cols = _table_columns(engine, "customer")
-            assert "cpe_mac_address" in cols
-            assert "onu_last_seen_at" in cols
+            assert "cpe_mac_address" not in _table_columns(engine, "customer")
 
             engine.dispose()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 ```
+
+If `downgrade`-first turns out not to work either, say so in your report rather
+than weakening the assertions — a migration test that does not execute the real
+`upgrade()` and `downgrade()` is worth nothing, and this migration's downgrade
+drops a unique constraint through batch mode, which is exactly the operation
+most likely to be wrong.
 
 Also add to `tests/test_cpe_linking_api.py` (create it):
 
@@ -579,30 +589,91 @@ _ONU_ID_RE = re.compile(r'^EPON\d+/(\d+):(\d+)$')
 
 Add `import re` to the imports if it is not already there.
 
-Add the two walk helpers, following `_walk_onu_table`'s existing structure —
-same engine setup, same `bulk_walk_cmd` arguments, same `_MAX_CELLS` ceiling,
-same `raise OSError(str(err_indication))` / `raise OltRejected(...)` on
-failure, and the same `finally: _safe_close(engine)`:
+Add one shared walk helper plus the two callers. `_walk_onu_table` (the
+existing function, around line 86) is the model for the engine setup and the
+error contract — read it and keep every detail the same:
 
 ```python
+async def _walk_oid(host, port, community, oid):
+    """Walk one OID subtree and return {index_suffix: value}, where the key is
+    the OID text after `oid.`.
+
+    Same engine setup, error contract and ceiling as _walk_onu_table: raises
+    OltRejected on an SNMP errorStatus, OSError (via pysnmp's errorIndication)
+    when the device never answers, and stops at _MAX_CELLS so a device that
+    streams forever cannot hang the caller.
+    """
+    engine = SnmpEngine()
+    try:
+        target = await UdpTransportTarget.create(
+            (host, port), timeout=_TIMEOUT_SECONDS, retries=_RETRIES,
+        )
+        prefix = oid + "."
+        cells = {}
+        async for err_indication, err_status, _err_index, var_binds in bulk_walk_cmd(
+            engine,
+            CommunityData(community, mpModel=1),  # SNMPv2c
+            target,
+            ContextData(),
+            0, 25,
+            ObjectType(ObjectIdentity(oid)),
+            lexicographicMode=False,
+        ):
+            if err_indication:
+                raise OSError(str(err_indication))
+            if err_status:
+                raise OltRejected(err_status.prettyPrint())
+            for name, value in var_binds:
+                text = str(name.get_oid())
+                if not text.startswith(prefix):
+                    continue
+                cells[text[len(prefix):]] = value.prettyPrint()
+            if len(cells) >= _MAX_CELLS:
+                logger.warning("VSOL OLT walk of %s hit the %s-cell ceiling at %s",
+                               oid, _MAX_CELLS, host)
+                break
+        return cells
+    finally:
+        _safe_close(engine)
+
+
 async def _walk_fdb_ports(host, port, community):
-    """dot1dTpFdbPort -> {mac: bridge_port}. The OID index encodes the MAC as
-    six decimal octets, e.g. ...1.2.6.0.12.66.219.81.190 -- the trailing six
-    are the address."""
-    # ... same walk skeleton as _walk_onu_table, collecting:
-    #   parts = oid[len(prefix):].split(".")
-    #   if len(parts) != 6: continue
-    #   mac = ":".join("%02x" % int(p) for p in parts)
-    #   out[mac] = int(value.prettyPrint())
+    """dot1dTpFdbPort -> {mac: bridge_port}.
+
+    The OID index is the MAC as six decimal octets -- ...1.2.0.12.66.219.81.190
+    means 00:0c:42:db:51:be. An index that is not six octets, or a value that
+    is not an integer, is skipped rather than raising: this table is read from
+    a device, not from something this code controls.
+    """
+    out = {}
+    for index, value in (await _walk_oid(host, port, community, FDB_PORT_OID)).items():
+        parts = index.split(".")
+        if len(parts) != 6:
+            continue
+        try:
+            mac = ":".join("%02x" % int(part) for part in parts)
+            out[mac] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 async def _walk_if_names(host, port, community):
-    """ifName -> {ifIndex: name}."""
-    # ... same walk skeleton, collecting:
-    #   out[int(index)] = value.prettyPrint()
+    """ifName -> {ifIndex: name}. A non-integer index is skipped."""
+    out = {}
+    for index, value in (await _walk_oid(host, port, community, IF_NAME_OID)).items():
+        try:
+            out[int(index)] = value
+        except (TypeError, ValueError):
+            continue
+    return out
 ```
 
-Then the public function:
+Then the public function. **Note two things the existing module does that a
+first draft usually gets wrong:** it passes `server.password` straight through
+(the `EncryptedString` column type has already decrypted it — there is no
+`decrypt()` call anywhere in this file), and it resolves the port as
+`server.api_port or DEFAULT_SNMP_PORT`.
 
 ```python
 def get_cpe_locations(server):
@@ -627,17 +698,25 @@ def get_cpe_locations(server):
         if match:
             by_position[(int(match.group(1)), int(match.group(2)))] = onu
 
+    port = server.api_port or DEFAULT_SNMP_PORT
     try:
-        fdb = asyncio.run(_walk_fdb_ports(server.host, server.api_port,
-                                          decrypt(server.password)))
-        names = asyncio.run(_walk_if_names(server.host, server.api_port,
-                                           decrypt(server.password)))
+        fdb = asyncio.run(_walk_fdb_ports(server.host, port, server.password))
+        names = asyncio.run(_walk_if_names(server.host, port, server.password))
     except OltRejected as exc:
-        _mark_checked(server, 'auth_failed')
-        return False, str(exc)
-    except OSError as exc:
-        _mark_checked(server, 'unreachable')
-        return False, str(exc)
+        _mark_checked(server, "auth_failed")
+        logger.warning("VSOL OLT rejected the FDB walk for device %s: %s",
+                       server.id, exc)
+        return False, "OLT rejected the SNMP request: {}".format(exc)
+    except Exception as exc:  # noqa: BLE001 -- this module never raises out
+        _mark_checked(server, "unreachable")
+        # WARNING with exc_info, never exception/error: Sentry's
+        # LoggingIntegration captures ERROR records WITH frame locals, and
+        # these frames' locals include the SNMP community string. At WARNING
+        # it becomes a breadcrumb, which carries none. Same reasoning, and
+        # the same shape, as get_olt_status's own handler.
+        logger.warning("VSOL OLT FDB walk failed for device %s: %s",
+                       server.id, exc, exc_info=True)
+        return False, str(exc) or exc.__class__.__name__
 
     located = {}
     for mac, bridge_port in fdb.items():
@@ -656,8 +735,13 @@ def get_cpe_locations(server):
     return True, located
 ```
 
-Match the existing file's exact conventions for `decrypt`, `_mark_checked` and
-`OltRejected` — read `get_olt_status` and copy how it does each.
+Add `import re` to `vsol_olt.py`'s imports — it is not there today.
+
+One consequence to be aware of, not a bug: `get_olt_status` returns
+`(False, "OLT responded but reported no ONUs ...")` rather than an empty list
+when the walk comes back empty, so `get_cpe_locations` inherits that failure
+for an OLT with no ONUs at all. That is correct — with no ONU inventory there
+is nothing to join CPEs to.
 
 - [ ] **Step 4: Run the tests**
 
