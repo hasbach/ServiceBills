@@ -2977,6 +2977,7 @@ def get_customers():
                 'mikrotik_server_id': c.mikrotik_server_id,
                 'pppoe_username': c.pppoe_username,
                 'onu_mac_address': c.onu_mac_address,
+                'cpe_mac_address': c.cpe_mac_address,
                 'subscription_plan': c.subscription_plan.to_dict() if c.subscription_plan else None
             }
             customers_with_plans.append(customer_dict)
@@ -2991,6 +2992,26 @@ def get_customers():
         return jsonify({'error': str(e)}), 400
     
 from datetime import datetime, timezone
+
+def _check_cpe_mac_available(mac, customer_id=None):
+    """Return an error message if another customer in this tenant already
+    holds this CPE MAC, else None.
+
+    The DB constraint uq_customer_tenant_cpe_mac is the real guarantee; this
+    exists to name the other customer, because "duplicate MAC" alone leaves
+    the operator hunting through 300 records for the clash.
+    """
+    if not mac:
+        return None
+    query = tenant_query(Customer).filter(Customer.cpe_mac_address == mac)
+    if customer_id is not None:
+        query = query.filter(Customer.id != customer_id)
+    holder = query.first()
+    if holder:
+        return (f"CPE MAC {mac} is already recorded for "
+                f"{holder.name}. A router belongs to one customer.")
+    return None
+
 
 @app.route('/api/customers', methods=['POST'])
 @jwt_required()
@@ -3050,6 +3071,18 @@ def add_customer():
         if mac_error:
             return jsonify({'error': mac_error}), 400
 
+        # cpe_mac_address is the customer's own router, as the OLT learns it --
+        # unique per customer (unlike onu_mac_address, which many customers can
+        # share). The duplicate check gives a friendly, name-the-holder error;
+        # uq_customer_tenant_cpe_mac is the real guarantee underneath.
+        cpe_mac_address, cpe_error = _validate_mac_address(
+            data.get('cpe_mac_address'), allow_empty=True)
+        if cpe_error:
+            return jsonify({'error': cpe_error}), 400
+        duplicate = _check_cpe_mac_available(cpe_mac_address)
+        if duplicate:
+            return jsonify({'error': duplicate}), 400
+
         # Create new customer first
         new_customer = new_for_tenant(
             Customer,
@@ -3070,7 +3103,8 @@ def add_customer():
             upstream_username=data.get('upstream_username') or None,
             mikrotik_server_id=data.get('mikrotik_server_id') or None,
             pppoe_username=data.get('pppoe_username') or None,
-            onu_mac_address=onu_mac_address
+            onu_mac_address=onu_mac_address,
+            cpe_mac_address=cpe_mac_address
         )
         db.session.add(new_customer)
         db.session.flush() # Flush to get new_customer.id
@@ -3331,6 +3365,22 @@ def update_customer(customer_id):
                 return jsonify({'error': mac_error}), 400
             customer.onu_mac_address = onu_mac_address
 
+        # cpe_mac_address: only touched when the key is present -- absent
+        # means "leave alone", empty string means "clear". Unlike
+        # onu_mac_address above, this field is unique per tenant (a router
+        # belongs to one customer), so re-check on every update, excluding
+        # this customer's own row -- otherwise re-saving their existing MAC
+        # would reject itself.
+        if 'cpe_mac_address' in data:
+            cpe_mac_address, cpe_error = _validate_mac_address(
+                data['cpe_mac_address'], allow_empty=True)
+            if cpe_error:
+                return jsonify({'error': cpe_error}), 400
+            duplicate = _check_cpe_mac_available(cpe_mac_address, customer.id)
+            if duplicate:
+                return jsonify({'error': duplicate}), 400
+            customer.cpe_mac_address = cpe_mac_address
+
         # Handle subscription plan change
         if 'subscription_plan_id' in data and data['subscription_plan_id'] != customer.subscription_plan_id:
             new_plan = tenant_query(SubscriptionPlan).filter_by(id=data['subscription_plan_id']).first()
@@ -3393,7 +3443,8 @@ def update_customer(customer_id):
                 'upstream_username': customer.upstream_username,
                 'mikrotik_server_id': customer.mikrotik_server_id,
                 'pppoe_username': customer.pppoe_username,
-                'onu_mac_address': customer.onu_mac_address
+                'onu_mac_address': customer.onu_mac_address,
+                'cpe_mac_address': customer.cpe_mac_address
             }
         }), 200
 
