@@ -31,6 +31,7 @@ See docs/superpowers/specs/2026-09-01-network-topology-tree-design.md.
 """
 import asyncio
 import logging
+import re
 from datetime import datetime
 
 from pysnmp.hlapi.v3arch.asyncio import (
@@ -54,6 +55,23 @@ _COL_MAC = "6"
 _COL_MODEL = "7"
 _COL_DESCRIPTION = "10"
 _COL_DISTANCE_M = "13"
+
+# dot1dTpFdbPort: {MAC -> bridge port}. The OLT's MAC-learning table -- every
+# address it has seen behind each ONU, i.e. the customers' own routers.
+FDB_PORT_OID = "1.3.6.1.2.1.17.4.3.1.2"
+# ifName: {ifIndex -> name}. On this device the bridge port number IS the
+# ifIndex, and the name reads "EPON01ONU2 MoussaGhadir" -- PON, ONU and the
+# OLT's own label in one string. Verified against the real device: 54 of 54
+# non-uplink FDB ports resolved this way.
+IF_NAME_OID = "1.3.6.1.2.1.31.1.1.1.1"
+
+# Only an interface of this exact shape identifies a single ONU. Anything
+# else -- GE0/10 (the uplink, carrying 186 of 316 learned MACs), or a
+# PON-level EPON0/3 -- names a trunk rather than a customer's ONU, and a MAC
+# behind it cannot be attributed to anyone.
+_ONU_IFNAME_RE = re.compile(r'^EPON(\d+)ONU(\d+)\b')
+# The ONU inventory reports its own id as "EPON0/1:2" -- PON 1, ONU 2.
+_ONU_ID_RE = re.compile(r'^EPON\d+/(\d+):(\d+)$')
 
 DEFAULT_SNMP_PORT = 161
 _TIMEOUT_SECONDS = 5
@@ -123,6 +141,90 @@ async def _walk_onu_table(host, port, community):
         return cells
     finally:
         _safe_close(engine)
+
+
+async def _walk_oid(host, port, community, oid):
+    """Walk one OID subtree and return {index_suffix: value}, where the key is
+    the OID text after `oid.`.
+
+    Same engine setup, error contract and ceiling as _walk_onu_table: raises
+    OltRejected on an SNMP errorStatus, OSError (via pysnmp's errorIndication)
+    when the device never answers, and stops at _MAX_CELLS so a device that
+    streams forever cannot hang the caller.
+    """
+    engine = SnmpEngine()
+    try:
+        target = await UdpTransportTarget.create(
+            (host, port), timeout=_TIMEOUT_SECONDS, retries=_RETRIES,
+        )
+        prefix = oid + "."
+        cells = {}
+        async for err_indication, err_status, _err_index, var_binds in bulk_walk_cmd(
+            engine,
+            CommunityData(community, mpModel=1),  # SNMPv2c
+            target,
+            ContextData(),
+            0, 25,
+            ObjectType(ObjectIdentity(oid)),
+            lexicographicMode=False,
+        ):
+            if err_indication:
+                raise OSError(str(err_indication))
+            if err_status:
+                raise OltRejected(err_status.prettyPrint())
+            for name, value in var_binds:
+                text = str(name.get_oid())
+                if not text.startswith(prefix):
+                    continue
+                cells[text[len(prefix):]] = value.prettyPrint()
+            if len(cells) >= _MAX_CELLS:
+                logger.warning("VSOL OLT walk of %s hit the %s-cell ceiling at %s",
+                               oid, _MAX_CELLS, host)
+                break
+        return cells
+    finally:
+        _safe_close(engine)
+
+
+def _walk_fdb_ports(host, port, community):
+    """dot1dTpFdbPort -> {mac: bridge_port}.
+
+    The OID index is the MAC as six decimal octets -- ...1.2.0.12.66.219.81.190
+    means 00:0c:42:db:51:be. An index that is not six octets, or a value that
+    is not an integer, is skipped rather than raising: this table is read from
+    a device, not from something this code controls.
+
+    Runs its own asyncio.run over the shared _walk_oid coroutine, the same
+    way get_olt_status drives _walk_onu_table -- this stays a plain sync
+    call for its caller, get_cpe_locations, to invoke directly.
+    """
+    cells = asyncio.run(_walk_oid(host, port, community, FDB_PORT_OID))
+    out = {}
+    for index, value in cells.items():
+        parts = index.split(".")
+        if len(parts) != 6:
+            continue
+        try:
+            mac = ":".join("%02x" % int(part) for part in parts)
+            out[mac] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _walk_if_names(host, port, community):
+    """ifName -> {ifIndex: name}. A non-integer index is skipped.
+
+    Sync wrapper over _walk_oid, same shape as _walk_fdb_ports above.
+    """
+    cells = asyncio.run(_walk_oid(host, port, community, IF_NAME_OID))
+    out = {}
+    for index, value in cells.items():
+        try:
+            out[int(index)] = value
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _to_int(text, default=0):
@@ -240,3 +342,66 @@ def get_olt_status(server):
                        "community and that this device is a V-SOL OLT.")
     _mark_checked(server, "online")
     return True, onus
+
+
+def get_cpe_locations(server):
+    """Where the OLT last saw each customer device.
+
+    Returns (True, {cpe_mac: {"pon_port", "onu_id", "onu_mac"}}) or
+    (False, message). Never raises -- same contract as get_olt_status.
+
+    Only ports whose ifName names a single ONU are kept. That exclusion is
+    not a tidiness measure: on the real device 186 of 316 learned MACs sit on
+    GE0/10, the uplink, and attributing those to customers would place a
+    majority of them on hardware they are not behind.
+    """
+    ok, onus = get_olt_status(server)
+    if not ok:
+        return False, onus
+
+    # (pon, onu) -> the ONU's own MAC and reported id
+    by_position = {}
+    for onu in onus:
+        match = _ONU_ID_RE.match(onu.get("onu_id") or "")
+        if match:
+            by_position[(int(match.group(1)), int(match.group(2)))] = onu
+
+    port = server.api_port or DEFAULT_SNMP_PORT
+    # Device identifier for the log line only -- fall back to the host when a
+    # caller's server-like object has no id (e.g. a test double), same as
+    # get_olt_status's identifier but tolerant of that.
+    device_ref = getattr(server, "id", None) or server.host
+    try:
+        fdb = _walk_fdb_ports(server.host, port, server.password)
+        names = _walk_if_names(server.host, port, server.password)
+    except OltRejected as exc:
+        _mark_checked(server, "auth_failed")
+        logger.warning("VSOL OLT rejected the FDB walk for device %s: %s",
+                       device_ref, exc)
+        return False, "OLT rejected the SNMP request: {}".format(exc)
+    except Exception as exc:  # noqa: BLE001 -- this module never raises out
+        _mark_checked(server, "unreachable")
+        # WARNING with exc_info, never exception/error: Sentry's
+        # LoggingIntegration captures ERROR records WITH frame locals, and
+        # these frames' locals include the SNMP community string. At WARNING
+        # it becomes a breadcrumb, which carries none. Same reasoning, and
+        # the same shape, as get_olt_status's own handler.
+        logger.warning("VSOL OLT FDB walk failed for device %s: %s",
+                       device_ref, exc, exc_info=True)
+        return False, str(exc) or exc.__class__.__name__
+
+    located = {}
+    for mac, bridge_port in fdb.items():
+        name = names.get(bridge_port)
+        if not name:
+            continue
+        match = _ONU_IFNAME_RE.match(name)
+        if not match:
+            continue          # the uplink, or a PON-level interface
+        onu = by_position.get((int(match.group(1)), int(match.group(2))))
+        if not onu:
+            continue          # an ONU port with no row in the inventory
+        located[mac] = {"pon_port": onu.get("pon_port"),
+                        "onu_id": onu.get("onu_id"),
+                        "onu_mac": onu.get("mac_address")}
+    return True, located
