@@ -306,3 +306,125 @@ def test_apply_is_tenant_scoped(app, client, monkeypatch):
     resp = client.post(f"/api/network-tree/olt/{olt_two['id']}/locate-customers/apply",
                        headers=hdr_two, json={"job_id": started["job_id"]})
     assert resp.status_code == 404
+
+
+# --- Fix round 1 (review finding): _resolve_onu_customers never exposed
+# onu_last_seen_at on the customer entries nested in the tree, so the
+# "remembered placement" marker had no data at all in production even though
+# the isolated, fixture-fed frontend test still passed. Same gap for
+# lastLocateAt on the device payload. Both are fixed now (see
+# _resolve_onu_customers and _build_device_tree); these tests are the
+# regression coverage that didn't exist before, driven through the real
+# locate-and-apply / refresh flow rather than a hand-set fixture, so they
+# actually fail if either field goes missing again. ---
+
+def _tree_by_id(client, hdr):
+    """Flatten /api/network-tree into a dict keyed by device id, regardless
+    of nesting depth -- mirrors tests/test_network_tree_endpoint.py's helper
+    of the same shape."""
+    def walk(nodes, out):
+        for n in nodes:
+            out[n["id"]] = n
+            walk(n.get("children") or [], out)
+        return out
+    return walk(client.get("/api/network-tree", headers=hdr).get_json()["tree"], {})
+
+
+def _locate_then_refresh_status(client, hdr, monkeypatch):
+    """Locate a customer behind the ONU (writing onu_mac_address and
+    onu_last_seen_at for real), then refresh the OLT's status so that same
+    customer comes back nested under an ONU in both get_network_tree and
+    get_network_job. Returns (olt, customer_id, status_job_id)."""
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    cid = _customer(client, hdr, plan_id, "Moussa",
+                    cpe_mac_address="aa:bb:cc:00:00:01").get_json()["customer_id"]
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, LOCATIONS))
+    apply_body = _locate_and_apply(client, hdr, olt["id"]).get_json()
+    assert apply_body["located"] == 1, apply_body
+
+    # ONUS's one entry reports the same MAC LOCATIONS just wrote onto the
+    # customer (b4:64:15:3f:c1:94), so the status refresh below resolves the
+    # customer behind it -- this is what get_network_tree's
+    # _latest_results_by_device and get_network_job both run through
+    # _resolve_onu_customers.
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+    started = client.post(f"/api/network-tree/olt/{olt['id']}/refresh",
+                         headers=hdr).get_json()
+    assert started["ok"] is True, started
+    return olt, cid, started["job_id"]
+
+
+def test_tree_carries_last_locate_at_for_a_located_olt_and_none_for_an_unlocated_one(
+        app, client, monkeypatch):
+    hdr = make_tenant(client, "Loc L", "loc_l_admin")
+    located_olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    _customer(client, hdr, plan_id, "Located", cpe_mac_address="aa:bb:cc:00:00:01")
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, LOCATIONS))
+    apply_body = _locate_and_apply(client, hdr, located_olt["id"]).get_json()
+    assert apply_body["located"] == 1, apply_body
+
+    # A second OLT in the same tenant that has never had a locate run.
+    unlocated_olt = _olt(client, hdr)
+
+    with app.app_context():
+        job = (appmod.NetworkAgentJob.query
+               .filter_by(device_id=located_olt["id"], operation="cpe_locations")
+               .order_by(appmod.NetworkAgentJob.id.desc()).first())
+        assert job is not None and job.finished_at is not None
+        expected_at = job.finished_at.strftime('%Y-%m-%d %H:%M:%S')
+
+    tree = _tree_by_id(client, hdr)
+    assert tree[located_olt["id"]]["lastLocateAt"] == expected_at
+    assert tree[unlocated_olt["id"]]["lastLocateAt"] is None
+
+
+def test_tree_carries_onu_last_seen_at_written_by_a_real_locate_run(app, client, monkeypatch):
+    """Not a hard-coded fixture value: read back what the locate-and-apply
+    flow actually wrote onto the customer row, and confirm the tree's
+    nested customer entry carries exactly that."""
+    hdr = make_tenant(client, "Loc M", "loc_m_admin")
+    olt, cid, _job_id = _locate_then_refresh_status(client, hdr, monkeypatch)
+
+    with app.app_context():
+        customer = appmod.Customer.query.get(cid)
+        assert customer.onu_last_seen_at is not None
+        expected = customer.onu_last_seen_at.strftime('%Y-%m-%d %H:%M:%S')
+
+    node = _tree_by_id(client, hdr)[olt["id"]]
+    customers = node["last_result"][0]["customers"]
+    assert customers, "the located customer must be nested under the ONU"
+    assert [c["onu_last_seen_at"] for c in customers] == [expected]
+
+
+def test_network_job_poll_carries_onu_last_seen_at_for_an_olt_status_job(app, client, monkeypatch):
+    """get_network_tree and get_network_job share _resolve_onu_customers, so
+    the same field must show up on the poll endpoint too."""
+    hdr = make_tenant(client, "Loc N", "loc_n_admin")
+    olt, cid, job_id = _locate_then_refresh_status(client, hdr, monkeypatch)
+
+    with app.app_context():
+        customer = appmod.Customer.query.get(cid)
+        expected = customer.onu_last_seen_at.strftime('%Y-%m-%d %H:%M:%S')
+
+    polled = client.get(f"/api/network-jobs/{job_id}", headers=hdr).get_json()
+    assert polled["result"][0]["customers"][0]["onu_last_seen_at"] == expected
+
+
+def test_never_located_customer_reports_onu_last_seen_at_as_none_not_absent(
+        app, client, monkeypatch):
+    """The frontend distinguishes 'never located' (None) from 'located and
+    since gone quiet' (a real timestamp) -- an absent key would collapse
+    that distinction, so the key must be present and explicitly None."""
+    hdr = make_tenant(client, "Loc O", "loc_o_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    _customer(client, hdr, plan_id, "NeverLocated", onu_mac_address="b4:64:15:3f:c1:94")
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+
+    started = client.post(f"/api/network-tree/olt/{olt['id']}/refresh", headers=hdr).get_json()
+    polled = client.get(f"/api/network-jobs/{started['job_id']}", headers=hdr).get_json()
+    customer = polled["result"][0]["customers"][0]
+    assert "onu_last_seen_at" in customer
+    assert customer["onu_last_seen_at"] is None
