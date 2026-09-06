@@ -12,6 +12,7 @@ import pollNetworkJob from './pollNetworkJob';
 import TreeNode from './TreeNode';
 import { buildTopologyTree } from './buildTopologyTree';
 import { filterTopologyTree } from './filterTopologyTree';
+import { formatStamp, parseUtc } from './formatStamp';
 
 // Auto-refresh a device only when its cached result is older than this. Without
 // a cap, every visit to the page would fire a fresh 13-second SNMP walk of the
@@ -27,17 +28,6 @@ import { filterTopologyTree } from './filterTopologyTree';
 // available for someone who wants live data right now -- so there is little
 // lost by waiting longer before the page fires one on its own.
 const STALE_AFTER_MS = 30 * 60 * 1000;
-
-/**
- * '2026-09-05 12:00:00' (the space-separated, no-offset format the API emits
- * everywhere it stamps a time) -> epoch ms, or NaN if unparseable. The single
- * place that knows this format, so describeAge and isStale -- which both used
- * to carry their own copy of this exact expression -- can never silently
- * desync from each other after a format change to only one of them.
- */
-export function parseUtc(stamp) {
-    return Date.parse(stamp.replace(' ', 'T') + 'Z');
-}
 
 /** '2026-09-05 12:00:00' (UTC, as the API emits it) -> "4 min ago". */
 export function describeAge(stamp, now = Date.now()) {
@@ -242,7 +232,7 @@ const NetworkTreeView = () => {
     const agentOnline = !!(agent && agent.is_online);
     const agentOffline = accessMode === 'agent' && !agentOnline;
     const agentOfflineReason = agent?.last_seen_at
-        ? `Agent offline (last seen ${agent.last_seen_at}). Start the agent on your network and try again.`
+        ? `Agent offline (last seen ${formatStamp(agent.last_seen_at)}). Start the agent on your network and try again.`
         : 'Agent offline (never connected). Start the agent on your network and try again.';
 
     // `auto` distinguishes a manual refresh (the "Load ONUs" button, or
@@ -577,7 +567,7 @@ const NetworkTreeView = () => {
                     <Chip size="small" color={agentOnline ? 'success' : 'error'}
                         label={agentOnline ? 'Agent online' : 'Agent offline'} />
                     <Typography variant="caption" color="text.secondary">
-                        {agent?.last_seen_at ? `last seen ${agent.last_seen_at}` : 'never connected'}
+                        {agent?.last_seen_at ? `last seen ${formatStamp(agent.last_seen_at)}` : 'never connected'}
                     </Typography>
                 </Stack>
             )}

@@ -15,6 +15,7 @@ import {
 import { apiService, useAppContext } from '../context/AppContext';
 import pollNetworkJob from './pollNetworkJob';
 import { STATUS_COLOR, STATUS_LABEL, NOT_CHECKED } from './deviceStatus';
+import { formatStamp } from './formatStamp';
 
 // A network device the tenant owns (starting with a core CCR), monitored for
 // RouterOS-level health -- independent of MikrotikServer, which is
@@ -87,7 +88,7 @@ const NetworkDeviceManagementView = () => {
     const agentOnline = !!(agent && agent.is_online);
     const agentOffline = accessMode === 'agent' && !agentOnline;
     const agentOfflineReason = agent?.last_seen_at
-        ? `Agent offline (last seen ${agent.last_seen_at}). Start the agent on your network and try again.`
+        ? `Agent offline (last seen ${formatStamp(agent.last_seen_at)}). Start the agent on your network and try again.`
         : 'Agent offline (never connected). Start the agent on your network and try again.';
 
     const loadDevices = async () => {
@@ -240,7 +241,7 @@ const NetworkDeviceManagementView = () => {
                     <Chip size="small" color={agentOnline ? 'success' : 'error'}
                         label={agentOnline ? 'Agent online' : 'Agent offline'} />
                     <Typography variant="caption" color="text.secondary">
-                        {agent?.last_seen_at ? `last seen ${agent.last_seen_at}` : 'never connected'}
+                        {agent?.last_seen_at ? `last seen ${formatStamp(agent.last_seen_at)}` : 'never connected'}
                     </Typography>
                 </Stack>
             )}
@@ -267,7 +268,7 @@ const NetworkDeviceManagementView = () => {
                                         {d.device_type === 'vsol_olt' ? ' — OLT (SNMP)' : ' — CCR (RouterOS)'}
                                     </TableCell>
                                     <TableCell>
-                                        <Tooltip title={d.last_checked_at || ''}>
+                                        <Tooltip title={d.last_checked_at ? formatStamp(d.last_checked_at) : ''}>
                                             <Chip size="small" label={STATUS_LABEL[d.last_status || NOT_CHECKED] || d.last_status} color={STATUS_COLOR[d.last_status || NOT_CHECKED] || 'default'} />
                                         </Tooltip>
                                     </TableCell>
