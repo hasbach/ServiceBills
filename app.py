@@ -530,6 +530,16 @@ class Customer(db.Model):
     # bridges), so this is a plain many-to-one string -- no unique constraint,
     # no join table -- the same shape as mikrotik_server_id/upstream_provider_id.
     onu_mac_address = db.Column(db.String(20), nullable=True, index=True)
+    # The customer's OWN router, as the OLT's MAC-learning table sees it.
+    # Unlike onu_mac_address -- which is the ONU's address and therefore
+    # SHARED by everyone behind that transparent bridge -- this identifies
+    # exactly one customer, which is what lets the OLT place them without
+    # anyone having to know which ONU they are on.
+    cpe_mac_address = db.Column(db.String(20), nullable=True, index=True)
+    # When that CPE was last located. Null means never. Compared against the
+    # newest completed cpe_locations job to tell a confirmed placement from a
+    # remembered one -- see the tree's "last seen" marker.
+    onu_last_seen_at = db.Column(db.DateTime, nullable=True)
     payments = db.relationship('Payment', backref='customer', lazy=True, cascade="all, delete-orphan")
     generated_receipts = db.relationship('GeneratedReceipt', back_populates='customer', cascade="all, delete-orphan")
     addon_purchases = db.relationship('AddonPurchase', backref='customer', lazy=True, cascade="all, delete-orphan")
@@ -538,6 +548,15 @@ class Customer(db.Model):
     feedback = db.relationship('CustomerFeedback', backref='customer', lazy=True, cascade="all, delete-orphan")
     payment_reminders = db.relationship('PaymentReminder', backref='customer', lazy=True, cascade="all, delete-orphan")
     whatsapp_notifications_enabled = db.Column(db.Boolean, default=True)
+    # A MAC identifies one physical device, so two customers cannot own the
+    # same one. The create/update endpoints check first for a friendly error
+    # naming the holder; this is the backstop that survives a race between
+    # two concurrent writes. NULLs do not collide in either Postgres or
+    # SQLite, so the many customers with no CPE recorded are unaffected.
+    __table_args__ = (
+        db.UniqueConstraint('tenant_id', 'cpe_mac_address',
+                            name='uq_customer_tenant_cpe_mac'),
+    )
     # In the Customer model, add a property:
     @property
     def subscription_plan_dict(self):

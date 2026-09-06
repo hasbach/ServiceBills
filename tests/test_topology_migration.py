@@ -304,3 +304,54 @@ def test_network_agent_tenant_unique_migration_adds_and_removes_the_constraint()
             engine.dispose()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+CPE_LINKING_REVISION = "c3a71d5e04b8"
+
+
+def test_cpe_linking_migration_upgrade_downgrade_upgrade():
+    """Same bootstrap reasoning as the network-agent migration test above: the
+    real chain cannot be walked on SQLite, so build the pre-migration schema
+    from the current models (minus what this migration adds), stamp at its
+    parent, and drive the real upgrade()/downgrade() from there."""
+    tmpdir = tempfile.mkdtemp(prefix="cpe_linking_migration_test_")
+    db_path = os.path.join(tmpdir, "cpe_linking_migration.db")
+    mig_app = Flask("test_cpe_linking_migration")
+    mig_app.config["SQLALCHEMY_DATABASE_URI"] = (
+        "sqlite:///" + db_path.replace("\\", "/"))
+    mig_db = SQLAlchemy(mig_app)
+    Migrate(mig_app, mig_db, directory=MIGRATIONS_DIR, render_as_batch=True)
+
+    try:
+        with mig_app.app_context():
+            engine = mig_db.engine
+            # Start from the post-migration schema and go DOWN first, rather
+            # than hand-dropping the columns to fake the pre-migration state.
+            # `ALTER TABLE customer DROP COLUMN cpe_mac_address` cannot work
+            # here: the column participates in uq_customer_tenant_cpe_mac, and
+            # SQLite refuses to drop a column an index or constraint depends
+            # on. Downgrading first exercises the real downgrade() and leaves
+            # exactly the pre-migration shape for the upgrade to act on.
+            appmod.db.metadata.create_all(bind=engine)
+            stamp(directory=MIGRATIONS_DIR, revision=CPE_LINKING_REVISION)
+
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            cols = _table_columns(engine, "customer")
+            assert "cpe_mac_address" not in cols
+            assert "onu_last_seen_at" not in cols
+            assert ("tenant_id", "cpe_mac_address") not in _unique_constraint_columns(
+                engine, "customer")
+
+            upgrade(directory=MIGRATIONS_DIR, revision=CPE_LINKING_REVISION)
+            cols = _table_columns(engine, "customer")
+            assert "cpe_mac_address" in cols
+            assert "onu_last_seen_at" in cols
+            assert ("tenant_id", "cpe_mac_address") in _unique_constraint_columns(
+                engine, "customer")
+
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            assert "cpe_mac_address" not in _table_columns(engine, "customer")
+
+            engine.dispose()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
