@@ -63,6 +63,7 @@ import {
     Receipt as ReceiptIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
+import { formatStamp } from './formatStamp';
 
 // --- NEW: Toolbar for bulk actions ---
 const EnhancedTableToolbar = ({ numSelected, onRenew, onCancel, onDelete, disabled }) => {
@@ -1434,7 +1435,9 @@ const SubscriptionsView = ({
                                                 <Chip
                                                     size="small"
                                                     variant="outlined"
-                                                    label={`As of ${upstreamSyncStatus.upstream_last_synced_at || 'now'}`}
+                                                    label={`As of ${upstreamSyncStatus.upstream_last_synced_at
+                                                        ? formatStamp(upstreamSyncStatus.upstream_last_synced_at)
+                                                        : 'now'}`}
                                                 />
                                                 {upstreamSyncStatus.upstream_drift && (
                                                     <Chip

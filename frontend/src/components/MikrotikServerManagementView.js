@@ -12,6 +12,7 @@ import {
     Wifi as TestConnectionIcon
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
+import { formatStamp } from './formatStamp';
 
 const STATUS_COLOR = { online: 'success', unreachable: 'error', auth_failed: 'warning' };
 const STATUS_LABEL = { online: 'Online', unreachable: 'Unreachable', auth_failed: 'Auth Failed' };
@@ -128,7 +129,7 @@ const MikrotikServerManagementView = () => {
                                     <TableCell>{s.service_name || <Typography component="span" variant="body2" color="text.secondary">— any —</Typography>}</TableCell>
                                     <TableCell>
                                         {s.last_status ? (
-                                            <Tooltip title={s.last_checked_at || ''}>
+                                            <Tooltip title={s.last_checked_at ? formatStamp(s.last_checked_at) : ''}>
                                                 <Chip size="small" label={STATUS_LABEL[s.last_status] || s.last_status} color={STATUS_COLOR[s.last_status] || 'default'} />
                                             </Tooltip>
                                         ) : (

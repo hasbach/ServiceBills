@@ -30,6 +30,7 @@ import ExpenseCategoryManager from './ExpenseCategoryManager.js';
 import UserManagement from './UserManagement.js';
 import SectorManager from './SectorManager.js';
 import WhatsAppTemplatesManager from './WhatsAppTemplatesManager.js';
+import { formatStamp } from './formatStamp';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
 
@@ -531,7 +532,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                                     <Typography variant="body1" sx={{ fontWeight: 600 }}>{agent.name}</Typography>
                                                 </Stack>
                                                 <Typography variant="body2" color="text.secondary">
-                                                    Last seen: {agent.last_seen_at || 'never connected'}
+                                                    Last seen: {agent.last_seen_at ? formatStamp(agent.last_seen_at) : 'never connected'}
                                                 </Typography>
                                                 <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
                                                     Version: {agent.agent_version || 'unknown'}
