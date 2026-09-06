@@ -171,7 +171,11 @@ const NetworkTreeView = () => {
         ? `Agent offline (last seen ${agent.last_seen_at}). Start the agent on your network and try again.`
         : 'Agent offline (never connected). Start the agent on your network and try again.';
 
-    const refreshOlt = useCallback(async (device) => {
+    // `auto` distinguishes a manual refresh (the "Load ONUs" button, or
+    // applying Match Labels) from the background auto-refresh effect below.
+    // Only a manual refresh may expand the node -- see the setExpanded guard
+    // further down.
+    const refreshOlt = useCallback(async (device, { auto = false } = {}) => {
         const seq = (refreshSeqRef.current[device.id] || 0) + 1;
         refreshSeqRef.current[device.id] = seq;
 
@@ -198,12 +202,20 @@ const NetworkTreeView = () => {
                         // wait on it.
                         mergeDeviceResult(device.id, job.result);
                         // Open the OLT's own node so the freshly-loaded PONs
-                        // are visible without an extra click.
-                        setExpanded((prev) => {
-                            const next = new Set(prev);
-                            next.add(`dev-${device.id}`);
-                            return next;
-                        });
+                        // are visible without an extra click -- but only for a
+                        // manual refresh. An admin who collapsed a large OLT
+                        // to reduce clutter must not have it spontaneously pop
+                        // back open because the background auto-refresh
+                        // effect (auto=true) happened to fire on it; that
+                        // effect fires unasked, exactly like checkDevice
+                        // already deliberately does not auto-expand below.
+                        if (!auto) {
+                            setExpanded((prev) => {
+                                const next = new Set(prev);
+                                next.add(`dev-${device.id}`);
+                                return next;
+                            });
+                        }
                     } else {
                         setErrorByDevice((prev) => ({ ...prev, [device.id]: job.error }));
                     }
@@ -295,18 +307,51 @@ const NetworkTreeView = () => {
     const autoRefreshedRef = useRef(new Set());
     useEffect(() => {
         if (accessMode === 'agent' && !agentOnline) return;
+        // Collect this run's stale devices and mark them in autoRefreshedRef
+        // *synchronously*, before anything is awaited below. loadTree(false)
+        // resyncs inside refreshOlt/checkDevice mutate `tree`, which re-runs
+        // this effect while the loop below is still going -- marking eagerly
+        // is what keeps that re-entrant run from re-collecting (and
+        // re-firing) the same devices, preserving the once-per-mount
+        // guarantee across effect re-runs, not just within one run.
+        const stale = [];
         tree.forEach((root) => {
             const walk = (device) => {
                 if (!autoRefreshedRef.current.has(device.id)
                         && isStale(device.last_result_at)) {
                     autoRefreshedRef.current.add(device.id);
-                    if (device.device_type === 'vsol_olt') refreshOlt(device);
-                    else checkDevice(device);
+                    stale.push(device);
                 }
                 (device.children || []).forEach(walk);
             };
             walk(root);
         });
+        if (!stale.length) return;
+        // Refresh one device at a time, awaiting each before starting the
+        // next, rather than firing every stale device at once. In 'direct'
+        // mode (today's default) the backend runs the connector *inline*,
+        // blocking the request thread for the whole walk (~13s for an OLT),
+        // and production runs a single synchronous gunicorn worker shared by
+        // every tenant. The first time any tenant opens this page after a
+        // deploy, last_result_at has never been written, so every device on
+        // the tree is stale at once -- firing them all together would stall
+        // that one worker for the sum of every check's duration. Doing them
+        // one at a time tops the page up gradually instead. Each call is
+        // individually caught so a failure on one device (agent drops
+        // mid-flight, bad credentials, a connectivity blip) can't stop the
+        // rest -- refreshOlt/checkDevice already record their own failure in
+        // errorByDevice; this catch exists only to keep the loop going in
+        // case one somehow rejects instead.
+        (async () => {
+            for (const device of stale) {
+                try {
+                    if (device.device_type === 'vsol_olt') await refreshOlt(device, { auto: true });
+                    else await checkDevice(device);
+                } catch (e) {
+                    // Swallowed on purpose -- see comment above.
+                }
+            }
+        })();
         // refreshOlt/checkDevice are stable for a given device set.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [tree, accessMode, agentOnline]);
@@ -338,15 +383,27 @@ const NetworkTreeView = () => {
     // Renders *Match Labels* and *Load ONUs* (OLT-only) into a device node's
     // card -- moved here unchanged from the old renderDevice, including the
     // agentOffline-driven disabling/tooltips and the canEditLinks gate on
-    // Match Labels. errorByDevice rides along in the same slot since it's
-    // the only per-device injection point TreeNode exposes.
+    // Match Labels. errorByDevice/refreshingIds are NOT OLT-only, though:
+    // checkDevice (the auto-refresh path for every non-OLT device, e.g. a
+    // CCR's device_health check) writes into both of those same maps, so a
+    // failed or in-flight check on a CCR needs to be visible here too, or it
+    // is written to state nothing ever renders. This is the only per-device
+    // injection point TreeNode exposes.
     const deviceActions = useCallback((node) => {
         const device = deviceById.get(node.deviceId);
-        if (!device || device.device_type !== 'vsol_olt') return null;
+        if (!device) return null;
+        const isOlt = device.device_type === 'vsol_olt';
         const isRefreshing = !!refreshingIds[device.id];
+        const error = errorByDevice[device.id];
+        // A non-OLT device with nothing to show (no error, nothing in
+        // flight) renders no actions at all, same as before this fix --
+        // returning an empty fragment instead of null here would make
+        // TreeNode render an empty .nt-actions div (which carries its own
+        // margin-top) under every CCR card even when idle.
+        if (!isOlt && !isRefreshing && !error) return null;
         return (
             <>
-                {canEditLinks && (
+                {isOlt && canEditLinks && (
                     <Tooltip title={agentOffline ? agentOfflineReason : ''}>
                         <span>
                             <Button size="small" startIcon={<LinkIcon />}
@@ -357,17 +414,25 @@ const NetworkTreeView = () => {
                         </span>
                     </Tooltip>
                 )}
-                <Tooltip title={agentOffline ? agentOfflineReason : ''}>
-                    <span>
-                        <Button size="small" variant="outlined" startIcon={<RefreshIcon />}
-                            disabled={isRefreshing || agentOffline}
-                            onClick={() => refreshOlt(device)}>
-                            {isRefreshing ? 'Checking…' : 'Load ONUs'}
-                        </Button>
-                    </span>
-                </Tooltip>
-                {errorByDevice[device.id] && (
-                    <Alert severity="error" className="nt-action-error">{errorByDevice[device.id]}</Alert>
+                {isOlt && (
+                    <Tooltip title={agentOffline ? agentOfflineReason : ''}>
+                        <span>
+                            <Button size="small" variant="outlined" startIcon={<RefreshIcon />}
+                                disabled={isRefreshing || agentOffline}
+                                onClick={() => refreshOlt(device)}>
+                                {isRefreshing ? 'Checking…' : 'Load ONUs'}
+                            </Button>
+                        </span>
+                    </Tooltip>
+                )}
+                {/* Non-OLT devices have no manual refresh button to carry a
+                    "Checking…" label, but a background checkDevice call is
+                    still in flight and still needs a visible indicator. */}
+                {!isOlt && isRefreshing && (
+                    <Typography variant="caption" color="text.secondary">Checking…</Typography>
+                )}
+                {error && (
+                    <Alert severity="error" className="nt-action-error">{error}</Alert>
                 )}
             </>
         );
