@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
     Box, Typography, Button, Chip, CircularProgress, Alert,
-    Stack, Tooltip,
+    Stack, Tooltip, TextField,
 } from '@mui/material';
 import {
     Refresh as RefreshIcon, Link as LinkIcon,
@@ -11,6 +11,7 @@ import OnuLabelMatcherDialog from './OnuLabelMatcherDialog';
 import pollNetworkJob from './pollNetworkJob';
 import TreeNode from './TreeNode';
 import { buildTopologyTree } from './buildTopologyTree';
+import { filterTopologyTree } from './filterTopologyTree';
 
 // Auto-refresh a device only when its cached result is older than this. Without
 // a cap, every visit to the page would fire a fresh 13-second SNMP walk of the
@@ -380,6 +381,18 @@ const NetworkTreeView = () => {
         return buildTopologyTree(tree).map(decorate);
     }, [tree]);
 
+    // Search box state -- filters `topology` down to matching branches and
+    // reports which ancestor keys must be forced open for every hit to be
+    // visible. Kept separate from `expanded` (the user's own manual
+    // expand/collapse state) rather than folded into it, so typing a search
+    // never discards branches the user opened by hand; the two sets are
+    // unioned below into what TreeNode actually renders from.
+    const [query, setQuery] = useState('');
+    const { nodes: visibleTree, expandedKeys: searchExpanded } = useMemo(
+        () => filterTopologyTree(topology, query), [topology, query]);
+    const effectiveExpanded = useMemo(
+        () => new Set([...expanded, ...searchExpanded]), [expanded, searchExpanded]);
+
     // Renders *Match Labels* and *Load ONUs* (OLT-only) into a device node's
     // card -- moved here unchanged from the old renderDevice, including the
     // agentOffline-driven disabling/tooltips and the canEditLinks gate on
@@ -465,25 +478,39 @@ const NetworkTreeView = () => {
                     then set the OLT's "Connected To" to the CCR.
                 </Alert>
             ) : (
-                <Box className="nt-root" sx={{
-                    '--nt-surface': (t) => t.palette.background.paper,
-                    '--nt-border': (t) => t.palette.divider,
-                    '--nt-border-strong': (t) => t.palette.text.secondary,
-                    '--nt-link': (t) => t.palette.divider,
-                    '--nt-up': (t) => t.palette.success.main,
-                    '--nt-down': (t) => t.palette.error.main,
-                    '--nt-down-bg': (t) => t.palette.error.light + '22',
-                    '--nt-warn': (t) => t.palette.warning.main,
-                    '--nt-muted': (t) => t.palette.text.disabled,
-                    '--nt-accent': (t) => t.palette.primary.main,
-                }}>
-                    <div className="nt-level">
-                        {topology.map((root) => (
-                            <TreeNode key={root.key} node={root} expanded={expanded}
-                                      onToggle={toggleNode} liveLinks actions={deviceActions} />
-                        ))}
-                    </div>
-                </Box>
+                <>
+                    <TextField
+                        size="small"
+                        fullWidth
+                        placeholder="Search customers, ONUs, MACs…"
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        sx={{ mb: 2 }}
+                    />
+                    {query && visibleTree.length === 0 ? (
+                        <Alert severity="info">{`No matches for "${query}"`}</Alert>
+                    ) : (
+                        <Box className="nt-root" sx={{
+                            '--nt-surface': (t) => t.palette.background.paper,
+                            '--nt-border': (t) => t.palette.divider,
+                            '--nt-border-strong': (t) => t.palette.text.secondary,
+                            '--nt-link': (t) => t.palette.divider,
+                            '--nt-up': (t) => t.palette.success.main,
+                            '--nt-down': (t) => t.palette.error.main,
+                            '--nt-down-bg': (t) => t.palette.error.light + '22',
+                            '--nt-warn': (t) => t.palette.warning.main,
+                            '--nt-muted': (t) => t.palette.text.disabled,
+                            '--nt-accent': (t) => t.palette.primary.main,
+                        }}>
+                            <div className="nt-level">
+                                {visibleTree.map((root) => (
+                                    <TreeNode key={root.key} node={root} expanded={effectiveExpanded}
+                                              onToggle={toggleNode} liveLinks actions={deviceActions} />
+                                ))}
+                            </div>
+                        </Box>
+                    )}
+                </>
             )}
 
             {matcherDevice && (
