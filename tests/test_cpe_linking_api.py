@@ -119,3 +119,174 @@ def test_raced_cpe_mac_collision_degrades_the_same_way_on_create_and_update(app,
         assert "one customer" in error
         assert "UNIQUE constraint" not in error
         assert "IntegrityError" not in error
+
+
+import types
+
+ONUS = [
+    {"pon_port": "PON1", "onu_id": "EPON0/1:2", "status": "online",
+     "mac_address": "b4:64:15:3f:c1:94", "description": "MoussaGhadir",
+     "model": "V2801D", "distance_m": 531},
+]
+LOCATIONS = {"aa:bb:cc:00:00:01": {"pon_port": "PON1", "onu_id": "EPON0/1:2",
+                                   "onu_mac": "b4:64:15:3f:c1:94"}}
+
+
+def _olt(client, hdr):
+    ccr = client.post("/api/network-devices", headers=hdr, json={
+        "name": "Core CCR", "host": "10.0.0.1", "username": "admin",
+        "password": "secret", "device_type": "mikrotik_ccr"}).get_json()["device"]
+    return client.post("/api/network-devices", headers=hdr, json={
+        "name": "EPON OLT", "host": "192.168.8.100", "password": "public",
+        "device_type": "vsol_olt", "parent_device_id": ccr["id"],
+    }).get_json()["device"]
+
+
+def _locate_and_apply(client, hdr, olt_id):
+    started = client.post(f"/api/network-tree/olt/{olt_id}/locate-customers",
+                          headers=hdr).get_json()
+    assert started["ok"] is True, started
+    return client.post(f"/api/network-tree/olt/{olt_id}/locate-customers/apply",
+                       headers=hdr, json={"job_id": started["job_id"]})
+
+
+def test_locate_places_a_customer_behind_the_onu_holding_their_cpe(app, client, monkeypatch):
+    hdr = make_tenant(client, "Loc A", "loc_a_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    cid = _customer(client, hdr, plan_id, "Moussa",
+                    cpe_mac_address="aa:bb:cc:00:00:01").get_json()["customer_id"]
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, LOCATIONS))
+
+    body = _locate_and_apply(client, hdr, olt["id"]).get_json()
+    assert body["located"] == 1
+    with app.app_context():
+        customer = appmod.Customer.query.get(cid)
+        assert customer.onu_mac_address == "b4:64:15:3f:c1:94"
+        assert customer.onu_last_seen_at is not None
+
+
+def test_a_cpe_matching_no_customer_is_ignored(app, client, monkeypatch):
+    hdr = make_tenant(client, "Loc B", "loc_b_admin")
+    olt = _olt(client, hdr)
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, LOCATIONS))
+    body = _locate_and_apply(client, hdr, olt["id"]).get_json()
+    assert body["located"] == 0
+    assert body["unmatched"] == 1
+
+
+def test_a_customer_whose_cpe_was_not_seen_is_left_completely_alone(app, client, monkeypatch):
+    """This is the memory. Their previous placement AND its timestamp stand."""
+    hdr = make_tenant(client, "Loc C", "loc_c_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    cid = _customer(client, hdr, plan_id, "Absent",
+                    cpe_mac_address="aa:bb:cc:99:99:99",
+                    onu_mac_address="f4:c4:d6:4d:80:e1").get_json()["customer_id"]
+    with app.app_context():
+        appmod.Customer.query.get(cid).onu_last_seen_at = appmod.datetime(2026, 1, 1)
+        appmod.db.session.commit()
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, LOCATIONS))
+
+    _locate_and_apply(client, hdr, olt["id"])
+    with app.app_context():
+        customer = appmod.Customer.query.get(cid)
+        assert customer.onu_mac_address == "f4:c4:d6:4d:80:e1"
+        assert customer.onu_last_seen_at == appmod.datetime(2026, 1, 1)
+
+
+def test_a_moved_cpe_updates_the_placement(app, client, monkeypatch):
+    hdr = make_tenant(client, "Loc D", "loc_d_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    cid = _customer(client, hdr, plan_id, "Mover",
+                    cpe_mac_address="aa:bb:cc:00:00:01",
+                    onu_mac_address="f4:c4:d6:4d:80:e1").get_json()["customer_id"]
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, LOCATIONS))
+
+    body = _locate_and_apply(client, hdr, olt["id"]).get_json()
+    assert body["moved"] == 1
+    with app.app_context():
+        assert appmod.Customer.query.get(cid).onu_mac_address == "b4:64:15:3f:c1:94"
+
+
+def test_a_cpe_recorded_with_hyphens_still_matches(app, client, monkeypatch):
+    hdr = make_tenant(client, "Loc E", "loc_e_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    cid = _customer(client, hdr, plan_id, "Hyphen",
+                    cpe_mac_address="AA-BB-CC-00-00-01").get_json()["customer_id"]
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, LOCATIONS))
+    _locate_and_apply(client, hdr, olt["id"])
+    with app.app_context():
+        assert appmod.Customer.query.get(cid).onu_mac_address == "b4:64:15:3f:c1:94"
+
+
+def test_applying_the_same_result_twice_is_harmless(app, client, monkeypatch):
+    hdr = make_tenant(client, "Loc F", "loc_f_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    _customer(client, hdr, plan_id, "Twice", cpe_mac_address="aa:bb:cc:00:00:01")
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, LOCATIONS))
+    _locate_and_apply(client, hdr, olt["id"])
+    body = _locate_and_apply(client, hdr, olt["id"]).get_json()
+    assert body["located"] == 1
+    assert body["moved"] == 0
+
+
+def test_a_malformed_entry_is_skipped_not_raised(app, client, monkeypatch):
+    hdr = make_tenant(client, "Loc G", "loc_g_admin")
+    olt = _olt(client, hdr)
+    plan_id = _plan(client, hdr)
+    _customer(client, hdr, plan_id, "Ok", cpe_mac_address="aa:bb:cc:00:00:01")
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, dict(LOCATIONS)))
+    started = client.post(f"/api/network-tree/olt/{olt['id']}/locate-customers",
+                          headers=hdr).get_json()
+    with app.app_context():
+        job = appmod.db.session.get(appmod.NetworkAgentJob, started["job_id"])
+        job.result = {"aa:bb:cc:00:00:01": {"onu_mac": "b4:64:15:3f:c1:94"},
+                      "bad": "not-an-object", "worse": {"onu_mac": None}}
+        appmod.db.session.commit()
+    resp = client.post(f"/api/network-tree/olt/{olt['id']}/locate-customers/apply",
+                       headers=hdr, json={"job_id": started["job_id"]})
+    assert resp.status_code == 200
+    assert resp.get_json()["located"] == 1
+
+
+def test_locate_on_a_non_olt_is_rejected(app, client):
+    hdr = make_tenant(client, "Loc H", "loc_h_admin")
+    ccr = client.post("/api/network-devices", headers=hdr, json={
+        "name": "Core CCR", "host": "10.0.0.1", "username": "admin",
+        "password": "secret", "device_type": "mikrotik_ccr"}).get_json()["device"]
+    assert client.post(f"/api/network-tree/olt/{ccr['id']}/locate-customers",
+                       headers=hdr).status_code == 400
+
+
+def test_employee_and_collector_cannot_locate_or_apply(app, client):
+    """Reading the tree is theirs; rewriting who lives where is not."""
+    admin_hdr = make_tenant(client, "Loc I", "loc_i_admin")
+    olt = _olt(client, admin_hdr)
+    for username, role in (("loc_i_emp", "employee"), ("loc_i_col", "collector")):
+        client.post("/api/users", headers=admin_hdr,
+                    json={"username": username, "password": "pw", "role": role})
+        token = client.post("/api/login", json={"username": username,
+                                                "password": "pw"}).get_json()["access_token"]
+        hdr = {"Authorization": f"Bearer {token}"}
+        assert client.post(f"/api/network-tree/olt/{olt['id']}/locate-customers",
+                           headers=hdr).status_code == 403, role
+        assert client.post(f"/api/network-tree/olt/{olt['id']}/locate-customers/apply",
+                           headers=hdr, json={"job_id": 1}).status_code == 403, role
+
+
+def test_apply_is_tenant_scoped(app, client, monkeypatch):
+    hdr_one = make_tenant(client, "Loc J1", "loc_j1_admin")
+    olt_one = _olt(client, hdr_one)
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda s: (True, LOCATIONS))
+    started = client.post(f"/api/network-tree/olt/{olt_one['id']}/locate-customers",
+                          headers=hdr_one).get_json()
+
+    hdr_two = make_tenant(client, "Loc J2", "loc_j2_admin")
+    olt_two = _olt(client, hdr_two)
+    resp = client.post(f"/api/network-tree/olt/{olt_two['id']}/locate-customers/apply",
+                       headers=hdr_two, json={"job_id": started["job_id"]})
+    assert resp.status_code == 404

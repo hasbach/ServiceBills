@@ -2653,6 +2653,22 @@ def _get_olt_status_core(device, block=True, timeout=None):
         _olt_check_semaphore.release()
 
 
+def _get_cpe_locations_core(device, block=True, timeout=None):
+    """The CPE-location walk, gated by the same semaphore as
+    _get_olt_status_core -- vsol_olt.get_cpe_locations performs its own
+    get_olt_status walk plus two more SNMP walks against the same OLT, so it
+    must be serialized against the plain status walk too, not just against
+    itself. Returns (ok, result) in the same shape as
+    vsol_olt.get_cpe_locations."""
+    acquired = _olt_check_semaphore.acquire(blocking=block, timeout=timeout)
+    if not acquired:
+        return False, 'Too many OLT checks already in progress -- try again shortly.'
+    try:
+        return vsol_olt.get_cpe_locations(device)
+    finally:
+        _olt_check_semaphore.release()
+
+
 def _sync_customer_upstream_status_core(customer, provider, block=True, timeout=None):
     """The actual portal check, gated by the concurrency semaphore above.
     Returns (ok, result) in the same shape as
@@ -9855,6 +9871,9 @@ def _run_device_operation_direct(device, operation, params):
     if operation == 'olt_status':
         return _get_olt_status_core(
             device, block=True, timeout=_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS)
+    if operation == 'cpe_locations':
+        return _get_cpe_locations_core(
+            device, block=True, timeout=_OLT_CHECK_ACQUIRE_TIMEOUT_SECONDS)
     if operation == 'device_health':
         return mikrotik.get_device_health(device)
     if operation == 'test_connection':
@@ -10280,6 +10299,89 @@ def apply_onu_label_matches(device_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
+
+
+def _apply_cpe_locations(result):
+    """Write each located customer's remembered ONU. Returns counts.
+
+    Deliberately never clears: a customer whose CPE was not in this result is
+    left completely alone, placement and timestamp both. That is what makes
+    this a memory rather than a live view -- a router switched off must not
+    erase where we know its owner lives.
+
+    Defensive about `result`'s shape for the same reason
+    _resolve_onu_customers is: in agent mode this is whatever JSON the on-prem
+    agent posted. _validate_agent_result rejects the worst shapes at the
+    boundary, but rows stored before that check existed can still be odd, and
+    a malformed entry must be skipped rather than abort the whole apply.
+    """
+    if not isinstance(result, dict):
+        return {'located': 0, 'moved': 0, 'unmatched': 0}
+
+    by_cpe = {}
+    for customer in tenant_query(Customer).filter(
+            Customer.cpe_mac_address.isnot(None)).all():
+        by_cpe[_normalize_mac(customer.cpe_mac_address)] = customer
+
+    located = moved = unmatched = 0
+    now = datetime.utcnow()
+    for raw_mac, entry in result.items():
+        if not isinstance(entry, dict):
+            continue
+        onu_mac = entry.get('onu_mac')
+        if not isinstance(onu_mac, str) or not onu_mac:
+            continue
+        customer = by_cpe.get(_normalize_mac(raw_mac))
+        if customer is None:
+            unmatched += 1
+            continue
+        if _normalize_mac(customer.onu_mac_address) != _normalize_mac(onu_mac):
+            moved += 1
+        customer.onu_mac_address = onu_mac
+        customer.onu_last_seen_at = now
+        located += 1
+    db.session.commit()
+    return {'located': located, 'moved': moved, 'unmatched': unmatched}
+
+
+@app.route('/api/network-tree/olt/<int:device_id>/locate-customers', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def locate_customers(device_id):
+    """Start a CPE-location walk. Writes nothing -- the apply step does that,
+    so the agent (which may run the walk) never touches customer records."""
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Network device not found!'}), 404
+    if device.device_type != 'vsol_olt':
+        return jsonify({'error': 'That device is not an OLT'}), 400
+    job, error = _create_device_job(device, 'cpe_locations')
+    if error:
+        return jsonify({'ok': False, 'message': error, 'job_id': None}), 200
+    return jsonify({'ok': True, 'message': None, 'job_id': job.id}), 200
+
+
+@app.route('/api/network-tree/olt/<int:device_id>/locate-customers/apply',
+           methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def apply_customer_locations(device_id):
+    """Second half of the two-call locate flow: authenticated as the logged-in
+    admin (never the agent), this is the only path that writes a customer's
+    remembered ONU. See _apply_cpe_locations for why a miss never clears."""
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Network device not found!'}), 404
+    if device.device_type != 'vsol_olt':
+        return jsonify({'error': 'That device is not an OLT'}), 400
+    job_id = (request.json or {}).get('job_id')
+    job = tenant_query(NetworkAgentJob).filter_by(
+        id=job_id, device_id=device.id, operation='cpe_locations').first()
+    if not job:
+        return jsonify({'message': 'Job not found'}), 404
+    if job.status != 'done' or job.error:
+        return jsonify({'error': job.error or 'The locate is still running.'}), 400
+    return jsonify(_apply_cpe_locations(job.result)), 200
 
 
 # --- Live actions on a customer's PPPoE secret (Concept B). Staff-triggered
