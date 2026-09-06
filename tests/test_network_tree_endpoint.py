@@ -487,6 +487,40 @@ def test_tree_ignores_jobs_that_are_not_done(app, client, monkeypatch):
     assert _tree_by_id(client, hdr)[olt["id"]]["last_result"] is None
 
 
+def test_tree_survives_a_real_failed_connector_run_after_a_good_one(app, client, monkeypatch):
+    """The scenario the hand-set 'failed' status above cannot reach: a failed
+    connector run is *also* stored as status='done' (result=None, error=<msg>)
+    by _create_device_job's direct-mode path -- see its 'job.status = done'
+    line regardless of ok/not-ok. Refresh once successfully, then refresh
+    again with the connector failing, and confirm the tree still carries the
+    last good result rather than collapsing to null. Without the
+    error-is-null / result-is-not-null filter in _latest_results_by_device,
+    this second assertion fails: the newest 'done' job is the failed one, so
+    last_result would be None and last_result_at would have moved forward to
+    the failed job's finished_at."""
+    hdr = make_tenant(client, "Tree V", "tree_v_admin")
+    ccr = make_ccr(client, hdr)
+    olt = make_olt(client, hdr, ccr["id"])
+
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, ONUS))
+    refresh_and_poll(client, hdr, olt["id"])
+    good = _tree_by_id(client, hdr)[olt["id"]]
+    assert good["last_result"] is not None
+    good_at = good["last_result_at"]
+
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (False, "SNMP timeout"))
+    failed = refresh_and_poll(client, hdr, olt["id"])
+    assert failed["status"] == "done"
+    assert failed["error"] == "SNMP timeout"
+    assert failed["result"] is None
+
+    node = _tree_by_id(client, hdr)[olt["id"]]
+    assert node["last_result"] is not None, "a failed check must not blank the cached tree"
+    macs = [o["mac_address"] for o in node["last_result"]]
+    assert "b4:64:15:3f:c1:94" in macs
+    assert node["last_result_at"] == good_at, "last_result_at must not advance to the failed job"
+
+
 def test_tree_carries_the_newer_of_two_completed_jobs_for_the_same_device(app, client, monkeypatch):
     """Pins 'newest wins' for _latest_results_by_device: ORDER BY created_at
     DESC with an id DESC tiebreak. Nothing else in the suite creates two

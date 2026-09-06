@@ -16,12 +16,33 @@ import { filterTopologyTree } from './filterTopologyTree';
 // Auto-refresh a device only when its cached result is older than this. Without
 // a cap, every visit to the page would fire a fresh 13-second SNMP walk of the
 // OLT; with one, opening the page repeatedly is free.
-const STALE_AFTER_MS = 5 * 60 * 1000;
+//
+// 30 minutes, not 5: in 'direct' mode -- the default for every tenant -- a
+// device check runs the connector *inline* in the request, blocking the
+// single synchronous gunicorn worker production runs for up to ~13 seconds.
+// At 5 minutes, almost every visit to this page cost the whole app a stall,
+// and two staff opening it during an outage each fired their own walk. The
+// cached render already carries an age label (describeAge, below) so a stale
+// cache is never presented as fresh, and a manual "Load ONUs" is always
+// available for someone who wants live data right now -- so there is little
+// lost by waiting longer before the page fires one on its own.
+const STALE_AFTER_MS = 30 * 60 * 1000;
+
+/**
+ * '2026-09-05 12:00:00' (the space-separated, no-offset format the API emits
+ * everywhere it stamps a time) -> epoch ms, or NaN if unparseable. The single
+ * place that knows this format, so describeAge and isStale -- which both used
+ * to carry their own copy of this exact expression -- can never silently
+ * desync from each other after a format change to only one of them.
+ */
+export function parseUtc(stamp) {
+    return Date.parse(stamp.replace(' ', 'T') + 'Z');
+}
 
 /** '2026-09-05 12:00:00' (UTC, as the API emits it) -> "4 min ago". */
 export function describeAge(stamp, now = Date.now()) {
     if (!stamp) return 'never checked';
-    const then = Date.parse(stamp.replace(' ', 'T') + 'Z');
+    const then = parseUtc(stamp);
     if (Number.isNaN(then)) return '';
     const mins = Math.floor((now - then) / 60000);
     if (mins < 1) return 'just now';
@@ -31,9 +52,15 @@ export function describeAge(stamp, now = Date.now()) {
     return `${Math.floor(hours / 24)} d ago`;
 }
 
-function isStale(stamp, now = Date.now()) {
+/**
+ * Whether a device's cached result is old enough that the auto-refresh
+ * effect should fire a fresh (potentially blocking, see STALE_AFTER_MS
+ * above) check for it. A null/empty or unparseable stamp counts as stale --
+ * there is nothing good cached, so there's nothing lost by trying.
+ */
+export function isStale(stamp, now = Date.now()) {
     if (!stamp) return true;
-    const then = Date.parse(stamp.replace(' ', 'T') + 'Z');
+    const then = parseUtc(stamp);
     return Number.isNaN(then) || (now - then) > STALE_AFTER_MS;
 }
 
@@ -393,7 +420,17 @@ const NetworkTreeView = () => {
             for (const device of stale) {
                 try {
                     if (device.device_type === 'vsol_olt') await refreshOlt(device, { auto: true });
-                    else await checkDevice(device);
+                    // checkDevice hits check-now, which is
+                    // @admin_or_finance_required() -- an employee or
+                    // collector's JWT gets a real 403 here, and there is no
+                    // retry, so without this gate every such user would see
+                    // an undismissable "Request failed" alert under every
+                    // non-OLT device (the CCR) on every page load. They still
+                    // get the CCR's cached Ports branch; they just never
+                    // attempt a refresh they aren't allowed to run. This is
+                    // the same canEditLinks check that already hides Match
+                    // Labels from these roles further down.
+                    else if (canEditLinks) await checkDevice(device);
                 } catch (e) {
                     // Swallowed on purpose -- see comment above.
                 }
@@ -401,7 +438,7 @@ const NetworkTreeView = () => {
         })();
         // refreshOlt/checkDevice are stable for a given device set.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [tree, accessMode, agentOnline]);
+    }, [tree, accessMode, agentOnline, canEditLinks]);
 
     // The node array from buildTopologyTree carries deviceId but not the raw
     // device row (device_type, host, ...) the action buttons below need --

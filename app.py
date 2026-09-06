@@ -9117,6 +9117,22 @@ def _latest_results_by_device(devices):
     per-device filter), and the id DESC tiebreak is preserved: two jobs for
     one device can share a created_at at SQLite's resolution, and without it
     "newest" would be arbitrary.
+
+    status == 'done' alone is not enough: a failed connector run is *also*
+    stored as 'done' (both _create_device_job's direct-mode path and
+    agent_post_result's failure branch set status='done', result=None,
+    error=<message> when the check fails). Without the error/result filter
+    below, the newest job after an outage-time failure would have
+    result=None, and the tree would collapse to nothing with last_result_at
+    advanced to the failure's timestamp -- exactly the opposite of the spec:
+    a failed check must leave the last good cached tree on screen. Filtering
+    on error IS NULL and result IS NOT NULL keeps only a genuinely
+    successful, renderable result as "the cached one". The operation filter
+    makes structural an invariant that otherwise holds only by accident:
+    last_result_operation is documented as 'olt_status' | 'device_health' |
+    null, but AGENT_OPERATIONS has three more values (test_connection,
+    secret_status, active_session) and nothing else stops one of those jobs
+    from being picked up here.
     """
     if not devices:
         return {}
@@ -9124,7 +9140,10 @@ def _latest_results_by_device(devices):
     for device in devices:
         job = (tenant_query(NetworkAgentJob)
                .filter(NetworkAgentJob.device_id == device.id,
-                       NetworkAgentJob.status == 'done')
+                       NetworkAgentJob.status == 'done',
+                       NetworkAgentJob.error.is_(None),
+                       NetworkAgentJob.result.isnot(None),
+                       NetworkAgentJob.operation.in_(('olt_status', 'device_health')))
                .order_by(NetworkAgentJob.created_at.desc(),
                          NetworkAgentJob.id.desc())
                .first())

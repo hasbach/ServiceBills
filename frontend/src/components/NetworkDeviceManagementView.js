@@ -42,7 +42,7 @@ const NetworkDeviceManagementView = () => {
 
     // checkingId/health/onuResult/healthError above are scalars shared by
     // whichever single device's "Check Now" dialog is open -- unlike
-    // NetworkTreeView's onusByDevice/errorByDevice/refreshingIds, which are
+    // NetworkTreeView's errorByDevice/refreshingIds, which are
     // objects keyed by device id and so can hold several devices' results
     // at once without collision. A poll now runs for up to 180s (see
     // pollNetworkJob), so it's entirely realistic to check device A, close
