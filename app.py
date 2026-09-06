@@ -3013,6 +3013,32 @@ def _check_cpe_mac_available(mac, customer_id=None):
     return None
 
 
+def _cpe_mac_integrity_error(exc, mac):
+    """True if an IntegrityError is the uq_customer_tenant_cpe_mac backstop
+    firing -- i.e. a concurrent request won the race between
+    _check_cpe_mac_available's read and this request's write. 'cpe_mac'
+    matches both the constraint name Postgres reports and the column name
+    SQLite reports, so this works against either backend without depending on
+    driver-specific structured error fields. Guarded on `mac` being truthy
+    because NULLs never collide on this constraint, so a falsy mac means
+    whatever fired is unrelated to CPE MAC.
+    """
+    return bool(mac) and 'cpe_mac' in str(exc).lower()
+
+
+def _cpe_mac_conflict_message(mac, customer_id=None):
+    """Friendly message for a raced CPE MAC collision caught by the DB
+    constraint after the pre-check already passed. Re-runs the same check
+    used before the write: the racing request has since committed, so it now
+    finds the real holder and names them exactly as the pre-check would have.
+    Falls back to a generic message in the unlikely event the holder can't be
+    found any more (e.g. deleted again between the failed commit and here).
+    """
+    return _check_cpe_mac_available(mac, customer_id) or (
+        f"CPE MAC {mac} is already recorded for another customer. "
+        f"A router belongs to one customer.")
+
+
 @app.route('/api/customers', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
@@ -3199,6 +3225,12 @@ def add_customer():
             'subscription_expiry': new_customer.subscription_expiry_date.strftime('%Y-%m-%d')
         }), 201
 
+    except IntegrityError as e:
+        db.session.rollback()
+        if _cpe_mac_integrity_error(e, cpe_mac_address):
+            return jsonify({'error': _cpe_mac_conflict_message(cpe_mac_address)}), 409
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         db.session.rollback()
         traceback.print_exc()
@@ -3214,8 +3246,12 @@ def update_customer(customer_id):
         customer = tenant_query(Customer).filter_by(id=customer_id).first()
         if not customer:
             return jsonify({'message': 'Customer not found!'}), 404
-        
+
         data = request.json
+        # Bound up front (not just inside the 'cpe_mac_address' branch below)
+        # so the IntegrityError handler can reference it without an
+        # UnboundLocalError when the request never touched this field.
+        cpe_mac_address = None
 
         # Update basic customer information
         if 'name' in data:
@@ -3448,6 +3484,12 @@ def update_customer(customer_id):
             }
         }), 200
 
+    except IntegrityError as e:
+        db.session.rollback()
+        if _cpe_mac_integrity_error(e, cpe_mac_address):
+            return jsonify({'error': _cpe_mac_conflict_message(cpe_mac_address, customer_id)}), 409
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
     except Exception as e:
         db.session.rollback()
         traceback.print_exc()
