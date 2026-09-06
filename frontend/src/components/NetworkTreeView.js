@@ -37,6 +37,55 @@ function isStale(stamp, now = Date.now()) {
     return Number.isNaN(then) || (now - then) > STALE_AFTER_MS;
 }
 
+/**
+ * The set TreeNode actually renders open nodes from: the union of the
+ * user's own persisted `expanded` set and whatever the active search is
+ * forcing open (`searchExpanded`), minus any per-query override recorded in
+ * `searchCollapsed` (see toggleExpansion below). Pure and exported so the
+ * two review requirements -- a click during search is never a silent no-op,
+ * and clearing the query leaves exactly the expansion state the user asked
+ * for -- can be unit-tested directly, without mounting the component (this
+ * project has no @testing-library/react).
+ */
+export function computeEffectiveExpanded(expanded, searchExpanded, searchCollapsed) {
+    const next = new Set([...expanded, ...searchExpanded]);
+    searchCollapsed.forEach((key) => next.delete(key));
+    return next;
+}
+
+/**
+ * Decide the effect of clicking node `key`, given the three sets above.
+ *
+ * A node the active search is holding open (its key is in searchExpanded)
+ * toggles `searchCollapsed` only -- an override scoped to the current query
+ * -- and leaves `expanded` untouched. That is what makes the click always
+ * visible immediately (computeEffectiveExpanded subtracts the override from
+ * the union, so the node visibly closes/reopens on screen) without ever
+ * silently rewriting the user's own persisted choice: `expanded` still says
+ * whatever it said before the click, so once the query changes and the
+ * override set is thrown away (see the effect in NetworkTreeView that
+ * resets searchCollapsed on every `query` change), the node reverts to
+ * exactly what `expanded` says on its own -- open if the user had
+ * separately, manually opened it; closed if they hadn't.
+ *
+ * Every other node (not currently forced open by search) toggles `expanded`
+ * directly, exactly as it did before search existed.
+ *
+ * Returns only the one set that actually changed, as { expanded: ... } or
+ * { searchCollapsed: ... } (never both), so the caller knows which state
+ * setter to call.
+ */
+export function toggleExpansion(key, { expanded, searchExpanded, searchCollapsed }) {
+    if (searchExpanded.has(key)) {
+        const next = new Set(searchCollapsed);
+        if (next.has(key)) next.delete(key); else next.add(key);
+        return { searchCollapsed: next };
+    }
+    const next = new Set(expanded);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return { expanded: next };
+}
+
 const NetworkTreeView = () => {
     // apiService is a direct module export here, not part of the hook's value
     // -- same as NetworkDeviceManagementView.
@@ -60,14 +109,11 @@ const NetworkTreeView = () => {
     // Set of expanded node *keys* (buildTopologyTree's node.key, e.g.
     // "dev-12" or "dev-12/pon-1/onu-aa:bb:...") -- not device ids, since a
     // node here can be a PON, an ONU, or a customer as well as a device.
+    // This is the user's OWN persisted choice. It is mutated only by
+    // toggleNode, declared further down (near the search box state) because
+    // it needs to consult searchExpanded/searchCollapsed to decide whether a
+    // click should touch this set at all -- see the comment there for why.
     const [expanded, setExpanded] = useState(() => new Set());
-    const toggleNode = useCallback((key) => {
-        setExpanded((prev) => {
-            const next = new Set(prev);
-            if (next.has(key)) next.delete(key); else next.add(key);
-            return next;
-        });
-    }, []);
     const [matcherDevice, setMatcherDevice] = useState(null);
 
     // Tenant-wide access mode ('direct' | 'agent') and, in agent mode, the
@@ -390,8 +436,35 @@ const NetworkTreeView = () => {
     const [query, setQuery] = useState('');
     const { nodes: visibleTree, expandedKeys: searchExpanded } = useMemo(
         () => filterTopologyTree(topology, query), [topology, query]);
+
+    // Per-query override of which search-forced nodes the user has clicked
+    // closed -- see toggleExpansion's doc comment above for the full
+    // rationale (this is the fix for a reviewed bug: expand/collapse used to
+    // silently corrupt `expanded`, the user's own persisted state, whenever
+    // it was clicked while a search held the same node open). Reset whenever
+    // `query` changes so an override never leaks from one search into the
+    // next, or lingers once the box is cleared.
+    const [searchCollapsed, setSearchCollapsed] = useState(() => new Set());
+    useEffect(() => {
+        // Guard against replacing an already-empty Set with a new empty Set
+        // every time `query` changes character-by-character while nothing
+        // has actually been overridden yet -- avoids a pointless extra
+        // render on every keystroke.
+        setSearchCollapsed((prev) => (prev.size ? new Set() : prev));
+    }, [query]);
+
+    // Declared here rather than beside `expanded`'s own state because it
+    // needs searchExpanded, which derives from `topology` (itself derived
+    // from `tree`) and so cannot exist any earlier in this component.
+    const toggleNode = useCallback((key) => {
+        const result = toggleExpansion(key, { expanded, searchExpanded, searchCollapsed });
+        if (result.searchCollapsed) setSearchCollapsed(result.searchCollapsed);
+        else setExpanded(result.expanded);
+    }, [expanded, searchExpanded, searchCollapsed]);
+
     const effectiveExpanded = useMemo(
-        () => new Set([...expanded, ...searchExpanded]), [expanded, searchExpanded]);
+        () => computeEffectiveExpanded(expanded, searchExpanded, searchCollapsed),
+        [expanded, searchExpanded, searchCollapsed]);
 
     // Renders *Match Labels* and *Load ONUs* (OLT-only) into a device node's
     // card -- moved here unchanged from the old renderDevice, including the
