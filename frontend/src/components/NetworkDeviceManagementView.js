@@ -10,7 +10,8 @@ import {
     Add as AddIcon,
     Edit as EditIcon,
     Delete as DeleteIcon,
-    NetworkCheck as CheckNowIcon
+    NetworkCheck as CheckNowIcon,
+    Wifi as TestConnectionIcon
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
 import pollNetworkJob from './pollNetworkJob';
@@ -200,6 +201,25 @@ const NetworkDeviceManagementView = () => {
         }
     };
 
+    const [testingId, setTestingId] = useState(null);
+
+    const handleTestConnection = async (device) => {
+        setTestingId(device.id);
+        try {
+            const { data } = await apiService.testNetworkDeviceConnection(device.id);
+            setSnackbar({
+                open: true,
+                message: data.ok ? 'Connection test queued.' : data.message,
+                severity: data.ok ? 'success' : 'error',
+            });
+            if (data.ok) loadDevices();
+        } catch (err) {
+            setSnackbar({ open: true, message: err.response?.data?.error || 'Connection test failed', severity: 'error' });
+        } finally {
+            setTestingId(null);
+        }
+    };
+
     const handleSaveLabel = async (interfaceName) => {
         try {
             const response = await apiService.setNetworkDeviceInterfaceLabel(healthDevice.id, {
@@ -228,7 +248,7 @@ const NetworkDeviceManagementView = () => {
                 <Button
                     variant="contained"
                     startIcon={<AddIcon />}
-                    onClick={() => { setEditingDevice({ name: '', host: '', device_type: 'mikrotik_ccr', parent_device_id: '', api_port: 8728, use_tls: false, username: '', password: '', status: 'active' }); setEditDialogOpen(true); }}
+                    onClick={() => { setEditingDevice({ name: '', host: '', device_type: 'mikrotik_ccr', parent_device_id: '', api_port: 8728, use_tls: false, username: '', password: '', service_name: '', status: 'active' }); setEditDialogOpen(true); }}
                     sx={{ width: { xs: '100%', sm: 'auto' } }}
                 >
                     Add Device
@@ -280,6 +300,13 @@ const NetworkDeviceManagementView = () => {
                                                 </IconButton>
                                             </span>
                                         </Tooltip>
+                                        {d.device_type !== 'vsol_olt' && (
+                                            <Tooltip title="Test Connection">
+                                                <IconButton color="info" onClick={() => handleTestConnection(d)} disabled={testingId === d.id}>
+                                                    {testingId === d.id ? <CircularProgress size={18} /> : <TestConnectionIcon fontSize="small" />}
+                                                </IconButton>
+                                            </Tooltip>
+                                        )}
                                         <Tooltip title="Edit">
                                             <IconButton onClick={() => { setEditingDevice({ ...d, password: '' }); setEditDialogOpen(true); }}>
                                                 <EditIcon fontSize="small" />
@@ -386,6 +413,14 @@ const NetworkDeviceManagementView = () => {
                                         : 'Required'}
                                     value={editingDevice?.password || ''}
                                     onChange={(e) => setEditingDevice({ ...editingDevice, password: e.target.value })} />
+                            </Grid>
+                        )}
+                        {editingDevice?.device_type !== 'vsol_olt' && (
+                            <Grid item xs={12}>
+                                <TextField fullWidth label="Service Name (Optional)"
+                                    value={editingDevice?.service_name || ''}
+                                    helperText="Only needed if this router runs more than one PPPoE server instance, or its network is shared with another ISP. Leave blank to match by PPPoE username alone."
+                                    onChange={(e) => setEditingDevice({ ...editingDevice, service_name: e.target.value })} />
                             </Grid>
                         )}
                         <Grid item xs={12}>

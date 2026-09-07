@@ -28,7 +28,6 @@ import {
     Badge as PayrollIcon,
     KeyboardArrowUp as KeyboardArrowUpIcon,
     CloudQueue as UpstreamProviderIcon,
-    Router as MikrotikIcon,
     NetworkCheck as NetworkDeviceIcon,
     AccountTree as NetworkTreeIcon,
 } from '@mui/icons-material';
@@ -58,7 +57,6 @@ import ResellerManagementView from './components/ResellerManagementView.js';
 import SuppliersView from './components/SuppliersView.js';
 import EmployeesView from './components/EmployeesView.js';
 import UpstreamProviderManagementView from './components/UpstreamProviderManagementView.js';
-import MikrotikServerManagementView from './components/MikrotikServerManagementView.js';
 import NetworkDeviceManagementView from './components/NetworkDeviceManagementView.js';
 import NetworkTreeView from './components/NetworkTreeView.js';
 
@@ -75,7 +73,6 @@ const NAV_ITEMS = [
     // Concept A/B (see docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
     // only one of these is ever relevant, gated by BusinessSettings.network_mode, not roles.
     { key: 'upstream-providers',  label: 'Upstream Providers',  icon: <UpstreamProviderIcon />, group: 'main',    allowedRoles: ['admin', 'finance'], visibleWhen: (bs) => bs?.network_mode === 'upstream_bridge' },
-    { key: 'mikrotik-servers',    label: 'Mikrotik Servers',    icon: <MikrotikIcon />,         group: 'main',    allowedRoles: ['admin', 'finance'], visibleWhen: (bs) => bs?.network_mode === 'local_mikrotik' },
     { key: 'network-devices',    label: 'Network Devices',    icon: <NetworkDeviceIcon />,    group: 'main',    allowedRoles: ['admin', 'finance'] },
     // 'employee'/'collector' get the tree read-only: they need to see which
     // ONU a customer sits behind and whether it's down. The write action on
@@ -278,7 +275,6 @@ const MainApp = ({
             case 'suppliers': return <SuppliersView />;
             case 'employees': return <EmployeesView />;
             case 'upstream-providers': return <UpstreamProviderManagementView customers={customers} />;
-            case 'mikrotik-servers': return <MikrotikServerManagementView />;
             case 'network-devices': return <NetworkDeviceManagementView />;
             case 'network-tree': return <NetworkTreeView />;
             case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;

@@ -132,12 +132,13 @@ const rawApiService = {
     topupUpstreamProvider: (id, data) => api.post(`/upstream-providers/${id}/topup`, data),
     recordUpstreamRenewalCost: (id, data) => api.post(`/upstream-providers/${id}/renewal-cost`, data),
 
-    // Mikrotik Server API methods (Concept B -- self-hosted local PPPoE)
-    fetchMikrotikServers: () => api.get('/mikrotik-servers'),
-    addMikrotikServer: (data) => api.post('/mikrotik-servers', data),
-    updateMikrotikServer: (id, data) => api.put(`/mikrotik-servers/${id}`, data),
-    deleteMikrotikServer: (id) => api.delete(`/mikrotik-servers/${id}`),
-    testMikrotikConnection: (id) => api.post(`/mikrotik-servers/${id}/test-connection`),
+    // Router/device live actions. The Mikrotik Server model was folded into
+    // NetworkDevice -- see
+    // docs/superpowers/specs/2026-09-07-mikrotik-device-consolidation-design.md
+    testNetworkDeviceConnection: (id) => api.post(`/network-devices/${id}/test-connection`),
+    fetchCustomerNetworkStatus: (customerId) => api.post(`/customers/${customerId}/network-status`),
+    suspendCustomerNetwork: (customerId) => api.post(`/customers/${customerId}/network-suspend`),
+    unsuspendCustomerNetwork: (customerId) => api.post(`/customers/${customerId}/network-unsuspend`),
 
     // Network Device API methods (device-health monitoring, independent of
     // MikrotikServer/PPPoE -- see
@@ -163,11 +164,6 @@ const rawApiService = {
     locateCustomers: (id) => api.post(`/network-tree/olt/${id}/locate-customers`),
     applyCustomerLocations: (id, jobId) =>
         api.post(`/network-tree/olt/${id}/locate-customers/apply`, { job_id: jobId }),
-
-    // Customer <-> Mikrotik live actions (staff-confirmed only, see spec)
-    fetchCustomerMikrotikStatus: (customerId) => api.get(`/customers/${customerId}/mikrotik-status`),
-    suspendCustomerMikrotik: (customerId) => api.post(`/customers/${customerId}/mikrotik-suspend`),
-    unsuspendCustomerMikrotik: (customerId) => api.post(`/customers/${customerId}/mikrotik-unsuspend`),
 
     // Customer <-> Upstream Portal read-only status sync (staff-triggered, see spec)
     syncCustomerUpstreamStatus: (customerId) => api.post(`/customers/${customerId}/upstream-status-sync`),
