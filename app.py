@@ -2269,9 +2269,11 @@ _TENANT_DELETE_ORDER = [
     # NetworkDevice arrived on the network-topology branch, so origin/main's
     # copy of this list never knew about it and won the merge. Without it a
     # tenant delete raises ForeignKeyViolation on Postgres (SQLite doesn't
-    # enforce FKs, so the gap is invisible there). Position is unconstrained:
-    # the only inbound FK is its own parent_device_id self-link, and one
-    # DELETE removes parent and child rows in the same statement.
+    # enforce FKs, so the gap is invisible there). Position is now
+    # constrained: Customer.network_device_id (app.py ~612) is an inbound FK
+    # to network_device, so NetworkDevice must stay AFTER Customer in this
+    # list, or a tenant delete raises ForeignKeyViolation against real
+    # Postgres while staying silently green on SQLite.
     # Jobs reference network_device, so they must go before it.
     NetworkAgentJob, NetworkAgent,
     NetworkDevice,

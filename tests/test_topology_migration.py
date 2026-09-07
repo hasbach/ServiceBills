@@ -492,12 +492,23 @@ def test_mikrotik_consolidation_migration_carries_rows_forward_and_keeps_the_tab
 
             with engine.begin() as conn:
                 device = conn.execute(sa.text(
-                    "SELECT id, name, host, service_name, device_type "
+                    "SELECT id, name, host, service_name, device_type, "
+                    "username, password, tenant_id "
                     "FROM network_device")).fetchall()
                 assert len(device) == 1
-                new_id, name, host, service_name, device_type = device[0]
-                assert (name, host, service_name, device_type) == (
-                    'Old CCR', '192.168.100.1', 'BCH', 'mikrotik_ccr')
+                (new_id, name, host, service_name, device_type,
+                 username, password, tenant_id) = device[0]
+                # username/password (the encrypted device credential) and
+                # tenant_id are the most consequential columns this branch
+                # copies -- a swap of the adjacent username/password pair in
+                # the migration's INSERT ... SELECT list would pass every
+                # assertion above while producing a silently unreachable
+                # device, and a dropped tenant_id would leak the row across
+                # tenants.
+                assert (name, host, service_name, device_type,
+                        username, password, tenant_id) == (
+                    'Old CCR', '192.168.100.1', 'BCH', 'mikrotik_ccr',
+                    'admin', 'secret', 1)
 
                 linked = conn.execute(sa.text(
                     "SELECT network_device_id FROM customer WHERE id = 3")).scalar()

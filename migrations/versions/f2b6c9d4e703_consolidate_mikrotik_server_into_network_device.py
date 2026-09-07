@@ -50,6 +50,12 @@ def _has_column(table, column):
     return column in {c['name'] for c in sa.inspect(op.get_bind()).get_columns(table)}
 
 
+def _has_index(table, name):
+    if not _has_table(table):
+        return False
+    return name in {i['name'] for i in sa.inspect(op.get_bind()).get_indexes(table)}
+
+
 def upgrade():
     bind = op.get_bind()
 
@@ -62,10 +68,17 @@ def upgrade():
         with op.batch_alter_table('customer', schema=None) as batch_op:
             batch_op.add_column(sa.Column('network_device_id', sa.Integer(),
                                           nullable=True))
-            batch_op.create_index(batch_op.f('ix_customer_network_device_id'),
-                                  ['network_device_id'], unique=False)
             batch_op.create_foreign_key('fk_customer_network_device_id',
                                         'network_device', ['network_device_id'], ['id'])
+
+    # Column-granular above is not enough on its own: a drifted database can
+    # have the column (e.g. a previous partial run, or hand-applied DDL)
+    # without the index, and that combination must still get the index here
+    # rather than silently skipping it because the column guard was false.
+    if not _has_index('customer', 'ix_customer_network_device_id'):
+        with op.batch_alter_table('customer', schema=None) as batch_op:
+            batch_op.create_index(batch_op.f('ix_customer_network_device_id'),
+                                  ['network_device_id'], unique=False)
 
     kept_old_table = False
     if _has_table('mikrotik_server'):
@@ -147,7 +160,11 @@ def downgrade():
 
     if _has_column('customer', 'network_device_id'):
         with op.batch_alter_table('customer', schema=None) as batch_op:
-            batch_op.drop_index(batch_op.f('ix_customer_network_device_id'))
+            # Guarded independently of the column: on a drifted database the
+            # column can survive without the index ever having existed, and
+            # an unconditional drop_index raises on Postgres in that case.
+            if _has_index('customer', 'ix_customer_network_device_id'):
+                batch_op.drop_index(batch_op.f('ix_customer_network_device_id'))
             batch_op.drop_column('network_device_id')
 
     if _has_column('network_device', 'service_name'):
