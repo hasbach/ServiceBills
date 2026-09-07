@@ -9221,6 +9221,26 @@ def check_network_device_now(device_id):
     return jsonify({'ok': True, 'message': None, 'job_id': job.id,
                     'device': device.to_dict()}), 200
 
+@app.route('/api/network-devices/<int:device_id>/test-connection', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def test_network_device_connection(device_id):
+    """Ask the device to prove it is reachable and the credential works.
+
+    Goes through _create_device_job like every other device call, so it works
+    identically in direct mode and through the on-prem agent. In direct mode
+    the returned job is already terminal; in agent mode the caller polls it.
+    """
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Network device not found!'}), 404
+    job, error = _create_device_job(device, 'test_connection')
+    if error:
+        return jsonify({'ok': False, 'message': error, 'job_id': None,
+                        'device': device.to_dict()}), 200
+    return jsonify({'ok': True, 'message': None, 'job_id': job.id,
+                    'device': device.to_dict()}), 200
+
 @app.route('/api/network-devices/<int:device_id>/interface-labels', methods=['PATCH'])
 @jwt_required()
 @admin_or_finance_required()
@@ -10500,22 +10520,36 @@ def _customer_network_context(customer_id):
         return None, None, ({'error': 'Linked network device not found.'}, 404)
     return customer, device, None
 
-@app.route('/api/customers/<int:customer_id>/mikrotik-status', methods=['GET'])
+@app.route('/api/customers/<int:customer_id>/network-status', methods=['POST'])
 @jwt_required()
-def get_customer_mikrotik_status(customer_id):
+def get_customer_network_status(customer_id):
+    """Queue the two reads that describe a customer's PPPoE state.
+
+    POST, not GET, because it now creates jobs. Two jobs rather than one
+    combined operation: a new operation would have to be added to the on-prem
+    agent, forcing the owner to hand-copy files onto the box, whereas
+    secret_status and active_session already ship in it.
+
+    In direct mode both jobs come back already terminal, so the caller's first
+    poll answers immediately and the frontend needs only one code path. In
+    agent mode the agent handles one job per 2-second poll, so a status check
+    resolves in up to about four seconds.
+    """
     customer, device, err = _customer_network_context(customer_id)
     if err:
         return jsonify(err[0]), err[1]
 
-    secret_ok, secret_status = mikrotik.get_secret_status(device, customer.pppoe_username)
-    session_ok, session = mikrotik.get_active_session(device, customer.pppoe_username)
+    params = {'pppoe_username': customer.pppoe_username}
+    secret_job, error = _create_device_job(device, 'secret_status', params)
+    if error:
+        return jsonify({'ok': False, 'message': error, 'jobs': None}), 200
+    session_job, error = _create_device_job(device, 'active_session', params)
+    if error:
+        return jsonify({'ok': False, 'message': error, 'jobs': None}), 200
 
-    return jsonify({
-        'secret_status': secret_status if secret_ok else None,
-        'secret_error': None if secret_ok else secret_status,
-        'active_session': session if session_ok else None,
-        'session_error': None if session_ok else session,
-    }), 200
+    return jsonify({'ok': True, 'message': None,
+                    'jobs': {'secret': secret_job.id,
+                             'session': session_job.id}}), 200
 
 @app.route('/api/customers/<int:customer_id>/mikrotik-suspend', methods=['POST'])
 @jwt_required()

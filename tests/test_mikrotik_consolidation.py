@@ -306,3 +306,104 @@ def test_every_supported_pairing_is_accepted(app, client, monkeypatch):
                     assert error is None, "{} rejected on {}: {}".format(
                         operation, device_type, error)
                     assert job is not None
+
+
+def _admin(client, business, username):
+    return make_tenant(client, business, username)
+
+
+def test_device_test_connection_creates_a_job(app, client, monkeypatch):
+    """The one genuinely useful button the deleted Mikrotik Servers page had.
+    It moves here rather than being lost."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Relay A", "relay_a_admin")
+    device_id = make_device(app, "Relay A")
+    r = client.post("/api/network-devices/{}/test-connection".format(device_id),
+                    headers=hdr)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["job_id"] is not None
+    with app.app_context():
+        job = appmod.db.session.get(appmod.NetworkAgentJob, body["job_id"])
+        assert job.operation == "test_connection"
+
+
+def test_test_connection_is_refused_on_an_olt(app, client):
+    hdr = _admin(client, "Relay B", "relay_b_admin")
+    device_id = make_device(app, "Relay B", device_type="vsol_olt",
+                            api_port=161, username="")
+    r = client.post("/api/network-devices/{}/test-connection".format(device_id),
+                    headers=hdr)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is False
+    assert body["job_id"] is None
+    assert "vsol_olt" in body["message"]
+
+
+def test_customer_network_status_creates_two_jobs(app, client, monkeypatch):
+    """Two existing operations rather than one new combined one: a new
+    operation would force an agent update, and the shipped agent already
+    dispatches both of these."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Relay C", "relay_c_admin")
+    device_id = make_device(app, "Relay C")
+    with app.app_context():
+        tenant = _tenant("Relay C")
+        # phone/address/subscription_plan_id/subscription_expiry_date are all
+        # NOT NULL on Customer -- same scaffolding as
+        # test_customers_link_to_a_network_device.
+        plan = appmod.SubscriptionPlan(
+            tenant_id=tenant.id, name="Basic", price=10, cost=5,
+            billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(
+            tenant_id=tenant.id, name="Bach", phone="1", address="a",
+            subscription_plan_id=plan.id,
+            subscription_expiry_date=appmod.datetime.utcnow(),
+            network_device_id=device_id, pppoe_username="bach1")
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        customer_id = customer.id
+
+    r = client.post("/api/customers/{}/network-status".format(customer_id),
+                    headers=hdr)
+    assert r.status_code == 200
+    jobs = r.get_json()["jobs"]
+    with app.app_context():
+        secret = appmod.db.session.get(appmod.NetworkAgentJob, jobs["secret"])
+        session = appmod.db.session.get(appmod.NetworkAgentJob, jobs["session"])
+        assert secret.operation == "secret_status"
+        assert session.operation == "active_session"
+        assert secret.params == {"pppoe_username": "bach1"}
+        assert session.params == {"pppoe_username": "bach1"}
+        # Direct mode: both are already terminal, so the frontend's first poll
+        # answers immediately and it needs only one code path.
+        assert secret.status == "done"
+        assert session.status == "done"
+
+
+def test_customer_network_status_needs_a_linked_device(app, client):
+    hdr = _admin(client, "Relay D", "relay_d_admin")
+    with app.app_context():
+        tenant = _tenant("Relay D")
+        # Same NOT NULL scaffolding as test_customers_link_to_a_network_device
+        # -- deliberately no network_device_id/pppoe_username, which is the
+        # condition under test.
+        plan = appmod.SubscriptionPlan(
+            tenant_id=tenant.id, name="Basic", price=10, cost=5,
+            billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(
+            tenant_id=tenant.id, name="Unlinked", phone="1", address="a",
+            subscription_plan_id=plan.id,
+            subscription_expiry_date=appmod.datetime.utcnow())
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        customer_id = customer.id
+    r = client.post("/api/customers/{}/network-status".format(customer_id),
+                    headers=hdr)
+    assert r.status_code == 400
+    assert "not linked" in r.get_json()["error"]
