@@ -393,6 +393,17 @@ DEVICE_TYPE_OPERATIONS = {
                      'secret_status', 'active_session'),
 }
 
+# Suspend/unsuspend write to the router, and the agent deliberately does not
+# relay writes: mikrotik.set_secret_enabled is absent from its ALLOWED_OPERATIONS
+# so that a compromised cloud can read the network but never disconnect anyone.
+# Until that gets its own design round, agent-mode tenants get an immediate,
+# honest refusal instead of a connection attempt from the cloud that can only
+# time out. See the spec's "Reads now, writes later".
+AGENT_WRITE_UNSUPPORTED_MESSAGE = (
+    'This action needs a direct connection to the router and is not yet '
+    'available through the on-prem agent.'
+)
+
 # An agent that hasn't polled within this window is treated as offline, and
 # jobs are refused rather than queued for something that will never run them.
 AGENT_ONLINE_WINDOW_SECONDS = 30
@@ -4332,6 +4343,11 @@ def _maybe_restore_mikrotik_access(customer):
     blocks the billing side. Returns a small status dict for the caller to
     fold into its response if useful, or None if there was nothing to do."""
     if not customer.network_device_id:
+        return None
+    if _tenant_access_mode() == 'agent':
+        # Re-enabling is a write, which the agent does not relay. Skip before
+        # opening anything: this runs after every settling payment, so a
+        # timeout here would tax the billing path on every transaction.
         return None
     try:
         device = tenant_query(NetworkDevice).filter_by(id=customer.network_device_id).first()
@@ -10562,22 +10578,26 @@ def get_customer_network_status(customer_id):
                     'jobs': {'secret': secret_job.id,
                              'session': session_job.id}}), 200
 
-@app.route('/api/customers/<int:customer_id>/mikrotik-suspend', methods=['POST'])
+@app.route('/api/customers/<int:customer_id>/network-suspend', methods=['POST'])
 @jwt_required()
-def suspend_customer_mikrotik(customer_id):
+def suspend_customer_network(customer_id):
     customer, device, err = _customer_network_context(customer_id)
     if err:
         return jsonify(err[0]), err[1]
+    if _tenant_access_mode() == 'agent':
+        return jsonify({'ok': False, 'message': AGENT_WRITE_UNSUPPORTED_MESSAGE}), 501
 
     ok, message = mikrotik.set_secret_enabled(device, customer.pppoe_username, False)
     return jsonify({'ok': ok, 'message': message}), (200 if ok else 502)
 
-@app.route('/api/customers/<int:customer_id>/mikrotik-unsuspend', methods=['POST'])
+@app.route('/api/customers/<int:customer_id>/network-unsuspend', methods=['POST'])
 @jwt_required()
-def unsuspend_customer_mikrotik(customer_id):
+def unsuspend_customer_network(customer_id):
     customer, device, err = _customer_network_context(customer_id)
     if err:
         return jsonify(err[0]), err[1]
+    if _tenant_access_mode() == 'agent':
+        return jsonify({'ok': False, 'message': AGENT_WRITE_UNSUPPORTED_MESSAGE}), 501
 
     ok, message = mikrotik.set_secret_enabled(device, customer.pppoe_username, True)
     return jsonify({'ok': ok, 'message': message}), (200 if ok else 502)

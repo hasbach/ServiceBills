@@ -483,3 +483,119 @@ def test_customer_network_status_deletes_orphaned_job_when_second_call_fails(app
             "the first job's id was discarded in the response above but its "
             "row survived as orphaned queued work: {}".format(
                 [(j.id, j.operation, j.status) for j in remaining]))
+
+
+def _set_agent_mode(app, tenant_name):
+    with app.app_context():
+        tenant = _tenant(tenant_name)
+        settings = appmod.BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+        if settings is None:
+            settings = appmod.BusinessSettings(
+                tenant_id=tenant.id, business_name=tenant_name,
+                address="Beirut", mobile="+96170000000")
+            appmod.db.session.add(settings)
+        settings.network_access_mode = "agent"
+        appmod.db.session.commit()
+
+
+def _linked_customer(app, tenant_name, device_id):
+    with app.app_context():
+        tenant = _tenant(tenant_name)
+        # phone/address/subscription_plan_id/subscription_expiry_date are all
+        # NOT NULL on Customer, and subscription_plan_id needs a real
+        # SubscriptionPlan row -- same scaffolding as
+        # test_customers_link_to_a_network_device.
+        plan = appmod.SubscriptionPlan(
+            tenant_id=tenant.id, name="Basic", price=10, cost=5,
+            billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(tenant_id=tenant.id, name="Bach",
+                                   phone="1", address="a",
+                                   subscription_plan_id=plan.id,
+                                   subscription_expiry_date=appmod.datetime.utcnow(),
+                                   network_device_id=device_id,
+                                   pppoe_username="bach1")
+        appmod.db.session.add(customer)
+        appmod.db.session.commit()
+        return customer.id
+
+
+def test_suspend_refuses_in_agent_mode_without_touching_the_router(app, client, monkeypatch):
+    """Today this would call the router from the cloud, find it unreachable and
+    hang until the connector times out. A fast, honest refusal beats a
+    13-second timeout that looks like a network fault."""
+    called = []
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda *a, **k: called.append(a) or (True, "ok"))
+    hdr = _admin(client, "Write A", "write_a_admin")
+    device_id = make_device(app, "Write A")
+    customer_id = _linked_customer(app, "Write A", device_id)
+    _set_agent_mode(app, "Write A")
+
+    r = client.post("/api/customers/{}/network-suspend".format(customer_id),
+                    headers=hdr)
+    assert r.status_code == 501
+    assert r.get_json()["ok"] is False
+    assert "direct connection" in r.get_json()["message"]
+    assert called == [], "the connector must not be reached at all"
+
+
+def test_unsuspend_refuses_in_agent_mode(app, client, monkeypatch):
+    called = []
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda *a, **k: called.append(a) or (True, "ok"))
+    hdr = _admin(client, "Write B", "write_b_admin")
+    device_id = make_device(app, "Write B")
+    customer_id = _linked_customer(app, "Write B", device_id)
+    _set_agent_mode(app, "Write B")
+
+    r = client.post("/api/customers/{}/network-unsuspend".format(customer_id),
+                    headers=hdr)
+    assert r.status_code == 501
+    assert called == []
+
+
+def test_suspend_still_works_in_direct_mode(app, client, monkeypatch):
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda *a, **k: (True, "disabled"))
+    hdr = _admin(client, "Write C", "write_c_admin")
+    device_id = make_device(app, "Write C")
+    customer_id = _linked_customer(app, "Write C", device_id)
+
+    r = client.post("/api/customers/{}/network-suspend".format(customer_id),
+                    headers=hdr)
+    assert r.status_code == 200
+    assert r.get_json()["ok"] is True
+
+
+def test_payment_restore_skips_in_agent_mode(app, client, monkeypatch):
+    """Runs after every settling payment, so a burned timeout here is a tax on
+    the billing path, not just on one click."""
+    called = []
+    monkeypatch.setattr(appmod.mikrotik, "get_secret_status",
+                        lambda *a, **k: called.append(a) or (True, "disabled"))
+    hdr = _admin(client, "Write D", "write_d_admin")
+    device_id = make_device(app, "Write D")
+    customer_id = _linked_customer(app, "Write D", device_id)
+    _set_agent_mode(app, "Write D")
+
+    with app.app_context():
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        tenant = _tenant("Write D")
+        # _maybe_restore_mikrotik_access's new guard calls _tenant_access_mode(),
+        # which -- like every tenant_query call -- needs a verified JWT in
+        # scope (tenancy.current_tenant_id() reads get_jwt()). That always
+        # holds in production: all three real callers (mark_payment_as_paid,
+        # mark_payment_gratis, bulk_mark_payments_paid) are @jwt_required()
+        # routes. Called bare in a plain app context it would raise instead
+        # of returning cleanly, so manufacture the same verified-JWT request
+        # context test_every_supported_pairing_is_accepted uses to call
+        # _create_device_job directly.
+        token = create_access_token(identity="write_d_admin",
+                                    additional_claims={"tenant_id": tenant.id})
+        with app.test_request_context(headers={"Authorization": f"Bearer {token}"}):
+            verify_jwt_in_request()
+            result = appmod._maybe_restore_mikrotik_access(customer)
+    assert result is None
+    assert called == []
