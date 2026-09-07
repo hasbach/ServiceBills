@@ -246,24 +246,22 @@ def test_an_olt_cannot_be_asked_a_pppoe_question(app, client):
     make_tenant(client, "Guard A", "guard_a_admin")
     device_id = make_device(app, "Guard A", device_type="vsol_olt",
                             api_port=161, username="")
-    with app.test_request_context():
-        with app.app_context():
-            device = appmod.db.session.get(appmod.NetworkDevice, device_id)
-            job, error = appmod._create_device_job(device, "secret_status",
-                                                   {"pppoe_username": "bach1"})
-            assert job is None
-            assert "vsol_olt" in error and "secret_status" in error
+    with app.app_context():
+        device = appmod.db.session.get(appmod.NetworkDevice, device_id)
+        job, error = appmod._create_device_job(device, "secret_status",
+                                               {"pppoe_username": "bach1"})
+        assert job is None
+        assert "vsol_olt" in error and "secret_status" in error
 
 
 def test_a_mikrotik_cannot_be_asked_an_snmp_question(app, client):
     make_tenant(client, "Guard B", "guard_b_admin")
     device_id = make_device(app, "Guard B")
-    with app.test_request_context():
-        with app.app_context():
-            device = appmod.db.session.get(appmod.NetworkDevice, device_id)
-            job, error = appmod._create_device_job(device, "olt_status")
-            assert job is None
-            assert "mikrotik_ccr" in error and "olt_status" in error
+    with app.app_context():
+        device = appmod.db.session.get(appmod.NetworkDevice, device_id)
+        job, error = appmod._create_device_job(device, "olt_status")
+        assert job is None
+        assert "mikrotik_ccr" in error and "olt_status" in error
 
 
 def test_every_supported_pairing_is_accepted(app, client, monkeypatch):
@@ -277,6 +275,24 @@ def test_every_supported_pairing_is_accepted(app, client, monkeypatch):
     assert set(appmod.DEVICE_TYPE_OPERATIONS) == set(appmod.NETWORK_DEVICE_TYPES)
     assert (set(appmod.DEVICE_TYPE_OPERATIONS['vsol_olt'])
             | set(appmod.DEVICE_TYPE_OPERATIONS['mikrotik_ccr'])) == set(appmod.AGENT_OPERATIONS)
+    # The two assertions above cannot catch the rows being fully swapped: the
+    # keys would still match NETWORK_DEVICE_TYPES and the union would still
+    # cover AGENT_OPERATIONS either way round. Pin each operation to the
+    # specific device type that can actually serve it, so a swap fails here
+    # instead of silently passing the loop below (which dispatches purely on
+    # operation name and would happily "accept" a swapped pairing).
+    snmp_ops = ('olt_status', 'cpe_locations')
+    routeros_ops = ('device_health', 'test_connection', 'secret_status', 'active_session')
+    for op in snmp_ops:
+        assert op in appmod.DEVICE_TYPE_OPERATIONS['vsol_olt'], (
+            "{} should be servable by vsol_olt (SNMP) -- rows may be swapped".format(op))
+        assert op not in appmod.DEVICE_TYPE_OPERATIONS['mikrotik_ccr'], (
+            "{} should NOT be servable by mikrotik_ccr -- rows may be swapped".format(op))
+    for op in routeros_ops:
+        assert op in appmod.DEVICE_TYPE_OPERATIONS['mikrotik_ccr'], (
+            "{} should be servable by mikrotik_ccr (RouterOS) -- rows may be swapped".format(op))
+        assert op not in appmod.DEVICE_TYPE_OPERATIONS['vsol_olt'], (
+            "{} should NOT be servable by vsol_olt -- rows may be swapped".format(op))
     with app.app_context():
         tenant = _tenant("Guard C")
         token = create_access_token(identity="guard_c_admin", additional_claims={"tenant_id": tenant.id})

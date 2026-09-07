@@ -10004,11 +10004,7 @@ def _create_device_job(device, operation, params=None):
     # No current_user_obj() helper exists in this codebase; resolve the acting
     # user the same way every other endpoint does. This field is informational
     # only, so a lookup miss (e.g. no JWT in scope) must never block the job.
-    try:
-        current_username = get_jwt_identity()
-    except RuntimeError:
-        # No JWT context available (e.g., called from tests or background tasks)
-        current_username = None
+    current_username = get_jwt_identity()
     current_user = User.query.filter_by(username=current_username).first() if current_username else None
 
     job = NetworkAgentJob(
