@@ -34,7 +34,16 @@ def stub_connectors(monkeypatch):
     192.168.100.1 genuinely answers -- so an unstubbed test would either hang
     on a timeout or, worse, hit production hardware. Every existing test in
     tests/test_network_devices.py and tests/test_network_agent_jobs.py stubs
-    the same way; this just gathers all six into one call.
+    the same way; this just gathers all six reads plus the one write into one
+    call.
+
+    set_secret_enabled (the write) is covered here too, not just the six
+    reads, because a test whose whole job is to prove a write is refused --
+    an agent-mode guard on suspend/unsuspend, or the restore-on-payment guard
+    in _maybe_restore_mikrotik_access -- must not be able to actually perform
+    that write if the refusal it exists to test ever regresses. Without this,
+    such a test would fail by hanging on a real socket to 192.168.100.1
+    instead of failing cleanly on an assertion.
     """
     monkeypatch.setattr(appmod.mikrotik, "get_device_health",
                         lambda d: (True, {"identity": "MikroTik", "uptime": "1d"}))
@@ -44,6 +53,8 @@ def stub_connectors(monkeypatch):
                         lambda d, username: (True, "enabled"))
     monkeypatch.setattr(appmod.mikrotik, "get_active_session",
                         lambda d, username: (True, {"address": "10.0.0.9"}))
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda d, username, enabled: (True, "ok"))
     # The OLT operations go through _get_olt_status_core /
     # _get_cpe_locations_core, but both call vsol_olt through the module
     # attribute, so patching here reaches them.
@@ -575,6 +586,15 @@ def test_payment_restore_skips_in_agent_mode(app, client, monkeypatch):
     called = []
     monkeypatch.setattr(appmod.mikrotik, "get_secret_status",
                         lambda *a, **k: called.append(a) or (True, "disabled"))
+    # get_secret_status's "disabled" return is the one value that cascades
+    # into _maybe_restore_mikrotik_access calling set_secret_enabled next
+    # (app.py) -- stub it too, and record calls, so that if the agent-mode
+    # guard above the status check is ever removed or broken, this test
+    # fails on the assertion below instead of opening a real socket to
+    # 192.168.100.1 via mikrotik._connect().
+    write_called = []
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda *a, **k: write_called.append(a) or (True, "ok"))
     hdr = _admin(client, "Write D", "write_d_admin")
     device_id = make_device(app, "Write D")
     customer_id = _linked_customer(app, "Write D", device_id)
@@ -599,3 +619,25 @@ def test_payment_restore_skips_in_agent_mode(app, client, monkeypatch):
             result = appmod._maybe_restore_mikrotik_access(customer)
     assert result is None
     assert called == []
+    assert write_called == [], (
+        "the agent-mode guard must return before set_secret_enabled is ever "
+        "reached, including on the 'disabled' path that would otherwise "
+        "call it next")
+
+
+def test_unsuspend_still_works_in_direct_mode(app, client, monkeypatch):
+    """Mirrors test_suspend_still_works_in_direct_mode -- suspend_customer_network
+    and unsuspend_customer_network (app.py) are structurally identical, just
+    calling set_secret_enabled with False vs True, so this is the regression
+    net proving the new agent-mode guard didn't accidentally disable
+    unsuspend for every direct-mode tenant too."""
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda *a, **k: (True, "enabled"))
+    hdr = _admin(client, "Write E", "write_e_admin")
+    device_id = make_device(app, "Write E")
+    customer_id = _linked_customer(app, "Write E", device_id)
+
+    r = client.post("/api/customers/{}/network-unsuspend".format(customer_id),
+                    headers=hdr)
+    assert r.status_code == 200
+    assert r.get_json()["ok"] is True
