@@ -21,6 +21,12 @@
 - Do **not** use `git stash` — the stash stack is shared across worktrees. Use a WIP commit if you must set work aside.
 - Nothing under `frontend/build/` or `build/` may be committed. If a build was run, revert those paths before committing: `git checkout -- frontend/build build && git clean -fdq frontend/build build`.
 - `NETWORK_DEVICE_TYPES` stays exactly `('mikrotik_ccr', 'vsol_olt')`. Do not add a device type.
+- **No test may open a real socket.** `_create_device_job` runs the connector
+  inline in direct mode, so any test that creates a job must stub the
+  connectors first — use `stub_connectors(monkeypatch)` from
+  `tests/test_mikrotik_consolidation.py`. The hosts in these tests are
+  DeltaNet's real addresses and the CCR at 192.168.100.1 answers from the
+  developer's LAN, so an unstubbed test hits production hardware.
 - Known pre-existing test-isolation bug: running `tests/test_topology_migration.py` **before** `tests/test_network_agent_program.py` breaks 5 tests in the latter (Alembic's `fileConfig(disable_existing_loggers=True)` disables the already-imported `servicebills_agent` logger). The full suite's alphabetical order is safe. Do not fix it in this cycle; do not be alarmed by it when running a subset.
 
 ## File Structure
@@ -85,6 +91,33 @@ def make_device(app, tenant_name, **over):
         appmod.db.session.add(device)
         appmod.db.session.commit()
         return device.id
+
+
+def stub_connectors(monkeypatch):
+    """Neutralise every connector a direct-mode job could reach.
+
+    _create_device_job runs the connector INLINE when the tenant is not in
+    agent mode, so any test that creates a job opens a real socket unless the
+    connectors are stubbed. The hosts in these tests are DeltaNet's real
+    addresses, and on a developer machine sitting on that LAN the CCR at
+    192.168.100.1 genuinely answers -- so an unstubbed test would either hang
+    on a timeout or, worse, hit production hardware. Every existing test in
+    tests/test_network_devices.py and tests/test_network_agent_jobs.py stubs
+    the same way; this just gathers all six into one call.
+    """
+    monkeypatch.setattr(appmod.mikrotik, "get_device_health",
+                        lambda d: (True, {"identity": "MikroTik", "uptime": "1d"}))
+    monkeypatch.setattr(appmod.mikrotik, "test_connection",
+                        lambda d: (True, "Connected"))
+    monkeypatch.setattr(appmod.mikrotik, "get_secret_status",
+                        lambda d, username: (True, "enabled"))
+    monkeypatch.setattr(appmod.mikrotik, "get_active_session",
+                        lambda d, username: (True, {"address": "10.0.0.9"}))
+    # The OLT operations go through _get_olt_status_core /
+    # _get_cpe_locations_core, but both call vsol_olt through the module
+    # attribute, so patching here reaches them.
+    monkeypatch.setattr(appmod.vsol_olt, "get_olt_status", lambda d: (True, []))
+    monkeypatch.setattr(appmod.vsol_olt, "get_cpe_locations", lambda d: (True, {}))
 
 
 def test_the_mikrotik_server_model_is_gone():
@@ -651,6 +684,8 @@ Append to `tests/test_mikrotik_consolidation.py`:
 def test_an_olt_cannot_be_asked_a_pppoe_question(app, client):
     """secret_status against an OLT is a job nobody can serve. Until the three
     read operations became reachable this was theoretical; now it isn't."""
+    # No stub needed: the guard rejects before any connector is reached, and
+    # that is precisely what the test is asserting.
     make_tenant(client, "Guard A", "guard_a_admin")
     device_id = make_device(app, "Guard A", device_type="vsol_olt",
                             api_port=161, username="")
@@ -672,9 +707,10 @@ def test_a_mikrotik_cannot_be_asked_an_snmp_question(app, client):
         assert "mikrotik_ccr" in error and "olt_status" in error
 
 
-def test_every_supported_pairing_is_accepted(app, client):
+def test_every_supported_pairing_is_accepted(app, client, monkeypatch):
     """The mapping is total -- NETWORK_DEVICE_TYPES is a closed set of two --
     so there is no fallback branch, and every listed pairing must work."""
+    stub_connectors(monkeypatch)
     make_tenant(client, "Guard C", "guard_c_admin")
     olt_id = make_device(app, "Guard C", name="OLT", device_type="vsol_olt",
                          api_port=161, username="")
@@ -762,9 +798,10 @@ def _admin(client, business, username):
     return make_tenant(client, business, username)
 
 
-def test_device_test_connection_creates_a_job(app, client):
+def test_device_test_connection_creates_a_job(app, client, monkeypatch):
     """The one genuinely useful button the deleted Mikrotik Servers page had.
     It moves here rather than being lost."""
+    stub_connectors(monkeypatch)
     hdr = _admin(client, "Relay A", "relay_a_admin")
     device_id = make_device(app, "Relay A")
     r = client.post("/api/network-devices/{}/test-connection".format(device_id),
@@ -790,10 +827,11 @@ def test_test_connection_is_refused_on_an_olt(app, client):
     assert "vsol_olt" in body["message"]
 
 
-def test_customer_network_status_creates_two_jobs(app, client):
+def test_customer_network_status_creates_two_jobs(app, client, monkeypatch):
     """Two existing operations rather than one new combined one: a new
     operation would force an agent update, and the shipped agent already
     dispatches both of these."""
+    stub_connectors(monkeypatch)
     hdr = _admin(client, "Relay C", "relay_c_admin")
     device_id = make_device(app, "Relay C")
     with app.app_context():
