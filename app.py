@@ -10545,6 +10545,17 @@ def get_customer_network_status(customer_id):
         return jsonify({'ok': False, 'message': error, 'jobs': None}), 200
     session_job, error = _create_device_job(device, 'active_session', params)
     if error:
+        # _create_device_job already committed secret_job as a real row (it
+        # commits internally), but its id is discarded by the early return
+        # below -- the browser never learns it exists and so never polls it.
+        # _prune_stale_agent_jobs only reaps terminal jobs ('done'/'failed'/
+        # 'expired'), never 'pending' ones, so left alone this would sit as
+        # live queued work until the agent eventually claims it and produces
+        # a result nobody reads. Delete it explicitly: that first commit
+        # already happened and can't be rolled back from here, so this needs
+        # its own delete and its own commit.
+        db.session.delete(secret_job)
+        db.session.commit()
         return jsonify({'ok': False, 'message': error, 'jobs': None}), 200
 
     return jsonify({'ok': True, 'message': None,

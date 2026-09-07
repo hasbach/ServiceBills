@@ -407,3 +407,79 @@ def test_customer_network_status_needs_a_linked_device(app, client):
                     headers=hdr)
     assert r.status_code == 400
     assert "not linked" in r.get_json()["error"]
+
+
+def test_customer_network_status_deletes_orphaned_job_when_second_call_fails(app, client, monkeypatch):
+    """Regression test for the Part A fix.
+
+    get_customer_network_status creates two jobs sequentially. In agent mode,
+    _create_device_job independently checks agent.is_online() against the
+    30-second staleness window on each call -- if that window lapses between
+    the two calls, the first job is already a committed row by the time the
+    second one fails, and the early-return response discards its id. Nobody
+    ever learns it exists, so nobody ever polls it, and _prune_stale_agent_jobs
+    only reaps terminal jobs -- never 'pending' ones -- so it would otherwise
+    sit forever as live queued work.
+
+    Rather than monkeypatching _create_device_job itself (which would skip
+    over its own logic), this simulates the real race at its actual source:
+    NetworkAgent.is_online() flipping from True to False between the two
+    calls inside the same request. That exercises the genuine
+    _create_device_job code path -- the agent-mode branch, the real insert
+    and commit for the first job, and the real rejection on the second --
+    with only the online/offline verdict itself faked, which is the one
+    thing that would otherwise depend on wall-clock timing.
+    """
+    hdr = _admin(client, "Orphan A", "orphan_a_admin")
+    device_id = make_device(app, "Orphan A")
+    with app.app_context():
+        tenant = _tenant("Orphan A")
+        # Same NOT NULL scaffolding as test_customers_link_to_a_network_device.
+        plan = appmod.SubscriptionPlan(
+            tenant_id=tenant.id, name="Basic", price=10, cost=5,
+            billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(
+            tenant_id=tenant.id, name="Bach", phone="1", address="a",
+            subscription_plan_id=plan.id,
+            subscription_expiry_date=appmod.datetime.utcnow(),
+            network_device_id=device_id, pppoe_username="bach1")
+        appmod.db.session.add(customer)
+        settings = appmod.BusinessSettings(
+            tenant_id=tenant.id, business_name="Orphan A",
+            address="Beirut", mobile="+96170000000",
+            network_access_mode="agent")
+        appmod.db.session.add(settings)
+        agent = appmod.NetworkAgent(tenant_id=tenant.id, name="Agent",
+                                    token_hash="x",
+                                    last_seen_at=appmod.datetime.utcnow())
+        appmod.db.session.add(agent)
+        appmod.db.session.commit()
+        customer_id = customer.id
+        tenant_id = tenant.id
+
+    # Online for the first _create_device_job call, offline for the second --
+    # the exact race described above. No stub_connectors needed: agent mode
+    # never touches the mikrotik/vsol_olt connectors from the cloud side.
+    online_calls = []
+
+    def flaky_is_online(self):
+        online_calls.append(1)
+        return len(online_calls) == 1
+
+    monkeypatch.setattr(appmod.NetworkAgent, "is_online", flaky_is_online)
+
+    r = client.post("/api/customers/{}/network-status".format(customer_id),
+                    headers=hdr)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is False
+    assert body["jobs"] is None
+
+    with app.app_context():
+        remaining = appmod.NetworkAgentJob.query.filter_by(tenant_id=tenant_id).all()
+        assert remaining == [], (
+            "the first job's id was discarded in the response above but its "
+            "row survived as orphaned queued work: {}".format(
+                [(j.id, j.operation, j.status) for j in remaining]))
