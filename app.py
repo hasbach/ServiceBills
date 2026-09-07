@@ -382,6 +382,17 @@ AGENT_OPERATIONS = (
     'active_session', 'olt_status', 'cpe_locations',
 )
 
+# Which operations each kind of device can actually answer. NETWORK_DEVICE_TYPES
+# is a closed set of exactly two, so this mapping is total and there is no
+# fallback branch to get wrong. Together the two rows cover AGENT_OPERATIONS
+# exactly -- a test asserts that, so adding an operation without placing it here
+# fails loudly rather than becoming quietly unreachable.
+DEVICE_TYPE_OPERATIONS = {
+    'vsol_olt': ('olt_status', 'cpe_locations'),
+    'mikrotik_ccr': ('device_health', 'test_connection',
+                     'secret_status', 'active_session'),
+}
+
 # An agent that hasn't polled within this window is treated as offline, and
 # jobs are refused rather than queued for something that will never run them.
 AGENT_ONLINE_WINDOW_SECONDS = 30
@@ -9985,10 +9996,19 @@ def _create_device_job(device, operation, params=None):
     if operation not in AGENT_OPERATIONS:
         return None, 'Unsupported operation: {}'.format(operation)
 
+    permitted = DEVICE_TYPE_OPERATIONS.get(device.device_type, ())
+    if operation not in permitted:
+        return None, 'A {} device cannot perform {}.'.format(
+            device.device_type, operation)
+
     # No current_user_obj() helper exists in this codebase; resolve the acting
     # user the same way every other endpoint does. This field is informational
     # only, so a lookup miss (e.g. no JWT in scope) must never block the job.
-    current_username = get_jwt_identity()
+    try:
+        current_username = get_jwt_identity()
+    except RuntimeError:
+        # No JWT context available (e.g., called from tests or background tasks)
+        current_username = None
     current_user = User.query.filter_by(username=current_username).first() if current_username else None
 
     job = NetworkAgentJob(

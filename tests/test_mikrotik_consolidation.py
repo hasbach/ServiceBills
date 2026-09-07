@@ -4,6 +4,7 @@ See docs/superpowers/specs/2026-09-07-mikrotik-device-consolidation-design.md.
 """
 import app as appmod
 from tests.conftest import make_tenant
+from flask_jwt_extended import create_access_token, verify_jwt_in_request
 
 
 def _tenant(name):
@@ -235,3 +236,57 @@ def test_delete_network_device_with_a_linked_customer_is_blocked(app, client):
 
     with app.app_context():
         assert appmod.db.session.get(appmod.NetworkDevice, device_id) is not None
+
+
+def test_an_olt_cannot_be_asked_a_pppoe_question(app, client):
+    """secret_status against an OLT is a job nobody can serve. Until the three
+    read operations became reachable this was theoretical; now it isn't."""
+    # No stub needed: the guard rejects before any connector is reached, and
+    # that is precisely what the test is asserting.
+    make_tenant(client, "Guard A", "guard_a_admin")
+    device_id = make_device(app, "Guard A", device_type="vsol_olt",
+                            api_port=161, username="")
+    with app.test_request_context():
+        with app.app_context():
+            device = appmod.db.session.get(appmod.NetworkDevice, device_id)
+            job, error = appmod._create_device_job(device, "secret_status",
+                                                   {"pppoe_username": "bach1"})
+            assert job is None
+            assert "vsol_olt" in error and "secret_status" in error
+
+
+def test_a_mikrotik_cannot_be_asked_an_snmp_question(app, client):
+    make_tenant(client, "Guard B", "guard_b_admin")
+    device_id = make_device(app, "Guard B")
+    with app.test_request_context():
+        with app.app_context():
+            device = appmod.db.session.get(appmod.NetworkDevice, device_id)
+            job, error = appmod._create_device_job(device, "olt_status")
+            assert job is None
+            assert "mikrotik_ccr" in error and "olt_status" in error
+
+
+def test_every_supported_pairing_is_accepted(app, client, monkeypatch):
+    """The mapping is total -- NETWORK_DEVICE_TYPES is a closed set of two --
+    so there is no fallback branch, and every listed pairing must work."""
+    stub_connectors(monkeypatch)
+    make_tenant(client, "Guard C", "guard_c_admin")
+    olt_id = make_device(app, "Guard C", name="OLT", device_type="vsol_olt",
+                         api_port=161, username="")
+    ccr_id = make_device(app, "Guard C", name="CCR2", host="192.168.100.2")
+    assert set(appmod.DEVICE_TYPE_OPERATIONS) == set(appmod.NETWORK_DEVICE_TYPES)
+    assert (set(appmod.DEVICE_TYPE_OPERATIONS['vsol_olt'])
+            | set(appmod.DEVICE_TYPE_OPERATIONS['mikrotik_ccr'])) == set(appmod.AGENT_OPERATIONS)
+    with app.app_context():
+        tenant = _tenant("Guard C")
+        token = create_access_token(identity="guard_c_admin", additional_claims={"tenant_id": tenant.id})
+        with app.test_request_context(headers={"Authorization": f"Bearer {token}"}):
+            verify_jwt_in_request()
+            for device_id, device_type in ((olt_id, 'vsol_olt'), (ccr_id, 'mikrotik_ccr')):
+                device = appmod.db.session.get(appmod.NetworkDevice, device_id)
+                for operation in appmod.DEVICE_TYPE_OPERATIONS[device_type]:
+                    job, error = appmod._create_device_job(
+                        device, operation, {"pppoe_username": "bach1"})
+                    assert error is None, "{} rejected on {}: {}".format(
+                        operation, device_type, error)
+                    assert job is not None
