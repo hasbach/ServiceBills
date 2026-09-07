@@ -307,63 +307,27 @@ class UpstreamProviderPayment(db.Model):
             'description': self.description
         }
 
-class MikrotikServer(db.Model):
-    """A Mikrotik router the tenant owns, running its own local PPPoE server
-    (mode: 'local_mikrotik'). Unlike UpstreamProvider, this is the tenant's own
-    hardware -- credentials are for the RouterOS API, not a third-party portal."""
-    id = db.Column(db.Integer, primary_key=True)
-    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
-    name = db.Column(db.String(100), nullable=False)
-    host = db.Column(db.String(255), nullable=False)
-    api_port = db.Column(db.Integer, nullable=False, default=8728)
-    use_tls = db.Column(db.Boolean, nullable=False, default=False)
-    username = db.Column(db.String(100), nullable=False)
-    password = db.Column(EncryptedString, nullable=False)  # encrypted at rest
-    # RouterOS /ppp/secret allows duplicate `name` values as long as `service`
-    # differs -- this happens for real when shared last-mile infrastructure
-    # carries more than one ISP's PPPoE traffic, so two unrelated ISPs can each
-    # have their own subscriber named e.g. "user1" on the same physical network.
-    # When set, every secret lookup/enable/disable on this router filters by
-    # (name, service) instead of name alone, so a username collision with some
-    # other ISP's subscriber can never cause this tenant's action to land on
-    # the wrong person's connection. Nullable/blank means "don't filter by
-    # service" (matches RouterOS's own 'any' default) -- safe for a tenant
-    # whose network has no such sharing and no collision risk.
-    service_name = db.Column(db.String(100), nullable=True)
-    status = db.Column(db.String(20), default='active')
-    # Set opportunistically by the most recent live call (test-connection or any
-    # enable/disable action) -- there is no standalone health-check job yet.
-    last_checked_at = db.Column(db.DateTime, nullable=True)
-    last_status = db.Column(db.String(20), nullable=True)  # 'online', 'unreachable', 'auth_failed'
-    customers = db.relationship('Customer', backref='mikrotik_server', lazy=True)
-
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'name': self.name,
-            'host': self.host,
-            'api_port': self.api_port,
-            'use_tls': self.use_tls,
-            'username': self.username,
-            'service_name': self.service_name or '',
-            'status': self.status,
-            'last_checked_at': self.last_checked_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_checked_at else None,
-            'last_status': self.last_status
-        }
-
 class NetworkDevice(db.Model):
-    """A network device the tenant owns, monitored for RouterOS-level health
-    (reachability, uptime, interface status) -- independent of MikrotikServer,
-    which is specifically about local PPPoE secret management. A tenant's CCR
-    can run in bridge mode (no local PPPoE) and still be worth monitoring here.
-    On-demand only: no scheduled job, no history -- see
-    docs/superpowers/specs/2026-09-01-network-device-health-monitoring-design.md."""
+    """A network device the tenant owns: the single row for one physical box,
+    covering both RouterOS-level health (reachability, uptime, interface
+    status) and, for a router running a local PPPoE server, the customers
+    authenticating against it. A tenant's CCR can run in bridge mode (no local
+    PPPoE) and still be worth monitoring here. Health checks are on-demand
+    only: no scheduled job, no history -- see
+    docs/superpowers/specs/2026-09-01-network-device-health-monitoring-design.md
+    and docs/superpowers/specs/2026-09-07-mikrotik-device-consolidation-design.md."""
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
     host = db.Column(db.String(255), nullable=False)
     api_port = db.Column(db.Integer, nullable=False, default=8728)
     use_tls = db.Column(db.Boolean, nullable=False, default=False)
+    # Only needed when this router runs more than one PPPoE server instance
+    # (DeltaNet's CCR runs four: BCH enabled, BCHVPN/MYISP/SMN-W disabled), or
+    # when its network is shared with another ISP. Blank means "match by
+    # /ppp/secret name only", which is correct for a single-instance router --
+    # see mikrotik._secret_where().
+    service_name = db.Column(db.String(100), nullable=True)
     username = db.Column(db.String(100), nullable=False)
     password = db.Column(EncryptedString, nullable=False)  # encrypted at rest
     status = db.Column(db.String(20), default='active')
@@ -390,6 +354,7 @@ class NetworkDevice(db.Model):
         'NetworkDevice', backref=db.backref('parent', remote_side=[id]),
         lazy='select',
     )
+    customers = db.relationship('Customer', backref='network_device', lazy=True)
 
     def to_dict(self):
         return {
@@ -398,6 +363,7 @@ class NetworkDevice(db.Model):
             'host': self.host,
             'api_port': self.api_port,
             'use_tls': self.use_tls,
+            'service_name': self.service_name,
             'device_type': self.device_type,
             'parent_device_id': self.parent_device_id,
             'username': self.username,
@@ -643,12 +609,13 @@ class Customer(db.Model):
     upstream_last_synced_at = db.Column(db.DateTime, nullable=True)
     # Populated only when network_mode is 'local_mikrotik' -- the router this
     # customer authenticates against and their /ppp/secret name on it.
-    mikrotik_server_id = db.Column(db.Integer, db.ForeignKey('mikrotik_server.id'), nullable=True)
+    network_device_id = db.Column(db.Integer, db.ForeignKey('network_device.id'),
+                                  nullable=True, index=True)
     pppoe_username = db.Column(db.String(100), nullable=True)
     # MAC of the ONU serving this customer, as the OLT reports it. Many
     # customers can sit behind one ONU (DeltaNet's ONUs are transparent
     # bridges), so this is a plain many-to-one string -- no unique constraint,
-    # no join table -- the same shape as mikrotik_server_id/upstream_provider_id.
+    # no join table -- the same shape as network_device_id/upstream_provider_id.
     onu_mac_address = db.Column(db.String(20), nullable=True, index=True)
     # The customer's OWN router, as the OLT's MAC-learning table sees it.
     # Unlike onu_mac_address -- which is the ONU's address and therefore
@@ -1108,7 +1075,7 @@ class BusinessSettings(db.Model):
     # docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
     # 'none' (default, no network integration), 'upstream_bridge' (subreseller
     # of an upstream's RADIUS portal -- see UpstreamProvider), or
-    # 'local_mikrotik' (tenant owns the edge -- see MikrotikServer).
+    # 'local_mikrotik' (tenant owns the edge -- see NetworkDevice).
     network_mode = db.Column(db.String(20), nullable=False, default='none')
     # 'direct'  -- the cloud calls devices itself (today's behaviour, and the
     #              only thing that works when ServiceBills runs on the LAN).
@@ -1483,7 +1450,7 @@ TENANT_OWNED_MODELS = (
     CustomerFeedback, PaymentReminder, UpgradeRequest, BillingPaymentAttempt,
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
-    UpstreamProvider, UpstreamProviderPayment, MikrotikServer,
+    UpstreamProvider, UpstreamProviderPayment,
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob,
     CustomerPaymentLink, CustomerWhishPaymentAttempt,
 )
@@ -3013,7 +2980,7 @@ def _validate_mac_address(raw, allow_empty):
     return mac, None
 
 
-def _check_network_link_conflict(exclude_customer_id, mikrotik_server_id, pppoe_username,
+def _check_network_link_conflict(exclude_customer_id, network_device_id, pppoe_username,
                                   upstream_provider_id, upstream_username):
     """A given (server, username) pair identifies exactly one live network
     account/secret. Two ServiceBills customer rows quietly pointing at the
@@ -3024,9 +2991,9 @@ def _check_network_link_conflict(exclude_customer_id, mikrotik_server_id, pppoe_
     Returns an error message if `exclude_customer_id` isn't the sole holder
     of either pair, else None. `exclude_customer_id` may be None (new
     customer, nothing to exclude yet)."""
-    if mikrotik_server_id and pppoe_username:
+    if network_device_id and pppoe_username:
         q = tenant_query(Customer).filter_by(
-            mikrotik_server_id=mikrotik_server_id, pppoe_username=pppoe_username)
+            network_device_id=network_device_id, pppoe_username=pppoe_username)
         if exclude_customer_id:
             q = q.filter(Customer.id != exclude_customer_id)
         conflict = q.first()
@@ -3110,7 +3077,7 @@ def get_customers():
                 'upstream_last_status': c.upstream_last_status,
                 'upstream_last_synced_at': c.upstream_last_synced_at.strftime('%Y-%m-%d %H:%M:%S') if c.upstream_last_synced_at else None,
                 'upstream_drift': _compute_upstream_drift(c),
-                'mikrotik_server_id': c.mikrotik_server_id,
+                'network_device_id': c.network_device_id,
                 'pppoe_username': c.pppoe_username,
                 'onu_mac_address': c.onu_mac_address,
                 'cpe_mac_address': c.cpe_mac_address,
@@ -3224,7 +3191,7 @@ def add_customer():
 
         conflict_error = _check_network_link_conflict(
             None,
-            data.get('mikrotik_server_id') or None, data.get('pppoe_username') or None,
+            data.get('network_device_id') or None, data.get('pppoe_username') or None,
             data.get('upstream_provider_id') or None, data.get('upstream_username') or None,
         )
         if conflict_error:
@@ -3270,7 +3237,7 @@ def add_customer():
             reseller_id=data.get('reseller_id') if data.get('reseller_id') != "" else None,
             upstream_provider_id=data.get('upstream_provider_id') or None,
             upstream_username=data.get('upstream_username') or None,
-            mikrotik_server_id=data.get('mikrotik_server_id') or None,
+            network_device_id=data.get('network_device_id') or None,
             pppoe_username=data.get('pppoe_username') or None,
             onu_mac_address=onu_mac_address,
             cpe_mac_address=cpe_mac_address
@@ -3505,8 +3472,8 @@ def update_customer(customer_id):
         # but first check the *effective* new state (existing value unless this
         # request overrides it) doesn't collide with some other customer already
         # holding the same network account.
-        effective_mikrotik_server_id = (data['mikrotik_server_id'] if 'mikrotik_server_id' in data
-                                         else customer.mikrotik_server_id) or None
+        effective_network_device_id = (data['network_device_id'] if 'network_device_id' in data
+                                        else customer.network_device_id) or None
         effective_pppoe_username = (data['pppoe_username'] if 'pppoe_username' in data
                                      else customer.pppoe_username) or None
         effective_upstream_provider_id = (data['upstream_provider_id'] if 'upstream_provider_id' in data
@@ -3515,7 +3482,7 @@ def update_customer(customer_id):
                                         else customer.upstream_username) or None
         conflict_error = _check_network_link_conflict(
             customer.id,
-            effective_mikrotik_server_id, effective_pppoe_username,
+            effective_network_device_id, effective_pppoe_username,
             effective_upstream_provider_id, effective_upstream_username,
         )
         if conflict_error:
@@ -3525,8 +3492,8 @@ def update_customer(customer_id):
             customer.upstream_provider_id = effective_upstream_provider_id
         if 'upstream_username' in data:
             customer.upstream_username = effective_upstream_username
-        if 'mikrotik_server_id' in data:
-            customer.mikrotik_server_id = effective_mikrotik_server_id
+        if 'network_device_id' in data:
+            customer.network_device_id = effective_network_device_id
         if 'pppoe_username' in data:
             customer.pppoe_username = effective_pppoe_username
 
@@ -3620,7 +3587,7 @@ def update_customer(customer_id):
                 'reseller_id': customer.reseller_id,
                 'upstream_provider_id': customer.upstream_provider_id,
                 'upstream_username': customer.upstream_username,
-                'mikrotik_server_id': customer.mikrotik_server_id,
+                'network_device_id': customer.network_device_id,
                 'pppoe_username': customer.pppoe_username,
                 'onu_mac_address': customer.onu_mac_address,
                 'cpe_mac_address': customer.cpe_mac_address
@@ -4342,7 +4309,7 @@ def _mark_payment_fully_paid(payment, customer, current_user=None):
 
 def _maybe_restore_mikrotik_access(customer):
     """Call after a payment/gratis commit that just settled a debt for a
-    customer linked to a MikrotikServer -- re-enables their /ppp/secret if (and
+    customer linked to a NetworkDevice -- re-enables their /ppp/secret if (and
     only if) it's currently disabled. Never called from anywhere that only
     mechanically advances the billing cycle (_renew_subscription_core) without
     money actually changing hands; see
@@ -4351,18 +4318,18 @@ def _maybe_restore_mikrotik_access(customer):
     Always runs after the caller's own commit -- never raises, never undoes or
     blocks the billing side. Returns a small status dict for the caller to
     fold into its response if useful, or None if there was nothing to do."""
-    if not customer.mikrotik_server_id:
+    if not customer.network_device_id:
         return None
     try:
-        server = tenant_query(MikrotikServer).filter_by(id=customer.mikrotik_server_id).first()
-        if not server or not customer.pppoe_username:
+        device = tenant_query(NetworkDevice).filter_by(id=customer.network_device_id).first()
+        if not device or not customer.pppoe_username:
             return None
-        ok, status = mikrotik.get_secret_status(server, customer.pppoe_username)
+        ok, status = mikrotik.get_secret_status(device, customer.pppoe_username)
         if not ok:
             return {'attempted': True, 'ok': False, 'message': status}
         if status != 'disabled':
             return None  # already enabled (or not_found) -- nothing to restore
-        ok, message = mikrotik.set_secret_enabled(server, customer.pppoe_username, True)
+        ok, message = mikrotik.set_secret_enabled(device, customer.pppoe_username, True)
         return {'attempted': True, 'ok': ok, 'message': message}
     except Exception as e:
         logging.error(f"Mikrotik re-enable check failed for customer {customer.id}: {e}")
@@ -9044,104 +9011,6 @@ def sync_customer_upstream_status(customer_id):
     }), 200
 
 
-@app.route('/api/mikrotik-servers', methods=['GET'])
-@jwt_required()
-@admin_or_finance_required()
-def get_mikrotik_servers():
-    servers = tenant_query(MikrotikServer).order_by(MikrotikServer.name).all()
-    result = []
-    for s in servers:
-        data = s.to_dict()
-        data['customers'] = [c.id for c in s.customers]
-        result.append(data)
-    return jsonify(result), 200
-
-@app.route('/api/mikrotik-servers', methods=['POST'])
-@jwt_required()
-@admin_or_finance_required()
-def create_mikrotik_server():
-    data = request.json
-    try:
-        if not data.get('password'):
-            return jsonify({'error': 'password is required'}), 400
-        server = MikrotikServer(
-            name=data['name'],
-            host=data['host'],
-            api_port=int(data.get('api_port') or (8729 if data.get('use_tls') else 8728)),
-            use_tls=bool(data.get('use_tls', False)),
-            username=data['username'],
-            password=data['password'],
-            service_name=data.get('service_name') or None,
-            status=data.get('status', 'active'),
-        )
-        db.session.add(server)
-        db.session.commit()
-        return jsonify({'message': 'Mikrotik server created successfully!', 'server': server.to_dict()}), 201
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': str(e)}), 400
-
-@app.route('/api/mikrotik-servers/<int:server_id>', methods=['PUT'])
-@jwt_required()
-@admin_or_finance_required()
-def update_mikrotik_server(server_id):
-    data = request.json
-    server = tenant_query(MikrotikServer).filter_by(id=server_id).first()
-    if not server:
-        return jsonify({'message': 'Mikrotik server not found!'}), 404
-    try:
-        server.name = data.get('name', server.name)
-        server.host = data.get('host', server.host)
-        if 'api_port' in data:
-            server.api_port = int(data['api_port'])
-        if 'use_tls' in data:
-            server.use_tls = bool(data['use_tls'])
-        server.username = data.get('username', server.username)
-        # Leave the stored password unchanged unless a new one is actually
-        # provided -- the edit form never pre-fills this field.
-        if data.get('password'):
-            server.password = data['password']
-        if 'service_name' in data:
-            server.service_name = data['service_name'] or None
-        if 'status' in data:
-            server.status = data['status']
-        db.session.commit()
-        return jsonify({'message': 'Mikrotik server updated successfully!', 'server': server.to_dict()}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': str(e)}), 400
-
-@app.route('/api/mikrotik-servers/<int:server_id>', methods=['DELETE'])
-@jwt_required()
-@admin_or_finance_required()
-def delete_mikrotik_server(server_id):
-    try:
-        server = tenant_query(MikrotikServer).filter_by(id=server_id).first()
-        if not server:
-            return jsonify({'message': 'Mikrotik server not found!'}), 404
-
-        if tenant_query(Customer).filter_by(mikrotik_server_id=server.id).first():
-            return jsonify({'error': 'Cannot delete a server with customers linked to it.'}), 400
-
-        db.session.delete(server)
-        db.session.commit()
-        return jsonify({'message': 'Mikrotik server deleted successfully!'}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/mikrotik-servers/<int:server_id>/test-connection', methods=['POST'])
-@jwt_required()
-@admin_or_finance_required()
-def test_mikrotik_connection(server_id):
-    server = tenant_query(MikrotikServer).filter_by(id=server_id).first()
-    if not server:
-        return jsonify({'message': 'Mikrotik server not found!'}), 404
-    ok, message = mikrotik.test_connection(server)
-    db.session.commit()  # persists last_checked_at/last_status set by test_connection
-    return jsonify({'ok': ok, 'message': message, 'server': server.to_dict()}), 200
-
-
 NETWORK_DEVICE_TYPES = ('mikrotik_ccr', 'vsol_olt')
 
 
@@ -9226,6 +9095,7 @@ def create_network_device():
             # string, held in `password`. Default to '' so the NOT NULL holds.
             username=data.get('username') or '',
             password=data.get('password') or '',
+            service_name=data.get('service_name') or None,
             status=data.get('status', 'active'),
             device_type=device_type,
             parent_device_id=parent_id,
@@ -9286,6 +9156,8 @@ def update_network_device(device_id):
         # provided -- the edit form never pre-fills this field.
         if data.get('password'):
             device.password = data['password']
+        if 'service_name' in data:
+            device.service_name = data['service_name'] or None
         if 'status' in data:
             device.status = data['status']
         db.session.commit()
@@ -9302,6 +9174,14 @@ def delete_network_device(device_id):
         device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
         if not device:
             return jsonify({'message': 'Network device not found!'}), 404
+        # Carried over from the deleted delete_mikrotik_server: customers now
+        # link to devices, and Postgres would reject the DELETE with a
+        # ForeignKeyViolation that the bare `except` below turns into an
+        # opaque 500. A named 400 tells the user what to actually do.
+        linked = tenant_query(Customer).filter_by(network_device_id=device.id).first()
+        if linked:
+            return jsonify({'error': 'Cannot delete a device with customers linked '
+                                     'to it. Unlink them first.'}), 400
         # Orphan rather than cascade: deleting the CCR must not silently take
         # the OLT with it, and the self-FK would otherwise refuse the delete.
         for child in tenant_query(NetworkDevice).filter_by(parent_device_id=device.id).all():
@@ -10588,29 +10468,29 @@ def apply_customer_locations(device_id):
 # --- Live actions on a customer's PPPoE secret (Concept B). Staff-triggered
 # only -- nothing in the app calls these automatically off a billing rule. ---
 
-def _customer_mikrotik_context(customer_id):
-    """Shared lookup for the 3 routes below. Returns (customer, server,
+def _customer_network_context(customer_id):
+    """Shared lookup for the 3 routes below. Returns (customer, device,
     error_response) -- error_response is a ready-to-return (body, status)
-    tuple when the customer/server/link isn't valid, else None."""
+    tuple when the customer/device/link isn't valid, else None."""
     customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
         return None, None, ({'message': 'Customer not found!'}, 404)
-    if not customer.mikrotik_server_id or not customer.pppoe_username:
-        return None, None, ({'error': 'Customer is not linked to a Mikrotik server.'}, 400)
-    server = tenant_query(MikrotikServer).filter_by(id=customer.mikrotik_server_id).first()
-    if not server:
-        return None, None, ({'error': 'Linked Mikrotik server not found.'}, 404)
-    return customer, server, None
+    if not customer.network_device_id or not customer.pppoe_username:
+        return None, None, ({'error': 'Customer is not linked to a network device.'}, 400)
+    device = tenant_query(NetworkDevice).filter_by(id=customer.network_device_id).first()
+    if not device:
+        return None, None, ({'error': 'Linked network device not found.'}, 404)
+    return customer, device, None
 
 @app.route('/api/customers/<int:customer_id>/mikrotik-status', methods=['GET'])
 @jwt_required()
 def get_customer_mikrotik_status(customer_id):
-    customer, server, err = _customer_mikrotik_context(customer_id)
+    customer, device, err = _customer_network_context(customer_id)
     if err:
         return jsonify(err[0]), err[1]
 
-    secret_ok, secret_status = mikrotik.get_secret_status(server, customer.pppoe_username)
-    session_ok, session = mikrotik.get_active_session(server, customer.pppoe_username)
+    secret_ok, secret_status = mikrotik.get_secret_status(device, customer.pppoe_username)
+    session_ok, session = mikrotik.get_active_session(device, customer.pppoe_username)
 
     return jsonify({
         'secret_status': secret_status if secret_ok else None,
@@ -10622,21 +10502,21 @@ def get_customer_mikrotik_status(customer_id):
 @app.route('/api/customers/<int:customer_id>/mikrotik-suspend', methods=['POST'])
 @jwt_required()
 def suspend_customer_mikrotik(customer_id):
-    customer, server, err = _customer_mikrotik_context(customer_id)
+    customer, device, err = _customer_network_context(customer_id)
     if err:
         return jsonify(err[0]), err[1]
 
-    ok, message = mikrotik.set_secret_enabled(server, customer.pppoe_username, False)
+    ok, message = mikrotik.set_secret_enabled(device, customer.pppoe_username, False)
     return jsonify({'ok': ok, 'message': message}), (200 if ok else 502)
 
 @app.route('/api/customers/<int:customer_id>/mikrotik-unsuspend', methods=['POST'])
 @jwt_required()
 def unsuspend_customer_mikrotik(customer_id):
-    customer, server, err = _customer_mikrotik_context(customer_id)
+    customer, device, err = _customer_network_context(customer_id)
     if err:
         return jsonify(err[0]), err[1]
 
-    ok, message = mikrotik.set_secret_enabled(server, customer.pppoe_username, True)
+    ok, message = mikrotik.set_secret_enabled(device, customer.pppoe_username, True)
     return jsonify({'ok': ok, 'message': message}), (200 if ok else 502)
 
 

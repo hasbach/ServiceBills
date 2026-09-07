@@ -1,5 +1,5 @@
 """Model-level tests for NetworkDevice -- tenant-scoped device-health
-monitoring, independent of MikrotikServer/PPPoE. See
+monitoring. See
 docs/superpowers/specs/2026-09-01-network-device-health-monitoring-design.md.
 """
 from datetime import datetime

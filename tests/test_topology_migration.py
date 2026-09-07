@@ -401,3 +401,113 @@ def test_connector_fingerprint_migration_upgrade_downgrade_upgrade():
             engine.dispose()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+MIKROTIK_CONSOLIDATION_REVISION = "f2b6c9d4e703"
+
+
+def test_mikrotik_consolidation_migration_upgrade_downgrade_upgrade():
+    """Same bootstrap reasoning as the migration tests above: the real chain
+    cannot be walked on SQLite, so build the current schema, stamp at this
+    revision, and drive its real downgrade()/upgrade() from there."""
+    tmpdir = tempfile.mkdtemp(prefix="mikrotik_consolidation_migration_test_")
+    db_path = os.path.join(tmpdir, "mikrotik_consolidation.db")
+    mig_app = Flask("test_mikrotik_consolidation_migration")
+    mig_app.config["SQLALCHEMY_DATABASE_URI"] = (
+        "sqlite:///" + db_path.replace("\\", "/"))
+    mig_db = SQLAlchemy(mig_app)
+    Migrate(mig_app, mig_db, directory=MIGRATIONS_DIR, render_as_batch=True)
+
+    try:
+        with mig_app.app_context():
+            engine = mig_db.engine
+            appmod.db.metadata.create_all(bind=engine)
+            stamp(directory=MIGRATIONS_DIR, revision=MIKROTIK_CONSOLIDATION_REVISION)
+
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            assert "mikrotik_server" in _table_names(engine)
+            assert "mikrotik_server_id" in _table_columns(engine, "customer")
+            assert "network_device_id" not in _table_columns(engine, "customer")
+            assert "service_name" not in _table_columns(engine, "network_device")
+
+            upgrade(directory=MIGRATIONS_DIR, revision=MIKROTIK_CONSOLIDATION_REVISION)
+            assert "mikrotik_server" not in _table_names(engine)
+            assert "mikrotik_server_id" not in _table_columns(engine, "customer")
+            assert "network_device_id" in _table_columns(engine, "customer")
+            assert "service_name" in _table_columns(engine, "network_device")
+
+            engine.dispose()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mikrotik_consolidation_migration_carries_rows_forward_and_keeps_the_table():
+    """The branch production will not take, and the one that must not lose data.
+
+    The container runs `flask db upgrade && exec gunicorn`, so refusing to
+    proceed on an unexpected row would be a full outage rather than a warning.
+    Copying forward and keeping the original is the only outcome that neither
+    fails the deploy nor destroys anything.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="mikrotik_consolidation_rows_test_")
+    db_path = os.path.join(tmpdir, "mikrotik_consolidation_rows.db")
+    mig_app = Flask("test_mikrotik_consolidation_rows")
+    mig_app.config["SQLALCHEMY_DATABASE_URI"] = (
+        "sqlite:///" + db_path.replace("\\", "/"))
+    mig_db = SQLAlchemy(mig_app)
+    Migrate(mig_app, mig_db, directory=MIGRATIONS_DIR, render_as_batch=True)
+
+    try:
+        with mig_app.app_context():
+            engine = mig_db.engine
+            appmod.db.metadata.create_all(bind=engine)
+            stamp(directory=MIGRATIONS_DIR, revision=MIKROTIK_CONSOLIDATION_REVISION)
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+
+            with engine.begin() as conn:
+                conn.execute(sa.text(
+                    "INSERT INTO tenant (id, name, slug, status, plan) "
+                    "VALUES (1, 'T', 't-slug', 'active', 'free')"))
+                conn.execute(sa.text(
+                    "INSERT INTO mikrotik_server "
+                    "(id, tenant_id, name, host, api_port, use_tls, username, "
+                    " password, service_name, status) "
+                    "VALUES (7, 1, 'Old CCR', '192.168.100.1', 8728, 0, 'admin', "
+                    "'secret', 'BCH', 'active')"))
+                # phone/address/subscription_plan_id/subscription_expiry_date
+                # are all NOT NULL on customer, so a linked customer cannot be
+                # inserted without a plan to point at.
+                conn.execute(sa.text(
+                    "INSERT INTO subscription_plan "
+                    "(id, tenant_id, name, price, cost, billing_cycle, currency) "
+                    "VALUES (1, 1, 'Basic', 10, 5, 'monthly', 'USD')"))
+                conn.execute(sa.text(
+                    "INSERT INTO customer (id, tenant_id, name, phone, address, "
+                    " subscription_plan_id, subscription_start_date, "
+                    " subscription_expiry_date, mikrotik_server_id, pppoe_username) "
+                    "VALUES (3, 1, 'Bach', '1', 'a', 1, '2026-09-07 00:00:00', "
+                    "'2026-10-07 00:00:00', 7, 'bach1')"))
+
+            upgrade(directory=MIGRATIONS_DIR, revision=MIKROTIK_CONSOLIDATION_REVISION)
+
+            with engine.begin() as conn:
+                device = conn.execute(sa.text(
+                    "SELECT id, name, host, service_name, device_type "
+                    "FROM network_device")).fetchall()
+                assert len(device) == 1
+                new_id, name, host, service_name, device_type = device[0]
+                assert (name, host, service_name, device_type) == (
+                    'Old CCR', '192.168.100.1', 'BCH', 'mikrotik_ccr')
+
+                linked = conn.execute(sa.text(
+                    "SELECT network_device_id FROM customer WHERE id = 3")).scalar()
+                assert linked == new_id, "the customer FK must follow the copied row"
+
+            # The original survives as a backup rather than being dropped.
+            assert "mikrotik_server" in _table_names(engine)
+            # The stale column is still removed -- only the table is kept.
+            assert "mikrotik_server_id" not in _table_columns(engine, "customer")
+
+            engine.dispose()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

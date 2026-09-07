@@ -112,7 +112,7 @@ def test_tenant_owned_models_all_in_delete_order():
     WhatsAppTemplate, added by this task."""
     known_pre_existing_gaps = {
         appmod.Employee, appmod.SalaryCharge, appmod.SalaryPayment,
-        appmod.UpstreamProvider, appmod.UpstreamProviderPayment, appmod.MikrotikServer,
+        appmod.UpstreamProvider, appmod.UpstreamProviderPayment,
         appmod.ExchangeRate,
     }
     missing = set(appmod.TENANT_OWNED_MODELS) - set(appmod._TENANT_DELETE_ORDER) - known_pre_existing_gaps

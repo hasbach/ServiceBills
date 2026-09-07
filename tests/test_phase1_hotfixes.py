@@ -197,10 +197,10 @@ def test_suppliers_post_rejects_unauthenticated(app, client):
     assert r.status_code == 401
 
 
-def test_mikrotik_servers_get_rejects_non_admin_finance(app, client):
+def test_network_devices_get_rejects_non_admin_finance(app, client):
     a = make_tenant(client, "Biz A", "a_authz4")
     collector_hdr = _add_collector(client, a, "collector_authz4")
-    r = client.get("/api/mikrotik-servers", headers=collector_hdr)
+    r = client.get("/api/network-devices", headers=collector_hdr)
     assert r.status_code == 403
 
 
