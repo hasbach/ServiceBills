@@ -482,7 +482,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                             <Grid item xs={12}>
                                 <TextField fullWidth select label="Network Integration" value={bizForm.network_mode}
                                     onChange={e => setBizForm(f => ({ ...f, network_mode: e.target.value }))}
-                                    helperText="How your network actually works — controls which sections (Upstream Providers / Mikrotik Servers) appear in the menu."
+                                    helperText="How your network actually works — controls whether Upstream Providers appears in the menu, and which network fields show on the Subscriptions form."
                                     sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }}>
                                     <MenuItem value="none">None — manage subscriptions/payments only</MenuItem>
                                     <MenuItem value="upstream_bridge">Bridged — I'm a subreseller on an upstream's RADIUS portal</MenuItem>

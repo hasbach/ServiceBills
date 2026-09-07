@@ -66,6 +66,16 @@ import { useAppContext } from '../context/AppContext.js';
 import { formatStamp } from './formatStamp';
 import { mergeNetworkStatus } from './mergeNetworkStatus';
 
+// Whether the Network Status panel should show the finished-state chips.
+// mergeNetworkStatus's `pending` flag stays true until BOTH the secret_status
+// and active_session polls have landed -- in agent mode that can take a few
+// 2-second rounds (see fetchNetworkStatus below) -- so gating on `pending`
+// too, not just on the result being non-null, is what stops a still-checking
+// poll from being rendered as a finished "Not connected" answer.
+export function shouldShowNetworkStatusChips(mikrotikStatus) {
+    return !!mikrotikStatus && !mikrotikStatus.pending;
+}
+
 // --- NEW: Toolbar for bulk actions ---
 const EnhancedTableToolbar = ({ numSelected, onRenew, onCancel, onDelete, disabled }) => {
     const theme = useTheme();
@@ -671,7 +681,11 @@ const SubscriptionsView = ({
         try {
             const { data } = await apiService.fetchCustomerNetworkStatus(customerId);
             if (!data.ok) {
-                setMikrotikStatus({ secret_error: data.message, pending: false });
+                // Complete shape (matching mergeNetworkStatus's), not just
+                // secret_error -- an absent active_session/session_error
+                // would otherwise render as though the session side were a
+                // current "Not connected" rather than genuinely unknown.
+                setMikrotikStatus({ secret_status: null, secret_error: data.message, active_session: null, session_error: null, pending: false });
                 return;
             }
             // Both jobs are already terminal in direct mode, so this usually
@@ -688,7 +702,7 @@ const SubscriptionsView = ({
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
         } catch (err) {
-            setMikrotikStatus({ secret_error: err.response?.data?.error || 'Status check failed', pending: false });
+            setMikrotikStatus({ secret_status: null, secret_error: err.response?.data?.error || 'Status check failed', active_session: null, session_error: null, pending: false });
         } finally {
             setMikrotikStatusLoading(false);
         }
@@ -702,7 +716,7 @@ const SubscriptionsView = ({
             setSnackbar({ open: true, message: data.message, severity: data.ok ? 'success' : 'warning' });
             if (data.ok) await fetchNetworkStatus(customerId);
         } catch (err) {
-            setSnackbar({ open: true, message: err.response?.data?.message || 'Action failed', severity: 'error' });
+            setSnackbar({ open: true, message: err.response?.data?.message || `Failed to ${action} connection`, severity: 'error' });
         } finally {
             setMikrotikActionLoading(false);
         }
@@ -1396,7 +1410,7 @@ const SubscriptionsView = ({
                                             {mikrotikStatusLoading ? <CircularProgress size={16} /> : 'Refresh'}
                                         </Button>
                                     </Box>
-                                    {mikrotikStatus ? (
+                                    {shouldShowNetworkStatusChips(mikrotikStatus) ? (
                                         <Box sx={{ mt: 1, display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
                                             <Chip
                                                 size="small"
@@ -1419,7 +1433,7 @@ const SubscriptionsView = ({
                                         </Box>
                                     ) : (
                                         <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                                            {mikrotikStatusLoading ? 'Checking…' : 'No status loaded yet.'}
+                                            {mikrotikStatusLoading || mikrotikStatus?.pending ? 'Checking…' : 'No status loaded yet.'}
                                         </Typography>
                                     )}
                                 </Box>

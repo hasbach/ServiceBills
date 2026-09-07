@@ -19,8 +19,10 @@ import { STATUS_COLOR, STATUS_LABEL, NOT_CHECKED } from './deviceStatus';
 import { formatStamp } from './formatStamp';
 
 // A network device the tenant owns (starting with a core CCR), monitored for
-// RouterOS-level health -- independent of MikrotikServer, which is
-// specifically about local PPPoE secret management. See
+// RouterOS-level health. Mikrotik rows here are the same NetworkDevice a
+// customer links to for local PPPoE secret management from Subscriptions --
+// see docs/superpowers/specs/2026-09-07-mikrotik-device-consolidation-design.md.
+// This page itself only covers health monitoring. See
 // docs/superpowers/specs/2026-09-01-network-device-health-monitoring-design.md.
 const NetworkDeviceManagementView = () => {
     const { setSnackbar } = useAppContext();
@@ -202,21 +204,37 @@ const NetworkDeviceManagementView = () => {
     };
 
     const [testingId, setTestingId] = useState(null);
+    // Same supersession guard as handleCheckNow's isCurrent above -- testingId
+    // is a scalar shared across every row's spinner, so a second Test
+    // Connection click (on this row or another) before the first call
+    // resolves must not let the first call's `finally` clear the second's
+    // still-in-flight spinner.
+    const testSeqRef = useRef({});
+    const activeTestDeviceIdRef = useRef(null);
 
     const handleTestConnection = async (device) => {
+        const seq = (testSeqRef.current[device.id] || 0) + 1;
+        testSeqRef.current[device.id] = seq;
+        activeTestDeviceIdRef.current = device.id;
+        const isCurrent = () => activeTestDeviceIdRef.current === device.id
+            && testSeqRef.current[device.id] === seq;
+
         setTestingId(device.id);
         try {
             const { data } = await apiService.testNetworkDeviceConnection(device.id);
+            // Safe regardless of supersession, same reasoning as
+            // handleCheckNow's setDevices above.
+            if (data.ok) loadDevices();
+            if (!isCurrent()) return;
             setSnackbar({
                 open: true,
                 message: data.ok ? 'Connection test queued.' : data.message,
                 severity: data.ok ? 'success' : 'error',
             });
-            if (data.ok) loadDevices();
         } catch (err) {
-            setSnackbar({ open: true, message: err.response?.data?.error || 'Connection test failed', severity: 'error' });
+            if (isCurrent()) setSnackbar({ open: true, message: err.response?.data?.error || 'Connection test failed', severity: 'error' });
         } finally {
-            setTestingId(null);
+            if (isCurrent()) setTestingId(null);
         }
     };
 

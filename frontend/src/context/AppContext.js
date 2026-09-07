@@ -140,9 +140,12 @@ const rawApiService = {
     suspendCustomerNetwork: (customerId) => api.post(`/customers/${customerId}/network-suspend`),
     unsuspendCustomerNetwork: (customerId) => api.post(`/customers/${customerId}/network-unsuspend`),
 
-    // Network Device API methods (device-health monitoring, independent of
-    // MikrotikServer/PPPoE -- see
-    // docs/superpowers/specs/2026-09-01-network-device-health-monitoring-design.md)
+    // Network Device API methods (CRUD + device-health monitoring). These
+    // operate on the same NetworkDevice rows as the router/PPPoE actions
+    // just above -- the two models were consolidated, see
+    // docs/superpowers/specs/2026-09-07-mikrotik-device-consolidation-design.md
+    // -- and docs/superpowers/specs/2026-09-01-network-device-health-monitoring-design.md
+    // for the health-monitoring side itself.
     fetchNetworkDevices: () => api.get('/network-devices'),
     addNetworkDevice: (data) => api.post('/network-devices', data),
     updateNetworkDevice: (id, data) => api.put(`/network-devices/${id}`, data),
