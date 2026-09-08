@@ -81,11 +81,18 @@ def test_job_defaults_to_pending_and_serializes(app, client):
         assert data["error"] is None
 
 
-def test_the_six_relayed_operations_are_read_only(app, client):
-    """set_secret_enabled writes to the CCR and must never be relayable."""
+def test_the_relayed_operations_are_six_reads_plus_two_named_writes(app, client):
+    """suspend_secret/unsuspend_secret were added by the writes cycle -- see
+    docs/superpowers/specs/2026-09-08-relay-pppoe-writes-design.md. This
+    superseded the original design's "read only" invariant (this test used to
+    assert exactly the six reads and nothing else); what still holds is that
+    the raw set_secret_enabled primitive is never itself a relayable
+    operation name -- writes are only reachable through the two named,
+    agent-validated operations, never a parameter on a generic setter."""
     assert appmod.AGENT_OPERATIONS == (
         "test_connection", "device_health", "secret_status",
         "active_session", "olt_status", "cpe_locations",
+        "suspend_secret", "unsuspend_secret",
     )
     assert "set_secret_enabled" not in appmod.AGENT_OPERATIONS
 

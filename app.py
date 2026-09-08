@@ -373,13 +373,15 @@ class NetworkDevice(db.Model):
             'interface_labels': self.interface_labels or {},
         }
 
-# The only operations the agent will ever relay. All six are reads.
-# mikrotik.set_secret_enabled is deliberately absent: it disables a customer's
-# PPPoE secret, and a cloud compromise must not be able to disconnect anyone.
-# See docs/superpowers/specs/2026-09-04-network-agent-layer-2-design.md.
+# What the agent will relay. Six reads, plus two PPPoE writes added in the
+# writes cycle -- see docs/superpowers/specs/2026-09-08-relay-pppoe-writes-design.md.
+# The writes are capped on the agent's own side (max_suspends_per_hour in
+# agent.toml), because relaying them hands the cloud a disconnect primitive it
+# deliberately did not have. Suspends are capped; unsuspends are not.
 AGENT_OPERATIONS = (
     'test_connection', 'device_health', 'secret_status',
     'active_session', 'olt_status', 'cpe_locations',
+    'suspend_secret', 'unsuspend_secret',
 )
 
 # Which operations each kind of device can actually answer. NETWORK_DEVICE_TYPES
@@ -390,8 +392,45 @@ AGENT_OPERATIONS = (
 DEVICE_TYPE_OPERATIONS = {
     'vsol_olt': ('olt_status', 'cpe_locations'),
     'mikrotik_ccr': ('device_health', 'test_connection',
-                     'secret_status', 'active_session'),
+                     'secret_status', 'active_session',
+                     'suspend_secret', 'unsuspend_secret'),
 }
+
+# An agent older than this cannot perform a write at all -- its
+# ALLOWED_OPERATIONS predates suspend_secret/unsuspend_secret, so it would
+# refuse the job. Checking here means the user is told to update their agent,
+# instead of clicking Suspend and waiting for a refusal from the box.
+MIN_AGENT_VERSION_FOR_WRITES = (1, 3, 0)
+
+
+def _parse_agent_version(raw):
+    """'1.3.0' -> (1, 3, 0). None for anything this cannot read confidently.
+
+    Deliberately strict: exactly three integer parts, nothing else. An agent
+    whose version we cannot parse is treated as too old rather than given the
+    benefit of the doubt, because the failure mode of guessing wrong is a
+    queued job that will be refused on the box with no explanation.
+    """
+    parts = (raw or '').strip().split('.')
+    if len(parts) != 3:
+        return None
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError:
+        return None
+
+
+def _agent_can_write(agent):
+    """(True, None) if this agent can perform a relayed write, else
+    (False, message). Accepts None for 'no agent registered'."""
+    version = _parse_agent_version(getattr(agent, 'agent_version', None)) if agent else None
+    if version is None or version < MIN_AGENT_VERSION_FOR_WRITES:
+        return False, (
+            'Update your on-prem agent to {} or newer to use this action. '
+            'Copy the current agent files onto your agent machine and '
+            'restart it, then try again.'.format(
+                '.'.join(str(part) for part in MIN_AGENT_VERSION_FOR_WRITES)))
+    return True, None
 
 # Suspend/unsuspend write to the router, and the agent deliberately does not
 # relay writes: mikrotik.set_secret_enabled is absent from its ALLOWED_OPERATIONS
