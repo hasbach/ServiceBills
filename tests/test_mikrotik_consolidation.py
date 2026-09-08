@@ -601,7 +601,17 @@ def test_suspend_still_works_in_direct_mode(app, client, monkeypatch):
 
 def test_payment_restore_skips_in_agent_mode(app, client, monkeypatch):
     """Runs after every settling payment, so a burned timeout here is a tax on
-    the billing path, not just on one click."""
+    the billing path, not just on one click.
+
+    No NetworkAgent is registered for this tenant, so _agent_can_write(None)
+    refuses the restore the same way it refuses a too-old one -- see
+    test_suspend_refuses_in_agent_mode_without_touching_the_router above. The
+    restore must still return before ever touching the connector; only the
+    shape of what it returns changed (a reason, not a bare None) once the
+    agent-mode branch grew a version gate instead of an unconditional skip.
+    tests/test_relay_writes.py's test_the_payment_restore_queues_without_
+    blocking_in_agent_mode covers the sibling case where a current agent IS
+    registered and the restore actually queues a job."""
     called = []
     monkeypatch.setattr(appmod.mikrotik, "get_secret_status",
                         lambda *a, **k: called.append(a) or (True, "disabled"))
@@ -636,7 +646,9 @@ def test_payment_restore_skips_in_agent_mode(app, client, monkeypatch):
         with app.test_request_context(headers={"Authorization": f"Bearer {token}"}):
             verify_jwt_in_request()
             result = appmod._maybe_restore_mikrotik_access(customer)
-    assert result is None
+    assert result["attempted"] is False
+    assert result["ok"] is False
+    assert "1.3.0" in result["message"], "no agent registered reads as too old to write"
     assert called == []
     assert write_called == [], (
         "the agent-mode guard must return before set_secret_enabled is ever "

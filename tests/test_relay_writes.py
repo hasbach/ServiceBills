@@ -493,3 +493,76 @@ def test_the_payment_restore_still_checks_status_first_in_direct_mode(app, clien
             result = appmod._maybe_restore_mikrotik_access(customer)
         assert result is None
     assert wrote == [], "an already-enabled secret needs no write in direct mode"
+
+
+def test_suspend_snapshots_the_requesting_username(app, client, monkeypatch):
+    """requested_by_username is a column Task 3 added after this plan was
+    written -- the brief's _record_write_audit predates it and does not set
+    it. It must come from the same resolved user as requested_by_user_id: a
+    snapshot that stays NULL forever would look like accountability while
+    providing none. See NetworkWriteAudit.requested_by_username and
+    test_deleting_the_user_nulls_the_id_but_the_username_survives_under_real_fk_enforcement
+    above for why the snapshot exists; this proves the write path actually
+    fills it in, not just that the column exists."""
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda d, u, enabled: (True, "disabled"))
+    hdr = _admin(client, "Wr H", "wr_h_admin")
+    device_id = make_device(app, "Wr H")
+    customer_id = _linked_customer(app, "Wr H", device_id)
+
+    r = client.post("/api/customers/{}/network-suspend".format(customer_id), headers=hdr)
+    assert r.status_code == 200
+
+    with app.app_context():
+        row = appmod.NetworkWriteAudit.query.filter_by(customer_id=customer_id).one()
+        assert row.requested_by_user_id is not None
+        assert row.requested_by_username == "wr_h_admin"
+
+
+def test_suspend_snapshots_the_requesting_username_in_agent_mode(app, client, monkeypatch):
+    """Mirrors test_suspend_snapshots_the_requesting_username for the queued
+    (agent-mode) branch of _perform_customer_write -- a separate
+    _record_write_audit call site that must not be missed."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr I", "wr_i_admin")
+    device_id = make_device(app, "Wr I")
+    customer_id = _linked_customer(app, "Wr I", device_id)
+    _set_agent_mode(app, "Wr I")
+    _set_agent_version(app, "Wr I", "1.3.0")
+
+    r = client.post("/api/customers/{}/network-suspend".format(customer_id), headers=hdr)
+    assert r.status_code == 200
+
+    with app.app_context():
+        row = appmod.NetworkWriteAudit.query.filter_by(customer_id=customer_id).one()
+        assert row.requested_by_user_id is not None
+        assert row.requested_by_username == "wr_i_admin"
+
+
+def test_the_automatic_restore_never_snapshots_a_username(app, client, monkeypatch):
+    """The flip side of the two tests above: the automatic, payment-triggered
+    restore has no acting user, and requested_by_username must stay NULL
+    exactly when requested_by_user_id does -- never populated from something
+    else (e.g. the agent, or the last staff member to touch the customer).
+    test_the_payment_restore_queues_without_blocking_in_agent_mode above
+    already checks requested_by_user_id is None for the agent-mode queue path;
+    this is the direct-mode counterpart, and both check the username too."""
+    monkeypatch.setattr(appmod.mikrotik, "get_secret_status", lambda d, u: (True, "disabled"))
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda d, u, enabled: (True, "disabled"))
+    _admin(client, "Wr J", "wr_j_admin")
+    device_id = make_device(app, "Wr J")
+    customer_id = _linked_customer(app, "Wr J", device_id)
+
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Wr J").first()
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        token = create_access_token(identity="wr_j_admin",
+                                    additional_claims={"tenant_id": tenant.id})
+        with app.test_request_context(headers={"Authorization": f"Bearer {token}"}):
+            verify_jwt_in_request()
+            result = appmod._maybe_restore_mikrotik_access(customer)
+        assert result["ok"] is True
+        row = appmod.NetworkWriteAudit.query.filter_by(customer_id=customer_id).one()
+        assert row.requested_by_user_id is None
+        assert row.requested_by_username is None, "nobody clicked it"

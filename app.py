@@ -4446,21 +4446,36 @@ def _maybe_restore_mikrotik_access(customer):
     fold into its response if useful, or None if there was nothing to do."""
     if not customer.network_device_id:
         return None
-    if _tenant_access_mode() == 'agent':
-        # Re-enabling is a write, which the agent does not relay. Skip before
-        # opening anything: this runs after every settling payment, so a
-        # timeout here would tax the billing path on every transaction.
-        return None
     try:
         device = tenant_query(NetworkDevice).filter_by(id=customer.network_device_id).first()
         if not device or not customer.pppoe_username:
             return None
+        if _tenant_access_mode() == 'agent':
+            # Deliberately does NOT read secret_status first, unlike direct
+            # mode below. This runs after every settling payment on a single
+            # synchronous worker, and the read would cost a second agent round
+            # trip on the billing path. Re-enabling an already-enabled secret
+            # is a no-op on RouterOS, so the pointless write is the cheaper of
+            # the two. requested_by_user_id stays null -- nobody clicked this.
+            allowed, why = _agent_can_write(tenant_query(NetworkAgent).first())
+            if not allowed:
+                return {'attempted': False, 'ok': False, 'message': why}
+            job, error = _create_device_job(
+                device, 'unsuspend_secret', {'pppoe_username': customer.pppoe_username})
+            if error:
+                return {'attempted': False, 'ok': False, 'message': error}
+            _record_write_audit(customer, device, 'unsuspend', 'queued', job_id=job.id)
+            db.session.commit()
+            return {'attempted': True, 'queued': True, 'ok': True, 'message': None}
         ok, status = mikrotik.get_secret_status(device, customer.pppoe_username)
         if not ok:
             return {'attempted': True, 'ok': False, 'message': status}
         if status != 'disabled':
             return None  # already enabled (or not_found) -- nothing to restore
         ok, message = mikrotik.set_secret_enabled(device, customer.pppoe_username, True)
+        _record_write_audit(customer, device, 'unsuspend', 'ok' if ok else 'failed',
+                            message=message)
+        db.session.commit()
         return {'attempted': True, 'ok': ok, 'message': message}
     except Exception as e:
         logging.error(f"Mikrotik re-enable check failed for customer {customer.id}: {e}")
@@ -10037,6 +10052,14 @@ def agent_post_result(job_id):
     else:
         job.result = None
         job.error = data.get('error') or 'The agent reported a failure'
+    # Close out the audit row for a relayed write. The job row itself will be
+    # pruned; this is the record that lasts.
+    if job.operation in ('suspend_secret', 'unsuspend_secret'):
+        audit = NetworkWriteAudit.query.filter_by(job_id=job.id).first()
+        if audit is not None:
+            audit.outcome = 'ok' if job.error is None else 'failed'
+            audit.message = job.error if job.error else (
+                job.result if isinstance(job.result, str) else None)
     db.session.commit()
     return jsonify({'message': 'Recorded'}), 200
 
