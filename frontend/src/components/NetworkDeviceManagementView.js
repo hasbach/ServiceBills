@@ -18,6 +18,23 @@ import pollNetworkJob from './pollNetworkJob';
 import { STATUS_COLOR, STATUS_LABEL, NOT_CHECKED } from './deviceStatus';
 import { formatStamp } from './formatStamp';
 
+// Exported for testing: given the job pollNetworkJob resolved for a Test
+// Connection request, what the toast should say. The initial POST's
+// `data.ok` only means _create_device_job accepted the work -- in direct
+// mode the connector has already run inline by then and any failure sits on
+// job.error, so reporting `data.ok` itself as pass/fail (the reviewed bug)
+// put a green "Connection test queued." toast next to a row that had just
+// flipped to Auth Failed. job.error is the actual pass/fail signal. Pulled
+// out to a named function so this mapping can be pinned by a test without
+// mounting the component -- this repo has no @testing-library/react
+// anywhere in it (see App.test.js).
+export function describeTestConnectionJob(job) {
+    return {
+        message: job.error || 'Connection OK',
+        severity: job.error ? 'error' : 'success',
+    };
+}
+
 // A network device the tenant owns (starting with a core CCR), monitored for
 // RouterOS-level health. Mikrotik rows here are the same NetworkDevice a
 // customer links to for local PPPoE secret management from Subscriptions --
@@ -222,15 +239,28 @@ const NetworkDeviceManagementView = () => {
         setTestingId(device.id);
         try {
             const { data } = await apiService.testNetworkDeviceConnection(device.id);
-            // Safe regardless of supersession, same reasoning as
+            const { ok, message, job_id, device: updatedDevice } = data;
+            // Keyed by device id already, so this is safe to apply
+            // regardless of which check is "current" -- it can never
+            // clobber another device's row. Same reasoning as
             // handleCheckNow's setDevices above.
-            if (data.ok) loadDevices();
+            setDevices(prev => prev.map(d => d.id === device.id ? updatedDevice : d));
+            if (!ok) {
+                // _create_device_job itself refused the work (e.g. agent
+                // offline) -- there's no job to poll.
+                if (isCurrent()) setSnackbar({ open: true, message, severity: 'error' });
+                return;
+            }
+            const job = await pollNetworkJob(job_id);
             if (!isCurrent()) return;
-            setSnackbar({
-                open: true,
-                message: data.ok ? 'Connection test queued.' : data.message,
-                severity: data.ok ? 'success' : 'error',
-            });
+            setSnackbar({ open: true, ...describeTestConnectionJob(job) });
+            // Only after the job resolves: in direct mode the device row's
+            // last_status is already committed by the time the job goes
+            // 'done', and in agent mode only once the agent posts its
+            // result -- refreshing against the pre-test response (as
+            // before) meant agent mode showed stale data with the real
+            // answer invisible until the page was re-navigated.
+            loadDevices();
         } catch (err) {
             if (isCurrent()) setSnackbar({ open: true, message: err.response?.data?.error || 'Connection test failed', severity: 'error' });
         } finally {

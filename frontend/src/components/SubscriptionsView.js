@@ -284,6 +284,20 @@ const SubscriptionsView = ({
     const [mikrotikActionLoading, setMikrotikActionLoading] = useState(false);
     const [upstreamSyncStatus, setUpstreamSyncStatus] = useState(null);
     const [upstreamSyncLoading, setUpstreamSyncLoading] = useState(false);
+    // Same supersession guard as NetworkDeviceManagementView's handleCheckNow/
+    // handleTestConnection: mikrotikStatus/mikrotikStatusLoading are scalars
+    // shared by whichever single customer's edit dialog is open, and
+    // fetchNetworkStatus's poll can run for up to ~15s in agent mode -- long
+    // enough to outlive the dialog it started in (closed, or reopened for a
+    // different customer) or to overlap a second Refresh click on the same
+    // customer. activeNetworkStatusCustomerIdRef is the customer the shared
+    // state currently belongs to; it's set to null (not just left stale)
+    // whenever the panel itself is reset below, so a poll still resolving
+    // from before that reset can't repaint over it. networkStatusSeqRef lets
+    // a newer poll for the SAME customer supersede an older one still in
+    // flight, same idea as checkSeqRef there.
+    const networkStatusSeqRef = React.useRef({});
+    const activeNetworkStatusCustomerIdRef = React.useRef(null);
 
     useEffect(() => {
         apiService.fetchResellers().then(res => setResellers(res.data)).catch(err => console.error("Failed to load resellers", err));
@@ -639,6 +653,11 @@ const SubscriptionsView = ({
         if (editDialogOpen && editingCustomer?.network_device_id && editingCustomer?.pppoe_username) {
             fetchNetworkStatus(editingCustomer.id);
         } else {
+            // No poll owns the panel any more -- clearing the ref (not just
+            // the state) stops a poll still resolving for whatever customer
+            // was showing before from repainting over this null once it
+            // lands. See activeNetworkStatusCustomerIdRef's declaration above.
+            activeNetworkStatusCustomerIdRef.current = null;
             setMikrotikStatus(null);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -677,6 +696,15 @@ const SubscriptionsView = ({
     };
 
     const fetchNetworkStatus = async (customerId) => {
+        const seq = (networkStatusSeqRef.current[customerId] || 0) + 1;
+        networkStatusSeqRef.current[customerId] = seq;
+        activeNetworkStatusCustomerIdRef.current = customerId;
+        // True only while no newer poll (for this customer or another) and no
+        // dialog-close/customer-switch has superseded this one -- see the
+        // refs' declaration above.
+        const isCurrent = () => activeNetworkStatusCustomerIdRef.current === customerId
+            && networkStatusSeqRef.current[customerId] === seq;
+
         setMikrotikStatusLoading(true);
         try {
             const { data } = await apiService.fetchCustomerNetworkStatus(customerId);
@@ -685,7 +713,7 @@ const SubscriptionsView = ({
                 // secret_error -- an absent active_session/session_error
                 // would otherwise render as though the session side were a
                 // current "Not connected" rather than genuinely unknown.
-                setMikrotikStatus({ secret_status: null, secret_error: data.message, active_session: null, session_error: null, pending: false });
+                if (isCurrent()) setMikrotikStatus({ secret_status: null, secret_error: data.message, active_session: null, session_error: null, pending: false });
                 return;
             }
             // Both jobs are already terminal in direct mode, so this usually
@@ -696,15 +724,16 @@ const SubscriptionsView = ({
                     apiService.fetchNetworkJob(data.jobs.secret),
                     apiService.fetchNetworkJob(data.jobs.session),
                 ]);
+                if (!isCurrent()) return;
                 const merged = mergeNetworkStatus(secret.data, session.data);
                 setMikrotikStatus(merged);
                 if (!merged.pending) return;
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
         } catch (err) {
-            setMikrotikStatus({ secret_status: null, secret_error: err.response?.data?.error || 'Status check failed', active_session: null, session_error: null, pending: false });
+            if (isCurrent()) setMikrotikStatus({ secret_status: null, secret_error: err.response?.data?.error || 'Status check failed', active_session: null, session_error: null, pending: false });
         } finally {
-            setMikrotikStatusLoading(false);
+            if (isCurrent()) setMikrotikStatusLoading(false);
         }
     };
 
