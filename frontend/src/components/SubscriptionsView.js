@@ -65,6 +65,7 @@ import {
 import { useAppContext } from '../context/AppContext.js';
 import { formatStamp } from './formatStamp';
 import { mergeNetworkStatus } from './mergeNetworkStatus';
+import pollNetworkJob from './pollNetworkJob';
 
 // Whether the Network Status panel should show the finished-state chips.
 // mergeNetworkStatus's `pending` flag stays true until BOTH the secret_status
@@ -756,21 +757,33 @@ const SubscriptionsView = ({
         try {
             const call = action === 'suspend' ? apiService.suspendCustomerNetwork : apiService.unsuspendCustomerNetwork;
             const { data } = await call(customerId);
-            // Both routes return HTTP 200 only when ok is true -- the 501
-            // agent-mode refusal and a 502 connector failure are both
-            // non-2xx and land in the catch below instead, so `data.ok` is
-            // always true by the time we get here. The old `data.ok ?
-            // 'success' : 'warning'` had a 'warning' branch that could
-            // never actually run.
-            setSnackbar({ open: true, message: data.message, severity: 'success' });
-            if (data.ok) await fetchNetworkStatus(customerId);
+            if (!data.ok) {
+                // A refusal the backend chose to return as 200: an agent too
+                // old to perform writes, or a job it declined to create. The
+                // message says which.
+                setSnackbar({ open: true, message: data.message, severity: 'warning' });
+                return;
+            }
+            if (data.job_id) {
+                // Agent mode: the router has not been touched yet. Wait for the
+                // box to report, so the toast describes what actually happened
+                // rather than that we asked.
+                const job = await pollNetworkJob(data.job_id);
+                setSnackbar({
+                    open: true,
+                    message: job.error || `Customer ${action}ed.`,
+                    severity: job.error ? 'error' : 'success',
+                });
+            } else {
+                setSnackbar({ open: true, message: data.message, severity: 'success' });
+            }
+            await fetchNetworkStatus(customerId);
         } catch (err) {
-            // Covers both the 501 refusal (agent mode doesn't support this
-            // write) and a genuine 502 connector failure. Deliberately the
-            // same severity for both: either way the action did not happen,
-            // and the message itself (AGENT_WRITE_UNSUPPORTED_MESSAGE, or
-            // the connector's own error) already says which one it was.
-            setSnackbar({ open: true, message: err.response?.data?.message || `Failed to ${action} connection`, severity: 'error' });
+            setSnackbar({
+                open: true,
+                message: err.response?.data?.message || `Failed to ${action} connection`,
+                severity: 'error',
+            });
         } finally {
             setMikrotikActionLoading(false);
         }
