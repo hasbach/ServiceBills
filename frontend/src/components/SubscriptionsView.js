@@ -282,7 +282,12 @@ const SubscriptionsView = ({
     // Network-status panel (Concept B -- see docs/superpowers/specs/2026-08-12-network-enforcement-design.md)
     const [mikrotikStatus, setMikrotikStatus] = useState(null);
     const [mikrotikStatusLoading, setMikrotikStatusLoading] = useState(false);
-    const [mikrotikActionLoading, setMikrotikActionLoading] = useState(false);
+    // Which customer currently has a suspend/unsuspend in flight, or null.
+    // Deliberately not a bare boolean: a relayed write waits on the agent for
+    // seconds (up to pollNetworkJob's ceiling), and a shared flag would leave
+    // a DIFFERENT customer's buttons disabled for the duration -- reachable
+    // by suspending one customer, closing the dialog, and opening another.
+    const [mikrotikActionCustomerId, setMikrotikActionCustomerId] = useState(null);
     const [upstreamSyncStatus, setUpstreamSyncStatus] = useState(null);
     const [upstreamSyncLoading, setUpstreamSyncLoading] = useState(false);
     // Same supersession guard as NetworkDeviceManagementView's handleCheckNow/
@@ -753,7 +758,11 @@ const SubscriptionsView = ({
     };
 
     const handleNetworkAction = async (customerId, action) => {
-        setMikrotikActionLoading(true);
+        setMikrotikActionCustomerId(customerId);
+        // The panel still belongs to this customer only while the ref does --
+        // fetchNetworkStatus sets it, and the dialog reset nulls it. See
+        // activeNetworkStatusCustomerIdRef's declaration.
+        const isCurrent = () => activeNetworkStatusCustomerIdRef.current === customerId;
         try {
             const call = action === 'suspend' ? apiService.suspendCustomerNetwork : apiService.unsuspendCustomerNetwork;
             const { data } = await call(customerId);
@@ -777,7 +786,14 @@ const SubscriptionsView = ({
             } else {
                 setSnackbar({ open: true, message: data.message, severity: 'success' });
             }
-            await fetchNetworkStatus(customerId);
+            // Guarded, unlike the snackbar above: fetchNetworkStatus takes
+            // ownership of the shared panel state, so calling it for a dialog
+            // the user has since closed or replaced would repaint THIS
+            // customer's chips into whichever customer is on screen now --
+            // and re-enable the buttons beside them. The toast is deliberately
+            // left unguarded: a global message about an action you took is
+            // still worth seeing after you close the dialog.
+            if (isCurrent()) await fetchNetworkStatus(customerId);
         } catch (err) {
             setSnackbar({
                 open: true,
@@ -785,7 +801,10 @@ const SubscriptionsView = ({
                 severity: 'error',
             });
         } finally {
-            setMikrotikActionLoading(false);
+            // Functional update: a newer action for a different customer may
+            // have started while this one was polling, and clearing
+            // unconditionally would unlock ITS buttons early.
+            setMikrotikActionCustomerId(prev => (prev === customerId ? null : prev));
         }
     };
 
@@ -1489,11 +1508,11 @@ const SubscriptionsView = ({
                                                 variant="outlined"
                                                 label={mikrotikStatus.active_session ? 'Currently connected' : 'Not connected'}
                                             />
-                                            <Button size="small" variant="outlined" color="error" disabled={mikrotikActionLoading}
+                                            <Button size="small" variant="outlined" color="error" disabled={mikrotikActionCustomerId === editingCustomer?.id}
                                                 onClick={() => handleNetworkAction(editingCustomer.id, 'suspend')}>
                                                 Suspend
                                             </Button>
-                                            <Button size="small" variant="outlined" color="success" disabled={mikrotikActionLoading}
+                                            <Button size="small" variant="outlined" color="success" disabled={mikrotikActionCustomerId === editingCustomer?.id}
                                                 onClick={() => handleNetworkAction(editingCustomer.id, 'unsuspend')}>
                                                 Unsuspend
                                             </Button>
