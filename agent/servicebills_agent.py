@@ -366,10 +366,22 @@ def execute_job(job, config):
                         None)
             logger.info("WRITE suspend %r", username)
             ok, value = mikrotik.set_secret_enabled(server, username, False)
-        else:  # unsuspend_secret -- the only remaining allowed operation
+        elif operation == "unsuspend_secret":
             username = params.get("pppoe_username")
             logger.info("WRITE unsuspend %r", username)
             ok, value = mikrotik.set_secret_enabled(server, username, True)
+        else:
+            # Deliberately not a catch-all `else` performing unsuspend. That
+            # idiom was safe only while the fallback was active_session, a
+            # read; the fallback is now a WRITE, so any operation ever added
+            # to ALLOWED_OPERATIONS without a matching elif here would
+            # otherwise silently unsuspend whichever customer's username
+            # happens to be in the job's params. validate_job's allowlist
+            # gate already makes this branch unreachable today, but in a
+            # file whose whole design is explicit allowlisting, the default
+            # for an unmatched operation must be to do nothing.
+            return (False, None,
+                    "Unhandled operation {!r}".format(operation), None)
     except Exception as exc:  # noqa: BLE001 -- a bad job must not kill the loop
         # Never logger.exception here: the frame locals hold the device
         # credential, and a traceback in the log file would expose it.

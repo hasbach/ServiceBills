@@ -628,6 +628,47 @@ def test_a_rate_limited_suspend_never_reaches_the_router(monkeypatch):
     assert called == [], "the connector must not be reached once the cap is hit"
 
 
+def test_a_suspend_that_fails_at_the_router_still_consumes_a_slot(monkeypatch):
+    """Locks in that the counter increments on an ADMITTED attempt, not a
+    successful one. Every other test in this file stubs set_secret_enabled to
+    return (True, "ok"), so admitted and successful are indistinguishable
+    across the whole suite -- an implementation that appended to the deque
+    only on success would pass all of them. Counting successes would let a
+    compromised cloud probe for free forever: a bad username, here, costs it
+    nothing and the cap would never bite. This test makes the connector fail
+    so the two cases separate."""
+    agent._recent_suspends.clear()
+    monkeypatch.setattr(agent.mikrotik, "set_secret_enabled",
+                        lambda s, u, enabled: (False, "no such secret"))
+    config = dict(CONFIG, max_suspends_per_hour=1)
+    suspend = job(operation="suspend_secret", params={"pppoe_username": "nope"})
+
+    agent.execute_job(suspend, config)              # admitted, fails at the router
+    ok, _, error, _ = agent.execute_job(suspend, config)
+
+    assert ok is False and "rate limit" in error.lower()
+
+
+def test_a_suspend_whose_connector_raises_still_consumes_a_slot(monkeypatch):
+    """Same regression as the test above, through execute_job's try/except
+    instead of a returned failure. A connector that raises is not exotic here
+    -- a router that is powered off does exactly that -- and the slot must
+    still be spent so the cap still bites on the very next attempt."""
+    agent._recent_suspends.clear()
+
+    def boom(server, username, enabled):
+        raise RuntimeError("no route to host")
+
+    monkeypatch.setattr(agent.mikrotik, "set_secret_enabled", boom)
+    config = dict(CONFIG, max_suspends_per_hour=1)
+    suspend = job(operation="suspend_secret", params={"pppoe_username": "nope"})
+
+    agent.execute_job(suspend, config)              # admitted, raises at the router
+    ok, _, error, _ = agent.execute_job(suspend, config)
+
+    assert ok is False and "rate limit" in error.lower()
+
+
 def test_both_write_operations_are_permitted_and_dispatch_correctly(monkeypatch):
     agent._recent_suspends.clear()
     seen = []
@@ -640,6 +681,32 @@ def test_both_write_operations_are_permitted_and_dispatch_correctly(monkeypatch)
     agent.execute_job(job(operation="unsuspend_secret",
                           params={"pppoe_username": "bach1"}), config)
     assert seen == [("bach1", False), ("bach1", True)]
+
+
+def test_an_operation_reaching_dispatch_without_an_elif_is_refused_not_defaulted(monkeypatch):
+    """Deliberately bypasses the allowlist gate in validate_job by adding a
+    fake name to ALLOWED_OPERATIONS -- that is the honest way to reach
+    execute_job's dispatch chain with an operation none of its elif branches
+    match, since the gate itself already refuses anything it doesn't
+    recognise. This is testing the defence BEHIND the gate, not the gate:
+    the dispatch chain's terminal else must refuse and touch no connector,
+    not fall through to the last branch in the chain (which performs
+    set_secret_enabled(..., True) -- unsuspending whichever customer's
+    username happens to be in the job's params) the way an unconditional
+    `else: # unsuspend_secret` once did."""
+    monkeypatch.setattr(agent, "ALLOWED_OPERATIONS",
+                        agent.ALLOWED_OPERATIONS + ("mystery_operation",))
+    called = []
+    monkeypatch.setattr(agent.mikrotik, "set_secret_enabled",
+                        lambda s, u, enabled: called.append((u, enabled)) or (True, "ok"))
+
+    ok, result, error, status = agent.execute_job(
+        job(operation="mystery_operation", params={"pppoe_username": "bach1"}),
+        CONFIG)
+
+    assert ok is False
+    assert "mystery_operation" in error
+    assert called == []
 
 
 def test_the_cap_defaults_when_absent_or_unparseable():
