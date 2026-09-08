@@ -62,7 +62,7 @@ The whole agent-side change, in one hand-copy. Independently testable with no cl
 Append to `tests/test_network_agent_program.py`:
 
 ```python
-def test_the_suspend_window_admits_up_to_the_cap(monkeypatch):
+def test_the_suspend_window_admits_up_to_the_cap():
     """The cap is the whole compensating control for relaying writes, so it is
     tested against an injected clock rather than a sleep."""
     agent._recent_suspends.clear()
@@ -71,7 +71,7 @@ def test_the_suspend_window_admits_up_to_the_cap(monkeypatch):
         True, True, True, False, False]
 
 
-def test_the_window_rolls_forward(monkeypatch):
+def test_the_window_rolls_forward():
     agent._recent_suspends.clear()
     now = 1_000_000.0
     for i in range(3):
@@ -275,19 +275,15 @@ In `execute_job`, replace the final `else` branch of the dispatch chain:
             ok, value = mikrotik.get_active_session(server, params.get("pppoe_username"))
         elif operation == "suspend_secret":
             username = params.get("pppoe_username")
-            if not _claim_suspend_slot(config.get("max_suspends_per_hour",
-                                                  MAX_SUSPENDS_PER_HOUR_DEFAULT)):
+            cap = config.get("max_suspends_per_hour", MAX_SUSPENDS_PER_HOUR_DEFAULT)
+            if not _claim_suspend_slot(cap):
                 logger.warning(
                     "REFUSED suspend of %r: rate limit of %s per hour reached. "
                     "If this was you, wait for the window to roll; if it was not, "
-                    "the cloud may be compromised.",
-                    username, config.get("max_suspends_per_hour",
-                                         MAX_SUSPENDS_PER_HOUR_DEFAULT))
+                    "the cloud may be compromised.", username, cap)
                 return (False, None,
                         "Refused by the on-prem agent: suspend rate limit of {} per "
-                        "hour reached.".format(
-                            config.get("max_suspends_per_hour",
-                                       MAX_SUSPENDS_PER_HOUR_DEFAULT)),
+                        "hour reached.".format(cap),
                         None)
             logger.info("WRITE suspend %r", username)
             ok, value = mikrotik.set_secret_enabled(server, username, False)
