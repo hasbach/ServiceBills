@@ -535,7 +535,15 @@ def _linked_customer(app, tenant_name, device_id):
 def test_suspend_refuses_in_agent_mode_without_touching_the_router(app, client, monkeypatch):
     """Today this would call the router from the cloud, find it unreachable and
     hang until the connector times out. A fast, honest refusal beats a
-    13-second timeout that looks like a network fault."""
+    13-second timeout that looks like a network fault.
+
+    Superseded in spirit by tests/test_relay_writes.py, which covers agent
+    mode with a *current* agent (queues a job) and with an *old* one (version
+    gate refuses). This one keeps its own, narrower case: agent mode with NO
+    agent registered at all -- _agent_can_write(None) treats a missing agent
+    the same as a too-old one, and that path (never reaching _create_device_job)
+    is worth its own regression net. The write must never happen inline
+    regardless of which refusal reason applies."""
     called = []
     monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
                         lambda *a, **k: called.append(a) or (True, "ok"))
@@ -546,13 +554,21 @@ def test_suspend_refuses_in_agent_mode_without_touching_the_router(app, client, 
 
     r = client.post("/api/customers/{}/network-suspend".format(customer_id),
                     headers=hdr)
-    assert r.status_code == 501
-    assert r.get_json()["ok"] is False
-    assert "direct connection" in r.get_json()["message"]
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is False
+    assert body["job_id"] is None
+    assert "1.3.0" in body["message"], "no agent registered reads as too old to write"
     assert called == [], "the connector must not be reached at all"
+
+    with app.app_context():
+        assert appmod.NetworkAgentJob.query.count() == 0
+        assert appmod.NetworkWriteAudit.query.count() == 0
 
 
 def test_unsuspend_refuses_in_agent_mode(app, client, monkeypatch):
+    """Mirrors test_suspend_refuses_in_agent_mode_without_touching_the_router
+    for unsuspend -- see its docstring."""
     called = []
     monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
                         lambda *a, **k: called.append(a) or (True, "ok"))
@@ -563,7 +579,10 @@ def test_unsuspend_refuses_in_agent_mode(app, client, monkeypatch):
 
     r = client.post("/api/customers/{}/network-unsuspend".format(customer_id),
                     headers=hdr)
-    assert r.status_code == 501
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is False
+    assert body["job_id"] is None
     assert called == []
 
 

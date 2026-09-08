@@ -10,8 +10,11 @@ from datetime import datetime
 
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
+from flask_jwt_extended import create_access_token, verify_jwt_in_request
 
 import app as appmod
+from tests.test_mikrotik_consolidation import (
+    stub_connectors, make_device, _admin, _set_agent_mode, _linked_customer)
 
 
 def test_both_write_operations_are_relayable():
@@ -320,3 +323,173 @@ def test_the_audit_model_is_tenant_owned_and_deleted_first(app):
                    appmod.NetworkAgentJob):
         assert audit_at < order.index(parent), (
             "NetworkWriteAudit must be deleted before {}".format(parent.__name__))
+
+
+def _set_agent_version(app, tenant_name, version):
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name=tenant_name).first()
+        agent = appmod.NetworkAgent.query.filter_by(tenant_id=tenant.id).first()
+        if agent is None:
+            agent = appmod.NetworkAgent(tenant_id=tenant.id, name="Box", token_hash="x")
+            appmod.db.session.add(agent)
+        agent.agent_version = version
+        agent.last_seen_at = appmod.datetime.utcnow()
+        appmod.db.session.commit()
+
+
+def test_suspend_still_writes_inline_in_direct_mode(app, client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda d, u, enabled: calls.append((u, enabled)) or (True, "disabled"))
+    hdr = _admin(client, "Wr A", "wr_a_admin")
+    device_id = make_device(app, "Wr A")
+    customer_id = _linked_customer(app, "Wr A", device_id)
+
+    r = client.post("/api/customers/{}/network-suspend".format(customer_id), headers=hdr)
+    assert r.status_code == 200
+    assert r.get_json()["ok"] is True
+    assert calls == [("bach1", False)]
+
+    with app.app_context():
+        row = appmod.NetworkWriteAudit.query.filter_by(customer_id=customer_id).one()
+        assert (row.action, row.outcome, row.job_id) == ("suspend", "ok", None)
+
+
+def test_suspend_queues_a_job_in_agent_mode(app, client, monkeypatch):
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr B", "wr_b_admin")
+    device_id = make_device(app, "Wr B")
+    customer_id = _linked_customer(app, "Wr B", device_id)
+    _set_agent_mode(app, "Wr B")
+    _set_agent_version(app, "Wr B", "1.3.0")
+
+    r = client.post("/api/customers/{}/network-suspend".format(customer_id), headers=hdr)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True and body["job_id"] is not None
+
+    with app.app_context():
+        job = appmod.db.session.get(appmod.NetworkAgentJob, body["job_id"])
+        assert job.operation == "suspend_secret"
+        assert job.params == {"pppoe_username": "bach1"}
+        row = appmod.NetworkWriteAudit.query.filter_by(customer_id=customer_id).one()
+        assert (row.action, row.outcome, row.job_id) == ("suspend", "queued", job.id)
+
+
+def test_an_old_agent_is_refused_before_a_job_is_created(app, client, monkeypatch):
+    """Otherwise the user clicks Suspend, waits, and gets a refusal from the
+    box with no idea why."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr C", "wr_c_admin")
+    device_id = make_device(app, "Wr C")
+    customer_id = _linked_customer(app, "Wr C", device_id)
+    _set_agent_mode(app, "Wr C")
+    _set_agent_version(app, "Wr C", "1.2.0")
+
+    r = client.post("/api/customers/{}/network-suspend".format(customer_id), headers=hdr)
+    assert r.get_json()["ok"] is False
+    assert "1.3.0" in r.get_json()["message"]
+    with app.app_context():
+        assert appmod.NetworkAgentJob.query.count() == 0
+        assert appmod.NetworkWriteAudit.query.count() == 0
+
+
+def test_unsuspend_queues_the_unsuspend_operation(app, client, monkeypatch):
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr D", "wr_d_admin")
+    device_id = make_device(app, "Wr D")
+    customer_id = _linked_customer(app, "Wr D", device_id)
+    _set_agent_mode(app, "Wr D")
+    _set_agent_version(app, "Wr D", "1.3.0")
+
+    r = client.post("/api/customers/{}/network-unsuspend".format(customer_id), headers=hdr)
+    job_id = r.get_json()["job_id"]
+    with app.app_context():
+        assert appmod.db.session.get(appmod.NetworkAgentJob, job_id).operation == "unsuspend_secret"
+        assert appmod.NetworkWriteAudit.query.one().action == "unsuspend"
+
+
+def test_the_audit_row_is_completed_when_the_agent_reports_back(app, client, monkeypatch):
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr E", "wr_e_admin")
+    device_id = make_device(app, "Wr E")
+    customer_id = _linked_customer(app, "Wr E", device_id)
+    _set_agent_mode(app, "Wr E")
+    _set_agent_version(app, "Wr E", "1.3.0")
+
+    job_id = client.post("/api/customers/{}/network-suspend".format(customer_id),
+                         headers=hdr).get_json()["job_id"]
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Wr E").first()
+        agent = appmod.NetworkAgent.query.filter_by(tenant_id=tenant.id).first()
+        token = appmod._issue_agent_token(agent)
+        job = appmod.db.session.get(appmod.NetworkAgentJob, job_id)
+        job.status = "claimed"
+        appmod.db.session.commit()
+
+    client.post("/api/agent/jobs/{}/result".format(job_id),
+                headers={"Authorization": "Bearer " + token},
+                json={"ok": True, "result": "disabled"})
+
+    with app.app_context():
+        row = appmod.NetworkWriteAudit.query.filter_by(job_id=job_id).one()
+        assert row.outcome == "ok"
+
+
+def test_the_payment_restore_queues_without_blocking_in_agent_mode(app, client, monkeypatch):
+    """Runs after every settling payment on a single synchronous worker, so it
+    must queue and return, never wait."""
+    stub_connectors(monkeypatch)
+    never = []
+    monkeypatch.setattr(appmod.mikrotik, "get_secret_status",
+                        lambda d, u: never.append(u) or (True, "disabled"))
+    _admin(client, "Wr F", "wr_f_admin")
+    device_id = make_device(app, "Wr F")
+    customer_id = _linked_customer(app, "Wr F", device_id)
+    _set_agent_mode(app, "Wr F")
+    _set_agent_version(app, "Wr F", "1.3.0")
+
+    with app.app_context():
+        # _maybe_restore_mikrotik_access calls _tenant_access_mode(), which --
+        # like every tenant_query call -- needs a verified JWT in scope
+        # (tenancy.current_tenant_id() reads get_jwt()). Same requirement,
+        # same fix, as test_payment_restore_skips_in_agent_mode in
+        # tests/test_mikrotik_consolidation.py: manufacture a verified-JWT
+        # request context rather than calling the bare function.
+        tenant = appmod.Tenant.query.filter_by(name="Wr F").first()
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        token = create_access_token(identity="wr_f_admin",
+                                    additional_claims={"tenant_id": tenant.id})
+        with app.test_request_context(headers={"Authorization": f"Bearer {token}"}):
+            verify_jwt_in_request()
+            result = appmod._maybe_restore_mikrotik_access(customer)
+        assert result is not None and result.get("queued") is True
+        job = appmod.NetworkAgentJob.query.filter_by(operation="unsuspend_secret").one()
+        assert job.params == {"pppoe_username": "bach1"}
+        row = appmod.NetworkWriteAudit.query.one()
+        assert row.requested_by_user_id is None, "nobody clicked it"
+    assert never == [], "agent mode must not spend a round trip reading status first"
+
+
+def test_the_payment_restore_still_checks_status_first_in_direct_mode(app, client, monkeypatch):
+    """The check avoids a pointless write, and in direct mode it costs nothing."""
+    monkeypatch.setattr(appmod.mikrotik, "get_secret_status", lambda d, u: (True, "enabled"))
+    wrote = []
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda d, u, enabled: wrote.append(u) or (True, "ok"))
+    _admin(client, "Wr G", "wr_g_admin")
+    device_id = make_device(app, "Wr G")
+    customer_id = _linked_customer(app, "Wr G", device_id)
+
+    with app.app_context():
+        # Same JWT-context requirement as the agent-mode test above -- direct
+        # mode's _tenant_access_mode() call needs it just as much.
+        tenant = appmod.Tenant.query.filter_by(name="Wr G").first()
+        customer = appmod.db.session.get(appmod.Customer, customer_id)
+        token = create_access_token(identity="wr_g_admin",
+                                    additional_claims={"tenant_id": tenant.id})
+        with app.test_request_context(headers={"Authorization": f"Bearer {token}"}):
+            verify_jwt_in_request()
+            result = appmod._maybe_restore_mikrotik_access(customer)
+        assert result is None
+    assert wrote == [], "an already-enabled secret needs no write in direct mode"

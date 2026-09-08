@@ -432,17 +432,6 @@ def _agent_can_write(agent):
                 '.'.join(str(part) for part in MIN_AGENT_VERSION_FOR_WRITES)))
     return True, None
 
-# Suspend/unsuspend write to the router, and the agent deliberately does not
-# relay writes: mikrotik.set_secret_enabled is absent from its ALLOWED_OPERATIONS
-# so that a compromised cloud can read the network but never disconnect anyone.
-# Until that gets its own design round, agent-mode tenants get an immediate,
-# honest refusal instead of a connection attempt from the cloud that can only
-# time out. See the spec's "Reads now, writes later".
-AGENT_WRITE_UNSUPPORTED_MESSAGE = (
-    'This action needs a direct connection to the router and is not yet '
-    'available through the on-prem agent.'
-)
-
 # An agent that hasn't polled within this window is treated as offline, and
 # jobs are refused rather than queued for something that will never run them.
 AGENT_ONLINE_WINDOW_SECONDS = 30
@@ -10189,6 +10178,35 @@ def _create_device_job(device, operation, params=None):
     return job, None
 
 
+def _record_write_audit(customer, device, action, outcome, message=None,
+                        job_id=None, user_id=None, username=None):
+    """Record one PPPoE write. Added to the session, not committed -- the
+    caller's own commit carries it, so the audit and the job land together or
+    not at all.
+
+    pppoe_username is copied in rather than looked up later: the audit must say
+    what was actually acted on even if the customer row is edited afterwards.
+
+    user_id/username must both come from the same resolved User row (or both
+    stay None for the automatic, nobody-clicked-it restore) -- username is the
+    snapshot that keeps "a human did this and their account was later deleted"
+    distinct from "no human was involved", once requested_by_user_id's own
+    ondelete='SET NULL' has fired. See NetworkWriteAudit.requested_by_username.
+    """
+    db.session.add(NetworkWriteAudit(
+        tenant_id=customer.tenant_id,
+        customer_id=customer.id,
+        network_device_id=device.id if device else None,
+        pppoe_username=customer.pppoe_username or '',
+        action=action,
+        requested_by_user_id=user_id,
+        requested_by_username=username,
+        job_id=job_id,
+        outcome=outcome,
+        message=message,
+    ))
+
+
 def _with_interface_labels(job, payload):
     """Merge staff-assigned interface labels onto a device_health job's result,
     at read time rather than write time. Labels are cloud-side data staff can
@@ -10696,29 +10714,55 @@ def get_customer_network_status(customer_id):
                     'jobs': {'secret': secret_job.id,
                              'session': session_job.id}}), 200
 
-@app.route('/api/customers/<int:customer_id>/network-suspend', methods=['POST'])
-@jwt_required()
-def suspend_customer_network(customer_id):
+def _perform_customer_write(customer_id, action):
+    """Shared body of network-suspend and network-unsuspend.
+
+    Direct mode runs the connector inline and records a terminal audit row.
+    Agent mode queues the matching operation and records a 'queued' row that
+    agent_post_result completes. Both return the same shape so the frontend has
+    one code path.
+    """
     customer, device, err = _customer_network_context(customer_id)
     if err:
         return jsonify(err[0]), err[1]
-    if _tenant_access_mode() == 'agent':
-        return jsonify({'ok': False, 'message': AGENT_WRITE_UNSUPPORTED_MESSAGE}), 501
 
-    ok, message = mikrotik.set_secret_enabled(device, customer.pppoe_username, False)
-    return jsonify({'ok': ok, 'message': message}), (200 if ok else 502)
+    enable = action == 'unsuspend'
+    operation = 'unsuspend_secret' if enable else 'suspend_secret'
+    username = get_jwt_identity()
+    user = User.query.filter_by(username=username).first() if username else None
+    user_id = user.id if user else None
+    requester_name = user.username if user else None
+
+    if _tenant_access_mode() == 'agent':
+        allowed, why = _agent_can_write(tenant_query(NetworkAgent).first())
+        if not allowed:
+            return jsonify({'ok': False, 'message': why, 'job_id': None}), 200
+        job, error = _create_device_job(
+            device, operation, {'pppoe_username': customer.pppoe_username})
+        if error:
+            return jsonify({'ok': False, 'message': error, 'job_id': None}), 200
+        _record_write_audit(customer, device, action, 'queued',
+                            job_id=job.id, user_id=user_id, username=requester_name)
+        db.session.commit()
+        return jsonify({'ok': True, 'message': None, 'job_id': job.id}), 200
+
+    ok, message = mikrotik.set_secret_enabled(device, customer.pppoe_username, enable)
+    _record_write_audit(customer, device, action, 'ok' if ok else 'failed',
+                        message=message, user_id=user_id, username=requester_name)
+    db.session.commit()
+    return jsonify({'ok': ok, 'message': message, 'job_id': None}), (200 if ok else 502)
+
+
+@app.route('/api/customers/<int:customer_id>/network-suspend', methods=['POST'])
+@jwt_required()
+def suspend_customer_network(customer_id):
+    return _perform_customer_write(customer_id, 'suspend')
+
 
 @app.route('/api/customers/<int:customer_id>/network-unsuspend', methods=['POST'])
 @jwt_required()
 def unsuspend_customer_network(customer_id):
-    customer, device, err = _customer_network_context(customer_id)
-    if err:
-        return jsonify(err[0]), err[1]
-    if _tenant_access_mode() == 'agent':
-        return jsonify({'ok': False, 'message': AGENT_WRITE_UNSUPPORTED_MESSAGE}), 501
-
-    ok, message = mikrotik.set_secret_enabled(device, customer.pppoe_username, True)
-    return jsonify({'ok': ok, 'message': message}), (200 if ok else 502)
+    return _perform_customer_write(customer_id, 'unsuspend')
 
 
 # --- NEW: API Endpoints for Suppliers ---
