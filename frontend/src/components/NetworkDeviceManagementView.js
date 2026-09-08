@@ -349,10 +349,12 @@ const NetworkDeviceManagementView = () => {
                                             </span>
                                         </Tooltip>
                                         {d.device_type !== 'vsol_olt' && (
-                                            <Tooltip title="Test Connection">
-                                                <IconButton color="info" onClick={() => handleTestConnection(d)} disabled={testingId === d.id}>
-                                                    {testingId === d.id ? <CircularProgress size={18} /> : <TestConnectionIcon fontSize="small" />}
-                                                </IconButton>
+                                            <Tooltip title={agentOffline ? agentOfflineReason : 'Test Connection'}>
+                                                <span>
+                                                    <IconButton color="info" onClick={() => handleTestConnection(d)} disabled={testingId === d.id || agentOffline}>
+                                                        {testingId === d.id ? <CircularProgress size={18} /> : <TestConnectionIcon fontSize="small" />}
+                                                    </IconButton>
+                                                </span>
                                             </Tooltip>
                                         )}
                                         <Tooltip title="Edit">

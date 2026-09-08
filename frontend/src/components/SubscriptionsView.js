@@ -730,6 +730,20 @@ const SubscriptionsView = ({
                 if (!merged.pending) return;
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
+            // All 15 attempts stayed pending -- land on a terminal shape
+            // instead of leaving `pending: true` up forever, which rendered
+            // as a permanent, spinner-less "Checking..." with no error and
+            // no sign it gave up (mikrotikStatusLoading is already false by
+            // then, since the loop above has returned control here).
+            if (isCurrent()) {
+                setMikrotikStatus({
+                    secret_status: null,
+                    secret_error: 'Status check timed out.',
+                    active_session: null,
+                    session_error: 'Status check timed out.',
+                    pending: false,
+                });
+            }
         } catch (err) {
             if (isCurrent()) setMikrotikStatus({ secret_status: null, secret_error: err.response?.data?.error || 'Status check failed', active_session: null, session_error: null, pending: false });
         } finally {
@@ -742,9 +756,20 @@ const SubscriptionsView = ({
         try {
             const call = action === 'suspend' ? apiService.suspendCustomerNetwork : apiService.unsuspendCustomerNetwork;
             const { data } = await call(customerId);
-            setSnackbar({ open: true, message: data.message, severity: data.ok ? 'success' : 'warning' });
+            // Both routes return HTTP 200 only when ok is true -- the 501
+            // agent-mode refusal and a 502 connector failure are both
+            // non-2xx and land in the catch below instead, so `data.ok` is
+            // always true by the time we get here. The old `data.ok ?
+            // 'success' : 'warning'` had a 'warning' branch that could
+            // never actually run.
+            setSnackbar({ open: true, message: data.message, severity: 'success' });
             if (data.ok) await fetchNetworkStatus(customerId);
         } catch (err) {
+            // Covers both the 501 refusal (agent mode doesn't support this
+            // write) and a genuine 502 connector failure. Deliberately the
+            // same severity for both: either way the action did not happen,
+            // and the message itself (AGENT_WRITE_UNSUPPORTED_MESSAGE, or
+            // the connector's own error) already says which one it was.
             setSnackbar({ open: true, message: err.response?.data?.message || `Failed to ${action} connection`, severity: 'error' });
         } finally {
             setMikrotikActionLoading(false);

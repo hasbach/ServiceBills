@@ -54,4 +54,20 @@ describe('shouldShowNetworkStatusChips', () => {
             session_error: null,
         })).toBe(true);
     });
+
+    test('all 15 poll attempts stayed pending -- the post-loop timeout shape shows the (error) chips too', () => {
+        // Reviewed bug: fetchNetworkStatus's polling loop used to fall
+        // straight through to `finally` when every attempt came back still
+        // pending, leaving `pending: true` (and mikrotikStatusLoading false)
+        // in state forever -- a permanent, spinner-less "Checking…" with no
+        // error and no sign it gave up. The fix lands on this same
+        // terminal-with-error shape once the loop is exhausted.
+        expect(shouldShowNetworkStatusChips({
+            pending: false,
+            secret_status: null,
+            secret_error: 'Status check timed out.',
+            active_session: null,
+            session_error: 'Status check timed out.',
+        })).toBe(true);
+    });
 });

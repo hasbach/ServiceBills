@@ -2292,8 +2292,8 @@ _TENANT_DELETE_ORDER = [
     # copy of this list never knew about it and won the merge. Without it a
     # tenant delete raises ForeignKeyViolation on Postgres (SQLite doesn't
     # enforce FKs, so the gap is invisible there). Position is now
-    # constrained: Customer.network_device_id (app.py ~612) is an inbound FK
-    # to network_device, so NetworkDevice must stay AFTER Customer in this
+    # constrained: Customer.network_device_id is an inbound FK to
+    # network_device, so NetworkDevice must stay AFTER Customer in this
     # list, or a tenant delete raises ForeignKeyViolation against real
     # Postgres while staying silently green on SQLite.
     # Jobs reference network_device, so they must go before it.
@@ -3022,7 +3022,7 @@ def _check_network_link_conflict(exclude_customer_id, network_device_id, pppoe_u
             q = q.filter(Customer.id != exclude_customer_id)
         conflict = q.first()
         if conflict:
-            return (f"Mikrotik username '{pppoe_username}' on this server is already linked "
+            return (f"Mikrotik username '{pppoe_username}' on this network device is already linked "
                      f"to customer '{conflict.name}' (id {conflict.id}). Unlink it there first.")
     if upstream_provider_id and upstream_username:
         q = tenant_query(Customer).filter_by(
@@ -9770,9 +9770,14 @@ def _validate_agent_result(operation, result):
     short string describing what's wrong (never raises). Only the three
     operations whose results this codebase actually parses into fields
     (olt_status's ONU list, device_health's optional interface list,
-    cpe_locations's CPE-MAC-to-ONU map) have a contract worth enforcing here;
-    test_connection/secret_status/active_session results are consumed as
-    opaque blobs, so there's nothing to validate.
+    cpe_locations's CPE-MAC-to-ONU map) have a contract worth enforcing here.
+    test_connection's result is consumed as an opaque success message, so
+    there's nothing to validate there -- but secret_status's result IS read
+    (the frontend compares it against 'enabled'/'disabled' to color a chip)
+    and so is active_session's (read for truthiness: "Currently connected"
+    vs. "Not connected"). Neither read can raise on an unexpected shape, so
+    there is still no shape worth enforcing here; this just corrects the
+    previous claim that nothing reads them.
     """
     if operation == 'olt_status':
         if not isinstance(result, list):
