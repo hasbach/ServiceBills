@@ -9789,6 +9789,67 @@ def agent_token_required():
     return decorator
 
 
+def _complete_write_audit(job):
+    """Resolve the NetworkWriteAudit paired with a write job going terminal.
+
+    Must be called from EVERY terminal transition, not just the happy path:
+    the job row is pruned after NETWORK_AGENT_JOB_RETENTION_DAYS and this row
+    is what lasts. The 'queued' guard makes it idempotent, so a later
+    reconciliation cannot overwrite an outcome already recorded.
+    """
+    if job.operation not in ('suspend_secret', 'unsuspend_secret'):
+        return
+    audit = NetworkWriteAudit.query.filter_by(
+        job_id=job.id, tenant_id=job.tenant_id).first()
+    if audit is not None and audit.outcome == 'queued':
+        audit.outcome = 'ok' if job.error is None else 'failed'
+        audit.message = job.error if job.error else (
+            job.result if isinstance(job.result, str) else None)
+
+
+def _note_late_agent_report(job, data):
+    """Handle a write result POSTed for a job that is no longer 'claimed' --
+    agent_post_result's 409 branch. Ordinary operation, not a broken agent:
+    the agent claimed the job, performed the write on the router, and took
+    longer than JOB_RESULT_TIMEOUT_SECONDS to report back, so a browser's poll
+    already ran the job's lazy expiry (_expire_job_if_stale) and closed the
+    job -- and, via _complete_write_audit, its paired audit row -- before this
+    POST ever arrived. A duplicate POST for a job this endpoint already
+    completed lands here the same way.
+
+    Deliberately NOT another call to _complete_write_audit: that function is a
+    one-shot, guarded by outcome == 'queued', because its job is to freeze the
+    FIRST verdict this cloud reaches once a job goes terminal. By the time
+    this runs, the audit row is already terminal -- and the agent is now
+    reporting the one thing nobody watching the clock actually witnessed:
+    what really happened at the router. Recording that as the new outcome
+    would mean trusting a late claim from a process outside this
+    application's trust boundary (see _validate_agent_result's docstring)
+    over whatever this cloud already committed, on a row whose entire job is
+    to be a trustworthy record months later -- and it would let one row's
+    outcome flip more than once, exactly what the 'queued' guard exists to
+    prevent. So the recorded outcome stays put, and this only appends a note:
+    the agent reported back, after the fact, saying X. A human reading the
+    row later sees both sides instead of a false confidence in either one.
+    """
+    if job.operation not in ('suspend_secret', 'unsuspend_secret'):
+        return
+    audit = NetworkWriteAudit.query.filter_by(
+        job_id=job.id, tenant_id=job.tenant_id).first()
+    if audit is None:
+        return
+    if isinstance(data, dict):
+        reported = 'ok' if data.get('ok') else 'failure ({})'.format(
+            data.get('error') or 'no error message given')
+    else:
+        reported = 'an unreadable payload'
+    note = ("Agent reported back ({}) after this job had already left "
+            "'claimed' (now '{}'); the outcome above reflects whichever "
+            'transition closed the job first, not this later report.'
+            ).format(reported, job.status)
+    audit.message = '{} -- {}'.format(audit.message, note) if audit.message else note
+
+
 @app.route('/api/agent/jobs', methods=['GET'])
 @limiter.limit("120 per minute")
 @agent_token_required()
@@ -9834,6 +9895,7 @@ def agent_poll_job():
         job.status = 'failed'
         job.error = 'Device no longer exists'
         job.finished_at = datetime.utcnow()
+        _complete_write_audit(job)
         db.session.commit()
         return '', 204
 
@@ -10007,6 +10069,11 @@ def agent_post_result(job_id):
         db.session.commit()
         return jsonify({'message': 'Job not found'}), 404
     if job.status != 'claimed':
+        # silent=True: this is a best-effort read for the audit note below,
+        # not the endpoint's real body parse (that happens only on the
+        # 'claimed' path below) -- a malformed body here must still return
+        # the 409 this branch exists to give, not a 400 from a strict parse.
+        _note_late_agent_report(job, request.get_json(silent=True))
         db.session.commit()
         return jsonify({'error': 'Job is {}, not claimed'.format(job.status)}), 409
 
@@ -10030,6 +10097,7 @@ def agent_post_result(job_id):
         # that gap without changing behavior for a missing body.
         job.result = None
         job.error = 'Malformed request body from agent: expected a JSON object'
+        _complete_write_audit(job)
         db.session.commit()
         return jsonify({'error': job.error}), 400
     data = data or {}
@@ -10053,13 +10121,10 @@ def agent_post_result(job_id):
         job.result = None
         job.error = data.get('error') or 'The agent reported a failure'
     # Close out the audit row for a relayed write. The job row itself will be
-    # pruned; this is the record that lasts.
-    if job.operation in ('suspend_secret', 'unsuspend_secret'):
-        audit = NetworkWriteAudit.query.filter_by(job_id=job.id).first()
-        if audit is not None:
-            audit.outcome = 'ok' if job.error is None else 'failed'
-            audit.message = job.error if job.error else (
-                job.result if isinstance(job.result, str) else None)
+    # pruned; this is the record that lasts. (Also called from every OTHER
+    # terminal transition a write job can take -- see _complete_write_audit's
+    # docstring; this is only the happy-path call site.)
+    _complete_write_audit(job)
     db.session.commit()
     return jsonify({'message': 'Recorded'}), 200
 
@@ -10093,19 +10158,34 @@ NETWORK_AGENT_JOB_RETENTION_DAYS = 7
 def _expire_job_if_stale(job):
     """Lazy expiry, evaluated when a job is read. Deliberately not a scheduled
     task: the in-process APScheduler fires during `flask db upgrade` on deploy,
-    and this path must not depend on it."""
+    and this path must not depend on it.
+
+    Residual gap, accepted rather than fixed: because this only runs when
+    something reads the job (GET /api/network-jobs/<id>), a write job nobody
+    ever polls again -- tab closed, page never reopened -- stays 'claimed'
+    forever, and its paired NetworkWriteAudit row stays 'queued' forever
+    along with it. That is different from the five stuck-'queued' routes
+    _complete_write_audit was added to close off below: those had a request
+    already in flight to hang the fix on, and this one doesn't -- there is no
+    read to attach a completion to when nobody ever reads. Adding a scheduled
+    sweep to close it would need the same infrastructure this function's own
+    docstring says isn't reliably available in production (see above); left
+    as documented, not silent.
+    """
     now = datetime.utcnow()
     if job.status == 'pending' and job.created_at:
         if (now - job.created_at).total_seconds() > JOB_CLAIM_TIMEOUT_SECONDS:
             job.status = 'expired'
             job.error = 'The agent did not pick this up. Is it still running?'
             job.finished_at = now
+            _complete_write_audit(job)
             db.session.commit()
     elif job.status == 'claimed' and job.claimed_at:
         if (now - job.claimed_at).total_seconds() > JOB_RESULT_TIMEOUT_SECONDS:
             job.status = 'failed'
             job.error = 'The agent claimed this check but never reported back.'
             job.finished_at = now
+            _complete_write_audit(job)
             db.session.commit()
     return job
 

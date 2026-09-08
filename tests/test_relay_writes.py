@@ -436,6 +436,221 @@ def test_the_audit_row_is_completed_when_the_agent_reports_back(app, client, mon
         assert row.outcome == "ok"
 
 
+def test_the_audit_row_is_completed_as_failed_when_the_agent_reports_a_failure(
+        app, client, monkeypatch):
+    """Sibling of the test above, for the other half of agent_post_result's
+    ok/failure branch. Also the first test in this file to assert on
+    audit.message, not just outcome."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr E2", "wr_e2_admin")
+    device_id = make_device(app, "Wr E2")
+    customer_id = _linked_customer(app, "Wr E2", device_id)
+    _set_agent_mode(app, "Wr E2")
+    _set_agent_version(app, "Wr E2", "1.3.0")
+
+    job_id = client.post("/api/customers/{}/network-suspend".format(customer_id),
+                         headers=hdr).get_json()["job_id"]
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Wr E2").first()
+        agent = appmod.NetworkAgent.query.filter_by(tenant_id=tenant.id).first()
+        token = appmod._issue_agent_token(agent)
+        job = appmod.db.session.get(appmod.NetworkAgentJob, job_id)
+        job.status = "claimed"
+        appmod.db.session.commit()
+
+    client.post("/api/agent/jobs/{}/result".format(job_id),
+                headers={"Authorization": "Bearer " + token},
+                json={"ok": False, "error": "no such secret"})
+
+    with app.app_context():
+        row = appmod.NetworkWriteAudit.query.filter_by(job_id=job_id).one()
+        assert row.outcome == "failed"
+        assert row.message == "no such secret"
+
+
+def test_the_audit_row_is_completed_when_the_agent_posts_a_malformed_body(
+        app, client, monkeypatch):
+    """One of the Critical fix's five previously-stuck-'queued' routes: a
+    non-object JSON body from the agent 400s and marks the job 'done' with an
+    error, via the branch in agent_post_result well before the happy-path
+    completion block -- that must complete the audit row too, not just the
+    job."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr R", "wr_r_admin")
+    device_id = make_device(app, "Wr R")
+    customer_id = _linked_customer(app, "Wr R", device_id)
+    _set_agent_mode(app, "Wr R")
+    _set_agent_version(app, "Wr R", "1.3.0")
+
+    job_id = client.post("/api/customers/{}/network-suspend".format(customer_id),
+                         headers=hdr).get_json()["job_id"]
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Wr R").first()
+        agent = appmod.NetworkAgent.query.filter_by(tenant_id=tenant.id).first()
+        token = appmod._issue_agent_token(agent)
+        job = appmod.db.session.get(appmod.NetworkAgentJob, job_id)
+        job.status = "claimed"
+        appmod.db.session.commit()
+
+    r = client.post("/api/agent/jobs/{}/result".format(job_id),
+                    headers={"Authorization": "Bearer " + token},
+                    json=["not", "an", "object"])
+    assert r.status_code == 400
+
+    with app.app_context():
+        row = appmod.NetworkWriteAudit.query.filter_by(job_id=job_id).one()
+        assert row.outcome == "failed"
+        assert "expected a JSON object" in row.message
+
+
+def test_expiring_a_never_claimed_write_job_completes_its_audit_row(
+        app, client, monkeypatch):
+    """Another of the Critical fix's five: a job no agent ever claimed within
+    JOB_CLAIM_TIMEOUT_SECONDS goes 'expired' via _expire_job_if_stale's lazy
+    pending-timeout branch -- that must complete the paired audit row too."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr S", "wr_s_admin")
+    device_id = make_device(app, "Wr S")
+    customer_id = _linked_customer(app, "Wr S", device_id)
+    _set_agent_mode(app, "Wr S")
+    _set_agent_version(app, "Wr S", "1.3.0")
+
+    job_id = client.post("/api/customers/{}/network-suspend".format(customer_id),
+                         headers=hdr).get_json()["job_id"]
+    with app.app_context():
+        job = appmod.db.session.get(appmod.NetworkAgentJob, job_id)
+        job.created_at = appmod.datetime.utcnow() - appmod.timedelta(
+            seconds=appmod.JOB_CLAIM_TIMEOUT_SECONDS + 1)
+        appmod.db.session.commit()
+
+        appmod._expire_job_if_stale(job)
+
+        assert job.status == "expired"
+        row = appmod.NetworkWriteAudit.query.filter_by(job_id=job_id).one()
+        assert row.outcome == "failed"
+        assert row.message == job.error
+
+
+def test_expiring_a_claimed_write_job_completes_its_audit_row(app, client, monkeypatch):
+    """Another of the Critical fix's five: a job claimed but never resolved
+    within JOB_RESULT_TIMEOUT_SECONDS goes 'failed' via _expire_job_if_stale's
+    lazy claimed-timeout branch -- the exact setup for the 409 race below,
+    checked here on its own first."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr T", "wr_t_admin")
+    device_id = make_device(app, "Wr T")
+    customer_id = _linked_customer(app, "Wr T", device_id)
+    _set_agent_mode(app, "Wr T")
+    _set_agent_version(app, "Wr T", "1.3.0")
+
+    job_id = client.post("/api/customers/{}/network-suspend".format(customer_id),
+                         headers=hdr).get_json()["job_id"]
+    with app.app_context():
+        job = appmod.db.session.get(appmod.NetworkAgentJob, job_id)
+        job.status = "claimed"
+        job.claimed_at = appmod.datetime.utcnow() - appmod.timedelta(
+            seconds=appmod.JOB_RESULT_TIMEOUT_SECONDS + 1)
+        appmod.db.session.commit()
+
+        appmod._expire_job_if_stale(job)
+
+        assert job.status == "failed"
+        row = appmod.NetworkWriteAudit.query.filter_by(job_id=job_id).one()
+        assert row.outcome == "failed"
+        assert row.message == job.error
+
+
+def test_polling_for_a_job_whose_device_was_deleted_completes_its_audit_row(
+        app, client, monkeypatch):
+    """The last of the Critical fix's five: agent_poll_job's claim endpoint
+    fails a job outright when its device vanished between creation and the
+    agent's next poll -- that must complete the paired audit row too, not
+    just the job. No existing test exercised this branch at all before this
+    one, for any operation."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr U", "wr_u_admin")
+    device_id = make_device(app, "Wr U")
+    customer_id = _linked_customer(app, "Wr U", device_id)
+    _set_agent_mode(app, "Wr U")
+    _set_agent_version(app, "Wr U", "1.3.0")
+
+    job_id = client.post("/api/customers/{}/network-suspend".format(customer_id),
+                         headers=hdr).get_json()["job_id"]
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Wr U").first()
+        agent = appmod.NetworkAgent.query.filter_by(tenant_id=tenant.id).first()
+        token = appmod._issue_agent_token(agent)
+        appmod.db.session.delete(appmod.db.session.get(appmod.NetworkDevice, device_id))
+        appmod.db.session.commit()
+
+    r = client.get("/api/agent/jobs", headers={"Authorization": "Bearer " + token,
+                                               "X-Agent-Version": "1.3.0"})
+    assert r.status_code == 204
+
+    with app.app_context():
+        job = appmod.db.session.get(appmod.NetworkAgentJob, job_id)
+        assert job.status == "failed"
+        row = appmod.NetworkWriteAudit.query.filter_by(job_id=job_id).one()
+        assert row.outcome == "failed"
+        assert row.message == "Device no longer exists"
+
+
+def test_a_late_agent_report_after_lazy_expiry_notes_the_discrepancy_but_does_not_overwrite_the_outcome(
+        app, client, monkeypatch):
+    """The Critical fix's worst case, straight from the review: the agent
+    claims the job, performs the disconnect on the router, takes longer than
+    JOB_RESULT_TIMEOUT_SECONDS, a browser's poll runs lazy expiry and closes
+    the job (and now, its audit row) as 'failed' first, and only then does
+    the agent's real result POST land -- rejected 409 because the job is no
+    longer 'claimed'.
+
+    The audit row must not be silently flipped to 'ok' on the agent's word
+    alone (a process outside this application's trust boundary, reporting
+    after the fact, with no way here to know which side is right) -- but the
+    record must show a human reading it later that the agent DID report
+    back, and what it said, rather than quietly dropping that information on
+    the floor."""
+    stub_connectors(monkeypatch)
+    hdr = _admin(client, "Wr V", "wr_v_admin")
+    device_id = make_device(app, "Wr V")
+    customer_id = _linked_customer(app, "Wr V", device_id)
+    _set_agent_mode(app, "Wr V")
+    _set_agent_version(app, "Wr V", "1.3.0")
+
+    job_id = client.post("/api/customers/{}/network-suspend".format(customer_id),
+                         headers=hdr).get_json()["job_id"]
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Wr V").first()
+        agent = appmod.NetworkAgent.query.filter_by(tenant_id=tenant.id).first()
+        token = appmod._issue_agent_token(agent)
+        job = appmod.db.session.get(appmod.NetworkAgentJob, job_id)
+        job.status = "claimed"
+        job.claimed_at = appmod.datetime.utcnow() - appmod.timedelta(
+            seconds=appmod.JOB_RESULT_TIMEOUT_SECONDS + 1)
+        appmod.db.session.commit()
+
+        # A browser's poll of GET /api/network-jobs/<id> would trigger this
+        # same lazy expiry; called directly here for a test that doesn't
+        # otherwise need network_view_required's role wiring in scope.
+        appmod._expire_job_if_stale(job)
+        assert job.status == "failed"
+
+    r = client.post("/api/agent/jobs/{}/result".format(job_id),
+                    headers={"Authorization": "Bearer " + token},
+                    json={"ok": True, "result": "disabled"})
+    assert r.status_code == 409
+
+    with app.app_context():
+        row = appmod.NetworkWriteAudit.query.filter_by(job_id=job_id).one()
+        assert row.outcome == "failed", (
+            "must not be overwritten to 'ok' on the late-arriving agent's "
+            "word alone")
+        assert "never reported back" in row.message, (
+            "the original lazy-expiry message must survive, not be replaced")
+        assert "Agent reported back (ok)" in row.message, (
+            "the discrepancy must be recorded for a human to find later")
+
+
 def test_the_payment_restore_queues_without_blocking_in_agent_mode(app, client, monkeypatch):
     """Runs after every settling payment on a single synchronous worker, so it
     must queue and return, never wait."""
