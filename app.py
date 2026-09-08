@@ -637,6 +637,50 @@ class NetworkAgentJob(db.Model):
 db.Index('ix_network_agent_job_poll', NetworkAgentJob.tenant_id,
          NetworkAgentJob.status, NetworkAgentJob.created_at)
 
+
+class NetworkWriteAudit(db.Model):
+    """One record per PPPoE write ServiceBills performed or asked for.
+
+    Job rows cannot serve as the audit trail: _prune_stale_agent_jobs deletes
+    terminal jobs after NETWORK_AGENT_JOB_RETENTION_DAYS, and a disconnect is
+    exactly the thing you want to be able to look up months later.
+
+    In agent mode this pairs with a line in the agent's own agent.log, giving
+    two records of every relayed write -- one of which an attacker who owns the
+    cloud cannot edit. A direct-mode write has only this row, which is correct:
+    there the cloud IS the party making the connection, so there is no second
+    witness to have.
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True)
+    network_device_id = db.Column(db.Integer, db.ForeignKey('network_device.id'), nullable=True)
+    # Recorded as sent, not looked up later: the point of the audit is what was
+    # actually acted on, which survives the customer row being edited or deleted.
+    pppoe_username = db.Column(db.String(100), nullable=False)
+    action = db.Column(db.String(10), nullable=False)   # 'suspend' | 'unsuspend'
+    # Null for the automatic restore after a settling payment -- nobody clicked
+    # it, and recording that honestly matters more than filling the column.
+    requested_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    # Nullable and expected to dangle: the job it names will be pruned.
+    job_id = db.Column(db.Integer, db.ForeignKey('network_agent_job.id'), nullable=True)
+    outcome = db.Column(db.String(10), nullable=False, default='queued')  # queued|ok|failed
+    message = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'customer_id': self.customer_id,
+            'pppoe_username': self.pppoe_username,
+            'action': self.action,
+            'requested_by_user_id': self.requested_by_user_id,
+            'outcome': self.outcome,
+            'message': self.message,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+        }
+
+
 class Customer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -1512,7 +1556,7 @@ TENANT_OWNED_MODELS = (
     Employee, SalaryCharge, SalaryPayment,
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment,
-    ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob,
+    ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt,
 )
 
@@ -2322,6 +2366,11 @@ def tenant_export():
 
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
+    # First: it holds FKs to customer, network_device, user and
+    # network_agent_job, so every one of those must still exist when it goes.
+    # SQLite does not enforce FKs, so getting this wrong is invisible locally
+    # and only fails against production Postgres.
+    NetworkWriteAudit,
     UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
     CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment,
     Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,

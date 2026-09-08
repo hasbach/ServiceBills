@@ -76,3 +76,67 @@ def test_a_missing_agent_cannot_write():
     """tenant_query(NetworkAgent).first() returns None when none is registered;
     the caller must not have to special-case that before asking."""
     assert appmod._agent_can_write(None)[0] is False
+
+
+from tests.conftest import make_tenant
+
+
+def test_an_audit_row_records_who_did_what_to_whom(app, client):
+    make_tenant(client, "Audit A", "audit_a_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Audit A").first()
+        row = appmod.NetworkWriteAudit(
+            tenant_id=tenant.id, customer_id=None, network_device_id=None,
+            pppoe_username="bach1", action="suspend",
+            requested_by_user_id=None, job_id=None, outcome="queued")
+        appmod.db.session.add(row)
+        appmod.db.session.commit()
+        stored = appmod.db.session.get(appmod.NetworkWriteAudit, row.id)
+        assert stored.action == "suspend"
+        assert stored.outcome == "queued"
+        assert stored.created_at is not None
+
+
+def test_the_audit_row_outlives_the_job_that_created_it(app, client):
+    """The whole reason this table exists: _prune_stale_agent_jobs deletes
+    terminal jobs, so a job row is not an audit trail."""
+    make_tenant(client, "Audit B", "audit_b_admin")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Audit B").first()
+        device = appmod.NetworkDevice(
+            tenant_id=tenant.id, name="CCR", host="192.168.100.1", api_port=8728,
+            username="admin", password="pw", device_type="mikrotik_ccr")
+        appmod.db.session.add(device)
+        appmod.db.session.commit()
+        job = appmod.NetworkAgentJob(
+            tenant_id=tenant.id, device_id=device.id, operation="suspend_secret",
+            status="done")
+        appmod.db.session.add(job)
+        appmod.db.session.commit()
+        row = appmod.NetworkWriteAudit(
+            tenant_id=tenant.id, pppoe_username="bach1", action="suspend",
+            job_id=job.id, outcome="ok", message="disabled")
+        appmod.db.session.add(row)
+        appmod.db.session.commit()
+        row_id, job_id = row.id, job.id
+
+        appmod.db.session.delete(appmod.db.session.get(appmod.NetworkAgentJob, job_id))
+        appmod.db.session.commit()
+
+        survivor = appmod.db.session.get(appmod.NetworkWriteAudit, row_id)
+        assert survivor is not None, "the audit row must outlive its job"
+        assert survivor.pppoe_username == "bach1"
+        assert survivor.action == "suspend"
+
+
+def test_the_audit_model_is_tenant_owned_and_deleted_first(app):
+    """It has FKs to tenant, customer, network_device, user and
+    network_agent_job, so it must be deleted before every one of them."""
+    assert appmod.NetworkWriteAudit in appmod.TENANT_OWNED_MODELS
+    order = appmod._TENANT_DELETE_ORDER
+    assert appmod.NetworkWriteAudit in order
+    audit_at = order.index(appmod.NetworkWriteAudit)
+    for parent in (appmod.Customer, appmod.NetworkDevice,
+                   appmod.NetworkAgentJob):
+        assert audit_at < order.index(parent), (
+            "NetworkWriteAudit must be deleted before {}".format(parent.__name__))
