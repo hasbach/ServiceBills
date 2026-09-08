@@ -30,34 +30,48 @@ def _has_table(name):
     return name in sa.inspect(op.get_bind()).get_table_names()
 
 
+def _has_index(table, name):
+    if not _has_table(table):
+        return False
+    return name in {i['name'] for i in sa.inspect(op.get_bind()).get_indexes(table)}
+
+
 def upgrade():
-    if _has_table('network_write_audit'):
-        return
-    op.create_table(
-        'network_write_audit',
-        sa.Column('id', sa.Integer(), nullable=False),
-        sa.Column('tenant_id', sa.Integer(), nullable=False),
-        sa.Column('customer_id', sa.Integer(), nullable=True),
-        sa.Column('network_device_id', sa.Integer(), nullable=True),
-        sa.Column('pppoe_username', sa.String(length=100), nullable=False),
-        sa.Column('action', sa.String(length=10), nullable=False),
-        sa.Column('requested_by_user_id', sa.Integer(), nullable=True),
-        sa.Column('job_id', sa.Integer(), nullable=True),
-        sa.Column('outcome', sa.String(length=10), nullable=False,
-                  server_default='queued'),
-        sa.Column('message', sa.Text(), nullable=True),
-        sa.Column('created_at', sa.DateTime(), nullable=True),
-        sa.ForeignKeyConstraint(['tenant_id'], ['tenant.id']),
-        sa.ForeignKeyConstraint(['customer_id'], ['customer.id'], ondelete='SET NULL'),
-        sa.ForeignKeyConstraint(['network_device_id'], ['network_device.id'], ondelete='SET NULL'),
-        sa.ForeignKeyConstraint(['requested_by_user_id'], ['user.id'], ondelete='SET NULL'),
-        sa.ForeignKeyConstraint(['job_id'], ['network_agent_job.id'], ondelete='SET NULL'),
-        sa.PrimaryKeyConstraint('id'),
-    )
-    op.create_index('ix_network_write_audit_tenant_id', 'network_write_audit',
-                    ['tenant_id'], unique=False)
-    op.create_index('ix_network_write_audit_created_at', 'network_write_audit',
-                    ['created_at'], unique=False)
+    if not _has_table('network_write_audit'):
+        op.create_table(
+            'network_write_audit',
+            sa.Column('id', sa.Integer(), nullable=False),
+            sa.Column('tenant_id', sa.Integer(), nullable=False),
+            sa.Column('customer_id', sa.Integer(), nullable=True),
+            sa.Column('network_device_id', sa.Integer(), nullable=True),
+            sa.Column('pppoe_username', sa.String(length=100), nullable=False),
+            sa.Column('action', sa.String(length=10), nullable=False),
+            sa.Column('requested_by_user_id', sa.Integer(), nullable=True),
+            sa.Column('job_id', sa.Integer(), nullable=True),
+            sa.Column('outcome', sa.String(length=10), nullable=False,
+                      server_default='queued'),
+            sa.Column('message', sa.Text(), nullable=True),
+            sa.Column('created_at', sa.DateTime(), nullable=True),
+            sa.ForeignKeyConstraint(['tenant_id'], ['tenant.id']),
+            sa.ForeignKeyConstraint(['customer_id'], ['customer.id'], ondelete='SET NULL'),
+            sa.ForeignKeyConstraint(['network_device_id'], ['network_device.id'], ondelete='SET NULL'),
+            sa.ForeignKeyConstraint(['requested_by_user_id'], ['user.id'], ondelete='SET NULL'),
+            sa.ForeignKeyConstraint(['job_id'], ['network_agent_job.id'], ondelete='SET NULL'),
+            sa.PrimaryKeyConstraint('id'),
+        )
+
+    # Guarded independently of the table check above: a drifted database can
+    # have the table (e.g. a partial earlier run, or hand-applied DDL)
+    # without one or both indexes, and that combination must still get the
+    # missing index here rather than silently skipping it because the table
+    # already existed. See f2b6c9d4e703's identical reasoning for
+    # ix_customer_network_device_id.
+    if not _has_index('network_write_audit', 'ix_network_write_audit_tenant_id'):
+        op.create_index('ix_network_write_audit_tenant_id', 'network_write_audit',
+                        ['tenant_id'], unique=False)
+    if not _has_index('network_write_audit', 'ix_network_write_audit_created_at'):
+        op.create_index('ix_network_write_audit_created_at', 'network_write_audit',
+                        ['created_at'], unique=False)
 
 
 def downgrade():

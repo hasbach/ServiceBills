@@ -83,10 +83,8 @@ def test_a_missing_agent_cannot_write():
     assert appmod._agent_can_write(None)[0] is False
 
 
-from tests.conftest import make_tenant
-
-
 def test_an_audit_row_records_who_did_what_to_whom(app, client):
+    from tests.conftest import make_tenant
     make_tenant(client, "Audit A", "audit_a_admin")
     with app.app_context():
         tenant = appmod.Tenant.query.filter_by(name="Audit A").first()
@@ -105,6 +103,7 @@ def test_an_audit_row_records_who_did_what_to_whom(app, client):
 def test_the_audit_row_outlives_the_job_that_created_it(app, client):
     """The whole reason this table exists: _prune_stale_agent_jobs deletes
     terminal jobs, so a job row is not an audit trail."""
+    from tests.conftest import make_tenant
     make_tenant(client, "Audit B", "audit_b_admin")
     with app.app_context():
         tenant = appmod.Tenant.query.filter_by(name="Audit B").first()

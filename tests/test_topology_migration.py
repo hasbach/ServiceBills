@@ -200,6 +200,10 @@ def _unique_constraint_columns(engine, table_name):
             for uc in sa.inspect(engine).get_unique_constraints(table_name)]
 
 
+def _index_names(engine, table_name):
+    return {ix["name"] for ix in sa.inspect(engine).get_indexes(table_name)}
+
+
 # The exact shape network_agent.tenant_id had right after 5f65a6fd6e8d's own
 # upgrade(): a plain, non-unique index, not yet the unique constraint
 # TENANT_UNIQUE_REVISION adds. Built by hand (rather than reusing
@@ -531,7 +535,10 @@ def test_write_audit_migration_upgrade_downgrade_upgrade():
     """Bootstrap with create_all + stamp rather than walking the chain, which
     cannot replay on SQLite. Also covers the second-run case: upgrade() must be
     a no-op when the table is already there, because production's schema and
-    the migration history disagree in both directions."""
+    the migration history disagree in both directions. And downgrade()'s own
+    no-op case -- run while the table is already absent -- which every
+    downgrade() call above this point in the test finds the table present, so
+    it takes a table dropped by hand, out from under Alembic, to reach it."""
     tmpdir = tempfile.mkdtemp(prefix="write_audit_migration_test_")
     db_path = os.path.join(tmpdir, "write_audit.db")
     mig_app = Flask("test_write_audit_migration")
@@ -560,6 +567,61 @@ def test_write_audit_migration_upgrade_downgrade_upgrade():
             # Second run against a database that already matches.
             upgrade(directory=MIGRATIONS_DIR, revision=WRITE_AUDIT_REVISION)
             assert "network_write_audit" in _table_names(engine)
+
+            # downgrade()'s own "table already absent" guard, run for real:
+            # drop the table by hand (stamped revision stays a4e17c92f88b, so
+            # Alembic still believes it needs to run this step down), then
+            # downgrade into that -- must not raise.
+            with engine.begin() as conn:
+                conn.execute(sa.text("DROP TABLE network_write_audit"))
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            assert "network_write_audit" not in _table_names(engine)
+
+            engine.dispose()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_write_audit_migration_creates_missing_indexes_when_the_table_already_exists():
+    """The drift shape f2b6c9d4e703 already guards against (see its own
+    _has_index and the comment on ix_customer_network_device_id) and this
+    migration originally didn't: a partial earlier run or hand-applied DDL can
+    leave the table in place without one or both of its indexes. upgrade()'s
+    table-exists check must not also silently skip index creation -- Alembic
+    never re-runs a stamped revision, so a gap left here self-heals never."""
+    tmpdir = tempfile.mkdtemp(prefix="write_audit_index_drift_test_")
+    db_path = os.path.join(tmpdir, "write_audit_index_drift.db")
+    mig_app = Flask("test_write_audit_index_drift")
+    mig_app.config["SQLALCHEMY_DATABASE_URI"] = (
+        "sqlite:///" + db_path.replace("\\", "/"))
+    mig_db = SQLAlchemy(mig_app)
+    Migrate(mig_app, mig_db, directory=MIGRATIONS_DIR, render_as_batch=True)
+
+    try:
+        with mig_app.app_context():
+            engine = mig_db.engine
+            appmod.db.metadata.create_all(bind=engine)
+            stamp(directory=MIGRATIONS_DIR, revision=WRITE_AUDIT_REVISION)
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            assert "network_write_audit" not in _table_names(engine)
+
+            # Recreate the table exactly as the model defines it (so its
+            # columns and FKs are never out of sync with app.py), then drop
+            # both indexes -- table present, indexes missing, stamped one
+            # revision behind a4e17c92f88b, the same drift a partial run or
+            # hand-applied DDL would leave in production.
+            appmod.db.metadata.tables['network_write_audit'].create(bind=engine)
+            with engine.begin() as conn:
+                conn.execute(sa.text("DROP INDEX ix_network_write_audit_tenant_id"))
+                conn.execute(sa.text("DROP INDEX ix_network_write_audit_created_at"))
+            assert "network_write_audit" in _table_names(engine)
+            assert _index_names(engine, "network_write_audit") == set()
+
+            upgrade(directory=MIGRATIONS_DIR, revision=WRITE_AUDIT_REVISION)
+            assert _index_names(engine, "network_write_audit") == {
+                "ix_network_write_audit_tenant_id",
+                "ix_network_write_audit_created_at",
+            }
 
             engine.dispose()
     finally:
