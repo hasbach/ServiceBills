@@ -522,3 +522,45 @@ def test_mikrotik_consolidation_migration_carries_rows_forward_and_keeps_the_tab
             engine.dispose()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+WRITE_AUDIT_REVISION = "a4e17c92f88b"
+
+
+def test_write_audit_migration_upgrade_downgrade_upgrade():
+    """Bootstrap with create_all + stamp rather than walking the chain, which
+    cannot replay on SQLite. Also covers the second-run case: upgrade() must be
+    a no-op when the table is already there, because production's schema and
+    the migration history disagree in both directions."""
+    tmpdir = tempfile.mkdtemp(prefix="write_audit_migration_test_")
+    db_path = os.path.join(tmpdir, "write_audit.db")
+    mig_app = Flask("test_write_audit_migration")
+    mig_app.config["SQLALCHEMY_DATABASE_URI"] = (
+        "sqlite:///" + db_path.replace("\\", "/"))
+    mig_db = SQLAlchemy(mig_app)
+    Migrate(mig_app, mig_db, directory=MIGRATIONS_DIR, render_as_batch=True)
+
+    try:
+        with mig_app.app_context():
+            engine = mig_db.engine
+            appmod.db.metadata.create_all(bind=engine)
+            stamp(directory=MIGRATIONS_DIR, revision=WRITE_AUDIT_REVISION)
+
+            downgrade(directory=MIGRATIONS_DIR, revision="-1")
+            assert "network_write_audit" not in _table_names(engine)
+
+            upgrade(directory=MIGRATIONS_DIR, revision=WRITE_AUDIT_REVISION)
+            assert "network_write_audit" in _table_names(engine)
+            cols = _table_columns(engine, "network_write_audit")
+            for expected in ("tenant_id", "customer_id", "network_device_id",
+                             "pppoe_username", "action", "requested_by_user_id",
+                             "job_id", "outcome", "message", "created_at"):
+                assert expected in cols, expected
+
+            # Second run against a database that already matches.
+            upgrade(directory=MIGRATIONS_DIR, revision=WRITE_AUDIT_REVISION)
+            assert "network_write_audit" in _table_names(engine)
+
+            engine.dispose()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
