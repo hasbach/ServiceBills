@@ -4461,7 +4461,8 @@ def _maybe_restore_mikrotik_access(customer):
             if not allowed:
                 return {'attempted': False, 'ok': False, 'message': why}
             job, error = _create_device_job(
-                device, 'unsuspend_secret', {'pppoe_username': customer.pppoe_username})
+                device, 'unsuspend_secret', {'pppoe_username': customer.pppoe_username},
+                commit=False)
             if error:
                 return {'attempted': False, 'ok': False, 'message': error}
             _record_write_audit(customer, device, 'unsuspend', 'queued', job_id=job.id)
@@ -10232,12 +10233,25 @@ def _prune_stale_agent_jobs(tenant_id):
     ).delete(synchronize_session=False)
 
 
-def _create_device_job(device, operation, params=None):
+def _create_device_job(device, operation, params=None, commit=True):
     """Create a job for this device operation.
 
     Returns (job, None) on success or (None, message) when the work cannot be
     accepted. In 'direct' mode the connector runs inline and the returned job
     is already terminal, so callers -- and the frontend -- have one shape.
+
+    commit=False defers durability to a flush: the job is INSERTed (job.id is
+    populated -- both Postgres and SQLite assign the primary key on INSERT,
+    before COMMIT) but the transaction is left open for the caller to commit.
+    This exists for _perform_customer_write and _maybe_restore_mikrotik_access,
+    the two agent-mode write callers that pair this job with a
+    NetworkWriteAudit row via _record_write_audit: with the default commit=True
+    the job becomes durable -- and claimable, and actionable -- here, before
+    that audit row even exists, so a failure between this return and the
+    caller's own commit would strand a queued, actionable write with no audit
+    row at all. Passing commit=False and committing once in the caller, after
+    both the job and the audit are in the session, is what makes them land
+    together or not at all for real. See _record_write_audit's docstring.
     """
     if operation not in AGENT_OPERATIONS:
         return None, 'Unsupported operation: {}'.format(operation)
@@ -10267,7 +10281,10 @@ def _create_device_job(device, operation, params=None):
         job.error = None if ok else value
         _prune_stale_agent_jobs(device.tenant_id)
         db.session.add(job)
-        db.session.commit()
+        if commit:
+            db.session.commit()
+        else:
+            db.session.flush()
         return job, None
 
     agent = tenant_query(NetworkAgent).first()
@@ -10277,15 +10294,31 @@ def _create_device_job(device, operation, params=None):
 
     _prune_stale_agent_jobs(device.tenant_id)
     db.session.add(job)
-    db.session.commit()
+    if commit:
+        db.session.commit()
+    else:
+        db.session.flush()
     return job, None
 
 
 def _record_write_audit(customer, device, action, outcome, message=None,
                         job_id=None, user_id=None, username=None):
     """Record one PPPoE write. Added to the session, not committed -- the
-    caller's own commit carries it, so the audit and the job land together or
-    not at all.
+    caller's own commit carries it.
+
+    In direct mode that commit is the only one this write ever makes, so the
+    audit lands or the whole request rolls back together, trivially. In agent
+    mode this is paired with a NetworkAgentJob the caller already created via
+    _create_device_job(..., commit=False) -- deferred to a flush rather than a
+    commit for exactly this reason (see that function's docstring) -- so the
+    job and this audit row are still both merely pending in the same session
+    when the caller's own commit finally runs, and they land together or not
+    at all there too. Without commit=False -- i.e. _create_device_job
+    committing the job on its own, the default everywhere else it's called --
+    the job would already be durable, and the agent free to claim and act on
+    it, before this function even runs; a failure between that commit and
+    this one would leave the job queued with no audit at all -- the one
+    outcome this table exists to prevent.
 
     pppoe_username is copied in rather than looked up later: the audit must say
     what was actually acted on even if the customer row is edited afterwards.
@@ -10834,14 +10867,24 @@ def _perform_customer_write(customer_id, action):
     username = get_jwt_identity()
     user = User.query.filter_by(username=username).first() if username else None
     user_id = user.id if user else None
-    requester_name = user.username if user else None
+    # get_jwt_identity() IS the username, so falling back to it on a lookup
+    # miss costs nothing when the lookup succeeds (same value either way) and
+    # matters when it doesn't: a staff account deleted after its token was
+    # issued (tokens last JWT_ACCESS_TOKEN_EXPIRES=8h, config.py) used to
+    # collapse both user_id and requester_name to None -- exactly the
+    # encoding NetworkWriteAudit reserves for "nobody clicked it, this was
+    # the automatic payment restore" (see _record_write_audit's docstring),
+    # making a human's suspend/unsuspend indistinguishable from the automatic
+    # one for up to 8 hours after their account is gone.
+    requester_name = user.username if user else username
 
     if _tenant_access_mode() == 'agent':
         allowed, why = _agent_can_write(tenant_query(NetworkAgent).first())
         if not allowed:
             return jsonify({'ok': False, 'message': why, 'job_id': None}), 200
         job, error = _create_device_job(
-            device, operation, {'pppoe_username': customer.pppoe_username})
+            device, operation, {'pppoe_username': customer.pppoe_username},
+            commit=False)
         if error:
             return jsonify({'ok': False, 'message': error, 'job_id': None}), 200
         _record_write_audit(customer, device, action, 'queued',

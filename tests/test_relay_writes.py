@@ -781,3 +781,97 @@ def test_the_automatic_restore_never_snapshots_a_username(app, client, monkeypat
         row = appmod.NetworkWriteAudit.query.filter_by(customer_id=customer_id).one()
         assert row.requested_by_user_id is None
         assert row.requested_by_username is None, "nobody clicked it"
+
+
+def test_create_device_job_with_commit_false_leaves_the_job_rollback_able(
+        app, client, monkeypatch):
+    """Mechanism regression for the Important finding on
+    _record_write_audit's docstring: _create_device_job used to commit the
+    job on its own -- durable, claimable, and actionable -- before
+    _record_write_audit (and the caller's own commit) ever ran. A failure in
+    between would leave a queued, actionable job with no audit row at all,
+    the one outcome this table exists to prevent. commit=False defers to a
+    flush instead (job.id is still real and usable), so the job is only ever
+    committed together with whatever the caller adds afterward.
+
+    Deliberately does NOT prove this by raising inside an HTTP request and
+    checking the job disappears afterward: this test harness's `app` fixture
+    keeps one ambient app context -- and therefore one db.session -- open for
+    the whole test (see conftest.py), so Flask's own per-request teardown
+    (which is what would roll back an uncommitted session after a real
+    unhandled exception in production) never actually runs between requests
+    inside a test. That would make such a test pass regardless of whether
+    _create_device_job honoured commit=False at all -- confirmed empirically
+    while writing this test: forcing an exception from a monkeypatched
+    _record_write_audit left the job durable and queryable afterward even
+    though nothing had explicitly committed it. Calling _create_device_job
+    directly and rolling back explicitly, instead, tests the actual mechanism
+    (flush vs. commit) without depending on that harness quirk.
+    """
+    stub_connectors(monkeypatch)
+    _admin(client, "Wr W", "wr_w_admin")
+    device_id = make_device(app, "Wr W")
+    _set_agent_mode(app, "Wr W")
+    _set_agent_version(app, "Wr W", "1.3.0")
+
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Wr W").first()
+        device = appmod.db.session.get(appmod.NetworkDevice, device_id)
+        # _create_device_job calls get_jwt_identity() and, via
+        # _tenant_access_mode()/tenant_query, current_tenant_id() -> get_jwt()
+        # -- both need a verified JWT in scope, same requirement and same fix
+        # as the payment-restore tests above.
+        token = create_access_token(identity="wr_w_admin",
+                                    additional_claims={"tenant_id": tenant.id})
+        with app.test_request_context(headers={"Authorization": f"Bearer {token}"}):
+            verify_jwt_in_request()
+            job, error = appmod._create_device_job(
+                device, "suspend_secret", {"pppoe_username": "bach1"}, commit=False)
+        assert error is None
+        assert job.id is not None, "flush must still populate the primary key"
+        assert appmod.db.session.get(appmod.NetworkAgentJob, job.id) is not None, (
+            "must be visible within the still-open transaction -- this is "
+            "what lets _record_write_audit reference job.id before the "
+            "caller's own commit")
+
+        appmod.db.session.rollback()
+
+        assert appmod.db.session.get(appmod.NetworkAgentJob, job.id) is None, (
+            "commit=False must leave the job merely flushed, not already "
+            "durable on its own -- otherwise a failure before the caller's "
+            "own commit would strand a queued, actionable job with no "
+            "paired audit row, exactly what this table exists to prevent")
+
+
+def test_a_deleted_staff_account_still_snapshots_a_username(app, client, monkeypatch):
+    """Regression for Important finding 2: requester_name used to fall back
+    to None on a User.query lookup miss, which is exactly the encoding
+    NetworkWriteAudit reserves for "nobody clicked it" (the automatic
+    restore) -- collapsing a human's suspend/unsuspend into indistinguishable-
+    from-automatic for up to JWT_ACCESS_TOKEN_EXPIRES (8h, config.py) after
+    their account is deleted. Reproduces that window directly: get a valid
+    token for an admin, delete that admin's User row (routine staff
+    offboarding), and use the still-valid token to suspend --
+    get_jwt_identity() still returns the username from the token itself even
+    though the User row backing it is gone, so requester_name must fall back
+    to that rather than to None."""
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda d, u, enabled: (True, "disabled"))
+    hdr = _admin(client, "Wr K", "wr_k_admin")
+    device_id = make_device(app, "Wr K")
+    customer_id = _linked_customer(app, "Wr K", device_id)
+
+    with app.app_context():
+        user = appmod.User.query.filter_by(username="wr_k_admin").first()
+        appmod.db.session.delete(user)
+        appmod.db.session.commit()
+
+    r = client.post("/api/customers/{}/network-suspend".format(customer_id), headers=hdr)
+    assert r.status_code == 200, "a deleted user's still-valid token must not break the write"
+
+    with app.app_context():
+        row = appmod.NetworkWriteAudit.query.filter_by(customer_id=customer_id).one()
+        assert row.requested_by_user_id is None, "the User row is gone"
+        assert row.requested_by_username == "wr_k_admin", (
+            "must fall back to get_jwt_identity() rather than collapsing to "
+            "None -- which is reserved for 'nobody clicked it'")
