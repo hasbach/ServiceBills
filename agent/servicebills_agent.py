@@ -191,15 +191,23 @@ class AgentConfigError(Exception):
 def _positive_int(value, default):
     """A positive int from agent.toml, or the default.
 
-    Anything unusable -- missing, a string, zero, negative -- falls back rather
-    than refusing to start. Same "degrade, don't outage" rule _configure_logging
-    and _warn_if_world_readable already follow: a typo in an optional setting
-    must not take an unattended box offline. Note zero falls back rather than
-    meaning "never allow", which would be an outage dressed as a setting.
+    Anything unusable -- missing, a non-numeric string, zero, negative --
+    falls back rather than refusing to start. Same "degrade, don't outage"
+    rule _configure_logging and _warn_if_world_readable already follow: a
+    typo in an optional setting must not take an unattended box offline.
+    Note zero falls back rather than meaning "never allow", which would be
+    an outage dressed as a setting.
+
+    OverflowError is caught alongside TypeError/ValueError because
+    tomllib.loads("max_suspends_per_hour = inf") parses to float('inf'), and
+    int() on that raises OverflowError rather than either of those -- an
+    operator writing `inf` to mean "no limit" must still fall back to the
+    default, not take the whole box offline before the poll loop's own
+    guards ever run.
     """
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return parsed if parsed > 0 else default
 
@@ -318,10 +326,11 @@ def execute_job(job, config):
     'unreachable', or 'auth_failed' -- read back from server.last_status
     after the connector runs (mikrotik.py/vsol_olt.py's _mark_checked sets
     it on both their success and failure paths). It is None when the
-    operation doesn't classify a device at all (secret_status, active_session
-    never touch last_status), when the job was refused before any connector
-    ran, or when the connector raised something its own try/except didn't
-    already turn into a classified failure. The cloud stamps
+    operation doesn't classify a device at all (secret_status, active_session,
+    suspend_secret, unsuspend_secret never touch last_status -- set_secret_
+    enabled never calls _mark_checked), when the job was refused before any
+    connector ran, or when the connector raised something its own try/except
+    didn't already turn into a classified failure. The cloud stamps
     NetworkDevice.last_status from this so the tree's status chip reflects
     agent-mode checks -- see agent_post_result.
     """
@@ -357,18 +366,21 @@ def execute_job(job, config):
             cap = config.get("max_suspends_per_hour", MAX_SUSPENDS_PER_HOUR_DEFAULT)
             if not _claim_suspend_slot(cap):
                 logger.warning(
-                    "REFUSED suspend of %r: rate limit of %s per hour reached. "
-                    "If this was you, wait for the window to roll; if it was not, "
-                    "the cloud may be compromised.", username, cap)
+                    "REFUSED suspend of %r on device %s (job %s): rate limit "
+                    "of %s per hour reached. If this was you, wait for the "
+                    "window to roll; if it was not, the cloud may be "
+                    "compromised.", username, device_id, job.get("job_id"), cap)
                 return (False, None,
                         "Refused by the on-prem agent: suspend rate limit of {} per "
                         "hour reached.".format(cap),
                         None)
-            logger.info("WRITE suspend %r", username)
+            logger.info("WRITE suspend %r on device %s (job %s)",
+                        username, device_id, job.get("job_id"))
             ok, value = mikrotik.set_secret_enabled(server, username, False)
         elif operation == "unsuspend_secret":
             username = params.get("pppoe_username")
-            logger.info("WRITE unsuspend %r", username)
+            logger.info("WRITE unsuspend %r on device %s (job %s)",
+                        username, device_id, job.get("job_id"))
             ok, value = mikrotik.set_secret_enabled(server, username, True)
         else:
             # Deliberately not a catch-all `else` performing unsuspend. That

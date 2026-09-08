@@ -228,7 +228,13 @@ def _claim_suspend_slot(cap, now=None):
     """
     now = time.time() if now is None else now
     cutoff = now - SUSPEND_WINDOW_SECONDS
-    while _recent_suspends and _recent_suspends[0] <= cutoff:
+    # Strictly less-than, NOT <=: a slot exactly SUSPEND_WINDOW_SECONDS old is
+    # still inside the rolling hour and must not be evicted yet. An earlier
+    # draft of this plan used <= here, which frees a slot one tick early at
+    # the exact boundary -- the mistake surfaces at test_the_window_rolls_
+    # forward's `now + 3601` assertion above. Corrected during Task 1 review;
+    # keep it `<` if you re-run this plan.
+    while _recent_suspends and _recent_suspends[0] < cutoff:
         _recent_suspends.popleft()
     if len(_recent_suspends) >= cap:
         return False

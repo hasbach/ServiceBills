@@ -577,14 +577,18 @@ def test_the_window_rolls_forward():
 
 def test_a_refused_suspend_does_not_consume_a_slot():
     """Otherwise a compromised cloud could lock the window open by hammering
-    it -- the refusal itself would keep pushing the window forward."""
+    it -- the refusal itself would keep pushing the window forward. Checked
+    against the deque's actual contents, not just its length: an
+    implementation that on refusal did popleft() then append(now) -- exactly
+    the "hammering pushes the window forward" failure this test is named
+    for -- would still leave the length at 2 and pass a length-only check."""
     agent._recent_suspends.clear()
     now = 1_000_000.0
     for i in range(2):
         agent._claim_suspend_slot(2, now=now + i)
     for i in range(10):
         assert agent._claim_suspend_slot(2, now=now + 100 + i) is False
-    assert len(agent._recent_suspends) == 2
+    assert list(agent._recent_suspends) == [now, now + 1]
 
 
 def test_suspend_is_rate_limited_but_unsuspend_is_not(monkeypatch):
@@ -720,6 +724,26 @@ def test_the_cap_defaults_when_absent_or_unparseable():
         "max_suspends_per_hour"] == 5
     assert agent.parse_config(dict(base, max_suspends_per_hour=12))[
         "max_suspends_per_hour"] == 12
+
+
+def test_the_cap_falls_back_on_an_infinite_toml_value():
+    """tomllib.loads("max_suspends_per_hour = inf") parses to float('inf'),
+    and int() on that raises OverflowError -- neither TypeError nor
+    ValueError, so _positive_int must catch it explicitly. Without that, an
+    operator writing `inf` to mean "no limit" gets parse_config raising
+    straight through load_config, before the poll loop's own guard ever
+    runs: an unattended box that will not start, from a typo in an optional
+    setting -- exactly what _positive_int's docstring promises can't
+    happen."""
+    raw = agent.tomllib.loads(
+        'cloud_url = "https://x.test"\n'
+        'token = "1.s"\n'
+        'max_suspends_per_hour = inf\n'
+        '[[device]]\n'
+        'id = 1\n'
+        'host = "10.0.0.1"\n'
+    )
+    assert agent.parse_config(raw)["max_suspends_per_hour"] == 5
 
 
 def test_the_agent_reports_the_write_capable_version():
