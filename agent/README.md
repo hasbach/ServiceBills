@@ -148,6 +148,25 @@ Windows editor or a git checkout with `core.autocrlf` does not make a
 correctly-updated file look stale. The same hashes are written to `agent.log`
 on startup, next to the version.
 
+## Suspend rate limit
+
+From 1.3.0 the agent can suspend and unsuspend a customer's PPPoE secret on
+behalf of ServiceBills. Reads were always safe to relay; a write can disconnect
+a paying customer, so this one is capped.
+
+`max_suspends_per_hour` in `agent.toml` (default 5) is the most suspensions the
+agent will perform in any rolling hour. Unsuspends are never limited — restoring
+service is not the risk, and ServiceBills restores automatically when a
+customer pays.
+
+The cap is enforced on this machine, not in the cloud, so nothing ServiceBills
+does can raise it. If it is reached you will see a line in `agent.log` starting
+`REFUSED suspend`, and ServiceBills will show the refusal. Every write the agent
+performs is logged there too, as `WRITE suspend` or `WRITE unsuspend`.
+
+Changing the cap needs only an `agent.toml` edit and a restart — not a re-copy
+of the program files.
+
 ## Troubleshooting
 
 **The scheduled task starts and immediately stops, or `agent.log` is empty

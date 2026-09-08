@@ -6,6 +6,13 @@ cloud_url    = "https://servicebills.onrender.com"
 token        = "PASTE-THE-TOKEN-SHOWN-ONCE-WHEN-YOU-CREATED-THE-AGENT"
 poll_seconds = 2
 
+# How many customers this agent will let the cloud suspend per rolling hour.
+# Unsuspends are never limited. This cap is enforced HERE, on this machine, so
+# that a compromised cloud cannot disconnect your whole customer base -- it is
+# the reason relaying suspend is safe at all. Raise it only if you genuinely
+# suspend in batches. Default 5 if omitted.
+max_suspends_per_hour = 5
+
 [[device]]
 id       = 1                  # must match the device's id in ServiceBills
 host     = "192.168.8.1"
