@@ -259,6 +259,56 @@ def test_deleting_the_customer_nulls_the_audit_rows_customer_id_under_real_fk_en
         engine.dispose()
 
 
+def test_deleting_the_user_nulls_the_id_but_the_username_survives_under_real_fk_enforcement():
+    """The finding this closes: DELETE /api/users/<int:user_id> hard-deletes a
+    User row during routine staff offboarding, and ondelete='SET NULL' on
+    requested_by_user_id degrades that FK exactly the way it degrades
+    customer_id/network_device_id/job_id above. But requested_by_user_id
+    carries "who" semantics the other three don't -- NULL there is defined by
+    the spec to mean the automatic restore, nobody clicked it. Without a
+    separate snapshot, a deleted user's old audit rows would read exactly like
+    that automatic restore, erasing the "who" from the trail. This proves the
+    snapshot actually survives the deletion that erases the FK: it must still
+    read the deleted user's username after requested_by_user_id has gone
+    NULL."""
+    engine = _sqlite_engine_with_fk_enforcement()
+    session = sessionmaker(bind=engine)()
+    try:
+        tenant = appmod.Tenant(name="Audit FK User", slug="audit-fk-user",
+                               status="active", plan="free")
+        session.add(tenant)
+        session.commit()
+        user = appmod.User(username="audit_fk_user_admin", role="admin",
+                           tenant_id=tenant.id)
+        user.set_password("pw")
+        session.add(user)
+        session.commit()
+        row = appmod.NetworkWriteAudit(
+            tenant_id=tenant.id, pppoe_username="bach1", action="suspend",
+            requested_by_user_id=user.id,
+            requested_by_username=user.username, outcome="ok")
+        session.add(row)
+        session.commit()
+        row_id, user_id = row.id, user.id
+
+        session.delete(session.get(appmod.User, user_id))
+        session.commit()
+        session.close()  # drop the identity map -- the next read must hit the DB
+
+        session = sessionmaker(bind=engine)()
+        survivor = session.get(appmod.NetworkWriteAudit, row_id)
+        assert survivor is not None, "the audit row must survive the user's deletion"
+        assert survivor.requested_by_user_id is None, "ondelete='SET NULL' must have fired"
+        assert survivor.requested_by_username == "audit_fk_user_admin", (
+            "requested_by_username is recorded as sent, not looked up later -- "
+            "it must survive independently of the user row. That is the whole "
+            "point: it is what still distinguishes 'a human did this and "
+            "their account is gone' from 'no human was involved'")
+    finally:
+        session.close()
+        engine.dispose()
+
+
 def test_the_audit_model_is_tenant_owned_and_deleted_first(app):
     """It has FKs to tenant, customer, network_device, user and
     network_agent_job, so it must be deleted before every one of them."""

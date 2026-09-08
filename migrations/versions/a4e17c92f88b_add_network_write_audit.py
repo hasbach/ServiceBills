@@ -47,6 +47,7 @@ def upgrade():
             sa.Column('pppoe_username', sa.String(length=100), nullable=False),
             sa.Column('action', sa.String(length=10), nullable=False),
             sa.Column('requested_by_user_id', sa.Integer(), nullable=True),
+            sa.Column('requested_by_username', sa.String(length=80), nullable=True),
             sa.Column('job_id', sa.Integer(), nullable=True),
             sa.Column('outcome', sa.String(length=10), nullable=False,
                       server_default='queued'),

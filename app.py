@@ -670,9 +670,20 @@ class NetworkWriteAudit(db.Model):
     # "deleted" true rather than aspirational.
     pppoe_username = db.Column(db.String(100), nullable=False)
     action = db.Column(db.String(10), nullable=False)   # 'suspend' | 'unsuspend'
-    # Null for the automatic restore after a settling payment -- nobody clicked
-    # it, and recording that honestly matters more than filling the column.
+    # NULL means the automatic restore after a settling payment -- nobody
+    # clicked it -- but ONLY in combination with requested_by_username below
+    # also being NULL. On its own this column going NULL is ambiguous:
+    # ondelete='SET NULL' fires just as readily when a human DID click it and
+    # that person's account was later deleted -- routine staff offboarding via
+    # DELETE /api/users/<int:user_id>, not a hypothetical.
     requested_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
+    # Recorded as sent, not looked up later -- same rationale as
+    # pppoe_username above: requested_by_user_id's own ondelete='SET NULL'
+    # means the FK can no longer be trusted to still name the acting user once
+    # that user's account is deleted. Without this snapshot, "nobody clicked
+    # it" (the automatic restore) and "someone did, and their account is
+    # gone" both collapse to the same NULL and become indistinguishable.
+    requested_by_username = db.Column(db.String(80), nullable=True)
     # Nullable, and actually set to NULL -- not left dangling -- once the job
     # it names is pruned by _prune_stale_agent_jobs: ondelete='SET NULL' is
     # what makes that safe instead of making every prune past that point raise.
@@ -688,6 +699,7 @@ class NetworkWriteAudit(db.Model):
             'pppoe_username': self.pppoe_username,
             'action': self.action,
             'requested_by_user_id': self.requested_by_user_id,
+            'requested_by_username': self.requested_by_username,
             'outcome': self.outcome,
             'message': self.message,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
