@@ -875,3 +875,40 @@ def test_a_deleted_staff_account_still_snapshots_a_username(app, client, monkeyp
         assert row.requested_by_username == "wr_k_admin", (
             "must fall back to get_jwt_identity() rather than collapsing to "
             "None -- which is reserved for 'nobody clicked it'")
+
+
+def _add_collector(client, admin_hdr, username):
+    client.post("/api/users", headers=admin_hdr,
+                json={"username": username, "password": "pw", "role": "collector"})
+    r = client.post("/api/login", json={"username": username, "password": "pw"})
+    return {"Authorization": "Bearer " + r.get_json()["access_token"]}
+
+
+def test_a_collector_cannot_disconnect_anyone(app, client, monkeypatch):
+    """Disconnecting a paying customer is an admin/finance action.
+
+    NETWORK_VIEW_ROLES deliberately includes 'employee' and 'collector' so they
+    can read the network tree, and network_view_required's own docstring calls
+    that access "read-only by construction". Before this cycle these two routes
+    returned a flat 501 in agent mode, so the missing decorator was unreachable;
+    relaying writes is what makes it live. admin_or_finance_required exists
+    precisely so read access does not hand out mutating calls to anyone able to
+    bypass a frontend that merely hides the buttons.
+    """
+    called = []
+    monkeypatch.setattr(appmod.mikrotik, "set_secret_enabled",
+                        lambda d, u, enabled: called.append(u) or (True, "disabled"))
+    admin_hdr = _admin(client, "Authz W", "authz_w_admin")
+    device_id = make_device(app, "Authz W")
+    customer_id = _linked_customer(app, "Authz W", device_id)
+    collector_hdr = _add_collector(client, admin_hdr, "authz_w_collector")
+
+    for action in ("network-suspend", "network-unsuspend"):
+        r = client.post("/api/customers/{}/{}".format(customer_id, action),
+                        headers=collector_hdr)
+        assert r.status_code == 403, "{} must refuse a collector".format(action)
+
+    assert called == [], "the router must not be touched by a refused caller"
+    with app.app_context():
+        assert appmod.NetworkWriteAudit.query.count() == 0, (
+            "a refused request must leave no audit row")

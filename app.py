@@ -4479,6 +4479,7 @@ def _maybe_restore_mikrotik_access(customer):
         db.session.commit()
         return {'attempted': True, 'ok': ok, 'message': message}
     except Exception as e:
+        db.session.rollback()
         logging.error(f"Mikrotik re-enable check failed for customer {customer.id}: {e}")
         return {'attempted': True, 'ok': False, 'message': str(e)}
 
@@ -9848,6 +9849,12 @@ def _note_late_agent_report(job, data):
             "'claimed' (now '{}'); the outcome above reflects whichever "
             'transition closed the job first, not this later report.'
             ).format(reported, job.status)
+    if audit.message and note in audit.message:
+        # Already recorded. The agent does not retry a 4xx (see its run_once),
+        # so a repeat means a duplicate POST rather than a new fact -- and
+        # without this guard each one would append again, growing a single
+        # Text value without bound on a row meant to be read months later.
+        return
     audit.message = '{} -- {}'.format(audit.message, note) if audit.message else note
 
 
@@ -10114,6 +10121,14 @@ def agent_post_result(job_id):
             # own logs rather than failing silently.
             job.result = None
             job.error = 'Malformed {} result from agent: {}'.format(job.operation, problem)
+            # A no-op today -- _validate_agent_result has no contract for
+            # suspend_secret/unsuspend_secret, so `problem` is always None for
+            # them and this branch is unreachable for a write. Called anyway
+            # because _complete_write_audit documents itself as required on
+            # EVERY terminal transition, and this is one: the day someone adds
+            # a validation contract for a write, the alternative is that the
+            # audit row silently stays 'queued' for a disconnect that happened.
+            _complete_write_audit(job)
             db.session.commit()
             return jsonify({'error': job.error}), 400
         job.result = result
@@ -10901,12 +10916,14 @@ def _perform_customer_write(customer_id, action):
 
 @app.route('/api/customers/<int:customer_id>/network-suspend', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def suspend_customer_network(customer_id):
     return _perform_customer_write(customer_id, 'suspend')
 
 
 @app.route('/api/customers/<int:customer_id>/network-unsuspend', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def unsuspend_customer_network(customer_id):
     return _perform_customer_write(customer_id, 'unsuspend')
 
