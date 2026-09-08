@@ -21,6 +21,7 @@ the first connection.
 See docs/superpowers/specs/2026-09-04-network-agent-layer-2-design.md.
 """
 import argparse
+import collections
 import hashlib
 import logging
 import logging.handlers
@@ -55,7 +56,7 @@ except ImportError as exc:
         "-- see README.md's Install section. Copying only the agent/ "
         "directory on its own is not enough.".format(exc))
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
 
 # How many hex characters of each file's sha256 are reported. This is a
 # diagnostic, not an attestation -- see connector_fingerprint() -- so 48 bits
@@ -63,13 +64,20 @@ AGENT_VERSION = "1.2.0"
 # that the whole header stays readable in a log line.
 FINGERPRINT_LENGTH = 12
 
-# Read-only, and deliberately so. mikrotik.set_secret_enabled disables a
-# customer's PPPoE secret; it is absent here so that even a compromised cloud
-# cannot disconnect anyone through this agent.
+# Read-only except for the two PPPoE writes below, which are relayed under an
+# agent-side rate limit -- see _claim_suspend_slot. Relaying a write gives the
+# cloud a disconnect primitive it deliberately did not have before; the cap is
+# what keeps a compromised cloud from disconnecting everyone.
 ALLOWED_OPERATIONS = (
     "test_connection", "device_health", "secret_status",
     "active_session", "olt_status", "cpe_locations",
+    "suspend_secret", "unsuspend_secret",
 )
+
+# The rolling-hour cap on suspends. Configurable in agent.toml so changing your
+# mind later does not cost another hand-copy onto this box.
+MAX_SUSPENDS_PER_HOUR_DEFAULT = 5
+SUSPEND_WINDOW_SECONDS = 3600
 
 DEFAULT_CONFIG_PATH = r"C:\ProgramData\ServiceBillsAgent\agent.toml"
 DEFAULT_LOG_PATH = r"C:\ProgramData\ServiceBillsAgent\agent.log"
@@ -78,6 +86,38 @@ UNAUTHORIZED_BACKOFF_SECONDS = 30
 HTTP_TIMEOUT_SECONDS = 30
 
 logger = logging.getLogger("servicebills_agent")
+
+
+# Timestamps of suspends this process has ADMITTED, newest last. Module-level
+# and therefore per-process: restarting the agent clears it. That is an
+# accepted weakness -- restarting requires access to the box, and an attacker
+# with that has no need of the cloud's disconnect primitive.
+_recent_suspends = collections.deque()
+
+
+def _claim_suspend_slot(cap, now=None):
+    """Take a slot in the rolling window, or refuse. True means go ahead.
+
+    Counts ADMITTED attempts, not successful ones. Counting successes would let
+    a compromised cloud probe indefinitely for free: every failure -- a
+    username that does not exist, a router that is down -- would cost it
+    nothing and the cap would never bite.
+
+    A refusal deliberately does NOT record a timestamp. If it did, hammering
+    the endpoint would keep pushing the window forward and the cap would never
+    recover.
+    """
+    now = time.time() if now is None else now
+    cutoff = now - SUSPEND_WINDOW_SECONDS
+    # Strictly less-than: a slot exactly SUSPEND_WINDOW_SECONDS old is still
+    # inside the rolling hour, so it must not be evicted yet. Using <= here
+    # would let one extra slot free up early at the exact boundary.
+    while _recent_suspends and _recent_suspends[0] < cutoff:
+        _recent_suspends.popleft()
+    if len(_recent_suspends) >= cap:
+        return False
+    _recent_suspends.append(now)
+    return True
 
 
 def _file_fingerprint(path):
@@ -148,6 +188,22 @@ class AgentConfigError(Exception):
     """agent.toml is missing or unusable. The agent refuses to start."""
 
 
+def _positive_int(value, default):
+    """A positive int from agent.toml, or the default.
+
+    Anything unusable -- missing, a string, zero, negative -- falls back rather
+    than refusing to start. Same "degrade, don't outage" rule _configure_logging
+    and _warn_if_world_readable already follow: a typo in an optional setting
+    must not take an unattended box offline. Note zero falls back rather than
+    meaning "never allow", which would be an outage dressed as a setting.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def parse_config(raw):
     """Validate a parsed TOML mapping and index its devices by id."""
     cloud_url = (raw.get("cloud_url") or "").rstrip("/")
@@ -178,6 +234,8 @@ def parse_config(raw):
         "cloud_url": cloud_url,
         "token": token,
         "poll_seconds": int(raw.get("poll_seconds", DEFAULT_POLL_SECONDS)),
+        "max_suspends_per_hour": _positive_int(
+            raw.get("max_suspends_per_hour"), MAX_SUSPENDS_PER_HOUR_DEFAULT),
         "devices": devices,
     }
 
@@ -292,8 +350,26 @@ def execute_job(job, config):
             ok, value = mikrotik.test_connection(server)
         elif operation == "secret_status":
             ok, value = mikrotik.get_secret_status(server, params.get("pppoe_username"))
-        else:  # active_session -- the only remaining allowed operation
+        elif operation == "active_session":
             ok, value = mikrotik.get_active_session(server, params.get("pppoe_username"))
+        elif operation == "suspend_secret":
+            username = params.get("pppoe_username")
+            cap = config.get("max_suspends_per_hour", MAX_SUSPENDS_PER_HOUR_DEFAULT)
+            if not _claim_suspend_slot(cap):
+                logger.warning(
+                    "REFUSED suspend of %r: rate limit of %s per hour reached. "
+                    "If this was you, wait for the window to roll; if it was not, "
+                    "the cloud may be compromised.", username, cap)
+                return (False, None,
+                        "Refused by the on-prem agent: suspend rate limit of {} per "
+                        "hour reached.".format(cap),
+                        None)
+            logger.info("WRITE suspend %r", username)
+            ok, value = mikrotik.set_secret_enabled(server, username, False)
+        else:  # unsuspend_secret -- the only remaining allowed operation
+            username = params.get("pppoe_username")
+            logger.info("WRITE unsuspend %r", username)
+            ok, value = mikrotik.set_secret_enabled(server, username, True)
     except Exception as exc:  # noqa: BLE001 -- a bad job must not kill the loop
         # Never logger.exception here: the frame locals hold the device
         # credential, and a traceback in the log file would expose it.

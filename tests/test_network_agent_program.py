@@ -548,3 +548,112 @@ def test_cpe_locations_dispatches_to_vsol(monkeypatch):
 
 def test_cpe_locations_is_in_the_agent_allowlist():
     assert "cpe_locations" in agent.ALLOWED_OPERATIONS
+
+
+# --- Relaying PPPoE writes: the agent's own rolling-hour suspend cap is the
+# whole compensating control for handing the cloud a disconnect primitive it
+# deliberately never had before. See docs/superpowers/specs/2026-09-08-relay-
+# pppoe-writes-design.md. -----------------------------------------------
+
+def test_the_suspend_window_admits_up_to_the_cap():
+    """The cap is the whole compensating control for relaying writes, so it is
+    tested against an injected clock rather than a sleep."""
+    agent._recent_suspends.clear()
+    now = 1_000_000.0
+    assert [agent._claim_suspend_slot(3, now=now + i) for i in range(5)] == [
+        True, True, True, False, False]
+
+
+def test_the_window_rolls_forward():
+    agent._recent_suspends.clear()
+    now = 1_000_000.0
+    for i in range(3):
+        assert agent._claim_suspend_slot(3, now=now + i) is True
+    assert agent._claim_suspend_slot(3, now=now + 10) is False
+    # One hour after the first slot, exactly one slot frees up.
+    assert agent._claim_suspend_slot(3, now=now + 3601) is True
+    assert agent._claim_suspend_slot(3, now=now + 3601) is False
+
+
+def test_a_refused_suspend_does_not_consume_a_slot():
+    """Otherwise a compromised cloud could lock the window open by hammering
+    it -- the refusal itself would keep pushing the window forward."""
+    agent._recent_suspends.clear()
+    now = 1_000_000.0
+    for i in range(2):
+        agent._claim_suspend_slot(2, now=now + i)
+    for i in range(10):
+        assert agent._claim_suspend_slot(2, now=now + 100 + i) is False
+    assert len(agent._recent_suspends) == 2
+
+
+def test_suspend_is_rate_limited_but_unsuspend_is_not(monkeypatch):
+    """Restoring service is not the attack, and the payment-triggered restore
+    must keep working unattended."""
+    agent._recent_suspends.clear()
+    calls = []
+    monkeypatch.setattr(agent.mikrotik, "set_secret_enabled",
+                        lambda s, u, enabled: calls.append((u, enabled)) or (True, "ok"))
+    config = dict(CONFIG, max_suspends_per_hour=2)
+
+    outcomes = [agent.execute_job(job(operation="suspend_secret",
+                                      params={"pppoe_username": "bach1"}), config)[0]
+                for _ in range(4)]
+    assert outcomes == [True, True, False, False]
+
+    for _ in range(6):
+        ok, _, error, _ = agent.execute_job(
+            job(operation="unsuspend_secret", params={"pppoe_username": "bach1"}), config)
+        assert (ok, error) == (True, None)
+
+    assert [enabled for _, enabled in calls] == [False, False] + [True] * 6
+
+
+def test_a_rate_limited_suspend_never_reaches_the_router(monkeypatch):
+    """The refusal must happen before the connector, not after -- the point is
+    that the customer stays connected."""
+    agent._recent_suspends.clear()
+    called = []
+    monkeypatch.setattr(agent.mikrotik, "set_secret_enabled",
+                        lambda s, u, enabled: called.append(u) or (True, "ok"))
+    config = dict(CONFIG, max_suspends_per_hour=1)
+    suspend = job(operation="suspend_secret", params={"pppoe_username": "bach1"})
+
+    agent.execute_job(suspend, config)
+    called.clear()
+    ok, _, error, _ = agent.execute_job(suspend, config)
+
+    assert ok is False
+    assert "rate limit" in error.lower()
+    assert called == [], "the connector must not be reached once the cap is hit"
+
+
+def test_both_write_operations_are_permitted_and_dispatch_correctly(monkeypatch):
+    agent._recent_suspends.clear()
+    seen = []
+    monkeypatch.setattr(agent.mikrotik, "set_secret_enabled",
+                        lambda s, u, enabled: seen.append((u, enabled)) or (True, "done"))
+    config = dict(CONFIG, max_suspends_per_hour=5)
+
+    agent.execute_job(job(operation="suspend_secret",
+                          params={"pppoe_username": "bach1"}), config)
+    agent.execute_job(job(operation="unsuspend_secret",
+                          params={"pppoe_username": "bach1"}), config)
+    assert seen == [("bach1", False), ("bach1", True)]
+
+
+def test_the_cap_defaults_when_absent_or_unparseable():
+    """Degrade, don't outage -- the same rule _configure_logging follows."""
+    base = {"cloud_url": "https://x.test", "token": "1.s",
+            "device": [{"id": 1, "host": "10.0.0.1"}]}
+    assert agent.parse_config(base)["max_suspends_per_hour"] == 5
+    assert agent.parse_config(dict(base, max_suspends_per_hour="nonsense"))[
+        "max_suspends_per_hour"] == 5
+    assert agent.parse_config(dict(base, max_suspends_per_hour=0))[
+        "max_suspends_per_hour"] == 5
+    assert agent.parse_config(dict(base, max_suspends_per_hour=12))[
+        "max_suspends_per_hour"] == 12
+
+
+def test_the_agent_reports_the_write_capable_version():
+    assert agent.AGENT_VERSION == "1.3.0"
