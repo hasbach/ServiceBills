@@ -653,17 +653,30 @@ class NetworkWriteAudit(db.Model):
     """
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
-    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True)
-    network_device_id = db.Column(db.Integer, db.ForeignKey('network_device.id'), nullable=True)
+    # SET NULL (not the database's default NO ACTION) on all four FKs below:
+    # this is an audit trail, not a live reference, so it must outlive the
+    # things it points at being deleted -- a pruned job, a churned customer, a
+    # decommissioned device, a removed staff account. NO ACTION would instead
+    # make Postgres refuse the DELETE outright the moment any audit row points
+    # at the thing being deleted, turning routine cleanup into a crash. CASCADE
+    # was also considered and rejected: it would delete the audit row along
+    # with its subject, which is exactly the durability this table exists to
+    # provide against (see the class docstring).
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id', ondelete='SET NULL'), nullable=True)
+    network_device_id = db.Column(db.Integer, db.ForeignKey('network_device.id', ondelete='SET NULL'), nullable=True)
     # Recorded as sent, not looked up later: the point of the audit is what was
-    # actually acted on, which survives the customer row being edited or deleted.
+    # actually acted on, which survives the customer row being edited or
+    # deleted -- customer_id's ondelete='SET NULL' above is what makes
+    # "deleted" true rather than aspirational.
     pppoe_username = db.Column(db.String(100), nullable=False)
     action = db.Column(db.String(10), nullable=False)   # 'suspend' | 'unsuspend'
     # Null for the automatic restore after a settling payment -- nobody clicked
     # it, and recording that honestly matters more than filling the column.
-    requested_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
-    # Nullable and expected to dangle: the job it names will be pruned.
-    job_id = db.Column(db.Integer, db.ForeignKey('network_agent_job.id'), nullable=True)
+    requested_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
+    # Nullable, and actually set to NULL -- not left dangling -- once the job
+    # it names is pruned by _prune_stale_agent_jobs: ondelete='SET NULL' is
+    # what makes that safe instead of making every prune past that point raise.
+    job_id = db.Column(db.Integer, db.ForeignKey('network_agent_job.id', ondelete='SET NULL'), nullable=True)
     outcome = db.Column(db.String(10), nullable=False, default='queued')  # queued|ok|failed
     message = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)

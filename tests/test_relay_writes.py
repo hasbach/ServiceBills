@@ -6,6 +6,11 @@ makes giving it one acceptable -- a version gate so a write is never queued for
 an agent that cannot perform it, and an audit trail that outlives job pruning.
 See docs/superpowers/specs/2026-09-08-relay-pppoe-writes-design.md.
 """
+from datetime import datetime
+
+import sqlalchemy as sa
+from sqlalchemy.orm import sessionmaker
+
 import app as appmod
 
 
@@ -127,6 +132,132 @@ def test_the_audit_row_outlives_the_job_that_created_it(app, client):
         assert survivor is not None, "the audit row must outlive its job"
         assert survivor.pppoe_username == "bach1"
         assert survivor.action == "suspend"
+
+
+def _sqlite_engine_with_fk_enforcement():
+    """A throwaway engine, deliberately not the shared app/db the `app`
+    fixture points at. SQLite only enforces foreign keys when
+    PRAGMA foreign_keys=ON is set on the connection -- it is off by default,
+    resets on every new connection, and Flask-SQLAlchemy caches one Engine
+    per Flask app for the life of the process (see
+    tests/test_topology_migration.py's module docstring for how that was
+    confirmed), so the shared engine cannot be repointed here without
+    silently changing FK behaviour for every other test that reuses it.
+    A dedicated engine, enabled once via the connect event below, is the only
+    way to actually exercise ondelete='SET NULL' instead of merely failing to
+    contradict it -- SQLite's default (unenforced) leaves a dangling job_id or
+    customer_id in place, which looks identical to a working SET NULL from a
+    test that never checks the column's actual value."""
+    engine = sa.create_engine("sqlite:///:memory:")
+
+    @sa.event.listens_for(engine, "connect")
+    def _enable_fk_enforcement(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    appmod.db.metadata.create_all(bind=engine)
+    return engine
+
+
+def test_deleting_the_job_nulls_the_audit_rows_job_id_under_real_fk_enforcement():
+    """The durability test above (test_the_audit_row_outlives_the_job_that_
+    created_it) runs under SQLite's default of FK enforcement being off, so it
+    cannot tell ondelete='SET NULL' apart from the database default of NO
+    ACTION -- both leave the audit row in place there, because SQLite never
+    checks the constraint at all. NO ACTION would only reveal itself as a
+    ForeignKeyViolation against a real, enforcing database (production's
+    Postgres, or SQLite with the pragma below) -- exactly the "invisible
+    locally, fails only on production Postgres" pattern this codebase has
+    already been bitten by twice. This turns enforcement on for a throwaway
+    engine so the constraint is actually exercised, not merely not
+    contradicted."""
+    engine = _sqlite_engine_with_fk_enforcement()
+    session = sessionmaker(bind=engine)()
+    try:
+        tenant = appmod.Tenant(name="Audit FK Job", slug="audit-fk-job",
+                               status="active", plan="free")
+        session.add(tenant)
+        session.commit()
+        device = appmod.NetworkDevice(
+            tenant_id=tenant.id, name="CCR", host="192.168.100.1", api_port=8728,
+            username="admin", password="pw", device_type="mikrotik_ccr")
+        session.add(device)
+        session.commit()
+        job = appmod.NetworkAgentJob(
+            tenant_id=tenant.id, device_id=device.id, operation="suspend_secret",
+            status="done")
+        session.add(job)
+        session.commit()
+        row = appmod.NetworkWriteAudit(
+            tenant_id=tenant.id, pppoe_username="bach1", action="suspend",
+            job_id=job.id, outcome="ok")
+        session.add(row)
+        session.commit()
+        row_id, job_id = row.id, job.id
+
+        session.delete(session.get(appmod.NetworkAgentJob, job_id))
+        session.commit()
+        session.close()  # drop the identity map -- the next read must hit the DB
+
+        session = sessionmaker(bind=engine)()
+        survivor = session.get(appmod.NetworkWriteAudit, row_id)
+        assert survivor is not None, "the audit row must survive the job's deletion"
+        assert survivor.job_id is None, "ondelete='SET NULL' must have fired"
+        assert survivor.pppoe_username == "bach1"
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_deleting_the_customer_nulls_the_audit_rows_customer_id_under_real_fk_enforcement():
+    """Same reasoning as the job test above, for the customer_id FK: a
+    business deletes exactly the customers who have churned, and those are
+    exactly the ones most likely to have suspend history. Under the database
+    default (NO ACTION) that history would make deleting them raise
+    ForeignKeyViolation on production Postgres, invisibly passing on SQLite's
+    default of not enforcing FKs at all."""
+    engine = _sqlite_engine_with_fk_enforcement()
+    session = sessionmaker(bind=engine)()
+    try:
+        tenant = appmod.Tenant(name="Audit FK Cust", slug="audit-fk-cust",
+                               status="active", plan="free")
+        session.add(tenant)
+        session.add(appmod.Currency(code="USD", name="US Dollar", decimal_places=2))
+        session.commit()
+        plan = appmod.SubscriptionPlan(
+            tenant_id=tenant.id, name="Basic", price=10, cost=5,
+            billing_cycle="monthly", currency="USD")
+        session.add(plan)
+        session.commit()
+        customer = appmod.Customer(
+            tenant_id=tenant.id, name="Bach", phone="1", address="a",
+            subscription_plan_id=plan.id,
+            subscription_expiry_date=datetime.utcnow(),
+            pppoe_username="bach1")
+        session.add(customer)
+        session.commit()
+        row = appmod.NetworkWriteAudit(
+            tenant_id=tenant.id, customer_id=customer.id, pppoe_username="bach1",
+            action="suspend", outcome="ok")
+        session.add(row)
+        session.commit()
+        row_id, customer_id = row.id, customer.id
+
+        session.delete(session.get(appmod.Customer, customer_id))
+        session.commit()
+        session.close()  # drop the identity map -- the next read must hit the DB
+
+        session = sessionmaker(bind=engine)()
+        survivor = session.get(appmod.NetworkWriteAudit, row_id)
+        assert survivor is not None, "the audit row must survive the customer's deletion"
+        assert survivor.customer_id is None, "ondelete='SET NULL' must have fired"
+        assert survivor.pppoe_username == "bach1", (
+            "pppoe_username is recorded as sent, not looked up later -- it "
+            "must survive independently of the customer row")
+    finally:
+        session.close()
+        engine.dispose()
 
 
 def test_the_audit_model_is_tenant_owned_and_deleted_first(app):
