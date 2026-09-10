@@ -9555,6 +9555,108 @@ def _latest_locate_at_by_device(devices):
     return out
 
 
+def _compute_map_status(nodes, onu_status):
+    """Colour every span on the geographic map from live ONU status.
+
+    One rule, evaluated bottom-up:
+
+        a node's subtree is ALIVE if it contains at least one online ONU,
+        itself included;
+        a node's subtree is KNOWN if it contains at least one ONU whose MAC
+        appears in the OLT's data at all, online or offline.
+
+    From which: a span is green if its child's subtree is alive, red if the
+    subtree is known and not alive, and grey if nothing below it is known.
+
+    The FAULT BOUNDARY is a red span whose parent node is still alive. That is
+    the whole point of the feature: everything red below the boundary is
+    consequence, not cause, so the boundary is the one span worth driving to.
+
+    Deliberately does NOT read last_dereg_reason. Colour must depend only on
+    status, because the scraped reason describes the *last* disconnection
+    rather than the current one, is 'N/A' on at least some offline ONUs, and
+    comes from a scrape that can fail -- any of which would turn a correct map
+    into a wrong one if it were allowed to decide colour.
+
+    Cycles are surfaced as `orphans`, never dropped: Tree v2 shipped a builder
+    that silently discarded whole cyclic components, so a mis-parented run
+    vanished from the page with no indication anything was missing.
+    """
+    by_id = {node.id: node for node in nodes}
+    children_of = {}
+    roots = []
+    # Ascending id throughout, so set/dict iteration order cannot leak into
+    # the response and make the payload differ between two identical calls.
+    ordered = sorted(nodes, key=lambda n: n.id)
+    for node in ordered:
+        parent_id = node.parent_node_id
+        if parent_id is None or parent_id == node.id or parent_id not in by_id:
+            roots.append(node)
+        else:
+            children_of.setdefault(parent_id, []).append(node)
+
+    visited, alive, known = set(), {}, {}
+
+    def walk(node):
+        visited.add(node.id)
+        own = None
+        if node.kind == 'onu' and node.onu_mac:
+            own = onu_status.get(_normalize_mac(node.onu_mac))
+        node_alive = own == 'online'
+        node_known = own is not None
+        for child in sorted(children_of.get(node.id, []), key=lambda n: n.id):
+            if child.id in visited:
+                continue
+            walk(child)
+            node_alive = node_alive or alive[child.id]
+            node_known = node_known or known[child.id]
+        alive[node.id] = node_alive
+        known[node.id] = node_known
+
+    for root in roots:
+        if root.id not in visited:
+            walk(root)
+
+    spans = []
+    for node in ordered:
+        parent_id = node.parent_node_id
+        if (parent_id is None or parent_id == node.id
+                or parent_id not in by_id or node.id not in alive):
+            continue
+        if alive[node.id]:
+            status = 'green'
+        elif known[node.id]:
+            status = 'red'
+        else:
+            status = 'grey'
+        spans.append({
+            'parent_node_id': parent_id,
+            'child_node_id': node.id,
+            'status': status,
+            'is_fault_boundary': status == 'red' and alive.get(parent_id, False),
+        })
+
+    node_status = {}
+    for node in ordered:
+        if node.id not in alive:
+            node_status[node.id] = 'unknown'      # unreachable: a cycle member
+        elif node.kind == 'onu':
+            own = onu_status.get(_normalize_mac(node.onu_mac)) if node.onu_mac else None
+            node_status[node.id] = own or 'unknown'
+        elif alive[node.id]:
+            node_status[node.id] = 'online'
+        elif known[node.id]:
+            node_status[node.id] = 'offline'
+        else:
+            node_status[node.id] = 'unknown'
+
+    return {
+        'spans': spans,
+        'node_status': node_status,
+        'orphans': sorted(n.id for n in nodes if n.id not in visited),
+    }
+
+
 def _build_device_tree(devices, latest_results=None, latest_locate_at=None):
     """Nest a flat device list by parent_device_id.
 
