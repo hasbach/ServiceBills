@@ -9510,20 +9510,10 @@ def _latest_results_by_device(devices):
             result = _resolve_onu_customers(result)
         elif job.operation == 'device_health':
             result = _with_interface_labels(job, {'result': result}).get('result')
-        # finished_at over created_at: every real code path that sets
-        # status='done' (_create_device_job's direct-mode branch,
-        # agent_post_result, and the two timeout branches in
-        # _expire_job_if_stale) sets finished_at in that same statement, so
-        # this is never a real behaviour change. It only guards a job row
-        # built directly (bypassing all of those), where finished_at is left
-        # unset -- created_at still has the ORM's own default and is never
-        # None, so this keeps "a genuinely successful job was found" from
-        # ever reporting a null freshness stamp to its caller.
-        at = job.finished_at or job.created_at
         out[device.id] = {
             'operation': job.operation,
             'result': result,
-            'at': at.strftime('%Y-%m-%d %H:%M:%S') if at else None,
+            'at': job.finished_at.strftime('%Y-%m-%d %H:%M:%S') if job.finished_at else None,
         }
     return out
 
@@ -11006,10 +10996,18 @@ def _map_onu_status(device):
 
     Reuses _latest_results_by_device rather than re-querying, because that
     helper already encodes the filter this page depends on: status == 'done'
-    AND error IS NULL AND result IS NOT NULL AND operation == 'olt_status'.
-    A failed run is also stored as 'done', so without that filter the newest
-    job after an outage would have result=None and this map would report every
-    ONU as unknown while advancing its own freshness stamp.
+    AND error IS NULL AND result IS NOT NULL AND operation IN ('olt_status',
+    'device_health'). A failed run is also stored as 'done', so without the
+    error/result half of that filter the newest job after an outage would
+    have result=None and this map would report every ONU as unknown while
+    advancing its own freshness stamp.
+
+    The operation half of the filter is broader than what this device can
+    ever actually produce, but that is safe here specifically: _require_olt
+    guarantees `device` is a vsol_olt, and DEVICE_TYPE_OPERATIONS['vsol_olt']
+    does not include 'device_health' -- so _create_device_job can never have
+    queued one for it, and the row _latest_results_by_device returns is
+    always the 'olt_status' walk this function expects to parse below.
 
     Contacts nothing. The map is cache-first by design: in direct mode a walk
     blocks the single sync gunicorn worker ~13s, and this page is granted to
@@ -11059,7 +11057,9 @@ def get_network_map():
         # the function that computes it. Deliberately absent here rather than
         # stubbed: a placeholder returning [] would be dead code for the whole
         # of this task, and the frontend that reads the key is not built until
-        # Task 6.
+        # Task 6. `rows` (unpacked above, unused so far) is what that function
+        # will compute the warnings from -- kept now so Task 5 is a plain
+        # addition here rather than a re-unpacking of _map_onu_status's return.
         **computed,
     }), 200
 
@@ -11080,7 +11080,11 @@ def get_unplaced_onus():
                 NetworkNode.olt_device_id == device.id,
                 NetworkNode.onu_mac.isnot(None)).all()
     }
-    unplaced = [row for row in _resolve_onu_customers(rows)
+    # rows is already enriched with customer matches -- _latest_results_by_device
+    # (which _map_onu_status reuses) runs 'olt_status' results through
+    # _resolve_onu_customers before returning them, so calling it again here
+    # would just repeat the same full Customer table scan for no new data.
+    unplaced = [row for row in rows
                 if _normalize_mac(row.get('mac_address') or '') not in placed]
     return jsonify({'onus': unplaced}), 200
 

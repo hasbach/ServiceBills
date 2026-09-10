@@ -54,8 +54,17 @@ def auth_headers(client, username="admin", password="pw", role="admin"):
         client.post("/api/register", json={"username": username, "password": password})
     else:
         tenant = Tenant.query.order_by(Tenant.id.desc()).first()
-        user = User(username=username, role=role,
-                    tenant_id=tenant.id if tenant else None)
+        if tenant is None:
+            # Fail here, at the actual mistake, instead of building a
+            # tenant-less user that later 401s from deep inside
+            # current_tenant_id() with no clue why. auth_headers(role=...)
+            # attaches the new user to the most recently created tenant, so
+            # a preceding make_tenant(...) call (or a role="admin"
+            # auth_headers(...) call) is required in the same test.
+            raise RuntimeError(
+                "auth_headers(role={!r}) requires a tenant to already exist "
+                "-- call make_tenant(...) first.".format(role))
+        user = User(username=username, role=role, tenant_id=tenant.id)
         user.set_password(password)
         db.session.add(user)
         db.session.commit()

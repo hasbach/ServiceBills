@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import app as appmod
 from tests.conftest import make_tenant, auth_headers
 
@@ -108,14 +110,21 @@ def test_a_failed_walk_must_not_blank_the_map(app, client):
     good = [{'mac_address': 'aa:aa:aa:aa:aa:aa', 'status': 'online',
              'pon_port': 1, 'onu_id': 1, 'description': 'villaEid',
              'distance': 856}]
+    # Explicit, ordered finished_at values -- a good walk 5 minutes ago,
+    # then a failed one just now -- so the scenario (older good result,
+    # newer failure) is spelled out rather than left to whatever order
+    # the two commits happen to land in.
+    now = datetime.utcnow()
     with app.app_context():
         appmod.db.session.add(appmod.NetworkAgentJob(
             tenant_id=1, device_id=olt, operation='olt_status',
-            status='done', result=good, error=None))
+            status='done', result=good, error=None,
+            finished_at=now - timedelta(minutes=5)))
         appmod.db.session.commit()
         appmod.db.session.add(appmod.NetworkAgentJob(
             tenant_id=1, device_id=olt, operation='olt_status',
-            status='done', result=None, error='SNMP timeout'))
+            status='done', result=None, error='SNMP timeout',
+            finished_at=now))
         appmod.db.session.commit()
     body = client.get(f'/api/network-map?olt_device_id={olt}',
                       headers=admin).get_json()
@@ -137,7 +146,8 @@ def test_unplaced_onus_excludes_already_placed_ones(app, client):
     with app.app_context():
         appmod.db.session.add(appmod.NetworkAgentJob(
             tenant_id=1, device_id=olt, operation='olt_status',
-            status='done', result=onus, error=None))
+            status='done', result=onus, error=None,
+            finished_at=datetime.utcnow()))
         appmod.db.session.add(appmod.NetworkNode(
             tenant_id=1, olt_device_id=olt, kind='root', label='CR',
             latitude=34.4367, longitude=35.8497))
@@ -170,7 +180,8 @@ def test_unplaced_onus_matches_a_placed_mac_across_separator_styles(app, client)
     with app.app_context():
         appmod.db.session.add(appmod.NetworkAgentJob(
             tenant_id=1, device_id=olt, operation='olt_status',
-            status='done', result=onus, error=None))
+            status='done', result=onus, error=None,
+            finished_at=datetime.utcnow()))
         appmod.db.session.add(appmod.NetworkNode(
             tenant_id=1, olt_device_id=olt, kind='root', label='CR',
             latitude=34.4367, longitude=35.8497))
