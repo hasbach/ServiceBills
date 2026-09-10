@@ -221,3 +221,22 @@ def test_node_with_dangling_parent_is_promoted_to_root():
     r = appmod._compute_map_status(nodes, {A: 'online'})
     assert r['orphans'] == []
     assert r['node_status'][1] == 'online'
+
+
+def test_junction_with_offline_and_unknown_children_accumulates_knownness():
+    """A junction is known if ANY child subtree is known. A child that is
+    offline is known (we know it's down); a child never reported is unknown.
+    The offline child's contribution to knownness must not be lost if the
+    unknown child is processed last (higher id). The child ordering is
+    deliberate: children are processed in ascending id order, so the unknown
+    child (id=4) must come after the offline child (id=3) to catch the dropped
+    accumulation."""
+    nodes = [FakeNode(1, 'root'),
+             FakeNode(2, 'junction', parent_node_id=1),
+             FakeNode(3, 'onu', parent_node_id=2, onu_mac=A),
+             FakeNode(4, 'onu', parent_node_id=2, onu_mac=B)]
+    r = appmod._compute_map_status(nodes, {A: 'offline'})  # B is never reported
+    assert r['node_status'][2] == 'offline'
+    assert span_for(r, 2)['status'] == 'red'
+    assert span_for(r, 3)['status'] == 'red'
+    assert span_for(r, 4)['status'] == 'grey'
