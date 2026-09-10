@@ -9581,6 +9581,15 @@ def _compute_map_status(nodes, onu_status):
     Cycles are surfaced as `orphans`, never dropped: Tree v2 shipped a builder
     that silently discarded whole cyclic components, so a mis-parented run
     vanished from the page with no indication anything was missing.
+
+    Unlike `_build_device_tree`, which promotes a cycle member so a healthy
+    device below a broken parent link still renders, this function leaves
+    the whole component `unknown` instead. Painting a subtree from an
+    arbitrarily-chosen cycle member would render a healthy-looking region
+    hanging off a parent link that is itself broken -- and on a map, that
+    means drawing cable spans that may not physically exist. Reporting the
+    component in `orphans` instead forces the bad parent link to be fixed
+    before the map claims to know anything about what's below it.
     """
     by_id = {node.id: node for node in nodes}
     children_of = {}
@@ -9595,6 +9604,13 @@ def _compute_map_status(nodes, onu_status):
         else:
             children_of.setdefault(parent_id, []).append(node)
 
+    # The only two statuses the OLT scrape actually reports; anything else
+    # (e.g. 'N/A', '' from a scrape hiccup) must read as unknown here AND in
+    # the node_status ONU branch below -- both must agree, or a single
+    # malformed value produces a self-contradictory payload (a red span next
+    # to a node whose own status says 'unknown').
+    KNOWN_ONU_STATUSES = ('online', 'offline')
+
     visited, alive, known = set(), {}, {}
 
     def walk(node):
@@ -9603,9 +9619,15 @@ def _compute_map_status(nodes, onu_status):
         if node.kind == 'onu' and node.onu_mac:
             own = onu_status.get(_normalize_mac(node.onu_mac))
         node_alive = own == 'online'
-        node_known = own is not None
+        node_known = own in KNOWN_ONU_STATUSES
         for child in sorted(children_of.get(node.id, []), key=lambda n: n.id):
             if child.id in visited:
+                # Unreachable by construction today: a node whose parent is
+                # present in `by_id` is filed into children_of, never into
+                # roots, so a cycle is never entered from the roots loop
+                # below and this branch never fires. Kept so that a future
+                # change to root selection cannot reintroduce an infinite
+                # walk here.
                 continue
             walk(child)
             node_alive = node_alive or alive[child.id]
@@ -9642,7 +9664,7 @@ def _compute_map_status(nodes, onu_status):
             node_status[node.id] = 'unknown'      # unreachable: a cycle member
         elif node.kind == 'onu':
             own = onu_status.get(_normalize_mac(node.onu_mac)) if node.onu_mac else None
-            node_status[node.id] = own or 'unknown'
+            node_status[node.id] = own if own in KNOWN_ONU_STATUSES else 'unknown'
         elif alive[node.id]:
             node_status[node.id] = 'online'
         elif known[node.id]:

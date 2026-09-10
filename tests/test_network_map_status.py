@@ -126,6 +126,10 @@ def test_a_cycle_is_reported_as_orphans_not_silently_dropped():
     assert r['orphans'] == [2, 3]
     assert all(s['child_node_id'] == 1 or s['child_node_id'] not in (2, 3)
                for s in r['spans'])
+    # Both ONUs are reported online by the OLT, yet they must still read as
+    # unknown, not offline: a cycle member is unreachable, and painting it
+    # offline would invent an outage on hardware that is actually alive.
+    assert all(r['node_status'][n] == 'unknown' for n in r['orphans'])
 
 
 def test_a_node_parented_to_itself_is_treated_as_a_root():
@@ -146,3 +150,74 @@ def test_output_is_deterministic_across_input_ordering():
     first = appmod._compute_map_status(nodes, status)
     second = appmod._compute_map_status(list(reversed(nodes)), status)
     assert first == second
+
+
+def test_junk_status_value_is_grey_and_unknown_not_red():
+    """A scrape hiccup can write a non-canonical value (e.g. 'N/A') into
+    onu_status. That must not count as known: it must come back grey, and
+    the node's own status must agree that it is 'unknown' -- the two halves
+    of the payload must never contradict each other."""
+    nodes = chain(A)
+    r = appmod._compute_map_status(nodes, {A: 'N/A'})
+    assert span_for(r, 2)['status'] == 'grey'
+    assert r['node_status'][2] == 'unknown'
+
+
+def test_grey_span_under_alive_parent_is_not_a_fault_boundary():
+    """A junction alive via one online child must not turn a merely-unknown
+    sibling span into a dispatchable fault -- grey is not red, no matter how
+    alive the parent is."""
+    nodes = [FakeNode(1, 'root'),
+             FakeNode(2, 'junction', parent_node_id=1),
+             FakeNode(3, 'onu', parent_node_id=2, onu_mac=A),
+             FakeNode(4, 'onu', parent_node_id=2, onu_mac=B)]
+    r = appmod._compute_map_status(nodes, {A: 'online'})  # B never reported
+    assert span_for(r, 4)['status'] == 'grey'
+    assert span_for(r, 4)['is_fault_boundary'] is False
+
+
+def test_fully_offline_junction_reports_offline_not_online():
+    """A junction whose entire subtree is offline (known, not alive) must
+    render 'offline' on its own dot, not 'online' -- rendering it online
+    would hide a real outage."""
+    nodes = [FakeNode(1, 'root'),
+             FakeNode(2, 'junction', parent_node_id=1),
+             FakeNode(3, 'onu', parent_node_id=2, onu_mac=A)]
+    r = appmod._compute_map_status(nodes, {A: 'offline'})
+    assert r['node_status'][2] == 'offline'
+
+
+def test_spans_are_ordered_ascending_by_child_node_id():
+    """Pins the documented ordering itself, not just order-invariance: the
+    determinism test above would still pass if every span came back
+    reversed, as long as it was reversed the same way both times."""
+    nodes = chain(A, B, C)
+    r = appmod._compute_map_status(
+        nodes, {A: 'online', B: 'online', C: 'online'})
+    child_ids = [s['child_node_id'] for s in r['spans']]
+    assert child_ids == [2, 3, 4]
+    assert child_ids == sorted(child_ids)
+
+
+def test_orphans_are_ordered_ascending():
+    """Input is deliberately not id-ascending (30, 10, 20): if the
+    implementation ever dropped its sorted() call, unsorted output would
+    just echo this input order, and a test built from already-ascending
+    input would never notice."""
+    nodes = [FakeNode(30, 'junction', parent_node_id=20),
+             FakeNode(10, 'junction', parent_node_id=30),
+             FakeNode(20, 'junction', parent_node_id=10)]
+    r = appmod._compute_map_status(nodes, {})
+    assert r['orphans'] == [10, 20, 30]
+    assert r['orphans'] == sorted(r['orphans'])
+
+
+def test_node_with_dangling_parent_is_promoted_to_root():
+    """A parent_node_id pointing at an id absent from the input (deleted, or
+    another tenant's row) must not orphan the node -- it is walked as a
+    root, same as a genuinely-root node, and so must never appear in
+    orphans."""
+    nodes = [FakeNode(1, 'onu', parent_node_id=999, onu_mac=A)]
+    r = appmod._compute_map_status(nodes, {A: 'online'})
+    assert r['orphans'] == []
+    assert r['node_status'][1] == 'online'
