@@ -11089,6 +11089,155 @@ def get_unplaced_onus():
     return jsonify({'onus': unplaced}), 200
 
 
+# --- Geographic fibre map: write endpoints -----------------------------------
+# Create/update/delete a node. Unlike the reads above, these stay on
+# admin_or_finance_required() -- see network_view_required()'s docstring:
+# widening the read side to field roles must not widen who can rewrite the
+# customer<->ONU mapping.
+
+def _node_descendant_ids(node_id, device_id):
+    """Every id at or below node_id, so a reparent cannot build a cycle.
+    Iterative with a seen-set: a cycle already in the data would make the
+    recursive form loop forever, and this helper must be usable to repair one."""
+    seen, frontier = {node_id}, [node_id]
+    while frontier:
+        rows = (db.session.query(NetworkNode.id)
+                .filter(NetworkNode.tenant_id == current_tenant_id(),
+                        NetworkNode.olt_device_id == device_id,
+                        NetworkNode.parent_node_id.in_(frontier)).all())
+        frontier = [r.id for r in rows if r.id not in seen]
+        seen.update(frontier)
+    return seen
+
+
+def _validate_node_payload(payload, device_id, node=None):
+    """(cleaned, error). `node` is the row being updated, or None on create."""
+    kind = payload.get('kind', node.kind if node else None)
+    if kind not in NODE_KINDS:
+        return None, (jsonify({'message': f'kind must be one of {NODE_KINDS}'}), 400)
+
+    cleaned = {'kind': kind}
+
+    label = payload.get('label', node.label if node else None)
+    if not (label or '').strip():
+        return None, (jsonify({'message': 'label is required'}), 400)
+    cleaned['label'] = label.strip()[:100]
+
+    for field, limit in (('latitude', 90.0), ('longitude', 180.0)):
+        if field in payload or node is None:
+            try:
+                value = float(payload[field])
+            except (KeyError, TypeError, ValueError):
+                return None, (jsonify({'message': f'{field} must be a number'}), 400)
+            if not -limit <= value <= limit:
+                return None, (jsonify(
+                    {'message': f'{field} must be between -{limit} and {limit}'}), 400)
+            cleaned[field] = value
+
+    # Parent: root has none, everything else must have one.
+    parent_id = payload.get('parent_node_id',
+                            node.parent_node_id if node else None)
+    if kind == 'root':
+        if parent_id is not None:
+            return None, (jsonify({'message': 'a root node cannot have a parent'}), 400)
+        existing_root = (tenant_query(NetworkNode)
+                         .filter_by(olt_device_id=device_id, kind='root')
+                         .filter(NetworkNode.id != (node.id if node else -1))
+                         .first())
+        if existing_root:
+            return None, (jsonify(
+                {'message': 'this OLT already has a root node'}), 400)
+    else:
+        if parent_id is None:
+            return None, (jsonify(
+                {'message': 'a non-root node requires a parent'}), 400)
+        parent = (tenant_query(NetworkNode)
+                  .filter_by(id=parent_id, olt_device_id=device_id).first())
+        if not parent:
+            return None, (jsonify({'message': 'parent node not found'}), 400)
+        if node is not None and parent_id in _node_descendant_ids(node.id, device_id):
+            return None, (jsonify(
+                {'message': 'cannot reparent a node under itself or its own '
+                            'descendant -- that would create a cycle'}), 400)
+    cleaned['parent_node_id'] = parent_id
+
+    # MAC: required on an ONU, forbidden otherwise, unique per OLT.
+    raw_mac = payload.get('onu_mac', node.onu_mac if node else None)
+    if kind == 'onu':
+        if not raw_mac:
+            return None, (jsonify(
+                {'message': 'an ONU node requires onu_mac'}), 400)
+        mac = _canonical_mac(raw_mac)
+        if not mac:
+            return None, (jsonify({'message': 'onu_mac is not a valid MAC'}), 400)
+        clash = (tenant_query(NetworkNode)
+                 .filter_by(olt_device_id=device_id, onu_mac=mac)
+                 .filter(NetworkNode.id != (node.id if node else -1)).first())
+        if clash:
+            return None, (jsonify(
+                {'message': f'that ONU is already placed as "{clash.label}"'}), 400)
+        cleaned['onu_mac'] = mac
+    else:
+        if raw_mac:
+            return None, (jsonify(
+                {'message': f'a {kind} node cannot carry onu_mac'}), 400)
+        cleaned['onu_mac'] = None
+
+    return cleaned, None
+
+
+@app.route('/api/network-map/nodes', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def create_network_node():
+    payload = request.json or {}
+    device, err = _require_olt(payload.get('olt_device_id'))
+    if err:
+        return err
+    cleaned, err = _validate_node_payload(payload, device.id, node=None)
+    if err:
+        return err
+    node = new_for_tenant(NetworkNode, olt_device_id=device.id, **cleaned)
+    db.session.add(node)
+    db.session.commit()
+    return jsonify(node.to_dict()), 201
+
+
+@app.route('/api/network-map/nodes/<int:node_id>', methods=['PUT'])
+@jwt_required()
+@admin_or_finance_required()
+def update_network_node(node_id):
+    node = tenant_query(NetworkNode).filter_by(id=node_id).first()
+    if not node:
+        return jsonify({'message': 'Node not found!'}), 404
+    cleaned, err = _validate_node_payload(request.json or {},
+                                          node.olt_device_id, node=node)
+    if err:
+        return err
+    for field, value in cleaned.items():
+        setattr(node, field, value)
+    db.session.commit()
+    return jsonify(node.to_dict()), 200
+
+
+@app.route('/api/network-map/nodes/<int:node_id>', methods=['DELETE'])
+@jwt_required()
+@admin_or_finance_required()
+def delete_network_node(node_id):
+    node = tenant_query(NetworkNode).filter_by(id=node_id).first()
+    if not node:
+        return jsonify({'message': 'Node not found!'}), 404
+    children = tenant_query(NetworkNode).filter_by(parent_node_id=node.id).all()
+    if children:
+        names = ', '.join(sorted(c.label for c in children))
+        return jsonify({'message':
+                        f'Cannot delete "{node.label}" -- it still carries: {names}. '
+                        f'Delete or reparent those first.'}), 409
+    db.session.delete(node)
+    db.session.commit()
+    return jsonify({'message': 'Node deleted'}), 200
+
+
 # --- Live actions on a customer's PPPoE secret (Concept B). Staff-triggered
 # only -- nothing in the app calls these automatically off a billing rule. ---
 

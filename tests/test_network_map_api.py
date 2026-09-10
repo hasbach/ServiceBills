@@ -197,3 +197,171 @@ def test_unplaced_onus_matches_a_placed_mac_across_separator_styles(app, client)
     body = client.get(f'/api/network-map/unplaced-onus?olt_device_id={olt}',
                       headers=admin).get_json()
     assert [o['mac_address'] for o in body['onus']] == ['bb:bb:bb:bb:bb:bb']
+
+
+def _node(client, headers, olt, **kw):
+    payload = {'olt_device_id': olt, 'kind': 'junction', 'label': 'P',
+               'latitude': 34.4367, 'longitude': 35.8497}
+    payload.update(kw)
+    return client.post('/api/network-map/nodes', headers=headers, json=payload)
+
+
+def test_writes_are_refused_to_employee(app, client):
+    """Read is widened to field roles; placing nodes is not. Widening the page
+    must not quietly widen who can rewrite the customer-to-ONU mapping."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    emp = auth_headers(client, 'emp', 'pw', role='employee')
+    assert _node(client, emp, olt, kind='root', label='CR').status_code == 403
+
+
+def test_root_must_have_no_parent_and_be_unique_per_olt(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    first = _node(client, admin, olt, kind='root', label='CR')
+    assert first.status_code == 201
+    assert _node(client, admin, olt, kind='root', label='CR2').status_code == 400
+    root_id = first.get_json()['id']
+    bad = _node(client, admin, olt, kind='root', label='CR3',
+                parent_node_id=root_id)
+    assert bad.status_code == 400
+
+
+def test_a_non_root_requires_a_parent(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    assert _node(client, admin, olt, kind='junction').status_code == 400
+
+
+def test_mac_is_required_on_onu_and_forbidden_elsewhere(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    assert _node(client, admin, olt, kind='onu', parent_node_id=root
+                 ).status_code == 400
+    assert _node(client, admin, olt, kind='junction', parent_node_id=root,
+                 onu_mac='aa:aa:aa:aa:aa:aa').status_code == 400
+    ok = _node(client, admin, olt, kind='onu', parent_node_id=root,
+               onu_mac='AA-AA-AA-AA-AA-AA')
+    assert ok.status_code == 201
+    assert ok.get_json()['onu_mac'] == 'aa:aa:aa:aa:aa:aa'   # canonicalised
+
+
+def test_one_onu_cannot_be_placed_twice(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    _node(client, admin, olt, kind='onu', parent_node_id=root,
+          onu_mac='aa:aa:aa:aa:aa:aa')
+    dup = _node(client, admin, olt, kind='onu', parent_node_id=root,
+                onu_mac='aa:aa:aa:aa:aa:aa')
+    assert dup.status_code == 400
+
+
+def test_a_malformed_mac_is_rejected(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    assert _node(client, admin, olt, kind='onu', parent_node_id=root,
+                 onu_mac='not-a-mac').status_code == 400
+
+
+def test_out_of_range_coordinates_are_rejected(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    assert _node(client, admin, olt, kind='root', label='CR',
+                 latitude=91.0).status_code == 400
+    assert _node(client, admin, olt, kind='root', label='CR',
+                 longitude=-181.0).status_code == 400
+
+
+def test_a_node_cannot_be_reparented_under_its_own_descendant(app, client):
+    """The cycle guard. _compute_map_status defends on read, but a cycle must
+    not be creatable in the first place."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    mid = _node(client, admin, olt, kind='junction', label='M',
+                parent_node_id=root).get_json()['id']
+    leaf = _node(client, admin, olt, kind='junction', label='L',
+                 parent_node_id=mid).get_json()['id']
+    r = client.put(f'/api/network-map/nodes/{mid}', headers=admin,
+                   json={'parent_node_id': leaf})
+    assert r.status_code == 400
+    self_parent = client.put(f'/api/network-map/nodes/{mid}', headers=admin,
+                             json={'parent_node_id': mid})
+    assert self_parent.status_code == 400
+
+
+def test_deleting_a_node_with_children_is_refused_with_409(app, client):
+    """Naming the children matters: re-tracing a run by hand is expensive, so
+    an accidental delete must be both blocked and explained."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    child = _node(client, admin, olt, kind='junction', label='Pole 4',
+                  parent_node_id=root).get_json()['id']
+    r = client.delete(f'/api/network-map/nodes/{root}', headers=admin)
+    assert r.status_code == 409
+    assert 'Pole 4' in r.get_json()['message']
+    assert client.delete(f'/api/network-map/nodes/{child}',
+                         headers=admin).status_code == 200
+
+
+def test_a_node_from_another_tenant_is_invisible(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    node = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    make_tenant(client, 'Other ISP', 'admin2')
+    other = auth_headers(client, 'admin2', 'pw', role='admin')
+    assert client.put(f'/api/network-map/nodes/{node}', headers=other,
+                      json={'label': 'hijacked'}).status_code == 404
+    assert client.delete(f'/api/network-map/nodes/{node}',
+                         headers=other).status_code == 404
+
+
+def test_partial_update_changes_only_the_given_fields(app, client):
+    """A drag-to-reposition sends only coordinates; a rename sends only a
+    label. Neither may blank onu_mac, parent_node_id or kind -- and since a
+    rename resubmits the node's own unchanged MAC, this also pins that the
+    uniqueness check excludes the row being updated from its own clash query."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    onu = _node(client, admin, olt, kind='onu', parent_node_id=root,
+                onu_mac='aa:aa:aa:aa:aa:aa').get_json()['id']
+
+    renamed = client.put(f'/api/network-map/nodes/{onu}', headers=admin,
+                         json={'label': 'Villa Eid'})
+    assert renamed.status_code == 200
+    body = renamed.get_json()
+    assert body['label'] == 'Villa Eid'
+    assert body['onu_mac'] == 'aa:aa:aa:aa:aa:aa'
+    assert body['parent_node_id'] == root
+    assert body['kind'] == 'onu'
+    assert body['latitude'] == 34.4367
+    assert body['longitude'] == 35.8497
+
+    moved = client.put(f'/api/network-map/nodes/{onu}', headers=admin,
+                       json={'latitude': 34.44, 'longitude': 35.86})
+    assert moved.status_code == 200
+    body = moved.get_json()
+    assert body['latitude'] == 34.44
+    assert body['longitude'] == 35.86
+    # Unspecified fields on this second, coordinates-only PUT must still
+    # survive -- including the label changed by the *previous* PUT.
+    assert body['label'] == 'Villa Eid'
+    assert body['onu_mac'] == 'aa:aa:aa:aa:aa:aa'
+    assert body['parent_node_id'] == root
+    assert body['kind'] == 'onu'
