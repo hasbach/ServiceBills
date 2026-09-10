@@ -8,7 +8,7 @@ os.environ["JWT_SECRET_KEY"] = "test-secret-not-for-prod"
 # in-memory DB anyway.
 os.environ["RUN_SCHEDULER"] = "0"
 import pytest
-from app import app as flask_app, db
+from app import app as flask_app, db, User, Tenant
 
 
 @pytest.fixture
@@ -34,7 +34,31 @@ def client(app):
 
 
 def auth_headers(client, username="admin", password="pw", role="admin"):
-    client.post("/api/register", json={"username": username, "password": password})
+    """Register (or re-authenticate) `username` and return its bearer headers.
+
+    role="admin" (the default) goes through the public /api/register flow,
+    exactly as before -- which always provisions a brand-new tenant with this
+    user as its admin, or (if `username` already exists, e.g. a prior
+    make_tenant() call) just re-logs into that existing account.
+
+    Any other role has no public self-serve path: /api/register hardcodes
+    role='admin', and POST /api/users (which does accept a role) requires an
+    admin's own bearer token to call. Callers that pass role= want a second,
+    differently-privileged user inside the tenant a preceding make_tenant()/
+    auth_headers() call in the same test already created -- not yet another
+    isolated tenant -- so build that row directly against the most recently
+    created tenant instead of round-tripping through an admin-authenticated
+    request.
+    """
+    if role == "admin":
+        client.post("/api/register", json={"username": username, "password": password})
+    else:
+        tenant = Tenant.query.order_by(Tenant.id.desc()).first()
+        user = User(username=username, role=role,
+                    tenant_id=tenant.id if tenant else None)
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
     r = client.post("/api/login", json={"username": username, "password": password})
     token = r.get_json()["access_token"]
     return {"Authorization": f"Bearer {token}"}

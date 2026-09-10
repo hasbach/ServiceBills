@@ -9510,10 +9510,20 @@ def _latest_results_by_device(devices):
             result = _resolve_onu_customers(result)
         elif job.operation == 'device_health':
             result = _with_interface_labels(job, {'result': result}).get('result')
+        # finished_at over created_at: every real code path that sets
+        # status='done' (_create_device_job's direct-mode branch,
+        # agent_post_result, and the two timeout branches in
+        # _expire_job_if_stale) sets finished_at in that same statement, so
+        # this is never a real behaviour change. It only guards a job row
+        # built directly (bypassing all of those), where finished_at is left
+        # unset -- created_at still has the ORM's own default and is never
+        # None, so this keeps "a genuinely successful job was found" from
+        # ever reporting a null freshness stamp to its caller.
+        at = job.finished_at or job.created_at
         out[device.id] = {
             'operation': job.operation,
             'result': result,
-            'at': job.finished_at.strftime('%Y-%m-%d %H:%M:%S') if job.finished_at else None,
+            'at': at.strftime('%Y-%m-%d %H:%M:%S') if at else None,
         }
     return out
 
@@ -10981,6 +10991,98 @@ def apply_customer_locations(device_id):
     if job.status != 'done' or job.error:
         return jsonify({'error': job.error or 'The locate is still running.'}), 400
     return jsonify(_apply_cpe_locations(job.result)), 200
+
+
+# --- Geographic fibre map: read endpoints ------------------------------------
+# The map never contacts a device. It renders from the OLT's last cached
+# 'olt_status' walk, exactly like the tree above -- in direct mode a walk
+# blocks the single synchronous gunicorn worker for ~13s, and this page is
+# granted to field roles (network_view_required) who may reopen it repeatedly.
+# See docs/superpowers/specs/2026-09-10-network-geo-fiber-map-design.md.
+
+def _map_onu_status(device):
+    """{normalised_mac: 'online'|'offline'} from the OLT's newest genuinely
+    successful walk, plus when that walk happened.
+
+    Reuses _latest_results_by_device rather than re-querying, because that
+    helper already encodes the filter this page depends on: status == 'done'
+    AND error IS NULL AND result IS NOT NULL AND operation == 'olt_status'.
+    A failed run is also stored as 'done', so without that filter the newest
+    job after an outage would have result=None and this map would report every
+    ONU as unknown while advancing its own freshness stamp.
+
+    Contacts nothing. The map is cache-first by design: in direct mode a walk
+    blocks the single sync gunicorn worker ~13s, and this page is granted to
+    field roles who may open it repeatedly.
+    """
+    latest = _latest_results_by_device([device]).get(device.id) or {}
+    rows = latest.get('result') or []
+    status = {}
+    for row in rows:
+        mac = row.get('mac_address')
+        if not mac:
+            continue
+        status[_normalize_mac(mac)] = (
+            'online' if row.get('status') == 'online' else 'offline')
+    return status, latest.get('at'), rows
+
+
+def _require_olt(device_id):
+    """(device, error_response). Mirrors the existing refresh endpoint's
+    checks so the map cannot be pointed at a CCR."""
+    device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
+    if not device:
+        return None, (jsonify({'message': 'Network device not found!'}), 404)
+    if device.device_type != 'vsol_olt':
+        return None, (jsonify({'error': 'That device is not an OLT'}), 400)
+    return device, None
+
+
+@app.route('/api/network-map', methods=['GET'])
+@jwt_required()
+@network_view_required()
+def get_network_map():
+    device_id = request.args.get('olt_device_id', type=int)
+    device, err = _require_olt(device_id)
+    if err:
+        return err
+    nodes = (tenant_query(NetworkNode)
+             .filter_by(olt_device_id=device.id)
+             .order_by(NetworkNode.id).all())
+    onu_status, last_result_at, rows = _map_onu_status(device)
+    computed = _compute_map_status(nodes, onu_status)
+    return jsonify({
+        'nodes': [n.to_dict() for n in nodes],
+        'onu_status': onu_status,
+        'last_result_at': last_result_at,
+        # 'distance_warnings' is added to this payload by Task 5, together with
+        # the function that computes it. Deliberately absent here rather than
+        # stubbed: a placeholder returning [] would be dead code for the whole
+        # of this task, and the frontend that reads the key is not built until
+        # Task 6.
+        **computed,
+    }), 200
+
+
+@app.route('/api/network-map/unplaced-onus', methods=['GET'])
+@jwt_required()
+@network_view_required()
+def get_unplaced_onus():
+    device_id = request.args.get('olt_device_id', type=int)
+    device, err = _require_olt(device_id)
+    if err:
+        return err
+    _, _, rows = _map_onu_status(device)
+    placed = {
+        _normalize_mac(mac) for (mac,) in
+        db.session.query(NetworkNode.onu_mac)
+        .filter(NetworkNode.tenant_id == current_tenant_id(),
+                NetworkNode.olt_device_id == device.id,
+                NetworkNode.onu_mac.isnot(None)).all()
+    }
+    unplaced = [row for row in _resolve_onu_customers(rows)
+                if _normalize_mac(row.get('mac_address') or '') not in placed]
+    return jsonify({'onus': unplaced}), 200
 
 
 # --- Live actions on a customer's PPPoE secret (Concept B). Staff-triggered
