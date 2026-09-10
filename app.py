@@ -373,6 +373,56 @@ class NetworkDevice(db.Model):
             'interface_labels': self.interface_labels or {},
         }
 
+NODE_KINDS = ('root', 'junction', 'onu')
+
+
+class NetworkNode(db.Model):
+    """One point on the geographic fibre map. Each node's link to its parent
+    IS a span -- fibre is a tree, so a node has exactly one parent and no
+    separate span table is needed. Mirrors NetworkDevice.parent_device_id.
+
+    See docs/superpowers/specs/2026-09-10-network-geo-fiber-map-design.md."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    olt_device_id = db.Column(db.Integer, db.ForeignKey('network_device.id'), nullable=False)
+    kind = db.Column(db.String(10), nullable=False)          # one of NODE_KINDS
+    label = db.Column(db.String(100), nullable=False)
+    # Numeric, not Float: ~11cm of precision with no binary-float drift across
+    # the JSON round-trip a drag-to-reposition performs on every save.
+    latitude = db.Column(db.Numeric(9, 6), nullable=False)
+    longitude = db.Column(db.Numeric(9, 6), nullable=False)
+    parent_node_id = db.Column(db.Integer, db.ForeignKey('network_node.id'), nullable=True)
+    # Colon-form MAC (see _canonical_mac). Set only when kind == 'onu'; this is
+    # what binds a placed point to a live ONU in the OLT's walk. Bound by MAC
+    # rather than (pon, onu_id) because a MAC survives the ONU being moved
+    # between PON ports, and it is the key Customer.onu_mac_address uses.
+    onu_mac = db.Column(db.String(20), nullable=True, index=True)
+    # Volatile scraped state, overwritten each fetch, never appended to.
+    # DISPLAY ONLY -- _compute_map_status must not read these. Populated by a
+    # later plan; the columns exist now so the map's one migration is the only
+    # one this feature needs.
+    last_dereg_reason = db.Column(db.String(20), nullable=True)
+    # When WE read it, deliberately not the OLT's own timestamp: the OLT has no
+    # real clock and reports uptime-relative times like 1970/01/30 17:52:34.
+    last_dereg_reason_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'olt_device_id': self.olt_device_id,
+            'kind': self.kind,
+            'label': self.label,
+            # float(), not str(): Numeric round-trips as Decimal, which is not
+            # JSON-serialisable and would 500 the whole map endpoint.
+            'latitude': float(self.latitude),
+            'longitude': float(self.longitude),
+            'parent_node_id': self.parent_node_id,
+            'onu_mac': self.onu_mac,
+            'last_dereg_reason': self.last_dereg_reason,
+        }
+
 # What the agent will relay. Six reads, plus two PPPoE writes added in the
 # writes cycle -- see docs/superpowers/specs/2026-09-08-relay-pppoe-writes-design.md.
 # The writes are capped on the agent's own side (max_suspends_per_hour in
@@ -1571,7 +1621,7 @@ TENANT_OWNED_MODELS = (
     MonthlyProfitEstimate,
     UpstreamProvider, UpstreamProviderPayment,
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
-    CustomerPaymentLink, CustomerWhishPaymentAttempt,
+    CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
 )
 
 from sqlalchemy import event as _sa_event
@@ -2398,8 +2448,11 @@ _TENANT_DELETE_ORDER = [
     # network_device, so NetworkDevice must stay AFTER Customer in this
     # list, or a tenant delete raises ForeignKeyViolation against real
     # Postgres while staying silently green on SQLite.
-    # Jobs reference network_device, so they must go before it.
-    NetworkAgentJob, NetworkAgent,
+    # Jobs reference network_device, so they must go before it. NetworkNode
+    # (the geo fibre map) also holds an FK to network_device.id (olt_device_id),
+    # so it too must precede NetworkDevice here or a tenant delete raises
+    # ForeignKeyViolation on Postgres while passing silently on SQLite.
+    NetworkAgentJob, NetworkAgent, NetworkNode,
     NetworkDevice,
     # Phase 3 fix: MonthlyProfitEstimate was missing here entirely. SQLite
     # doesn't enforce FK constraints, so a tenant delete silently orphaned
