@@ -485,7 +485,7 @@ git commit -m "feat: add span-colouring algorithm with fault-boundary detection"
 
 **Interfaces:**
 - Consumes: `NetworkNode` (Task 1); `_compute_map_status` (Task 2); `_latest_results_by_device(devices)` (app.py:9400); `_resolve_onu_customers(onus)` (app.py:9654); `vsol_olt._dedupe_by_mac`; `network_view_required()` (app.py:1731).
-- Produces: `GET /api/network-map?olt_device_id=<id>` → `{nodes, spans, node_status, orphans, onu_status, last_result_at, distance_warnings}`; `GET /api/network-map/unplaced-onus?olt_device_id=<id>` → `{onus: [...]}`.
+- Produces: `GET /api/network-map?olt_device_id=<id>` → `{nodes, spans, node_status, orphans, onu_status, last_result_at}` (Task 5 adds `distance_warnings`); `GET /api/network-map/unplaced-onus?olt_device_id=<id>` → `{onus: [...]}`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -667,7 +667,11 @@ def get_network_map():
         'nodes': [n.to_dict() for n in nodes],
         'onu_status': onu_status,
         'last_result_at': last_result_at,
-        'distance_warnings': _map_distance_warnings(nodes, rows),
+        # 'distance_warnings' is added to this payload by Task 5, together with
+        # the function that computes it. Deliberately absent here rather than
+        # stubbed: a placeholder returning [] would be dead code for the whole
+        # of this task, and the frontend that reads the key is not built until
+        # Task 6.
         **computed,
     }), 200
 
@@ -695,7 +699,7 @@ def get_unplaced_onus():
 
 `current_tenant_id()`, `tenant_query()` and `new_for_tenant(model, **kwargs)` all come from `tenancy.py` and are already imported in `app.py`. There is no underscore-prefixed variant of any of them — do not invent one.
 
-`_map_distance_warnings` is written in Task 5. Until then, stub it as `return []` in **this** step so the endpoint imports, and Task 5 replaces the stub with the real implementation and its tests.
+Do **not** create `_map_distance_warnings` in this task. It arrives whole in Task 5, along with the `distance_warnings` key in this endpoint's payload. Nothing before Task 6 reads that key.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1033,10 +1037,8 @@ git commit -m "feat: add network map node CRUD with cycle and uniqueness guards"
 
 ### Task 5: Gross-placement sanity check
 
-Replaces the Task 3 stub.
-
 **Files:**
-- Modify: `app.py` — replace the `_map_distance_warnings` stub
+- Modify: `app.py` — add `_map_distance_warnings`, and add its `distance_warnings` key to `get_network_map`'s payload
 - Test: `tests/test_network_map_distance.py`
 
 **Interfaces:**
@@ -1158,11 +1160,11 @@ def test_a_cycle_does_not_hang_the_check():
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_network_map_distance.py -v`
-Expected: FAIL — the Task 3 stub returns `[]`, so the two flagging tests fail while the silent ones pass vacuously.
+Expected: every test FAILS with `AttributeError: module 'app' has no attribute '_map_distance_warnings'`. Note that a *stubbed* version returning `[]` would make six of these nine tests pass vacuously — which is exactly why no stub was created in Task 3.
 
 - [ ] **Step 3: Write the implementation**
 
-Replace the stub in `app.py`:
+Add to `app.py`:
 
 ```python
 # All three are named constants, not literals: the real values can only be
@@ -1239,10 +1241,12 @@ Add a module-level `_to_int_or_none(value)` returning `None` for anything non-nu
 Run: `python -m pytest tests/test_network_map_distance.py -v`
 Expected: 9 passed
 
-- [ ] **Step 5: Confirm the endpoint now returns warnings**
+- [ ] **Step 5: Wire it into the map payload**
 
-Run: `python -m pytest tests/test_network_map_api.py -v`
-Expected: all still pass (`distance_warnings` is now real rather than `[]`).
+Add `'distance_warnings': _map_distance_warnings(nodes, rows),` to the `jsonify` block in `get_network_map` (Task 3 left a comment marking the spot), then confirm nothing regressed:
+
+Run: `python -m pytest tests/test_network_map_api.py tests/test_network_map_status.py -v`
+Expected: all pass.
 
 - [ ] **Step 6: Commit**
 
