@@ -11064,6 +11064,16 @@ def _map_distance_warnings(nodes, onu_rows):
         if chain is None:
             continue
 
+        # The second clause is currently implied by the first: given the
+        # floor guarantee above (distance >= DISTANCE_CHECK_MIN_METRES),
+        # chain > distance * DISTANCE_CHECK_FACTOR algebraically forces
+        # chain - distance > DISTANCE_CHECK_MIN_GAP_METRES, so it can never
+        # be the deciding factor for any input that clears the floor with
+        # today's constant values. It stays anyway: it becomes load-bearing
+        # again the moment the floor is lowered or the factor is tuned below
+        # 2.0 -- both explicitly expected once real placements exist -- and
+        # together the two clauses are what make the rule safe at both ends
+        # of the range (proportional for long runs, absolute for short ones).
         if (chain > distance * DISTANCE_CHECK_FACTOR
                 and chain - distance > DISTANCE_CHECK_MIN_GAP_METRES):
             warnings.append({'node_id': node.id,
