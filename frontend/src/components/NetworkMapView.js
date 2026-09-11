@@ -15,6 +15,7 @@ import L from 'leaflet';
 // '/api', so paths here start at '/network-map', not '/api/network-map'.
 import { apiService, useAppContext } from '../context/AppContext';
 import { spanStyle, nodeMarkerStyle, TILE_LAYERS } from './fiberMapStyles';
+import { formatStamp } from './formatStamp';
 import 'leaflet/dist/leaflet.css';
 import './networkMap.css';
 
@@ -28,6 +29,13 @@ const DEFAULT_CENTER = [34.4367, 35.8497];
 // rather than rendering a control that would just 403 on click, is the
 // whole point of the role prop.
 const EDIT_ROLES = ['admin', 'finance'];
+
+// Separator- and case-insensitive, matching the backend's _normalize_mac:
+// strip everything but hex digits before comparing, so 'aa:aa:aa:aa:aa:aa'
+// and 'AA-AA-AA-AA-AA-AA' compare equal here the same way they do server-side.
+function normalizeMacJs(mac) {
+  return (mac || '').toLowerCase().replace(/[^0-9a-f]/g, '');
+}
 
 // nodeMarkerStyle's fillOpacity is meant as CircleMarker-style fill opacity --
 // the fill can fade while the outline stays put -- but CSS `opacity` on the
@@ -125,7 +133,7 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
     (data?.nodes || [])
       .map((n) => n.onu_mac)
       .filter(Boolean)
-      .map((mac) => mac.toLowerCase())
+      .map(normalizeMacJs)
   ), [data]);
   // Defence in depth: get_unplaced_onus already excludes anything with a
   // node server-side, but this page's own `data.nodes` is sometimes fresher
@@ -133,7 +141,7 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
   // unplaced-onus fetch lands) -- re-filtering here means a stale response
   // can never show an ONU as unplaced when this page already knows better.
   const unplacedFiltered = useMemo(() => unplaced.filter(
-    (o) => o.mac_address && !placedMacs.has(o.mac_address.toLowerCase())
+    (o) => o.mac_address && !placedMacs.has(normalizeMacJs(o.mac_address))
   ), [unplaced, placedMacs]);
 
   const closeDialog = () => { if (!saving) setDialog(null); };
@@ -243,11 +251,23 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
   if (loading) return <CircularProgress />;
   if (!data) return <Alert severity="error">The network map is unavailable.</Alert>;
 
-  const byId = Object.fromEntries(data.nodes.map((n) => [n.id, n]));
-  const root = data.nodes.find((n) => n.kind === 'root');
+  // `data` can be truthy and still not be the payload shape this page
+  // expects -- e.g. the service worker's offline fallback resolves any
+  // failed fetch to a fake 200 whose body is the plain string
+  // "You are offline.", which is truthy and sails past the `!data` check
+  // above. Defaulting every read here means a malformed payload degrades to
+  // an empty map instead of throwing and white-screening the whole app.
+  const nodes = data.nodes || [];
+  const spans = data.spans || [];
+  const orphans = data.orphans || [];
+  const distanceWarnings = data.distance_warnings || [];
+  const nodeStatus = data.node_status || {};
+
+  const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
+  const root = nodes.find((n) => n.kind === 'root');
   const center = root ? [root.latitude, root.longitude] : DEFAULT_CENTER;
   const layer = TILE_LAYERS.find((l) => l.key === layerKey) || TILE_LAYERS[0];
-  const boundary = data.spans.filter((s) => s.is_fault_boundary);
+  const boundary = spans.filter((s) => s.is_fault_boundary);
   const pendingParent = pendingParentId != null ? byId[pendingParentId] : null;
 
   return (
@@ -262,17 +282,22 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
         </Alert>
       )}
 
-      {data.orphans.length > 0 && (
+      {orphans.length > 0 && (
         <Alert severity="warning" sx={{ mb: 2 }}>
-          {data.orphans.length} node(s) are not connected to the control room
-          and are not drawn. Their parent links form a loop and need fixing.
+          {orphans.length} node(s) are not connected to the control room --
+          their spans are not drawn. Their parent links form a loop and need
+          fixing.
         </Alert>
       )}
 
-      {data.distance_warnings.length > 0 && (
+      {distanceWarnings.length > 0 && (
         <Alert severity="info" sx={{ mb: 2 }}>
-          {data.distance_warnings.length} pin(s) sit much further from the
-          control room than the OLT reports. Likely placed in the wrong spot.
+          {distanceWarnings.length} pin(s) sit much further from the
+          control room than the OLT reports: {distanceWarnings
+            .map((w) => byId[w.node_id]?.label)
+            .filter(Boolean)
+            .sort()
+            .join(', ')}. Likely placed in the wrong spot.
         </Alert>
       )}
 
@@ -290,14 +315,14 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
             with nothing that would 403 on click. */}
         {canEdit && (
           <ToggleButton size="small" value="add" selected={addMode} onChange={toggleAddMode}>
-            {data.nodes.length === 0 ? 'Add node (control room)' : 'Add node'}
+            {nodes.length === 0 ? 'Add node (control room)' : 'Add node'}
           </ToggleButton>
         )}
       </Stack>
 
       {canEdit && addMode && (
         <Alert severity="info" sx={{ mb: 1 }}>
-          {data.nodes.length === 0
+          {nodes.length === 0
             ? 'Click the map to place the control room.'
             : pendingParent
               ? `Click the map to place the next node down the line from "${pendingParent.label}".`
@@ -317,7 +342,7 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
 
           {canEdit && <MapClickCapture onMapClick={handleMapClick} />}
 
-          {data.spans.map((span) => {
+          {spans.map((span) => {
             const a = byId[span.parent_node_id];
             const b = byId[span.child_node_id];
             if (!a || !b) return null;
@@ -334,8 +359,8 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
             );
           })}
 
-          {data.nodes.map((node) => {
-            const status = data.node_status[node.id] || 'unknown';
+          {nodes.map((node) => {
+            const status = nodeStatus[node.id] || 'unknown';
             const icon = nodeDivIcon(node.kind, status);
             return (
               <Marker key={node.id} position={[node.latitude, node.longitude]}
@@ -370,7 +395,7 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
 
       <Typography variant="caption" sx={{ mt: 1, display: 'block' }}>
         {data.last_result_at
-          ? `ONU status from the OLT check at ${data.last_result_at}.`
+          ? `ONU status from the OLT check at ${formatStamp(data.last_result_at)}.`
           : 'No successful OLT check yet — every span is shown as unknown.'}
       </Typography>
 

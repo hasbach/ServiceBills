@@ -9604,11 +9604,19 @@ def _compute_map_status(nodes, onu_status):
         else:
             children_of.setdefault(parent_id, []).append(node)
 
-    # The only two statuses the OLT scrape actually reports; anything else
-    # (e.g. 'N/A', '' from a scrape hiccup) must read as unknown here AND in
-    # the node_status ONU branch below -- both must agree, or a single
-    # malformed value produces a self-contradictory payload (a red span next
-    # to a node whose own status says 'unknown').
+    # _compute_map_status is a public-shaped helper -- it takes whatever
+    # {mac: status} mapping it's handed, not only the one this file happens
+    # to build -- so this guard is defensive against a caller that passes
+    # through a status the OLT scrape didn't actually report (e.g. 'N/A', ''
+    # from a scrape hiccup). The current, sole caller (_map_onu_status)
+    # already collapses every row to strictly 'online' or 'offline' before
+    # onu_status is ever built, so today `own` here is only ever one of
+    # those two values or None (a MAC absent from the walk); the malformed-
+    # value case this guard exists for cannot actually reach it yet. Both
+    # this and the node_status ONU branch below must still agree on the
+    # rule, or a future non-normalising caller would produce a
+    # self-contradictory payload (a red span next to a node whose own status
+    # says 'unknown').
     KNOWN_ONU_STATUSES = ('online', 'offline')
 
     visited, alive, known = set(), {}, {}

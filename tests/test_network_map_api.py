@@ -66,6 +66,24 @@ def test_map_read_is_allowed_for_employee(app, client):
     assert body['orphans'] == []
 
 
+def test_map_read_response_has_exactly_the_documented_keys(app, client):
+    """FINDING 7 (final whole-branch review): the frontend reads
+    'distance_warnings' off this payload (among others), but nothing on
+    either side asserted the key even existed -- deleting it from
+    get_network_map's response passed every other backend test. Pin the
+    exact top-level key set so a future key removal or rename fails here
+    instead of only being caught in production."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    body = client.get(f'/api/network-map?olt_device_id={olt}',
+                      headers=admin).get_json()
+    assert set(body.keys()) == {
+        'nodes', 'spans', 'node_status', 'orphans', 'onu_status',
+        'last_result_at', 'distance_warnings',
+    }
+
+
 def test_map_read_rejects_a_role_outside_network_view(app, client):
     make_tenant(client, 'DeltaNet', 'admin')
     admin = auth_headers(client, 'admin', 'pw', role='admin')
