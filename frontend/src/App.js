@@ -30,6 +30,7 @@ import {
     CloudQueue as UpstreamProviderIcon,
     NetworkCheck as NetworkDeviceIcon,
     AccountTree as NetworkTreeIcon,
+    Map as NetworkMapIcon,
 } from '@mui/icons-material';
 import { AppContextProvider, useAppContext, apiService } from './context/AppContext.js';
 import DashboardView from './components/DashboardView.js';
@@ -59,6 +60,7 @@ import EmployeesView from './components/EmployeesView.js';
 import UpstreamProviderManagementView from './components/UpstreamProviderManagementView.js';
 import NetworkDeviceManagementView from './components/NetworkDeviceManagementView.js';
 import NetworkTreeView from './components/NetworkTreeView.js';
+import NetworkMapPage from './components/NetworkMapPage.js';
 
 // ── Navigation config ────────────────────────────────────────────────────────
 const NAV_ITEMS = [
@@ -79,6 +81,11 @@ const NAV_ITEMS = [
     // the page (Match Labels) is hidden from them in NetworkTreeView.js and
     // refused by admin_or_finance_required() on the endpoints behind it.
     { key: 'network-tree',       label: 'Network Tree',       icon: <NetworkTreeIcon />,      group: 'main',    allowedRoles: ['admin', 'finance', 'employee', 'collector'] },
+    // Same roles as network-tree above: the map's read endpoints are also
+    // network_view_required() (admin/finance/employee/collector), and writes
+    // are admin_or_finance_required() -- enforced inside NetworkMapView.js
+    // (canEdit) and the backend itself, not by this nav entry.
+    { key: 'network-map',        label: 'Network Map',        icon: <NetworkMapIcon />,       group: 'main',    allowedRoles: ['admin', 'finance', 'employee', 'collector'] },
     { key: 'employees',          label: 'Payroll',            icon: <PayrollIcon />,             group: 'main',      allowedRoles: ['admin'] },
     { key: 'payments',           label: 'Payments',           icon: <PaymentIcon />,         group: 'main',      allowedRoles: ['admin', 'finance', 'collector'] },
     { key: 'receipts',           label: 'Receipts',           icon: <ReceiptIcon />,         group: 'main',      allowedRoles: ['admin', 'finance'] },
@@ -277,6 +284,7 @@ const MainApp = ({
             case 'upstream-providers': return <UpstreamProviderManagementView customers={customers} />;
             case 'network-devices': return <NetworkDeviceManagementView />;
             case 'network-tree': return <NetworkTreeView />;
+            case 'network-map': return <NetworkMapPage />;
             case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
             case 'payments': return <PaymentsView />;
             case 'receipts': return <ReceiptsView />;
