@@ -10,11 +10,21 @@ self.addEventListener('activate', event => {
 
 // A fetch event handler is REQUIRED by Chrome/Android to trigger the beforeinstallprompt event
 self.addEventListener('fetch', event => {
-  // Simple network-first approach, or just pass-through
+  // Only intercept GET requests
+  if (event.request.method !== 'GET') return;
+
   event.respondWith(
-    fetch(event.request).catch(() => {
-      // Offline fallback could be added here
-      return new Response("You are offline.");
+    fetch(event.request).catch(error => {
+      // For navigation requests (page loads), return an offline message
+      if (event.request.mode === 'navigate') {
+        return new Response("You are offline.", {
+          status: 503,
+          statusText: "Service Unavailable",
+          headers: { 'Content-Type': 'text/plain' }
+        });
+      }
+      // For API calls and static assets, propagate the network error so fetch/axios catches it
+      throw error;
     })
   );
 });

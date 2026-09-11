@@ -61,6 +61,7 @@ import UpstreamProviderManagementView from './components/UpstreamProviderManagem
 import NetworkDeviceManagementView from './components/NetworkDeviceManagementView.js';
 import NetworkTreeView from './components/NetworkTreeView.js';
 import NetworkMapPage from './components/NetworkMapPage.js';
+import ErrorBoundary from './components/ErrorBoundary.js';
 
 // ── Navigation config ────────────────────────────────────────────────────────
 const NAV_ITEMS = [
@@ -372,7 +373,7 @@ const MainApp = ({
 
 // This component now decides whether to show the Login/Register screens or the MainApp
 const AppContent = () => {
-    const { isAuthenticated, setSnackbar, logout, user } = useAppContext();
+    const { isAuthenticated, setSnackbar, user } = useAppContext();
     const location = useLocation();
     const isSuperadmin = (user?.role || '') === 'superadmin';
 
@@ -414,7 +415,11 @@ const AppContent = () => {
         }
     }, [businessSettings]);
 
+    const userRoles = (user?.role || '').split(',').map(r => r.trim().toLowerCase());
+    const canManagePlans = userRoles.includes('admin') || userRoles.includes('finance');
+
     const refetchSubscriptionPlans = useCallback(async () => {
+        if (!canManagePlans) return;
         try {
             const plansRes = await apiService.fetchSubscriptionPlans();
             setSubscriptionPlans(plansRes || []);
@@ -422,7 +427,7 @@ const AppContent = () => {
             console.error("Error fetching subscription plans:", error);
             setSnackbar({ open: true, message: 'Failed to refresh subscription plans.', severity: 'error' });
         }
-    }, [setSnackbar]);
+    }, [canManagePlans, setSnackbar]);
 
     const refetchCustomers = useCallback(async (page = 1, per_page = 25, searchQuery = '', sortBy = 'expiry_date', resellerId = '') => {
         try {
@@ -436,7 +441,7 @@ const AppContent = () => {
             });
         } catch (error) {
             console.error("Error fetching customers:", error);
-            setSnackbar({ open: true, message: 'Failed to load customers.', severity: 'error' });
+            setSnackbar({ open: true, message: 'Failed to refresh customers list.', severity: 'error' });
         }
     }, [setSnackbar]);
 
@@ -465,7 +470,7 @@ const AppContent = () => {
                     // --- FIX: Correctly await and destructure responses ---
                     const [customersRes, plansRes, settingsRes] = await Promise.all([
                         apiService.fetchCustomers(),
-                        apiService.fetchSubscriptionPlans(),
+                        canManagePlans ? apiService.fetchSubscriptionPlans() : Promise.resolve([]),
                         apiService.fetchBusinessSettings(),
                     ]);
 
@@ -491,7 +496,7 @@ const AppContent = () => {
         } else {
             setLoading(false); // If not authenticated, stop loading
         }
-    }, [isAuthenticated, setSnackbar]);
+    }, [isAuthenticated, isSuperadmin, canManagePlans, setSnackbar]);
 
 
     // Public deep-link screens render regardless of auth (email links land here).
@@ -550,11 +555,13 @@ function App() {
     return (
         <ThemeProvider theme={theme}>
             <CssBaseline />
-            <BrowserRouter>
-                <AppContextProvider>
-                    <AppContentWrapper />
-                </AppContextProvider>
-            </BrowserRouter>
+            <ErrorBoundary>
+                <BrowserRouter>
+                    <AppContextProvider>
+                        <AppContentWrapper />
+                    </AppContextProvider>
+                </BrowserRouter>
+            </ErrorBoundary>
         </ThemeProvider>
     );
 }
