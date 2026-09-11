@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timedelta
 
 import app as appmod
@@ -724,9 +725,27 @@ def test_a_reparent_against_a_cycle_returns_400_promptly(app, client):
         appmod.db.session.commit()
         a_id, b_id = a.id, b.id
 
-    r = client.put(f'/api/network-map/nodes/{a_id}', headers=admin,
-                   json={'parent_node_id': b_id})
-    assert r.status_code == 400
+    # Run the request off the main thread and join with a timeout: if the
+    # seen-set guard inside _node_descendant_ids ever regresses, the walk
+    # over this forged cycle hangs forever rather than raising, and without
+    # pytest-timeout installed (deliberately not added -- see FINDING 5) an
+    # un-timed call here would hang the whole suite/CI instead of failing
+    # this one test. 15s is generous for a walk that normally takes
+    # milliseconds.
+    result = {}
+
+    def run():
+        result['response'] = client.put(
+            f'/api/network-map/nodes/{a_id}', headers=admin,
+            json={'parent_node_id': b_id})
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=15)
+    assert not t.is_alive(), (
+        'descendant walk did not terminate within 15s -- the seen-set '
+        'termination guard in _node_descendant_ids appears to have regressed')
+    assert result['response'].status_code == 400
 
 
 # --- FINDING 8: coordinates are required on create, not just in-range -----
@@ -749,3 +768,191 @@ def test_missing_longitude_on_create_is_rejected(app, client):
         'olt_device_id': olt, 'kind': 'root', 'label': 'CR',
         'latitude': 34.4367})
     assert r.status_code == 400
+
+
+# --- Fix round 2, FINDING 1: _coerce_fk_id's own branches, previously
+# untested -- each of the following passed with all 41 prior tests green
+# even with the corresponding branch mutated away. ------------------------
+
+def test_a_boolean_parent_node_id_does_not_silently_become_id_1(app, client):
+    """isinstance(True, int) is True in Python and int(True) == 1, so
+    without _coerce_fk_id's explicit bool guard, {"parent_node_id": true}
+    would silently resolve to whatever row has id 1 -- usually the root,
+    exactly the node created first below in this fresh per-test database."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    assert root == 1, 'test assumes a fresh per-test DB where the first node is id 1'
+    for bad in (True, False):
+        r = _node(client, admin, olt, kind='junction', label='X',
+                  parent_node_id=bad)
+        assert r.status_code == 400, f'{bad!r} should 400, got {r.status_code}'
+
+
+def test_a_whole_valued_float_parent_node_id_is_rejected_against_a_real_row(app, client):
+    """The existing 'abc'/[]/{}}/12.7 coercion test happens to use a float
+    (12.7) that matches no row either way, so a mutation truncating floats
+    via int() instead of rejecting them outright would still 400 there --
+    just for the wrong reason (parent not found, not "must be an integer").
+    12.0 aimed at a node id that genuinely exists closes that gap: if
+    truncation crept back in, this would silently succeed instead of 400."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    last_id = root
+    for i in range(11):
+        last_id = _node(client, admin, olt, kind='junction', label=f'J{i}',
+                        parent_node_id=root).get_json()['id']
+    assert last_id == 12, 'test assumes a fresh per-test DB with sequential ids'
+    r = _node(client, admin, olt, kind='junction', label='X', parent_node_id=12.0)
+    assert r.status_code == 400
+
+
+def test_a_list_or_dict_parent_node_id_on_a_root_is_rejected(app, client):
+    """Distinct from the existing 'abc'/[]/{}/12.7 test, which uses kind=
+    junction: there, a mutation changing _coerce_fk_id's final fallback from
+    (None, False) to (None, True) would still 400 -- just for the wrong
+    reason ("a non-root node requires a parent"), because [] and {} would
+    be treated as an absent (None) parent, which a non-root node still
+    lacks. A root payload has no such fallback error to hide behind: a
+    root's parent is legitimately None, so only the coercion's own
+    ok=False keeps this a 400."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    for bad in ([], {}):
+        r = _node(client, admin, olt, kind='root', label='CR', parent_node_id=bad)
+        assert r.status_code == 400, f'{bad!r} should 400, got {r.status_code}'
+
+
+# --- Fix round 2, FINDING 2: booleans must not be accepted as coordinates -
+
+def test_boolean_coordinates_are_rejected(app, client):
+    """float(True) is 1.0 and float(False) is 0.0, so without an explicit
+    bool guard {"latitude": true, "longitude": false} would 201 a node at a
+    confidently wrong 0N 1E -- a real dispatch-location bug on a map used to
+    send technicians. Mirrors the bool guard _coerce_fk_id already has."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    for bad in (True, False):
+        assert _node(client, admin, olt, kind='root', label='CR',
+                     latitude=bad).status_code == 400, f'latitude={bad!r}'
+        assert _node(client, admin, olt, kind='root', label='CR',
+                     longitude=bad).status_code == 400, f'longitude={bad!r}'
+
+
+def test_int_and_float_coordinates_are_still_accepted(app, client):
+    """The bool guard must not overreach: genuine ints and floats are still
+    real coordinates."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    r = _node(client, admin, olt, kind='root', label='CR',
+              latitude=34, longitude=35.8497)
+    assert r.status_code == 201
+    body = r.get_json()
+    assert body['latitude'] == 34.0
+    assert body['longitude'] == 35.8497
+
+    r2 = _node(client, admin, olt, kind='junction', label='J',
+               parent_node_id=body['id'], latitude=34.4367, longitude=35.8497)
+    assert r2.status_code == 201
+
+
+# --- Fix round 2, FINDING 3: out-of-range and non-positive ids must 400,
+# not reach the database and crash. -----------------------------------------
+
+def test_an_oversized_parent_node_id_is_rejected_not_500(app, client):
+    """100000000000000000000 reaching the database raises OverflowError on
+    SQLite (a DataError on Postgres) instead of 400ing cleanly."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    r = _node(client, admin, olt, kind='junction', label='X',
+              parent_node_id=100000000000000000000)
+    assert r.status_code == 400
+
+
+def test_an_oversized_olt_device_id_is_rejected_not_500(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    r = client.post('/api/network-map/nodes', headers=admin, json={
+        'olt_device_id': 100000000000000000000, 'kind': 'root', 'label': 'CR',
+        'latitude': 34.4367, 'longitude': 35.8497})
+    assert r.status_code == 400
+
+
+def test_zero_and_negative_parent_node_ids_are_rejected(app, client):
+    """No valid row id is ever zero or negative, so these must 400 directly
+    out of _coerce_fk_id rather than fall through to a "parent not found"
+    lookup."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    for bad in (0, -1, -100000000000000000000):
+        r = _node(client, admin, olt, kind='junction', label='X',
+                  parent_node_id=bad)
+        assert r.status_code == 400, f'{bad!r} should 400, got {r.status_code}'
+
+
+# --- Fix round 2, FINDING 6: MAC uniqueness is scoped per OLT, not tenant --
+
+def test_same_mac_allowed_under_two_different_olts_in_one_tenant(app, client):
+    """The clash query is scoped with filter_by(olt_device_id=device_id);
+    dropping that filter would survive the rest of the suite (there is
+    already a cross-tenant test, test_a_foreign_tenants_mac_does_not_clash,
+    but no same-tenant/different-OLT one). The same ONU model or a genuine
+    data-entry repeat of a MAC across two different OLTs owned by the same
+    tenant must not collide -- only a repeat under the *same* OLT should."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt1 = _olt(client, admin)
+    r = client.post('/api/network-devices', headers=admin, json={
+        'name': 'OLT2', 'host': '192.168.8.101', 'api_port': 161,
+        'username': '', 'password': 'public', 'device_type': 'vsol_olt'})
+    olt2 = r.get_json()['device']['id']
+    root1 = _node(client, admin, olt1, kind='root', label='CR1').get_json()['id']
+    root2 = _node(client, admin, olt2, kind='root', label='CR2').get_json()['id']
+    r1 = _node(client, admin, olt1, kind='onu', label='Onu1', parent_node_id=root1,
+               onu_mac='dd:dd:dd:dd:dd:dd')
+    r2 = _node(client, admin, olt2, kind='onu', label='Onu2', parent_node_id=root2,
+               onu_mac='dd:dd:dd:dd:dd:dd')
+    assert r1.status_code == 201, r1.get_json()
+    assert r2.status_code == 201, r2.get_json()
+
+
+# --- Fix round 2, FINDING 7: a corrupt stored MAC must not block an
+# unrelated partial update. --------------------------------------------------
+
+def test_a_partial_update_is_not_blocked_by_a_corrupt_stored_mac(app, client):
+    """Same class of bug as the cycle case already fixed in the previous
+    round: pre-existing corruption in a field an edit doesn't touch must not
+    block that edit. Forges a node with a malformed onu_mac directly via the
+    ORM -- every write path through the API always runs onu_mac through
+    _canonical_mac before saving, so a non-canonical/invalid stored value
+    can only arise from data that predates that invariant -- then confirms a
+    label-only PUT still succeeds instead of 400ing on "onu_mac is not a
+    valid MAC"."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    with app.app_context():
+        onu = appmod.NetworkNode(
+            tenant_id=1, olt_device_id=olt, kind='onu', label='Corrupt',
+            latitude=34.4367, longitude=35.8497, parent_node_id=root,
+            onu_mac='not-a-mac')
+        appmod.db.session.add(onu)
+        appmod.db.session.commit()
+        onu_id = onu.id
+
+    r = client.put(f'/api/network-map/nodes/{onu_id}', headers=admin,
+                   json={'label': 'Renamed'})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['label'] == 'Renamed'
+    # Untouched and unvalidated -- still the corrupt value that was stored.
+    assert body['onu_mac'] == 'not-a-mac'

@@ -11095,6 +11095,9 @@ def get_unplaced_onus():
 # widening the read side to field roles must not widen who can rewrite the
 # customer<->ONU mapping.
 
+_MAX_FK_ID = 2 ** 63 - 1   # signed 64-bit ceiling shared by SQLite and Postgres
+
+
 def _coerce_fk_id(raw):
     """(id_or_None, ok) for a foreign-key-shaped JSON value.
 
@@ -11103,27 +11106,46 @@ def _coerce_fk_id(raw):
     JSON string fine via column affinity, but a later Python-side membership
     test (an `in` against a set of ints already loaded from the database)
     silently never matches a str, which is exactly how the cycle guard used
-    to become a no-op (see FINDING 1). None/True means "absent", which is a
+    to become a no-op (see FINDING 1). None means "absent", which is a
     legitimate value on its own -- e.g. a root node has no parent.
 
     A bool is rejected even though Python's bool is an int subclass -- a
-    JSON true/false has no business becoming a row id. A float (12.7, or a
-    whole-valued 12.0) is rejected outright rather than silently truncated
-    by int(): the strict, no-fuzzy-coercion idiom _canonical_mac already
-    uses for MACs applies here too.
+    JSON true/false has no business becoming a row id (isinstance(True, int)
+    is True and int(True) == 1, so without this a stray `true` would
+    silently resolve to whatever row happens to have id 1). A float (12.7,
+    or a whole-valued 12.0) is rejected outright rather than silently
+    truncated by int().
+
+    Also rejected: anything outside 1..2**63-1. No valid row id is ever zero
+    or negative, so those are refused here rather than left to fall through
+    to a "not found" lookup; and a value beyond a signed 64-bit int would
+    otherwise reach the database query and blow up there instead (SQLite
+    raises OverflowError, Postgres a DataError) -- a 400 here is cheaper and
+    clearer than a 500 from the driver.
+
+    This is deliberately not a hardened parser: int() on a string tolerates
+    surrounding whitespace, a leading '+', and Unicode decimal digits (e.g.
+    ' 5', '5 ', '+5', '٥') -- each still yields a genuine, in-range
+    Python int, so the cycle guard and every downstream comparison behave
+    correctly either way. That leniency is int()'s normal behaviour on
+    well-formed numerals, not fuzzy or partial coercion, so it is left as-is.
     """
     if raw is None:
         return None, True
     if isinstance(raw, bool) or isinstance(raw, float):
         return None, False
     if isinstance(raw, int):
-        return raw, True
-    if isinstance(raw, str):
+        value = raw
+    elif isinstance(raw, str):
         try:
-            return int(raw), True
+            value = int(raw)
         except ValueError:
             return None, False
-    return None, False
+    else:
+        return None, False
+    if not (0 < value <= _MAX_FK_ID):
+        return None, False
+    return value, True
 
 
 def _node_descendant_ids(node_id, device_id):
@@ -11158,9 +11180,17 @@ def _validate_node_payload(payload, device_id, node=None):
 
     for field, limit in (('latitude', 90.0), ('longitude', 180.0)):
         if field in payload or node is None:
+            raw_value = payload.get(field)
+            # float(True) is 1.0 and float(False) is 0.0 -- a bool has no
+            # business becoming a coordinate, so it is rejected the same
+            # way _coerce_fk_id rejects one as a row id. Without this,
+            # {"latitude": true, "longitude": false} would 201 a node at a
+            # confidently wrong 0N 1E on a map used to dispatch technicians.
+            if isinstance(raw_value, bool):
+                return None, (jsonify({'message': f'{field} must be a number'}), 400)
             try:
-                value = float(payload[field])
-            except (KeyError, TypeError, ValueError):
+                value = float(raw_value)
+            except (TypeError, ValueError):
                 return None, (jsonify({'message': f'{field} must be a number'}), 400)
             if not -limit <= value <= limit:
                 return None, (jsonify(
@@ -11211,34 +11241,50 @@ def _validate_node_payload(payload, device_id, node=None):
                             'descendant -- that would create a cycle'}), 400)
     cleaned['parent_node_id'] = parent_id
 
-    # MAC: required on an ONU, forbidden otherwise, unique per OLT.
+    # MAC: required on an ONU, forbidden otherwise, unique per OLT. Only
+    # actually re-validated/re-canonicalised when it is changing -- the same
+    # gating the parent/cycle check above uses, and for the same reason (see
+    # FINDING 7): a corrupt *stored* MAC (predating _canonical_mac's
+    # invariant, or written some other way) must not block an unrelated
+    # label- or coordinates-only edit, since dragging a pin or renaming a
+    # node is exactly how an operator would go on to fix that very data. As
+    # with parent_node_id, an omitted key already lands here equal to the
+    # stored value via the payload.get(...) default below, so comparing
+    # against that covers both "key omitted" and "key resent unchanged".
     raw_mac = payload.get('onu_mac', node.onu_mac if node else None)
+    mac_changing = node is None or raw_mac != node.onu_mac
     if kind == 'onu':
         if not raw_mac:
             return None, (jsonify(
                 {'message': 'an ONU node requires onu_mac'}), 400)
-        mac = _canonical_mac(raw_mac)
-        if not mac:
-            return None, (jsonify({'message': 'onu_mac is not a valid MAC'}), 400)
-        # Compare normalised on both sides. The stored column can hold
-        # whatever separator/case style it was first entered with, so a raw
-        # string match against it (as before) misses a clash that only
-        # differs in separator style -- exactly what get_unplaced_onus
-        # already guards against on the read side (see FINDING 2). The
-        # per-OLT node count is small (well under a hundred), so fetching
-        # the candidate rows and comparing with _normalize_mac in Python is
-        # simpler and no less correct than a SQL-side collation trick.
-        candidates = (tenant_query(NetworkNode)
-                      .filter_by(olt_device_id=device_id)
-                      .filter(NetworkNode.onu_mac.isnot(None))
-                      .filter(NetworkNode.id != (node.id if node else -1))
-                      .all())
-        clash = next((c for c in candidates
-                      if _normalize_mac(c.onu_mac) == _normalize_mac(mac)), None)
-        if clash:
-            return None, (jsonify(
-                {'message': f'that ONU is already placed as "{clash.label}"'}), 400)
-        cleaned['onu_mac'] = mac
+        if not mac_changing:
+            # Pass the stored value through as-is -- it already lives in the
+            # database, valid or not, and this request isn't touching it.
+            cleaned['onu_mac'] = raw_mac
+        else:
+            mac = _canonical_mac(raw_mac)
+            if not mac:
+                return None, (jsonify({'message': 'onu_mac is not a valid MAC'}), 400)
+            # Compare normalised on both sides. The stored column can hold
+            # whatever separator/case style it was first entered with, so a
+            # raw string match against it (as before) misses a clash that
+            # only differs in separator style -- exactly what
+            # get_unplaced_onus already guards against on the read side (see
+            # FINDING 2). The per-OLT node count is small (well under a
+            # hundred), so fetching the candidate rows and comparing with
+            # _normalize_mac in Python is simpler and no less correct than a
+            # SQL-side collation trick.
+            candidates = (tenant_query(NetworkNode)
+                          .filter_by(olt_device_id=device_id)
+                          .filter(NetworkNode.onu_mac.isnot(None))
+                          .filter(NetworkNode.id != (node.id if node else -1))
+                          .all())
+            clash = next((c for c in candidates
+                          if _normalize_mac(c.onu_mac) == _normalize_mac(mac)), None)
+            if clash:
+                return None, (jsonify(
+                    {'message': f'that ONU is already placed as "{clash.label}"'}), 400)
+            cleaned['onu_mac'] = mac
     else:
         if raw_mac:
             return None, (jsonify(
