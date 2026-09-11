@@ -103,3 +103,35 @@ test('a failed device fetch shows an error rather than an endless spinner', asyn
   expect(screen.queryByTestId('network-map-view')).toBeNull();
   expect(screen.getByText(/could not load network devices/i)).toBeInTheDocument();
 });
+
+test('switching OLTs remounts the map to reset its internal state', async () => {
+  // Track mounts via a useEffect that fires only on component mount.
+  // If key={selectedOltId} is present, changing the key unmounts and remounts
+  // the component, so this spy is called twice. Without the key, the same
+  // component re-renders with new props, so the spy is called only once.
+  const mountSpy = jest.fn();
+  mockNetworkMapView.mockImplementation((props) => {
+    React.useEffect(() => {
+      mountSpy(props.oltDeviceId);
+    }, []); // Empty deps: runs only on mount, never again for this instance
+    return <div data-testid="network-map-view" />;
+  });
+
+  mockFetchNetworkDevices.mockResolvedValue({ data: [OLT_1, OLT_2] });
+  render(<NetworkMapPage />);
+
+  // Initial render with OLT_1
+  await waitFor(() => expect(screen.getByTestId('network-map-view')).toBeInTheDocument());
+  expect(mountSpy).toHaveBeenCalledTimes(1);
+  expect(mountSpy).toHaveBeenLastCalledWith(OLT_1.id);
+
+  // Switch to OLT_2 via the selector
+  fireEvent.mouseDown(screen.getByRole('combobox'));
+  fireEvent.click(await screen.findByRole('option', { name: OLT_2.name }));
+
+  // The map should remount (new key), so the mount spy is called a second time.
+  // Without key={selectedOltId}, this assertion fails because the component
+  // re-renders in place without a new mount.
+  await waitFor(() => expect(mountSpy).toHaveBeenCalledTimes(2));
+  expect(mountSpy).toHaveBeenLastCalledWith(OLT_2.id);
+});
