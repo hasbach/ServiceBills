@@ -1,0 +1,21 @@
+/* Only the fault boundary animates -- the span a technician should drive to. */
+@keyframes fiber-fault-pulse {
+  0%   { stroke-opacity: 1; }
+  50%  { stroke-opacity: 0.35; }
+  100% { stroke-opacity: 1; }
+}
+.fiber-span-fault-boundary {
+  animation: fiber-fault-pulse 1.4s ease-in-out infinite;
+}
+.fiber-map-container {
+  height: 70vh;
+  width: 100%;
+  border-radius: 8px;
+}
+/* Leaflet computes size from the container, so a zero-height parent renders a
+   blank map with no error. Guard against a flex parent collapsing it. */
+.fiber-map-container .leaflet-container {
+  height: 100%;
+  width: 100%;
+  background: #e0e0e0;
+}
