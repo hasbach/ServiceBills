@@ -4,6 +4,7 @@ describe('spanStyle', () => {
   test('a green span is thin and solid', () => {
     const s = spanStyle({ status: 'green', is_fault_boundary: false });
     expect(s.color).toBe('#2e7d32');
+    expect(s.weight).toBe(3);
     expect(s.dashArray).toBeNull();
     expect(s.className).toBe('');
   });
@@ -11,12 +12,14 @@ describe('spanStyle', () => {
   test('an ordinary red span is red but not animated', () => {
     const s = spanStyle({ status: 'red', is_fault_boundary: false });
     expect(s.color).toBe('#c62828');
+    expect(s.weight).toBe(3);
     expect(s.className).toBe('');
   });
 
   test('the fault boundary is thicker and animated', () => {
     const boundary = spanStyle({ status: 'red', is_fault_boundary: true });
     const ordinary = spanStyle({ status: 'red', is_fault_boundary: false });
+    expect(boundary.weight).toBe(7);
     expect(boundary.weight).toBeGreaterThan(ordinary.weight);
     expect(boundary.className).toBe('fiber-span-fault-boundary');
   });
@@ -24,7 +27,8 @@ describe('spanStyle', () => {
   test('a grey span is dashed, so unknown never reads as an outage', () => {
     const s = spanStyle({ status: 'grey', is_fault_boundary: false });
     expect(s.color).toBe('#9e9e9e');
-    expect(s.dashArray).not.toBeNull();
+    expect(s.weight).toBe(2);
+    expect(s.dashArray).toBe('6 6');
   });
 
   test('an unrecognised status falls back to grey rather than throwing', () => {
@@ -37,6 +41,19 @@ describe('nodeMarkerStyle', () => {
   test('the root is drawn larger than an ONU', () => {
     expect(nodeMarkerStyle('root', 'online').radius)
       .toBeGreaterThan(nodeMarkerStyle('onu', 'online').radius);
+  });
+
+  test('every kind and status renders at 0.9 fill opacity', () => {
+    expect(nodeMarkerStyle('root', 'online').fillOpacity).toBe(0.9);
+    expect(nodeMarkerStyle('junction', 'offline').fillOpacity).toBe(0.9);
+    expect(nodeMarkerStyle('onu', 'unknown').fillOpacity).toBe(0.9);
+  });
+
+  test('a junction is the smallest marker on the map', () => {
+    const junction = nodeMarkerStyle('junction', 'online').radius;
+    expect(junction).toBe(6);
+    expect(junction).toBeLessThan(nodeMarkerStyle('root', 'online').radius);
+    expect(junction).toBeLessThan(nodeMarkerStyle('onu', 'online').radius);
   });
 
   test('offline is red and online is green at every kind', () => {
