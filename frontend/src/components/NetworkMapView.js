@@ -29,6 +29,19 @@ const DEFAULT_CENTER = [34.4367, 35.8497];
 // whole point of the role prop.
 const EDIT_ROLES = ['admin', 'finance'];
 
+// nodeMarkerStyle's fillOpacity is meant as CircleMarker-style fill opacity --
+// the fill can fade while the outline stays put -- but CSS `opacity` on the
+// div fades the *whole element*, border included. Baking the alpha into the
+// background color instead (rather than the div's opacity) keeps the white
+// border fully opaque while only the fill dims.
+function hexToRgba(hex, alpha) {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.substring(0, 2), 16);
+  const g = parseInt(h.substring(2, 4), 16);
+  const b = parseInt(h.substring(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 function nodeDivIcon(kind, status) {
   // A CircleMarker (used for the read-only Task 6 view) is a Leaflet Path,
   // and Leaflet Paths cannot be dragged without an extra plugin -- there is
@@ -42,7 +55,7 @@ function nodeDivIcon(kind, status) {
   return L.divIcon({
     className: 'fiber-node-icon',
     html: `<div style="width:${d}px;height:${d}px;border-radius:50%;` +
-          `background:${color};opacity:${fillOpacity};border:2px solid #fff;` +
+          `background:${hexToRgba(color, fillOpacity)};border:2px solid #fff;` +
           `box-shadow:0 0 2px rgba(0,0,0,.6);"></div>`,
     iconSize: [d, d],
     iconAnchor: [d / 2, d / 2],

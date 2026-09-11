@@ -5,18 +5,36 @@ import '@testing-library/jest-dom';
 // react-leaflet renders a real Leaflet map, which jsdom cannot size. Stub it to
 // plain divs: these tests are about which CONTROLS appear for which role and
 // what the page does with the payload -- not about Leaflet's own rendering.
-// useMapEvents is stubbed to a no-op (rather than omitted) so the component's
-// click-capture child can call it without crashing; no test here simulates an
-// actual map click.
+//
+// The mocks below are ACTIVE, not inert: useMapEvents records the handler map
+// it was given (mockMapEventHandlers.current) so a test can fire a `click`
+// with a realistic Leaflet event shape ({ latlng: { lat, lng } }); Marker
+// records its own `draggable` and `eventHandlers` props, keyed by position, so
+// a test can find the marker for a specific node and fire a realistic
+// `dragend` event ({ target: { getLatLng: () => ({ lat, lng }) } }) -- exactly
+// what NetworkMapView.js's handleDragEnd reads off the event.
+const mockMapEventHandlers = { current: null };
+const mockMarkersByPosition = new Map();
 jest.mock('react-leaflet', () => ({
   MapContainer: ({ children }) => <div data-testid="map">{children}</div>,
   TileLayer: ({ url }) => <div data-testid="tile" data-url={url} />,
   CircleMarker: ({ children }) => <div data-testid="marker">{children}</div>,
-  Marker: ({ children }) => <div data-testid="marker">{children}</div>,
+  Marker: ({ children, position, draggable, eventHandlers }) => {
+    const key = position.join(',');
+    mockMarkersByPosition.set(key, { draggable: !!draggable, eventHandlers });
+    return (
+      <div data-testid="marker" data-position={key}>
+        {children}
+      </div>
+    );
+  },
   Popup: ({ children }) => <div data-testid="popup">{children}</div>,
   Polyline: ({ children }) => <div data-testid="span">{children}</div>,
   Tooltip: ({ children }) => <div>{children}</div>,
-  useMapEvents: () => null,
+  useMapEvents: (handlers) => {
+    mockMapEventHandlers.current = handlers;
+    return null;
+  },
 }));
 
 // apiService has no generic `.get` -- the raw axios instance lives at
@@ -68,12 +86,24 @@ const UNPLACED = {
   ],
 };
 
+// Finds the mock Marker DOM node whose children render the given text (e.g. a
+// node's label, shown in its Tooltip/Popup), then looks up the real `Marker`
+// props (draggable / eventHandlers) that mock recorded for that position.
+function markerPropsFor(text) {
+  const el = screen.getAllByTestId('marker')
+    .find((node) => within(node).queryAllByText(text).length > 0);
+  if (!el) return null;
+  return mockMarkersByPosition.get(el.getAttribute('data-position'));
+}
+
 beforeEach(() => {
   mockApiGet.mockReset();
   mockApiPost.mockReset();
   mockApiPut.mockReset();
   mockApiDelete.mockReset();
   mockSetSnackbar.mockReset();
+  mockMapEventHandlers.current = null;
+  mockMarkersByPosition.clear();
   mockApiGet.mockImplementation((url) => {
     if (url === '/network-map/unplaced-onus') {
       return Promise.resolve({ data: UNPLACED });
@@ -226,4 +256,99 @@ test('a 409 on delete surfaces the server message verbatim', async () => {
     })));
   // The map must still be showing (delete failed, nothing should vanish).
   expect(screen.getAllByText(/Villa Eid/).length).toBeGreaterThan(0);
+});
+
+test('clicking the map in add-mode as an admin begins placing the control room', async () => {
+  // Zero nodes yet -- the simplest, unambiguous case: a click should
+  // immediately open the placement dialog rather than needing a
+  // "Draw from here" parent selected first.
+  mockApiGet.mockImplementation((url) => {
+    if (url === '/network-map/unplaced-onus') return Promise.resolve({ data: UNPLACED });
+    return Promise.resolve({ data: { ...PAYLOAD, nodes: [], spans: [], orphans: [] } });
+  });
+  render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: /add node/i }));
+  });
+  expect(mockMapEventHandlers.current).not.toBeNull();
+
+  await act(async () => {
+    mockMapEventHandlers.current.click({ latlng: { lat: 34.44, lng: 35.85 } });
+  });
+
+  const dialog = screen.getByRole('dialog');
+  expect(within(dialog).getByText(/Place the control room/i)).toBeInTheDocument();
+  expect(mockApiPost).not.toHaveBeenCalled();
+});
+
+test('clicking the map as an employee does nothing -- the canEdit gate', async () => {
+  render(<NetworkMapView oltDeviceId={1} userRole="employee" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+
+  // MapClickCapture (and the useMapEvents click handler it wires up) is only
+  // ever mounted when canEdit is true -- an employee should never even
+  // register a click handler in the first place.
+  expect(mockMapEventHandlers.current).toBeNull();
+
+  // Belt and braces: even if a handler somehow got registered, firing it
+  // must be a no-op -- no dialog, no POST.
+  if (mockMapEventHandlers.current) {
+    act(() => { mockMapEventHandlers.current.click({ latlng: { lat: 34.44, lng: 35.85 } }); });
+  }
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(mockApiPost).not.toHaveBeenCalled();
+});
+
+test('dragging a marker as an admin issues a PUT carrying the new coordinates', async () => {
+  mockApiPut.mockResolvedValue({ data: {} });
+  render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+
+  const { eventHandlers } = markerPropsFor(/Villa Eid/);
+  expect(typeof eventHandlers?.dragend).toBe('function');
+
+  await act(async () => {
+    eventHandlers.dragend({ target: { getLatLng: () => ({ lat: 34.5, lng: 35.9 }) } });
+  });
+
+  expect(mockApiPut).toHaveBeenCalledWith(
+    '/network-map/nodes/2', { latitude: 34.5, longitude: 35.9 });
+});
+
+test('a failed drag PUT reloads the map so the pin snaps back, and tells the user', async () => {
+  mockApiPut.mockRejectedValue(new Error('boom'));
+  render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+
+  const mapCallsBefore = mockApiGet.mock.calls
+    .filter((c) => c[0] !== '/network-map/unplaced-onus').length;
+
+  const { eventHandlers } = markerPropsFor(/Villa Eid/);
+  await act(async () => {
+    eventHandlers.dragend({ target: { getLatLng: () => ({ lat: 34.5, lng: 35.9 }) } });
+  });
+
+  await waitFor(() => expect(mockSetSnackbar).toHaveBeenCalledWith(
+    expect.objectContaining({
+      severity: 'error',
+      message: expect.stringMatching(/could not move the node/i),
+    })));
+
+  const mapCallsAfter = mockApiGet.mock.calls
+    .filter((c) => c[0] !== '/network-map/unplaced-onus').length;
+  expect(mapCallsAfter).toBeGreaterThan(mapCallsBefore);
+});
+
+test('markers are draggable for an admin and not for an employee', async () => {
+  const admin = render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+  expect(markerPropsFor(/Villa Eid/).draggable).toBe(true);
+  admin.unmount();
+
+  mockMarkersByPosition.clear();
+  render(<NetworkMapView oltDeviceId={1} userRole="employee" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+  expect(markerPropsFor(/Villa Eid/).draggable).toBe(false);
 });
