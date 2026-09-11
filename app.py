@@ -10990,6 +10990,88 @@ def apply_customer_locations(device_id):
 # granted to field roles (network_view_required) who may reopen it repeatedly.
 # See docs/superpowers/specs/2026-09-10-network-geo-fiber-map-design.md.
 
+def _to_int_or_none(value):
+    """Like vsol_olt._to_int, but None on failure rather than 0.
+
+    This module's 0 has a specific meaning (ONU offline), so it must stay
+    distinguishable from "the field was missing or unparsable" -- a
+    default of 0 here would make the two indistinguishable and let an
+    offline row silently pass the distance check's "was it reported at
+    all" test.
+    """
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# All three are named constants, not literals: the real values can only be
+# tuned once genuine placements exist, and the spec records why a single
+# percentage cannot work at both ends of the range.
+DISTANCE_CHECK_MIN_METRES = 100       # below this, ranging error dominates
+DISTANCE_CHECK_FACTOR = 2.0           # chain must exceed reported by this much
+DISTANCE_CHECK_MIN_GAP_METRES = 100   # ...AND by this many absolute metres
+
+
+def _great_circle_metres(lat1, lon1, lat2, lon2):
+    """Haversine. Plain stdlib -- no geo dependency for one formula."""
+    radius = 6371000.0
+    p1, p2 = math.radians(float(lat1)), math.radians(float(lat2))
+    dp = p2 - p1
+    dl = math.radians(float(lon2) - float(lon1))
+    a = (math.sin(dp / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
+    return 2 * radius * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _map_distance_warnings(nodes, onu_rows):
+    """Flag ONUs whose traced chain is grossly longer than the OLT's reported
+    distance -- a pin in the wrong village, not a pin across the street.
+
+    Requires BOTH a proportional and an absolute overshoot. The factor stops
+    it firing on long runs with legitimate slack; the absolute gap stops it
+    firing on short runs where the OLT's fixed offset dominates (the owner
+    reports 1m reading as 6m). Advisory only: never blocks a save.
+    """
+    by_id = {n.id: n for n in nodes}
+    reported = {}
+    for row in onu_rows or []:
+        mac = row.get('mac_address')
+        distance = _to_int_or_none(row.get('distance'))
+        if mac and distance:      # 0 means "offline", not "at the OLT"
+            reported[_normalize_mac(mac)] = distance
+
+    warnings = []
+    for node in sorted(nodes, key=lambda n: n.id):
+        if node.kind != 'onu' or not node.onu_mac:
+            continue
+        distance = reported.get(_normalize_mac(node.onu_mac))
+        if not distance or distance < DISTANCE_CHECK_MIN_METRES:
+            continue
+
+        # Walk to the root, summing spans. seen-set, not recursion: a cycle
+        # would otherwise loop forever, and this must survive bad data.
+        chain, current, seen = 0.0, node, {node.id}
+        while current.parent_node_id and current.parent_node_id in by_id:
+            parent = by_id[current.parent_node_id]
+            if parent.id in seen:
+                chain = None      # cyclic: no meaningful chain length
+                break
+            chain += _great_circle_metres(current.latitude, current.longitude,
+                                          parent.latitude, parent.longitude)
+            seen.add(parent.id)
+            current = parent
+        if chain is None:
+            continue
+
+        if (chain > distance * DISTANCE_CHECK_FACTOR
+                and chain - distance > DISTANCE_CHECK_MIN_GAP_METRES):
+            warnings.append({'node_id': node.id,
+                             'chain_metres': int(round(chain)),
+                             'reported_metres': distance})
+    return warnings
+
+
 def _map_onu_status(device):
     """{normalised_mac: 'online'|'offline'} from the OLT's newest genuinely
     successful walk, plus when that walk happened.
@@ -11053,13 +11135,10 @@ def get_network_map():
         'nodes': [n.to_dict() for n in nodes],
         'onu_status': onu_status,
         'last_result_at': last_result_at,
-        # 'distance_warnings' is added to this payload by Task 5, together with
-        # the function that computes it. Deliberately absent here rather than
-        # stubbed: a placeholder returning [] would be dead code for the whole
-        # of this task, and the frontend that reads the key is not built until
-        # Task 6. `rows` (unpacked above, unused so far) is what that function
-        # will compute the warnings from -- kept now so Task 5 is a plain
-        # addition here rather than a re-unpacking of _map_onu_status's return.
+        # `rows` is the same OLT walk _map_onu_status already parsed for
+        # status; _map_distance_warnings re-reads it for each ONU's reported
+        # distance rather than this endpoint re-querying or re-shaping it.
+        'distance_warnings': _map_distance_warnings(nodes, rows),
         **computed,
     }), 200
 
