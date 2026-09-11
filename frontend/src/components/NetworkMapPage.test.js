@@ -14,6 +14,7 @@ const mockSetSnackbar = jest.fn();
 let mockUser = { role: 'admin' };
 jest.mock('../context/AppContext', () => ({
   apiService: {
+    fetchNetworkMapOlts: (...a) => mockFetchNetworkDevices(...a),
     fetchNetworkDevices: (...a) => mockFetchNetworkDevices(...a),
   },
   useAppContext: () => ({ user: mockUser, setSnackbar: mockSetSnackbar }),

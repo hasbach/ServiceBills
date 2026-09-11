@@ -38,7 +38,10 @@ def upgrade():
     tenant_cols = {c['name'] for c in insp.get_columns('tenant')}
     if 'public_pay_slug' not in tenant_cols:
         op.add_column('tenant', sa.Column('public_pay_slug', sa.String(32), nullable=True))
-        op.create_unique_constraint('uq_tenant_public_pay_slug', 'tenant', ['public_pay_slug'])
+        if bind.dialect.name != 'sqlite':
+            op.create_unique_constraint('uq_tenant_public_pay_slug', 'tenant', ['public_pay_slug'])
+        else:
+            op.create_index('uq_tenant_public_pay_slug', 'tenant', ['public_pay_slug'], unique=True)
     else:
         print("NOTE: tenant.public_pay_slug already exists -- skipping")
 

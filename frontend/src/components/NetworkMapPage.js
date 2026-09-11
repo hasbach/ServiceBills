@@ -21,10 +21,10 @@ function primaryRole(rawRole) {
 
 // The map is scoped to one OLT (NetworkDevice with device_type 'vsol_olt');
 // unlike NetworkTreeView, which renders every device at once, the map needs
-// to know which one. Reuses NetworkDeviceManagementView's own
-// apiService.fetchNetworkDevices() call rather than adding a new endpoint --
-// there is no dedicated "list OLTs" route, and the device list is already
-// small per tenant.
+// to know which one. Uses apiService.fetchNetworkMapOlts() (with fallback to
+// fetchNetworkDevices for backwards compatibility) so field roles like
+// employee and collector can load OLTs without being blocked by the admin-only
+// /api/network-devices endpoint.
 export default function NetworkMapPage() {
     const { user, setSnackbar } = useAppContext();
     const userRole = primaryRole(user?.role);
@@ -38,7 +38,8 @@ export default function NetworkMapPage() {
         let cancelled = false;
         (async () => {
             try {
-                const response = await apiService.fetchNetworkDevices();
+                const fetcher = apiService.fetchNetworkMapOlts || apiService.fetchNetworkDevices;
+                const response = await fetcher();
                 if (cancelled) return;
                 const oltDevices = (response.data || []).filter((d) => d.device_type === 'vsol_olt');
                 setOlts(oltDevices);
