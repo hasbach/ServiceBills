@@ -11136,6 +11136,16 @@ def _require_olt(device_id):
     return device, None
 
 
+@app.route('/api/network-map/olts', methods=['GET'])
+@jwt_required()
+@network_view_required()
+def get_network_map_olts():
+    olts = (tenant_query(NetworkDevice)
+            .filter_by(device_type='vsol_olt')
+            .order_by(NetworkDevice.name).all())
+    return jsonify([o.to_dict() for o in olts]), 200
+
+
 @app.route('/api/network-map', methods=['GET'])
 @jwt_required()
 @network_view_required()

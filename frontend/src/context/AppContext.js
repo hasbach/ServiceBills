@@ -168,6 +168,9 @@ const rawApiService = {
     applyCustomerLocations: (id, jobId) =>
         api.post(`/network-tree/olt/${id}/locate-customers/apply`, { job_id: jobId }),
 
+    // Geographic Fiber Map
+    fetchNetworkMapOlts: () => api.get('/network-map/olts'),
+
     // Customer <-> Upstream Portal read-only status sync (staff-triggered, see spec)
     syncCustomerUpstreamStatus: (customerId) => api.post(`/customers/${customerId}/upstream-status-sync`),
 

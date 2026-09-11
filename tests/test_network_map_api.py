@@ -974,3 +974,46 @@ def test_a_partial_update_is_not_blocked_by_a_corrupt_stored_mac(app, client):
     assert body['label'] == 'Renamed'
     # Untouched and unvalidated -- still the corrupt value that was stored.
     assert body['onu_mac'] == 'not-a-mac'
+
+
+def test_network_map_olts_allows_employee_and_collector(app, client):
+    """NetworkMapPage must be able to list the tenant's OLT devices for field
+    roles (employee, collector) so the map can load for them without hitting
+    the admin-only /api/network-devices endpoint."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    # Add a CCR device to verify it gets filtered out (only vsol_olt returned)
+    client.post('/api/network-devices', headers=admin, json={
+        'name': 'Edge CCR', 'host': '192.168.100.1', 'api_port': 8728,
+        'username': 'admin', 'password': 'x', 'device_type': 'mikrotik_ccr'})
+
+    for role in ('employee', 'collector'):
+        hdr = auth_headers(client, f'user_{role}', 'pw', role=role)
+        r = client.get('/api/network-map/olts', headers=hdr)
+        assert r.status_code == 200, f'Expected 200 for {role}, got {r.status_code}'
+        devices = r.get_json()
+        assert len(devices) == 1
+        assert devices[0]['id'] == olt
+        assert devices[0]['device_type'] == 'vsol_olt'
+
+    # Unauthorized role should 403
+    cust = auth_headers(client, 'cust', 'pw', role='customer')
+    assert client.get('/api/network-map/olts', headers=cust).status_code == 403
+
+    # Unauthenticated should 401
+    assert client.get('/api/network-map/olts').status_code == 401
+
+
+def test_network_map_olts_is_tenant_isolated(app, client):
+    """An employee of tenant B must never see tenant A's OLTs."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin_a = auth_headers(client, 'admin', 'pw', role='admin')
+    _olt(client, admin_a)
+
+    make_tenant(client, 'Other ISP', 'admin_b')
+    emp_b = auth_headers(client, 'emp_b', 'pw', role='employee')
+    r = client.get('/api/network-map/olts', headers=emp_b)
+    assert r.status_code == 200
+    assert r.get_json() == []
+
