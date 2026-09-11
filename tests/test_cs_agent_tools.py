@@ -100,7 +100,15 @@ def test_lookup_customer_with_agent_secret(app, client):
         headers={"X-CS-Agent-Secret": "secret_agent_token_xyz"}
     )
     assert good_res.status_code == 200
-    data = good_res.get_json()
+    assert good_res.get_json()["found"] is True
+
+    # 3. With 'phone_number' query param instead of 'phone' -> 200
+    alias_res = client.get(
+        f"/api/cs-agent/tools/lookup-customer?phone_number=03112233&tenant_id={tenant.id}",
+        headers={"X-CS-Agent-Secret": "secret_agent_token_xyz"}
+    )
+    assert alias_res.status_code == 200
+    data = alias_res.get_json()
     assert data["found"] is True
     assert data["primary_customer"]["name"] == "Layla Saad"
 

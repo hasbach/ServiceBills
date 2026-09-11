@@ -12094,26 +12094,49 @@ def get_cs_agent_config():
     }), 200
 
 
-@app.route('/api/cs-agent/tools/lookup-customer', methods=['GET'])
+@app.route('/api/cs-agent/tools/lookup-customer', methods=['GET', 'POST'])
 def cs_tool_lookup_customer():
     appmod = sys.modules[__name__]
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
     
-    phone = request.args.get('phone', '')
-    result = cs_agent_tools.lookup_customer(appmod, tenant_id, phone)
+    phone = (
+        request.args.get('phone') or 
+        request.args.get('phone_number') or 
+        request.args.get('caller_id') or 
+        request.args.get('number')
+    )
+    if not phone and request.is_json:
+        data = request.get_json(silent=True) or {}
+        phone = (
+            data.get('phone') or 
+            data.get('phone_number') or 
+            data.get('caller_id') or 
+            data.get('number')
+        )
+
+    result = cs_agent_tools.lookup_customer(appmod, tenant_id, str(phone or '').strip())
     return jsonify(result), 200
 
 
-@app.route('/api/cs-agent/tools/customer-status', methods=['GET'])
+@app.route('/api/cs-agent/tools/customer-status', methods=['GET', 'POST'])
+@app.route('/api/cs-agent/tools/get-customer-status', methods=['GET', 'POST'])
 def cs_tool_customer_status():
     appmod = sys.modules[__name__]
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
 
-    customer_id = request.args.get('customer_id', type=int)
+    customer_id = request.args.get('customer_id', type=int) or request.args.get('id', type=int)
+    if not customer_id and request.is_json:
+        data = request.get_json(silent=True) or {}
+        raw_id = data.get('customer_id') or data.get('id')
+        try:
+            customer_id = int(raw_id) if raw_id is not None else None
+        except (ValueError, TypeError):
+            customer_id = None
+
     if not customer_id:
         return jsonify(error="customer_id is required"), 400
 
@@ -12121,50 +12144,73 @@ def cs_tool_customer_status():
     return jsonify(result), (200 if result.get('found') else 404)
 
 
-@app.route('/api/cs-agent/tools/network-diagnostic', methods=['POST'])
+@app.route('/api/cs-agent/tools/network-diagnostic', methods=['POST', 'GET'])
 def cs_tool_network_diagnostic():
     appmod = sys.modules[__name__]
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
 
-    data = request.get_json(silent=True) or {}
-    customer_id = data.get('customer_id') or request.args.get('customer_id', type=int)
-    if not customer_id:
+    data = (request.get_json(silent=True) or {}) if request.is_json else {}
+    raw_id = data.get('customer_id') or request.args.get('customer_id') or request.args.get('id')
+    if not raw_id:
         return jsonify(error="customer_id is required"), 400
 
-    wait_seconds = data.get('wait_seconds', 15)
-    result = cs_agent_tools.network_diagnostic(appmod, tenant_id, int(customer_id), wait_seconds=wait_seconds)
+    try:
+        customer_id = int(raw_id)
+    except (ValueError, TypeError):
+        return jsonify(error="Invalid customer_id"), 400
+
+    wait_seconds = data.get('wait_seconds') or request.args.get('wait_seconds', default=15)
+    try:
+        wait_seconds = int(wait_seconds)
+    except (ValueError, TypeError):
+        wait_seconds = 15
+
+    result = cs_agent_tools.network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=wait_seconds)
     return jsonify(result), 200
 
 
-@app.route('/api/cs-agent/tools/send-payment-link', methods=['POST'])
+@app.route('/api/cs-agent/tools/send-payment-link', methods=['POST', 'GET'])
 def cs_tool_send_payment_link():
     appmod = sys.modules[__name__]
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
 
-    data = request.get_json(silent=True) or {}
-    customer_id = data.get('customer_id') or request.args.get('customer_id', type=int)
-    if not customer_id:
+    data = (request.get_json(silent=True) or {}) if request.is_json else {}
+    raw_id = data.get('customer_id') or request.args.get('customer_id') or request.args.get('id')
+    if not raw_id:
         return jsonify(error="customer_id is required"), 400
 
-    result = cs_agent_tools.send_payment_link(appmod, tenant_id, int(customer_id))
+    try:
+        customer_id = int(raw_id)
+    except (ValueError, TypeError):
+        return jsonify(error="Invalid customer_id"), 400
+
+    result = cs_agent_tools.send_payment_link(appmod, tenant_id, customer_id)
     return jsonify(result), 200
 
 
-@app.route('/api/cs-agent/tools/escalate', methods=['POST'])
+@app.route('/api/cs-agent/tools/escalate', methods=['POST', 'GET'])
+@app.route('/api/cs-agent/tools/escalate-to-human', methods=['POST', 'GET'])
 def cs_tool_escalate():
     appmod = sys.modules[__name__]
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
 
-    data = request.get_json(silent=True) or {}
-    customer_id = data.get('customer_id')
-    reason = data.get('reason', 'Customer requested assistance')
-    summary = data.get('summary', '')
+    data = (request.get_json(silent=True) or {}) if request.is_json else {}
+    raw_id = data.get('customer_id') or request.args.get('customer_id') or request.args.get('id')
+    customer_id = None
+    if raw_id:
+        try:
+            customer_id = int(raw_id)
+        except (ValueError, TypeError):
+            pass
+
+    reason = data.get('reason') or request.args.get('reason') or 'Customer requested assistance'
+    summary = data.get('summary') or request.args.get('summary') or ''
 
     result = cs_agent_tools.escalate_to_human(appmod, tenant_id, customer_id, reason, summary)
     return jsonify(result), 200
