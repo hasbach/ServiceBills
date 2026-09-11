@@ -365,3 +365,387 @@ def test_partial_update_changes_only_the_given_fields(app, client):
     assert body['onu_mac'] == 'aa:aa:aa:aa:aa:aa'
     assert body['parent_node_id'] == root
     assert body['kind'] == 'onu'
+
+
+# --- FINDING 1: parent_node_id / olt_device_id must be coerced to int -------
+
+def test_a_string_parent_node_id_cannot_bypass_the_cycle_guard(app, client):
+    """The critical finding. `"<id>" in _node_descendant_ids(...)` (a
+    set[int]) is always False regardless of whether <id> is genuinely in
+    the set, because the database's own filter_by(id=parent_id) resolves a
+    JSON string parent id fine via column affinity while the Python `in`
+    check downstream never matches a str against a set of ints. Mirrors
+    test_a_node_cannot_be_reparented_under_its_own_descendant exactly,
+    except both parent ids are sent as strings."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    mid = _node(client, admin, olt, kind='junction', label='M',
+                parent_node_id=root).get_json()['id']
+    leaf = _node(client, admin, olt, kind='junction', label='L',
+                 parent_node_id=mid).get_json()['id']
+    descendant = client.put(f'/api/network-map/nodes/{mid}', headers=admin,
+                            json={'parent_node_id': str(leaf)})
+    assert descendant.status_code == 400
+    self_parent = client.put(f'/api/network-map/nodes/{mid}', headers=admin,
+                             json={'parent_node_id': str(mid)})
+    assert self_parent.status_code == 400
+
+
+def test_a_non_coercible_parent_node_id_is_rejected(app, client):
+    """None (absent) must stay legitimate -- a root's parent, meaning "no
+    parent" -- while any present-but-junk value 400s instead of reaching
+    the database or the descendant-set check in some half-coerced state."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    for bad in ('abc', [], {}, 12.7):
+        r = _node(client, admin, olt, kind='junction', label='X',
+                  parent_node_id=bad)
+        assert r.status_code == 400, f'{bad!r} should 400, got {r.status_code}'
+
+
+def test_a_string_olt_device_id_on_post_is_rejected(app, client):
+    """olt_device_id has the identical weakness parent_node_id had -- read
+    with a bare payload.get(...) instead of the type=int coercion the read
+    endpoints use for the same field via request.args.get(...)."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    r = client.post('/api/network-map/nodes', headers=admin, json={
+        'olt_device_id': 'abc', 'kind': 'root', 'label': 'CR',
+        'latitude': 34.4367, 'longitude': 35.8497})
+    assert r.status_code == 400
+
+
+# --- FINDING 2: MAC uniqueness must compare normalised values both ways ----
+
+def test_duplicate_onu_rejected_when_stored_mac_is_non_canonical(app, client):
+    """The uniqueness query used to canonicalise only the *incoming* value
+    and string-match it against the *stored* column -- so a hyphenated-
+    uppercase MAC already on file would not catch a colon-lowercase repeat
+    of the very same ONU. get_unplaced_onus already normalises both sides;
+    this write path must match it. Stored directly via the ORM because
+    every write path through the API always runs onu_mac through
+    _canonical_mac before saving, so the non-canonical form can only arise
+    from a value that predates that invariant (or a future writer that
+    doesn't share it) -- exactly the scenario this guards against."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    with app.app_context():
+        appmod.db.session.add(appmod.NetworkNode(
+            tenant_id=1, olt_device_id=olt, kind='onu', label='Villa Eid',
+            latitude=34.4368, longitude=35.8498, parent_node_id=root,
+            onu_mac='AA-AA-AA-AA-AA-AA'))
+        appmod.db.session.commit()
+    dup = _node(client, admin, olt, kind='onu', label='Dup', parent_node_id=root,
+                onu_mac='aa:aa:aa:aa:aa:aa')
+    assert dup.status_code == 400
+
+
+# --- FINDING 3: a non-string label must 400, not 500 ------------------------
+
+def test_a_non_string_label_is_rejected(app, client):
+    """_canonical_mac guards this exact case (a non-string reaching a method
+    only strings have) by design; the label branch must follow the same
+    house idiom instead of calling .strip() on whatever payload['label'] is
+    and raising AttributeError."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    assert _node(client, admin, olt, kind='root', label=12345).status_code == 400
+    assert _node(client, admin, olt, kind='root', label=['Pole 4']).status_code == 400
+
+
+# --- FINDING 4: tenant isolation, pinned against each of the 5 guards ------
+
+def test_a_foreign_tenants_node_cannot_be_used_as_a_parent(app, client):
+    """Pins tenant_query on the parent lookup in _validate_node_payload.
+    Under data the API itself could ever produce, tenant_id and
+    olt_device_id always agree (one OLT device belongs to exactly one
+    tenant), so a plain cross-tenant attempt is already stopped by the
+    olt_device_id half of that same filter_by(...) regardless of whether
+    tenant_query is still there -- it would pass this test either way and
+    prove nothing. Only a row that violates that invariant actually
+    exercises the tenant_query half, so that's what gets forged: a node
+    tagged tenant A but sitting on tenant B's real OLT id, the way a stray
+    row from data drift or an unrelated bug might."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    auth_headers(client, 'admin', 'pw', role='admin')  # tenant A, id=1
+
+    make_tenant(client, 'Other ISP', 'admin_b')
+    admin_b = auth_headers(client, 'admin_b', 'pw', role='admin')
+    olt_b = _olt(client, admin_b)
+
+    with app.app_context():
+        foreign = appmod.NetworkNode(
+            tenant_id=1, olt_device_id=olt_b, kind='junction', label='ghost',
+            latitude=34.4367, longitude=35.8497, parent_node_id=None)
+        appmod.db.session.add(foreign)
+        appmod.db.session.commit()
+        foreign_id = foreign.id
+
+    r = _node(client, admin_b, olt_b, kind='junction', label='X',
+             parent_node_id=foreign_id)
+    assert r.status_code == 400
+
+
+def test_a_foreign_tenants_mac_does_not_clash(app, client):
+    """Pins tenant_query on the MAC-clash query, by the same reasoning and
+    the same kind of forged row as the parent-lookup test above."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    auth_headers(client, 'admin', 'pw', role='admin')  # tenant A, id=1
+
+    make_tenant(client, 'Other ISP', 'admin_b')
+    admin_b = auth_headers(client, 'admin_b', 'pw', role='admin')
+    olt_b = _olt(client, admin_b)
+    root_b = _node(client, admin_b, olt_b, kind='root', label='CR').get_json()['id']
+
+    with app.app_context():
+        foreign = appmod.NetworkNode(
+            tenant_id=1, olt_device_id=olt_b, kind='onu', label='ghost-onu',
+            latitude=34.4367, longitude=35.8497, parent_node_id=None,
+            onu_mac='cc:cc:cc:cc:cc:cc')
+        appmod.db.session.add(foreign)
+        appmod.db.session.commit()
+
+    r = _node(client, admin_b, olt_b, kind='onu', label='Real', parent_node_id=root_b,
+             onu_mac='cc:cc:cc:cc:cc:cc')
+    assert r.status_code == 201
+
+
+def test_deleting_a_node_is_unaffected_by_a_foreign_tenants_children(app, client):
+    """Pins tenant_query on delete's children lookup. Forges a row whose
+    parent_node_id equals a real tenant-B node's id but is itself tagged
+    tenant A -- again a combination the API can never produce on its own,
+    since a node's parent is always resolved through the same
+    tenant-scoped lookup the first test in this group pins."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    auth_headers(client, 'admin', 'pw', role='admin')  # tenant A, id=1
+
+    make_tenant(client, 'Other ISP', 'admin_b')
+    admin_b = auth_headers(client, 'admin_b', 'pw', role='admin')
+    olt_b = _olt(client, admin_b)
+    leaf_b = _node(client, admin_b, olt_b, kind='root', label='CR').get_json()['id']
+
+    with app.app_context():
+        foreign = appmod.NetworkNode(
+            tenant_id=1, olt_device_id=olt_b, kind='junction', label='ghost-child',
+            latitude=34.4367, longitude=35.8497, parent_node_id=leaf_b)
+        appmod.db.session.add(foreign)
+        appmod.db.session.commit()
+
+    r = client.delete(f'/api/network-map/nodes/{leaf_b}', headers=admin_b)
+    assert r.status_code == 200
+
+
+def test_descendant_walk_does_not_cross_tenants(app, client):
+    """Pins the tenant filter inside _node_descendant_ids itself -- distinct
+    from the parent-lookup guard above, which gates *which* node is
+    accepted as a parent; this one gates what counts as *inside* a node's
+    own subtree. A plain cross-tenant attempt can't even reach this code
+    (the parent lookup 400s first), so this bridges through a forged
+    foreign-tenant row: target_b's subtree is walked, and if the tenant
+    filter were dropped from the walk, it would leak through the foreign
+    row into deep_b -- a real tenant-B row that, through the forged bridge
+    alone, looks like target_b's descendant."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    auth_headers(client, 'admin', 'pw', role='admin')  # tenant A, id=1
+
+    make_tenant(client, 'Other ISP', 'admin_b')
+    admin_b = auth_headers(client, 'admin_b', 'pw', role='admin')
+    olt_b = _olt(client, admin_b)
+    root_b = _node(client, admin_b, olt_b, kind='root', label='CR').get_json()['id']
+    target_b = _node(client, admin_b, olt_b, kind='junction', label='target',
+                     parent_node_id=root_b).get_json()['id']
+
+    with app.app_context():
+        ghost = appmod.NetworkNode(
+            tenant_id=1, olt_device_id=olt_b, kind='junction', label='ghost',
+            latitude=34.4367, longitude=35.8497, parent_node_id=target_b)
+        appmod.db.session.add(ghost)
+        appmod.db.session.commit()
+        deep_b = appmod.NetworkNode(
+            tenant_id=2, olt_device_id=olt_b, kind='junction', label='deep',
+            latitude=34.4367, longitude=35.8497, parent_node_id=ghost.id)
+        appmod.db.session.add(deep_b)
+        appmod.db.session.commit()
+        deep_b_id = deep_b.id
+
+    r = client.put(f'/api/network-map/nodes/{target_b}', headers=admin_b,
+                   json={'parent_node_id': deep_b_id})
+    assert r.status_code == 200
+
+
+def test_cannot_create_a_node_on_a_foreign_tenants_olt(app, client):
+    """Pins _require_olt's own tenant scope on POST. Unlike the other four
+    guards in this group, this one needs no forged row: tenant B can just
+    hand tenant A's real, valid OLT device id straight to POST."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin_a = auth_headers(client, 'admin', 'pw', role='admin')
+    olt_a = _olt(client, admin_a)
+
+    make_tenant(client, 'Other ISP', 'admin_b')
+    admin_b = auth_headers(client, 'admin_b', 'pw', role='admin')
+
+    r = _node(client, admin_b, olt_a, kind='root', label='hijack-root')
+    assert r.status_code == 404
+
+
+# --- FINDING 5: existing guards, previously untested against regression ---
+
+def test_an_invalid_kind_is_rejected(app, client):
+    """Must send a valid parent along with the bad kind -- otherwise a
+    'banana' with no parent_node_id also fails the separate "non-root
+    requires a parent" check, and the test would 400 for the wrong reason
+    even with the kind check itself deleted (kind has no DB-level CHECK
+    constraint, just a comment saying it should be one of NODE_KINDS)."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    assert _node(client, admin, olt, kind='banana', label='X',
+                parent_node_id=root).status_code == 400
+
+
+def test_a_blank_label_is_rejected(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    assert _node(client, admin, olt, kind='root', label='   ').status_code == 400
+
+
+def test_a_label_is_stripped_of_surrounding_whitespace(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    r = _node(client, admin, olt, kind='root', label='  Pole 4  ')
+    assert r.status_code == 201
+    assert r.get_json()['label'] == 'Pole 4'
+
+
+def test_a_label_is_truncated_to_100_characters(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    r = _node(client, admin, olt, kind='root', label='x' * 200)
+    assert r.status_code == 201
+    assert len(r.get_json()['label']) == 100
+
+
+def test_updating_a_root_does_not_collide_with_itself(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    r = client.put(f'/api/network-map/nodes/{root}', headers=admin,
+                   json={'label': 'Control Room'})
+    assert r.status_code == 200
+    assert r.get_json()['label'] == 'Control Room'
+
+
+def test_changing_kind_from_onu_to_junction_clears_onu_mac(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    onu = _node(client, admin, olt, kind='onu', parent_node_id=root,
+                onu_mac='aa:aa:aa:aa:aa:aa').get_json()['id']
+    r = client.put(f'/api/network-map/nodes/{onu}', headers=admin,
+                   json={'kind': 'junction', 'onu_mac': None})
+    assert r.status_code == 200
+    assert r.get_json()['onu_mac'] is None
+    assert r.get_json()['kind'] == 'junction'
+
+
+# --- FINDING 6: a partial update must not be blocked by a pre-existing cycle
+
+def test_a_partial_update_succeeds_inside_an_existing_cycle(app, client):
+    """A label-only PUT on a node that already sits inside a cycle must not
+    be rejected on account of that pre-existing corruption -- dragging a
+    pin or renaming it is exactly how an operator repairs one. Forges a
+    genuine cycle directly since the write endpoints themselves can never
+    create one through the API."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    with app.app_context():
+        a = appmod.NetworkNode(tenant_id=1, olt_device_id=olt, kind='junction',
+                               label='A', latitude=34.4367, longitude=35.8497,
+                               parent_node_id=None)
+        appmod.db.session.add(a)
+        appmod.db.session.commit()
+        b = appmod.NetworkNode(tenant_id=1, olt_device_id=olt, kind='junction',
+                               label='B', latitude=34.4367, longitude=35.8497,
+                               parent_node_id=a.id)
+        appmod.db.session.add(b)
+        appmod.db.session.commit()
+        a.parent_node_id = b.id   # close the cycle: a -> b -> a
+        appmod.db.session.commit()
+        a_id = a.id
+
+    r = client.put(f'/api/network-map/nodes/{a_id}', headers=admin,
+                   json={'label': 'A renamed'})
+    assert r.status_code == 200
+    assert r.get_json()['label'] == 'A renamed'
+
+
+# --- FINDING 7: the descendant walk must terminate on cyclic data ---------
+
+def test_a_reparent_against_a_cycle_returns_400_promptly(app, client):
+    """Removing the seen-set filter from _node_descendant_ids survives the
+    suite otherwise, so this pins its termination property directly: a
+    reparent attempt that forces the walk to actually traverse a forged
+    cycle must come back with 400, not hang. Three nodes, not two -- a
+    two-node mutual cycle can't distinguish "reparent onto the unchanged
+    current parent" (skipped entirely by FINDING 6's gating) from a walk
+    that genuinely needs to run."""
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    with app.app_context():
+        a = appmod.NetworkNode(tenant_id=1, olt_device_id=olt, kind='junction',
+                               label='A', latitude=34.4367, longitude=35.8497,
+                               parent_node_id=None)
+        b = appmod.NetworkNode(tenant_id=1, olt_device_id=olt, kind='junction',
+                               label='B', latitude=34.4367, longitude=35.8497,
+                               parent_node_id=None)
+        c = appmod.NetworkNode(tenant_id=1, olt_device_id=olt, kind='junction',
+                               label='C', latitude=34.4367, longitude=35.8497,
+                               parent_node_id=None)
+        appmod.db.session.add_all([a, b, c])
+        appmod.db.session.commit()
+        # A's parent is C, B's parent is A, C's parent is B: A -> B -> C -> A.
+        a.parent_node_id = c.id
+        b.parent_node_id = a.id
+        c.parent_node_id = b.id
+        appmod.db.session.commit()
+        a_id, b_id = a.id, b.id
+
+    r = client.put(f'/api/network-map/nodes/{a_id}', headers=admin,
+                   json={'parent_node_id': b_id})
+    assert r.status_code == 400
+
+
+# --- FINDING 8: coordinates are required on create, not just in-range -----
+
+def test_missing_latitude_on_create_is_rejected(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    r = client.post('/api/network-map/nodes', headers=admin, json={
+        'olt_device_id': olt, 'kind': 'root', 'label': 'CR',
+        'longitude': 35.8497})
+    assert r.status_code == 400
+
+
+def test_missing_longitude_on_create_is_rejected(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    r = client.post('/api/network-map/nodes', headers=admin, json={
+        'olt_device_id': olt, 'kind': 'root', 'label': 'CR',
+        'latitude': 34.4367})
+    assert r.status_code == 400

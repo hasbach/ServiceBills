@@ -11095,6 +11095,37 @@ def get_unplaced_onus():
 # widening the read side to field roles must not widen who can rewrite the
 # customer<->ONU mapping.
 
+def _coerce_fk_id(raw):
+    """(id_or_None, ok) for a foreign-key-shaped JSON value.
+
+    ok=False means "present but not a valid id" and the caller must 400
+    rather than let the value reach a query -- filter_by(id=...) resolves a
+    JSON string fine via column affinity, but a later Python-side membership
+    test (an `in` against a set of ints already loaded from the database)
+    silently never matches a str, which is exactly how the cycle guard used
+    to become a no-op (see FINDING 1). None/True means "absent", which is a
+    legitimate value on its own -- e.g. a root node has no parent.
+
+    A bool is rejected even though Python's bool is an int subclass -- a
+    JSON true/false has no business becoming a row id. A float (12.7, or a
+    whole-valued 12.0) is rejected outright rather than silently truncated
+    by int(): the strict, no-fuzzy-coercion idiom _canonical_mac already
+    uses for MACs applies here too.
+    """
+    if raw is None:
+        return None, True
+    if isinstance(raw, bool) or isinstance(raw, float):
+        return None, False
+    if isinstance(raw, int):
+        return raw, True
+    if isinstance(raw, str):
+        try:
+            return int(raw), True
+        except ValueError:
+            return None, False
+    return None, False
+
+
 def _node_descendant_ids(node_id, device_id):
     """Every id at or below node_id, so a reparent cannot build a cycle.
     Iterative with a seen-set: a cycle already in the data would make the
@@ -11119,6 +11150,8 @@ def _validate_node_payload(payload, device_id, node=None):
     cleaned = {'kind': kind}
 
     label = payload.get('label', node.label if node else None)
+    if label is not None and not isinstance(label, str):
+        return None, (jsonify({'message': 'label must be a string'}), 400)
     if not (label or '').strip():
         return None, (jsonify({'message': 'label is required'}), 400)
     cleaned['label'] = label.strip()[:100]
@@ -11134,9 +11167,17 @@ def _validate_node_payload(payload, device_id, node=None):
                     {'message': f'{field} must be between -{limit} and {limit}'}), 400)
             cleaned[field] = value
 
-    # Parent: root has none, everything else must have one.
-    parent_id = payload.get('parent_node_id',
-                            node.parent_node_id if node else None)
+    # Parent: root has none, everything else must have one. Coerced to int
+    # (or rejected) before anything below touches it -- filter_by(id=...)
+    # resolves a JSON string parent_id fine via column affinity, but the
+    # descendant-set membership test further down is a Python `in` against
+    # a set[int] and silently never matches a str, making the cycle guard a
+    # no-op (see FINDING 1).
+    raw_parent_id = payload.get('parent_node_id',
+                                node.parent_node_id if node else None)
+    parent_id, parent_id_ok = _coerce_fk_id(raw_parent_id)
+    if not parent_id_ok:
+        return None, (jsonify({'message': 'parent_node_id must be an integer'}), 400)
     if kind == 'root':
         if parent_id is not None:
             return None, (jsonify({'message': 'a root node cannot have a parent'}), 400)
@@ -11155,7 +11196,16 @@ def _validate_node_payload(payload, device_id, node=None):
                   .filter_by(id=parent_id, olt_device_id=device_id).first())
         if not parent:
             return None, (jsonify({'message': 'parent node not found'}), 400)
-        if node is not None and parent_id in _node_descendant_ids(node.id, device_id):
+        # Only worth walking the (possibly already-corrupt) tree when the
+        # parent is actually changing -- a label- or coordinates-only PUT on
+        # a node that already sits inside a cycle must still succeed, since
+        # dragging a pin or renaming it is exactly how an operator repairs
+        # one (see FINDING 6). An omitted key already lands here equal to
+        # node.parent_node_id via the payload.get(...) default above, so
+        # this one comparison covers both "key omitted" and "key resent
+        # unchanged" without a separate `in payload` check.
+        parent_changed = node is not None and parent_id != node.parent_node_id
+        if parent_changed and parent_id in _node_descendant_ids(node.id, device_id):
             return None, (jsonify(
                 {'message': 'cannot reparent a node under itself or its own '
                             'descendant -- that would create a cycle'}), 400)
@@ -11170,9 +11220,21 @@ def _validate_node_payload(payload, device_id, node=None):
         mac = _canonical_mac(raw_mac)
         if not mac:
             return None, (jsonify({'message': 'onu_mac is not a valid MAC'}), 400)
-        clash = (tenant_query(NetworkNode)
-                 .filter_by(olt_device_id=device_id, onu_mac=mac)
-                 .filter(NetworkNode.id != (node.id if node else -1)).first())
+        # Compare normalised on both sides. The stored column can hold
+        # whatever separator/case style it was first entered with, so a raw
+        # string match against it (as before) misses a clash that only
+        # differs in separator style -- exactly what get_unplaced_onus
+        # already guards against on the read side (see FINDING 2). The
+        # per-OLT node count is small (well under a hundred), so fetching
+        # the candidate rows and comparing with _normalize_mac in Python is
+        # simpler and no less correct than a SQL-side collation trick.
+        candidates = (tenant_query(NetworkNode)
+                      .filter_by(olt_device_id=device_id)
+                      .filter(NetworkNode.onu_mac.isnot(None))
+                      .filter(NetworkNode.id != (node.id if node else -1))
+                      .all())
+        clash = next((c for c in candidates
+                      if _normalize_mac(c.onu_mac) == _normalize_mac(mac)), None)
         if clash:
             return None, (jsonify(
                 {'message': f'that ONU is already placed as "{clash.label}"'}), 400)
@@ -11191,7 +11253,14 @@ def _validate_node_payload(payload, device_id, node=None):
 @admin_or_finance_required()
 def create_network_node():
     payload = request.json or {}
-    device, err = _require_olt(payload.get('olt_device_id'))
+    # Coerced the same way and for the same reason as parent_node_id (see
+    # FINDING 1) -- this was a bare payload.get(...), so a JSON string
+    # device id resolved in _require_olt's own filter_by(id=...) via column
+    # affinity, leaving the same latent foot-gun the parent lookup had.
+    device_id, device_id_ok = _coerce_fk_id(payload.get('olt_device_id'))
+    if not device_id_ok:
+        return jsonify({'message': 'olt_device_id must be an integer'}), 400
+    device, err = _require_olt(device_id)
     if err:
         return err
     cleaned, err = _validate_node_payload(payload, device.id, node=None)
