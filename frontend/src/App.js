@@ -31,6 +31,7 @@ import {
     NetworkCheck as NetworkDeviceIcon,
     AccountTree as NetworkTreeIcon,
     Map as NetworkMapIcon,
+    SmartToy as SmartToyIcon,
 } from '@mui/icons-material';
 import { AppContextProvider, useAppContext, apiService } from './context/AppContext.js';
 import DashboardView from './components/DashboardView.js';
@@ -61,6 +62,7 @@ import UpstreamProviderManagementView from './components/UpstreamProviderManagem
 import NetworkDeviceManagementView from './components/NetworkDeviceManagementView.js';
 import NetworkTreeView from './components/NetworkTreeView.js';
 import NetworkMapPage from './components/NetworkMapPage.js';
+import CSAgentVoiceTest from './components/CSAgentVoiceTest.js';
 import ErrorBoundary from './components/ErrorBoundary.js';
 
 // ── Navigation config ────────────────────────────────────────────────────────
@@ -97,6 +99,7 @@ const NAV_ITEMS = [
     { key: 'subscription-plans', label: 'Subscription Plans', icon: <PlansIcon />,           group: 'manage',    allowedRoles: ['admin', 'finance'] },
     { key: 'messaging',          label: 'Messaging',          icon: <MessageIcon />,         group: 'manage',    allowedRoles: ['admin'] },
     { key: 'settings',           label: 'Settings',           icon: <SettingsIcon />,        group: 'manage',    allowedRoles: ['admin'] },
+    { key: 'cs-agent-voice',     label: 'AI Voice Agent',     icon: <SmartToyIcon />,        group: 'manage',    allowedRoles: ['admin'] },
     { key: 'billing',            label: 'Billing & Plan',     icon: <PaymentIcon />,         group: 'manage',    allowedRoles: ['admin'] },
 ];
 
@@ -296,6 +299,7 @@ const MainApp = ({
             case 'subscription-plans': return <SubscriptionPlansView subscriptionPlans={subscriptionPlans} refetchSubscriptionPlans={refetchSubscriptionPlans} setSnackbar={setSnackbar} />;
             case 'messaging': return hasRole('admin') ? <MessagingView /> : <Typography>Access Denied</Typography>;
             case 'settings': return hasRole('admin') ? <SettingsView businessSettings={businessSettings} setBusinessSettings={setBusinessSettings} setSnackbar={setSnackbar} /> : <Typography>Access Denied</Typography>;
+            case 'cs-agent-voice': return hasRole('admin') ? <CSAgentVoiceTest /> : <Typography>Access Denied</Typography>;
             case 'billing': return hasRole('admin') ? <BillingView /> : <Typography>Access Denied</Typography>;
             default:
                 if (hasRole('employee') || hasRole('technician')) return <ServiceManagementView />;

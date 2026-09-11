@@ -24,6 +24,7 @@ from dateutil.relativedelta import relativedelta # REQUIRED: pip install python-
 import signal
 import sys
 import json
+import cs_agent_tools
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager, verify_jwt_in_request
 try:
@@ -1539,6 +1540,59 @@ class UpgradeRequest(db.Model):
             'contact_name': self.contact_name, 'contact_email': self.contact_email,
             'contact_phone': self.contact_phone, 'message': self.message,
             'status': self.status,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+        }
+
+
+class CSAgentSession(db.Model):
+    """Tracks a customer service agent session across phone, web test, or WhatsApp."""
+    __tablename__ = "cs_agent_session"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    channel = db.Column(db.String(20), nullable=False, default='phone')  # 'phone', 'web_test', 'whatsapp'
+    caller_identifier = db.Column(db.String(50), nullable=True, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True, index=True)
+    state = db.Column(db.String(20), nullable=False, default='active')  # 'active', 'escalated', 'closed'
+    metadata_json = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    last_active_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'tenant_id': self.tenant_id,
+            'channel': self.channel,
+            'caller_identifier': self.caller_identifier,
+            'customer_id': self.customer_id,
+            'state': self.state,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'last_active_at': self.last_active_at.strftime('%Y-%m-%d %H:%M:%S') if self.last_active_at else None,
+        }
+
+
+class CSAgentMessageLog(db.Model):
+    """Audit and transcript log for customer service agent interactions."""
+    __tablename__ = "cs_agent_message_log"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('cs_agent_session.id'), nullable=True, index=True)
+    direction = db.Column(db.String(5), nullable=False, default='in')  # 'in' | 'out'
+    tool_name = db.Column(db.String(50), nullable=True)
+    tool_input = db.Column(db.JSON, nullable=True)
+    tool_output = db.Column(db.JSON, nullable=True)
+    transcript = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'tenant_id': self.tenant_id,
+            'session_id': self.session_id,
+            'direction': self.direction,
+            'tool_name': self.tool_name,
+            'tool_input': self.tool_input,
+            'tool_output': self.tool_output,
+            'transcript': self.transcript,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
         }
 
@@ -12022,6 +12076,99 @@ def fix_employee_balance(employee_id):
     employee.balance = float(data['balance'])
     db.session.commit()
     return jsonify({'message': 'Employee balance fixed successfully!', 'employee': employee.to_dict()}), 200
+
+
+# ---------------------------------------------------------------------------
+# Customer Service AI Agent Tool Endpoints (Multi-Tenant & ElevenLabs Compatible)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/cs-agent/config', methods=['GET'])
+def get_cs_agent_config():
+    """Returns CS agent public configuration (e.g. Agent ID for WebSocket testing)."""
+    agent_id = app.config.get('ELEVENLABS_AGENT_ID', '')
+    return jsonify({
+        'status': 'ok',
+        'elevenlabs_agent_id': agent_id,
+        'has_agent_id': bool(agent_id),
+        'ws_url': f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={agent_id}" if agent_id else None
+    }), 200
+
+
+@app.route('/api/cs-agent/tools/lookup-customer', methods=['GET'])
+def cs_tool_lookup_customer():
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+    
+    phone = request.args.get('phone', '')
+    result = cs_agent_tools.lookup_customer(appmod, tenant_id, phone)
+    return jsonify(result), 200
+
+
+@app.route('/api/cs-agent/tools/customer-status', methods=['GET'])
+def cs_tool_customer_status():
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+
+    customer_id = request.args.get('customer_id', type=int)
+    if not customer_id:
+        return jsonify(error="customer_id is required"), 400
+
+    result = cs_agent_tools.get_customer_status(appmod, tenant_id, customer_id)
+    return jsonify(result), (200 if result.get('found') else 404)
+
+
+@app.route('/api/cs-agent/tools/network-diagnostic', methods=['POST'])
+def cs_tool_network_diagnostic():
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+
+    data = request.get_json(silent=True) or {}
+    customer_id = data.get('customer_id') or request.args.get('customer_id', type=int)
+    if not customer_id:
+        return jsonify(error="customer_id is required"), 400
+
+    wait_seconds = data.get('wait_seconds', 15)
+    result = cs_agent_tools.network_diagnostic(appmod, tenant_id, int(customer_id), wait_seconds=wait_seconds)
+    return jsonify(result), 200
+
+
+@app.route('/api/cs-agent/tools/send-payment-link', methods=['POST'])
+def cs_tool_send_payment_link():
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+
+    data = request.get_json(silent=True) or {}
+    customer_id = data.get('customer_id') or request.args.get('customer_id', type=int)
+    if not customer_id:
+        return jsonify(error="customer_id is required"), 400
+
+    result = cs_agent_tools.send_payment_link(appmod, tenant_id, int(customer_id))
+    return jsonify(result), 200
+
+
+@app.route('/api/cs-agent/tools/escalate', methods=['POST'])
+def cs_tool_escalate():
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+
+    data = request.get_json(silent=True) or {}
+    customer_id = data.get('customer_id')
+    reason = data.get('reason', 'Customer requested assistance')
+    summary = data.get('summary', '')
+
+    result = cs_agent_tools.escalate_to_human(appmod, tenant_id, customer_id, reason, summary)
+    return jsonify(result), 200
+
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')

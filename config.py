@@ -55,3 +55,7 @@ class Config:
     SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
     SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
     MAIL_FROM = os.environ.get("MAIL_FROM", "noreply@servicesbills.net")
+
+    # --- Customer Service AI Agent ---
+    CS_AGENT_SECRET = os.environ.get("CS_AGENT_SECRET", "")
+    ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID", "")
