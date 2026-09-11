@@ -56,14 +56,35 @@ def test_normalize_lebanese_phone():
 
 
 def test_cs_agent_config(app, client):
-    """GET /api/cs-agent/config returns agent settings."""
+    """GET /api/cs-agent/config returns agent settings with env fallback, and POST saves per-tenant ID."""
     app.config["ELEVENLABS_AGENT_ID"] = "agent_test_123"
+    
+    # 1. Without tenant settings, falls back to env var
     res = client.get("/api/cs-agent/config")
     assert res.status_code == 200
     data = res.get_json()
     assert data["status"] == "ok"
     assert data["elevenlabs_agent_id"] == "agent_test_123"
     assert "agent_test_123" in data["ws_url"]
+
+    # 2. Authenticated tenant saves custom agent ID
+    headers = auth_headers(client, "admin_agent_config", "pw123")
+    save_res = client.post(
+        "/api/cs-agent/config",
+        json={"elevenlabs_agent_id": "tenant_custom_agent_999"},
+        headers=headers
+    )
+    assert save_res.status_code == 200
+    save_data = save_res.get_json()
+    assert save_data["status"] == "ok"
+    assert save_data["settings"]["elevenlabs_agent_id"] == "tenant_custom_agent_999"
+
+    # 3. GET now returns tenant-specific ID instead of env fallback
+    get_res = client.get("/api/cs-agent/config", headers=headers)
+    assert get_res.status_code == 200
+    get_data = get_res.get_json()
+    assert get_data["elevenlabs_agent_id"] == "tenant_custom_agent_999"
+    assert "tenant_custom_agent_999" in get_data["ws_url"]
 
 
 def test_lookup_customer_with_jwt_auth(app, client):

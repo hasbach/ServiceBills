@@ -2,13 +2,14 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
     Box, Card, CardContent, Typography, TextField, Button,
     Chip, Stack, IconButton, CircularProgress,
-    Alert, Paper, Grid, Switch, FormControlLabel
+    Alert, Paper, Grid, Switch, FormControlLabel, LinearProgress
 } from '@mui/material';
 import {
     Mic as MicIcon,
     MicOff as MicOffIcon,
     CallEnd as CallEndIcon,
-    PhoneInTalk as PhoneInTalkIcon
+    PhoneInTalk as PhoneInTalkIcon,
+    Save as SaveIcon
 } from '@mui/icons-material';
 import axios from 'axios';
 
@@ -17,6 +18,9 @@ export default function CSAgentVoiceTest() {
     const [status, setStatus] = useState('idle'); // idle | connecting | connected | speaking | listening | error
     const [errorMessage, setErrorMessage] = useState('');
     const [isMuted, setIsMuted] = useState(false);
+    const [audioLevel, setAudioLevel] = useState(0);
+    const [saveSuccess, setSaveSuccess] = useState('');
+    const [savingConfig, setSavingConfig] = useState(false);
     const [transcripts, setTranscripts] = useState([]);
     const [eventLogs, setEventLogs] = useState([]);
     const [autoScroll, setAutoScroll] = useState(true);
@@ -66,6 +70,53 @@ export default function CSAgentVoiceTest() {
         ]);
     };
 
+    const handleSaveAgentId = async () => {
+        if (!agentId.trim()) {
+            setErrorMessage('يرجى إدخال ElevenLabs Agent ID قبل الحفظ.');
+            return;
+        }
+        setSavingConfig(true);
+        setSaveSuccess('');
+        setErrorMessage('');
+        try {
+            const token = localStorage.getItem('token');
+            await axios.post('/api/cs-agent/config', {
+                elevenlabs_agent_id: agentId.trim()
+            }, {
+                headers: token ? { Authorization: `Bearer ${token}` } : {}
+            });
+            setSaveSuccess('تم حفظ معرف الوكيل بنجاح لهذا المشترك!');
+            setTimeout(() => setSaveSuccess(''), 4000);
+        } catch (err) {
+            setErrorMessage('فشل حفظ إعدادات الوكيل: ' + (err.response?.data?.error || err.message));
+        } finally {
+            setSavingConfig(false);
+        }
+    };
+
+    // Helper: Downsample audio Float32Array to 16,000 Hz (ElevenLabs standard)
+    const downsampleTo16k = (buffer, inputSampleRate) => {
+        if (!buffer || buffer.length === 0 || inputSampleRate === 16000) return buffer;
+        const ratio = inputSampleRate / 16000;
+        const newLength = Math.round(buffer.length / ratio);
+        const result = new Float32Array(newLength);
+        let offsetResult = 0;
+        let offsetBuffer = 0;
+        while (offsetResult < result.length) {
+            const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+            let accum = 0;
+            let count = 0;
+            for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                accum += buffer[i];
+                count++;
+            }
+            result[offsetResult] = count > 0 ? accum / count : 0;
+            offsetResult++;
+            offsetBuffer = nextOffsetBuffer;
+        }
+        return result;
+    };
+
     // ── WebSocket Audio Pipeline ─────────────────────────────────────────────
     const startConversation = async () => {
         if (!agentId.trim()) {
@@ -89,15 +140,28 @@ export default function CSAgentVoiceTest() {
             });
             mediaStreamRef.current = stream;
 
-            // 2. AudioContext setup (16 kHz is standard for voice agent STT)
+            // 2. AudioContext setup (try 16kHz context, fallback to system default)
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
-            const audioCtx = new AudioCtx();
+            let audioCtx;
+            try {
+                audioCtx = new AudioCtx({ sampleRate: 16000 });
+            } catch (e) {
+                audioCtx = new AudioCtx();
+            }
             audioContextRef.current = audioCtx;
+
+            if (audioCtx.state === 'suspended') {
+                await audioCtx.resume();
+            }
 
             const source = audioCtx.createMediaStreamSource(stream);
             // ScriptProcessorNode to buffer audio chunks
             const processor = audioCtx.createScriptProcessor(4096, 1, 1);
             processorRef.current = processor;
+
+            // Muted gain node to prevent speaker loopback/echo while keeping processor running
+            const muteGain = audioCtx.createGain();
+            muteGain.gain.value = 0;
 
             // 3. Connect WebSocket
             const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(agentId.trim())}`;
@@ -120,16 +184,32 @@ export default function CSAgentVoiceTest() {
 
                 // Start recording and sending audio
                 source.connect(processor);
-                processor.connect(audioCtx.destination);
+                processor.connect(muteGain);
+                muteGain.connect(audioCtx.destination);
 
+                let chunkCount = 0;
                 processor.onaudioprocess = (e) => {
-                    if (isMuted || ws.readyState !== WebSocket.OPEN) return;
+                    if (ws.readyState !== WebSocket.OPEN) return;
                     const inputData = e.inputBuffer.getChannelData(0);
 
-                    // Convert Float32Array to 16-bit PCM
-                    const pcm16 = new Int16Array(inputData.length);
+                    // Calculate RMS volume for live VU meter
+                    let sum = 0;
                     for (let i = 0; i < inputData.length; i++) {
-                        const s = Math.max(-1, Math.min(1, inputData[i]));
+                        sum += inputData[i] * inputData[i];
+                    }
+                    const rms = Math.sqrt(sum / inputData.length);
+                    const level = Math.min(100, Math.round(rms * 450));
+                    setAudioLevel(level);
+
+                    if (isMuted) return;
+
+                    // Ensure strictly 16,000 Hz PCM for ElevenLabs
+                    const samples16k = downsampleTo16k(inputData, audioCtx.sampleRate);
+
+                    // Convert Float32Array to 16-bit PCM
+                    const pcm16 = new Int16Array(samples16k.length);
+                    for (let i = 0; i < samples16k.length; i++) {
+                        const s = Math.max(-1, Math.min(1, samples16k[i]));
                         pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                     }
 
@@ -144,6 +224,13 @@ export default function CSAgentVoiceTest() {
                     ws.send(JSON.stringify({
                         user_audio_chunk: base64Chunk
                     }));
+
+                    chunkCount++;
+                    if (chunkCount === 1) {
+                        logEvent('Audio Streaming', `Mic active (${audioCtx.sampleRate}Hz -> 16kHz PCM). ElevenLabs is listening.`);
+                    } else if (chunkCount % 100 === 0) {
+                        logEvent('Streaming Stats', `Sent ${chunkCount} audio chunks (Current input level: ${level}%)`);
+                    }
                 };
             };
 
@@ -185,6 +272,7 @@ export default function CSAgentVoiceTest() {
     };
 
     const cleanupAudio = () => {
+        setAudioLevel(0);
         if (processorRef.current) {
             processorRef.current.disconnect();
             processorRef.current = null;
@@ -379,7 +467,7 @@ export default function CSAgentVoiceTest() {
                     <Card elevation={1} sx={{ borderRadius: '16px', height: '100%', display: 'flex', flexDirection: 'column' }}>
                         <CardContent sx={{ p: 3, flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
                             {/* Agent ID & Status Header */}
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 3, flexWrap: 'wrap' }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2, flexWrap: 'wrap' }}>
                                 <TextField
                                     size="small"
                                     label="ElevenLabs Agent ID"
@@ -389,6 +477,17 @@ export default function CSAgentVoiceTest() {
                                     disabled={status !== 'idle' && status !== 'error'}
                                     sx={{ minWidth: 260, flexGrow: 1 }}
                                 />
+
+                                <Button
+                                    variant="outlined"
+                                    size="medium"
+                                    startIcon={savingConfig ? <CircularProgress size={16} /> : <SaveIcon />}
+                                    onClick={handleSaveAgentId}
+                                    disabled={savingConfig || !agentId.trim()}
+                                    sx={{ whiteSpace: 'nowrap' }}
+                                >
+                                    حفظ للمشترك
+                                </Button>
 
                                 <Chip
                                     label={
@@ -408,6 +507,12 @@ export default function CSAgentVoiceTest() {
                                     sx={{ fontWeight: 600, px: 1 }}
                                 />
                             </Box>
+
+                            {saveSuccess && (
+                                <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSaveSuccess('')}>
+                                    {saveSuccess}
+                                </Alert>
+                            )}
 
                             {/* Call Control Button */}
                             <Box sx={{ display: 'flex', justifyContent: 'center', my: 2 }}>
@@ -461,6 +566,33 @@ export default function CSAgentVoiceTest() {
                                     </Stack>
                                 )}
                             </Box>
+
+                            {/* Microphone Live VU Meter */}
+                            {status !== 'idle' && status !== 'error' && (
+                                <Box sx={{ width: '100%', maxWidth: 360, mx: 'auto', mt: 1, mb: 2, textAlign: 'center' }}>
+                                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
+                                        <Typography variant="caption" color="text.secondary">
+                                            مستوى التقاط الميكروفون (VU Meter)
+                                        </Typography>
+                                        <Typography variant="caption" fontWeight={700} color={audioLevel > 5 ? 'success.main' : 'text.disabled'}>
+                                            {audioLevel > 5 ? 'عم يسمع صوتك' : 'ساكت أو بعيد'} ({audioLevel}%)
+                                        </Typography>
+                                    </Box>
+                                    <LinearProgress
+                                        variant="determinate"
+                                        value={Math.min(100, audioLevel)}
+                                        sx={{
+                                            height: 10,
+                                            borderRadius: 5,
+                                            backgroundColor: 'action.hover',
+                                            '& .MuiLinearProgress-bar': {
+                                                backgroundColor: audioLevel > 15 ? '#2e7d32' : audioLevel > 5 ? '#1976d2' : '#9e9e9e',
+                                                transition: 'transform 0.08s linear'
+                                            }
+                                        }}
+                                    />
+                                </Box>
+                            )}
 
                             {/* Live Transcripts Dialogue */}
                             <Typography variant="subtitle2" fontWeight={700} sx={{ mt: 2, mb: 1 }}>

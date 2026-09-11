@@ -1544,6 +1544,27 @@ class UpgradeRequest(db.Model):
         }
 
 
+class CSAgentSettings(db.Model):
+    """Tenant-scoped settings for Customer Service AI Agent."""
+    __tablename__ = "cs_agent_settings"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, unique=True, index=True)
+    elevenlabs_agent_id = db.Column(db.String(100), nullable=True)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'tenant_id': self.tenant_id,
+            'elevenlabs_agent_id': self.elevenlabs_agent_id or '',
+            'is_active': self.is_active,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
+        }
+
+
 class CSAgentSession(db.Model):
     """Tracks a customer service agent session across phone, web test, or WhatsApp."""
     __tablename__ = "cs_agent_session"
@@ -12082,10 +12103,47 @@ def fix_employee_balance(employee_id):
 # Customer Service AI Agent Tool Endpoints (Multi-Tenant & ElevenLabs Compatible)
 # ---------------------------------------------------------------------------
 
-@app.route('/api/cs-agent/config', methods=['GET'])
-def get_cs_agent_config():
-    """Returns CS agent public configuration (e.g. Agent ID for WebSocket testing)."""
-    agent_id = app.config.get('ELEVENLABS_AGENT_ID', '')
+@app.route('/api/cs-agent/config', methods=['GET', 'POST'])
+def cs_agent_config():
+    """Returns or updates CS agent configuration (tenant-scoped with env fallback)."""
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+
+    if request.method == 'POST':
+        if not is_jwt:
+            verify_jwt_in_request()
+            claims = get_jwt()
+            tenant_id = int(claims.get('tenant_id')) if claims else None
+        if not tenant_id:
+            return jsonify(error="Unauthorized"), 401
+
+        data = request.get_json(silent=True) or {}
+        try:
+            settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
+            if not settings:
+                settings = CSAgentSettings(tenant_id=tenant_id)
+                db.session.add(settings)
+
+            if 'elevenlabs_agent_id' in data:
+                settings.elevenlabs_agent_id = (data.get('elevenlabs_agent_id') or '').strip()
+            db.session.commit()
+            return jsonify(status='ok', settings=settings.to_dict()), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify(error=f"Database error: {str(e)}"), 500
+
+    agent_id = ''
+    if tenant_id:
+        try:
+            settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
+            if settings and settings.elevenlabs_agent_id:
+                agent_id = settings.elevenlabs_agent_id
+        except Exception:
+            db.session.rollback()
+
+    if not agent_id:
+        agent_id = app.config.get('ELEVENLABS_AGENT_ID', '')
+
     return jsonify({
         'status': 'ok',
         'elevenlabs_agent_id': agent_id,
