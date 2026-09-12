@@ -19,6 +19,8 @@ services:
         value: app.py
       - key: DISABLE_AUTO_CREATE_ALL
         value: "1"
+      - key: WEB_CONCURRENCY
+        value: "4"   # Min 3 needed: (1) WhatsApp/WebSocket, (2) ElevenLabs tool webhook, (3) on-premise agent poll+result
       - key: RUN_SCHEDULER
         value: "1"
       - key: FERNET_KEY

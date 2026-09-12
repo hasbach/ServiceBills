@@ -370,8 +370,10 @@ def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
     # 4. Short-poll waiting for the on-premise agent to claim and complete the job.
     # Timeline: agent polls every DEFAULT_POLL_SECONDS=2s → up to 2s before claim,
     # then 3-8s for the hardware query (Mikrotik RouterOS API / OLT SNMP).
-    # ElevenLabs allows up to 18s for webhook tool calls, so 12s is safe.
-    poll_timeout = min(float(wait_seconds or 12), 12.0)
+    # Customers willingly wait several minutes for a real diagnosis.
+    # ElevenLabs allows up to ~30s for webhook tool calls; 60s is the max we'd
+    # ever need in practice (most jobs complete in under 15s with 4 workers).
+    poll_timeout = min(float(wait_seconds or 60), 60.0)
     deadline = time.time() + max(0.5, poll_timeout)
     completed_job = job
     while time.time() < deadline:
