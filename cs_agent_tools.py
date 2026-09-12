@@ -1012,7 +1012,7 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
         esc_res = escalate_to_human(
             appmod, tenant_id, cust_id,
             reason="طلب التحدث مع موظف عبر واتساب",
-            summary=text
+            summary=clean_text
         )
         ticket_id = esc_res.get("ticket_id", "")
         reply_text = (

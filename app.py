@@ -7849,86 +7849,90 @@ def whatsapp_webhook():
                                     except Exception as ex_med:
                                         logging.error(f"Error forwarding media: {ex_med}")
 
-                        # 2. Automatically log as a Support Ticket in Dashboard if customer found
-                        ticket = None
-                        if cust_obj:
-                            try:
-                                ticket = SupportTicket(
-                                    tenant_id=resolved_tenant_id,
-                                    customer_id=cust_obj.id,
-                                    title=f"WhatsApp Reply from {cust_name} (+{sender_phone})",
-                                    description=f"Incoming WhatsApp message:\n\n{msg_text}\n\n[Received via Meta Cloud API Webhook at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC]",
-                                    status='open',
-                                    priority='medium',
-                                    created_at=datetime.utcnow(),
-                                    updated_at=datetime.utcnow()
-                                )
-                                db.session.add(ticket)
-                                db.session.commit()
-                                logging.info(f"Created support ticket #{ticket.id} for WhatsApp reply from {cust_name}.")
-                            except Exception as ex_t:
-                                db.session.rollback()
-                                logging.error(f"Failed to create support ticket for WhatsApp reply: {ex_t}")
-
-                        # 3. Send AI Customer Service reply back to customer (or fallback acknowledgment)
+                        # 2. Check if CS Agent is active for this tenant
                         is_forwarding_mobile_reply = bool(
                             settings and settings.forwarding_mobile and
                             normalize_whatsapp_phone(settings.forwarding_mobile) == sender_phone
                         )
-                        if (settings and settings.access_token and settings.phone_number_id
-                                and getattr(settings, 'auto_reply_enabled', True) and not is_forwarding_mobile_reply):
-                            try:
-                                # Check if CS Agent settings exist and are active for this tenant
+                        cs_agent_active = False
+                        if settings and settings.access_token and settings.phone_number_id:
+                            cs_settings = CSAgentSettings.query.filter_by(tenant_id=resolved_tenant_id).first()
+                            if cs_settings is None or cs_settings.is_active:
                                 cs_agent_active = True
-                                cs_settings = CSAgentSettings.query.filter_by(tenant_id=resolved_tenant_id).first()
-                                if cs_settings and not cs_settings.is_active:
-                                    cs_agent_active = False
 
-                                if cs_agent_active:
-                                    cs_agent_tools.handle_whatsapp_cs_ai_reply(
-                                        appmod=sys.modules[__name__],
+                        ticket = None
+                        if cs_agent_active and getattr(settings, 'auto_reply_enabled', True) and not is_forwarding_mobile_reply:
+                            # 3a. CS AI Agent handles the message autonomously.
+                            # Routine messages (greetings, inquiries, status checks) do NOT create open support tickets.
+                            # Support tickets are ONLY opened if the agent decides to escalate to human staff.
+                            try:
+                                cs_agent_tools.handle_whatsapp_cs_ai_reply(
+                                    appmod=sys.modules[__name__],
+                                    tenant_id=resolved_tenant_id,
+                                    sender_phone=sender_phone,
+                                    customer=cust_obj,
+                                    incoming_text=msg_text,
+                                    is_voice=bool(msg_type in ['audio', 'voice']),
+                                    settings=settings,
+                                    ticket=None
+                                )
+                            except Exception as ex_ai:
+                                logging.error(f"Error executing CS AI reply: {ex_ai}")
+                        elif not is_forwarding_mobile_reply:
+                            # 3b. CS Agent is inactive/disabled: create support ticket for human staff follow-up
+                            if cust_obj:
+                                try:
+                                    ticket = SupportTicket(
                                         tenant_id=resolved_tenant_id,
-                                        sender_phone=sender_phone,
-                                        customer=cust_obj,
-                                        incoming_text=msg_text,
-                                        is_voice=bool(msg_type in ['audio', 'voice']),
-                                        settings=settings,
-                                        ticket=ticket
+                                        customer_id=cust_obj.id,
+                                        title=f"WhatsApp Reply from {cust_name} (+{sender_phone})",
+                                        description=f"Incoming WhatsApp message:\n\n{msg_text}\n\n[Received via Meta Cloud API Webhook at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC]",
+                                        status='open',
+                                        priority='medium',
+                                        created_at=datetime.utcnow(),
+                                        updated_at=datetime.utcnow()
                                     )
-                                else:
-                                    # Fallback to standard static canned reply
-                                    recent_tickets_count = 0
-                                    if cust_obj:
-                                        recent_tickets_count = SupportTicket.query.filter_by(tenant_id=resolved_tenant_id).filter(
-                                            SupportTicket.customer_id == cust_obj.id,
-                                            SupportTicket.created_at >= datetime.utcnow() - timedelta(minutes=15)
-                                        ).count()
-                                    
-                                    # If recent_tickets_count <= 1 (meaning only the ticket we just created right now, or 0 if no customer object), send auto-reply
-                                    if recent_tickets_count <= 1:
-                                        reply_text = getattr(settings, 'auto_reply_message', None) or (
-                                            "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\n"
-                                            "سيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم"
-                                        )
-                                        api_version = settings.api_version or 'v19.0'
-                                        url_reply = f'https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages'
-                                        headers_reply = {
-                                            'Authorization': f'Bearer {settings.access_token}',
-                                            'Content-Type': 'application/json',
-                                        }
-                                        payload_reply = {
-                                            'messaging_product': 'whatsapp',
-                                            'to': sender_phone,
-                                            'type': 'text',
-                                            'text': {'body': reply_text}
-                                        }
+                                    db.session.add(ticket)
+                                    db.session.commit()
+                                    logging.info(f"Created support ticket #{ticket.id} for WhatsApp reply from {cust_name} (CS Agent inactive).")
+                                except Exception as ex_t:
+                                    db.session.rollback()
+                                    logging.error(f"Failed to create support ticket for WhatsApp reply: {ex_t}")
+
+                            # Fallback to standard static canned reply if auto-reply enabled
+                            if settings and settings.access_token and settings.phone_number_id and getattr(settings, 'auto_reply_enabled', True):
+                                recent_tickets_count = 0
+                                if cust_obj:
+                                    recent_tickets_count = SupportTicket.query.filter_by(tenant_id=resolved_tenant_id).filter(
+                                        SupportTicket.customer_id == cust_obj.id,
+                                        SupportTicket.created_at >= datetime.utcnow() - timedelta(minutes=15)
+                                    ).count()
+                                
+                                if recent_tickets_count <= 1:
+                                    reply_text = getattr(settings, 'auto_reply_message', None) or (
+                                        "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\n"
+                                        "سيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم"
+                                    )
+                                    api_version = settings.api_version or 'v19.0'
+                                    url_reply = f'https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages'
+                                    headers_reply = {
+                                        'Authorization': f'Bearer {settings.access_token}',
+                                        'Content-Type': 'application/json',
+                                    }
+                                    payload_reply = {
+                                        'messaging_product': 'whatsapp',
+                                        'to': sender_phone,
+                                        'type': 'text',
+                                        'text': {'body': reply_text}
+                                    }
+                                    try:
                                         res_rep = requests.post(url_reply, json=payload_reply, headers=headers_reply, timeout=10)
                                         if res_rep.ok:
-                                            logging.info(f"Sent automated acknowledgment reply to customer (+{sender_phone}).")
+                                            logging.info(f"Sent fallback canned reply to +{sender_phone}.")
                                         else:
-                                            logging.warning(f"Could not send auto-reply to customer (+{sender_phone}): {res_rep.text}")
-                            except Exception as ex_rep:
-                                logging.error(f"Error handling WhatsApp reply/AI to customer: {ex_rep}")
+                                            logging.warning(f"Could not send fallback canned reply to +{sender_phone}: {res_rep.text}")
+                                    except Exception as ex_rep:
+                                        logging.error(f"Error sending fallback canned reply: {ex_rep}")
 
         except Exception as e:
             logging.error(f"Error processing WhatsApp webhook: {e}")

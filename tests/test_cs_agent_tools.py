@@ -443,3 +443,58 @@ def test_process_customer_message_ai_greeting_uses_yara(app, client):
         assert "كفي مساعدتك" in res_ongoing["reply_text"] or "تفضل" in res_ongoing["reply_text"]
 
 
+def test_whatsapp_ai_reply_no_unwanted_tickets(app, client, monkeypatch):
+    """Verifies that routine AI conversation does NOT create SupportTickets, but escalation does."""
+    import cs_agent_tools
+    from unittest.mock import MagicMock
+
+    class MockResponse:
+        ok = True
+        status_code = 200
+        text = '{"messages": [{"id": "wamid.mock"}]}'
+        def json(self):
+            return {"messages": [{"id": "wamid.mock"}]}
+
+    monkeypatch.setattr(cs_agent_tools.requests, "post", lambda *a, **kw: MockResponse())
+
+    headers = auth_headers(client, "admin_test_tickets", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_test_tickets").first()
+        cust_id, _ = _setup_customer(app, tenant.id, "Tarek Ziad", "70666555", balance=-20.0)
+        cust = appmod.db.session.get(appmod.Customer, cust_id)
+
+        settings = MagicMock()
+        settings.access_token = "mock_token"
+        settings.phone_number_id = "mock_phone_id"
+        settings.api_version = "v19.0"
+
+        # 1. Routine greeting: should NOT create any SupportTicket
+        initial_ticket_count = appmod.SupportTicket.query.filter_by(tenant_id=tenant.id).count()
+        cs_agent_tools.handle_whatsapp_cs_ai_reply(
+            appmod, tenant.id, "96170666555", cust, "مرحبا صباح الخير", is_voice=False, settings=settings
+        )
+        after_greeting_count = appmod.SupportTicket.query.filter_by(tenant_id=tenant.id).count()
+        assert after_greeting_count == initial_ticket_count
+
+        # 2. Routine balance inquiry: should NOT create any SupportTicket
+        cs_agent_tools.handle_whatsapp_cs_ai_reply(
+            appmod, tenant.id, "96170666555", cust, "قديش في عليي رصيد", is_voice=False, settings=settings
+        )
+        after_bal_count = appmod.SupportTicket.query.filter_by(tenant_id=tenant.id).count()
+        assert after_bal_count == initial_ticket_count
+
+        # 3. Explicit escalation: SHOULD create a SupportTicket via escalate_to_human
+        esc_res = cs_agent_tools.handle_whatsapp_cs_ai_reply(
+            appmod, tenant.id, "96170666555", cust, "بدي احكي مع موظف الدعم ضروري", is_voice=False, settings=settings
+        )
+        assert esc_res["intent"] == "escalate"
+        after_esc_count = appmod.SupportTicket.query.filter_by(tenant_id=tenant.id).count()
+        assert after_esc_count == initial_ticket_count + 1
+        
+        # Verify ticket details
+        created_ticket = appmod.SupportTicket.query.filter_by(tenant_id=tenant.id).order_by(appmod.SupportTicket.id.desc()).first()
+        assert created_ticket.priority == "high"
+        assert "مساعد الذكاء الاصطناعي" in created_ticket.title
+
+
+
