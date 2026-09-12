@@ -567,14 +567,15 @@ def get_effective_elevenlabs_voice_id(api_key, agent_id=None):
     if _CACHED_VOICE_ID:
         return _CACHED_VOICE_ID
 
-    configured = current_app.config.get('ELEVENLABS_VOICE_ID') or os.environ.get('ELEVENLABS_VOICE_ID')
+    # 1. Configured voice ID (defaults to 'albaa6OioIhKtKdCEkQw' - laloosh female voice)
+    configured = current_app.config.get('ELEVENLABS_VOICE_ID') or os.environ.get('ELEVENLABS_VOICE_ID') or "albaa6OioIhKtKdCEkQw"
     if configured:
         _CACHED_VOICE_ID = configured
         return _CACHED_VOICE_ID
 
     target_agent_id = agent_id or current_app.config.get('ELEVENLABS_AGENT_ID') or os.environ.get('ELEVENLABS_AGENT_ID')
 
-    # 1. Try to fetch the voice assigned to the user's agent
+    # 2. Try to fetch the voice assigned to the user's agent
     if target_agent_id and api_key:
         try:
             res = requests.get(
@@ -595,25 +596,8 @@ def get_effective_elevenlabs_voice_id(api_key, agent_id=None):
         except Exception as e:
             logging.warning(f"Could not read agent voice: {e}")
 
-    # 2. Query /v1/voices to find an allowed premade or account voice
-    if api_key:
-        try:
-            res = requests.get("https://api.elevenlabs.io/v1/voices", headers={"xi-api-key": api_key}, timeout=5)
-            if res.ok:
-                voices = res.json().get("voices", [])
-                premade = [v["voice_id"] for v in voices if v.get("category") == "premade"]
-                if premade:
-                    _CACHED_VOICE_ID = premade[0]
-                    logging.info(f"Using allowed premade voice '{_CACHED_VOICE_ID}'")
-                    return _CACHED_VOICE_ID
-                elif voices:
-                    _CACHED_VOICE_ID = voices[0]["voice_id"]
-                    return _CACHED_VOICE_ID
-        except Exception as e:
-            logging.warning(f"Could not query /v1/voices: {e}")
-
-    # Default fallback: Adam (premade voice permitted on all tiers)
-    _CACHED_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
+    # Fallback to laloosh
+    _CACHED_VOICE_ID = "albaa6OioIhKtKdCEkQw"
     return _CACHED_VOICE_ID
 
 

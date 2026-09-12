@@ -60,3 +60,4 @@ class Config:
     CS_AGENT_SECRET = os.environ.get("CS_AGENT_SECRET", "")
     ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID", "")
     ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+    ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "albaa6OioIhKtKdCEkQw")
