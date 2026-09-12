@@ -560,6 +560,14 @@ def transcribe_voice_elevenlabs(audio_bytes, api_key=None, mime_type='audio/ogg'
         return None
 
 
+def clean_speech_tags(text):
+    """Strips TTS prompt emotion tags like [warmly], [friendly], etc. from text."""
+    if not text:
+        return ""
+    cleaned = re.sub(r'\[[a-zA-Z_\s]+\]\s*', '', text)
+    return cleaned.strip()
+
+
 _CACHED_AGENT_CONFIG = {}
 _CACHED_AGENT_CONFIG_TIME = 0
 
@@ -688,9 +696,16 @@ def synthesize_speech_elevenlabs(text, voice_id=None, api_key=None, agent_id=Non
         logging.warning("synthesize_speech_elevenlabs: No voice ID available from ElevenLabs agent configuration.")
         return None
 
+    clean_text = clean_speech_tags(text)
+    if not clean_text:
+        return None
+
     model_id = agent_cfg.get("model_id") or "eleven_multilingual_v2"
+    if "multilingual" not in model_id and "turbo" not in model_id and "flash" not in model_id:
+        model_id = "eleven_multilingual_v2"
+
     payload = {
-        "text": text,
+        "text": clean_text,
         "model_id": model_id,
         "voice_settings": {
             "stability": 0.5,
@@ -766,7 +781,7 @@ def handle_whatsapp_audio_transcription(access_token, media_id, api_version='v19
     return transcribe_voice_elevenlabs(audio_bytes, mime_type=mime)
 
 
-def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_voice=False):
+def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_voice=False, is_new_session=True):
     """Processes incoming customer WhatsApp message or voice note transcript,
     analyzing the intent and generating a friendly, accurate Lebanese Arabic reply.
     """
@@ -776,7 +791,7 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
     # 1. Greetings & courtesy (شكرا، يعطيك العافية، مرحبا)
     courtesy_thanks = ["شكرا", "شكرن", "يسلمو", "تسلم", "الله يعطيك العافية", "يعطيكم العافية", "مشكور", "ما قصرت"]
     if any(kw in norm for kw in courtesy_thanks) and len(norm) < 35:
-        reply_text = "تكرم عينك والله يعافيك! معك يارا من الدعم الفني، إذا احتجت أي مساعدة نحن موجودين دائماً."
+        reply_text = "تكرم عينك والله يعافيك! معك يارا من الدعم الفني، إذا احتجت أي مساعدة أنا بالخدمة دائماً."
         return {
             "intent": "courtesy",
             "reply_text": reply_text,
@@ -792,12 +807,14 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
     ]
     if any(kw in norm for kw in greeting_keywords) and len(norm) < 40:
         agent_cfg = get_elevenlabs_agent_config()
-        first_msg = agent_cfg.get("first_message")
-        if first_msg:
+        first_msg = clean_speech_tags(agent_cfg.get("first_message"))
+        name_str = f" {customer.name}" if customer else ""
+        if is_new_session and first_msg:
             reply_text = first_msg
-        else:
-            name_str = f" {customer.name}" if customer else ""
+        elif is_new_session:
             reply_text = f"أهلاً وسهلاً بك{name_str}! معك يارا من الدعم الفني، كيف بقدر ساعدك اليوم؟"
+        else:
+            reply_text = f"أهلاً وسهلاً فيك{name_str}! معك يارا، تفضل كيف بقدر كفي مساعدتك؟"
         return {
             "intent": "greeting",
             "reply_text": reply_text,
@@ -838,11 +855,11 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             plan = status.get("plan_name", "غير محدد")
             is_active = status.get("is_subscription_active", False)
             if not is_active or days <= 0:
-                reply_text = f"أهلاً بك {customer.name}.\nاشتراكك منتهي الصلاحية حالياً. يرجى تجديد الاشتراك لتفعيل الخدمة فوراً."
+                reply_text = f"أهلاً بك {customer.name}! معك يارا، اشتراكك منتهي الصلاحية حالياً. فيك تجدده فوراً عبر Whish أو تزورنا بالمركز ليرجع الخط شغال."
             else:
-                reply_text = f"أهلاً بك {customer.name}.\nاشتراكك في باقة ({plan}) ساري المفعول، باقي عليه {days} يوم، وتاريخ الانتهاء هو: {exp}."
+                reply_text = f"أهلاً بك {customer.name}! معك يارا، اشتراكك بباقة ({plan}) ساري المفعول، باقي عليه {days} يوم وتاريخ الانتهاء هو {exp}. في شي تاني بقدر ساعدك فيه؟"
         else:
-            reply_text = "أهلاً بك! يرجى تزويدنا برقم الهاتف المسجل لمراجعة تاريخ تجديد اشتراكك."
+            reply_text = "أهلاً بك! معك يارا من الدعم الفني، يرجى تزويدنا برقم هاتفك المسجل لمراجعة موعد تجديد اشتراكك."
         return {
             "intent": "expiry_inquiry",
             "reply_text": reply_text,
@@ -860,9 +877,9 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             status = get_customer_status(appmod, tenant_id, customer.id)
             plan = status.get("plan_name", "غير محدد")
             price = status.get("plan_price", 0.0)
-            reply_text = f"أهلاً بك {customer.name}.\nباقتك الحالية هي: {plan}، وقيمتها {price:.2f} دولار شهرياً."
+            reply_text = f"أهلاً بك {customer.name}! معك يارا، باقتك الحالية هي {plan} وقيمتها {price:.2f} دولار شهرياً."
         else:
-            reply_text = "أهلاً بك! يرجى تزويدنا برقم هاتفك المسجل لمعرفة تفاصيل باقتك الحالية."
+            reply_text = "أهلاً بك! معك يارا من الدعم الفني، يرجى تزويدنا برقم هاتفك المسجل لمعرفة تفاصيل باقتك الحالية."
         return {
             "intent": "plan_inquiry",
             "reply_text": reply_text,
@@ -884,17 +901,17 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
                 pay_data = send_payment_link(appmod, tenant_id, customer.id)
                 pay_url = pay_data.get("payment_url", "")
                 reply_text = (
-                    f"أهلاً وسهلاً بك {customer.name}.\n"
+                    f"أهلاً وسهلاً بك {customer.name}! معك يارا،\n"
                     f"رصيدك المستحق الحالي هو: {bal_due:.2f} دولار.\n"
                     f"فيك تدفع بسهولة عبر Whish Money على الرابط التالي أو بزيارة مركزنا:\n{pay_url}"
                 )
             else:
                 reply_text = (
-                    f"أهلاً وسهلاً بك {customer.name}.\n"
-                    "حسابك خالص وما في عليك أي مبالغ مستحقة للدفع حالياً. شكراً إلك!"
+                    f"أهلاً وسهلاً بك {customer.name}! معك يارا، "
+                    "حسابك خالص وما في عليك أي مبالغ مستحقة للدفع حالياً، شكراً إلك!"
                 )
         else:
-            reply_text = "أهلاً بك! يرجى تزويدنا باسمك أو رقم هاتفك المسجل لنتمكن من مراجعة رصيد حسابك."
+            reply_text = "أهلاً بك! معك يارا من الدعم الفني، يرجى تزويدنا برقم هاتفك المسجل لنتمكن من مراجعة رصيد حسابك."
 
         return {
             "intent": "balance_inquiry",
@@ -929,12 +946,12 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             diag = network_diagnostic(appmod, tenant_id, customer.id, wait_seconds=3.0)
             diagnosis_msg = diag.get("diagnosis_ar", "اشتراكك مفعّل على النظام.")
             reply_text = (
-                f"أهلاً بك {customer.name}.\n"
+                f"أهلاً بك {customer.name}! معك يارا، فحصتلك الخط:\n"
                 f"{diagnosis_msg}\n\n"
                 "نصيحة سريعة: جرب طفي الراوتر وشغله بالكهربا دقيقة. إذا استمر العطل، فريق الصيانة رح يتابع خطك بأسرع وقت."
             )
         else:
-            reply_text = "أهلاً بك. تم تسجيل ملاحظتك بخصوص اتصال الإنترنت، وسيقوم فريق الدعم الفني بالمتابعة معك فوراً."
+            reply_text = "أهلاً بك! معك يارا، تم تسجيل ملاحظتك بخصوص اتصال الإنترنت، وسيقوم فريق الدعم الفني بالمتابعة معك فوراً."
 
         return {
             "intent": "connection_issue",
@@ -950,8 +967,8 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
     ]
     if any(kw in norm for kw in office_keywords):
         reply_text = (
-            "أهلاً وسهلاً بك! مركز DeltaNet بخدمتكم يومياً من الساعة 9:00 صباحاً حتى 8:00 مساءً.\n"
-            "للمساعدة الفورية فيك تتواصل معنا مباشرة هون على الواتساب أو تشرفنا بالمركز."
+            "أهلاً وسهلاً بك! معك يارا، مركز DeltaNet بخدمتكم يومياً من الساعة 9:00 صباحاً حتى 8:00 مساءً.\n"
+            "لأي مساعدة فيك تتواصل معنا هون مباشرة على الواتساب أو تشرفنا بالمركز."
         )
         return {
             "intent": "office_info",
@@ -971,7 +988,7 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
         )
         ticket_id = esc_res.get("ticket_id", "")
         reply_text = (
-            f"تكرم عينك! حولت طلبك لفريق الدعم الفني وسجلتلك تذكرة برقم {ticket_id}. "
+            f"تكرم عينك! معك يارا، حولت طلبك لفريق الدعم الفني وسجلتلك تذكرة برقم {ticket_id}. "
             "رح يتواصل معك أحد موظفينا بأقرب وقت ممكن."
         )
         return {
@@ -981,14 +998,21 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             "escalate": True
         }
 
-    # 10. Default polite fallback / Greeting
+    # 10. Default polite fallback
     agent_cfg = get_elevenlabs_agent_config()
-    first_msg = agent_cfg.get("first_message")
-    if first_msg:
+    first_msg = clean_speech_tags(agent_cfg.get("first_message"))
+    name_str = f" {customer.name}" if customer else ""
+
+    if is_new_session and first_msg:
         reply_text = first_msg
-    else:
-        name_str = f" {customer.name}" if customer else ""
+    elif is_new_session:
         reply_text = f"أهلاً وسهلاً بك{name_str}! معك يارا من الدعم الفني، كيف بقدر ساعدك اليوم؟"
+    else:
+        # Customer is replying in an ongoing conversation: NEVER repeat greeting!
+        reply_text = (
+            f"تكرم عينك{name_str}! معك يارا، كيف بقدر ساعدك بالتفصيل؟ "
+            "فيك تسألني عن رصيدك والفاتورة، تجديد الاشتراك، فحص سرعة وجودة النت، أو طلب التحدث مع الدعم الفني."
+        )
 
     return {
         "intent": "general",
@@ -1007,7 +1031,26 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     if not settings or not settings.access_token or not settings.phone_number_id:
         return None
 
-    ai_result = process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_voice=is_voice)
+    # Check if there is already an active session with messages for this phone number
+    now = datetime.utcnow()
+    is_new_session = True
+    try:
+        session = appmod.CSAgentSession.query.filter_by(
+            tenant_id=tenant_id,
+            channel='whatsapp',
+            caller_identifier=sender_phone,
+            state='active'
+        ).first()
+        if session and session.updated_at and (now - session.updated_at < timedelta(minutes=30)):
+            has_logs = appmod.CSAgentMessageLog.query.filter_by(session_id=session.id).first() is not None
+            if has_logs:
+                is_new_session = False
+    except Exception as e_sess:
+        logging.warning(f"Error checking active session: {e_sess}")
+
+    ai_result = process_customer_message_ai(
+        appmod, tenant_id, customer, incoming_text, is_voice=is_voice, is_new_session=is_new_session
+    )
     reply_text = ai_result.get("reply_text")
     if not reply_text:
         return None

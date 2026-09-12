@@ -147,6 +147,7 @@ def _unauthorized(e):
 # Phase 2: a real liveness/readiness check, replacing a static-file check that
 # proved nothing about the app itself. Unauthenticated by design (load balancers/
 # uptime monitors don't carry a JWT); reveals no tenant data, only DB reachability.
+@app.route('/health')
 @app.route('/api/health')
 def health_check():
     db_ok = True
