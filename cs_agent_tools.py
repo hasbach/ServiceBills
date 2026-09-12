@@ -559,7 +559,65 @@ def transcribe_voice_elevenlabs(audio_bytes, api_key=None, mime_type='audio/ogg'
         return None
 
 
-def synthesize_speech_elevenlabs(text, voice_id=None, api_key=None):
+_CACHED_VOICE_ID = None
+
+def get_effective_elevenlabs_voice_id(api_key, agent_id=None):
+    """Finds an authorized ElevenLabs voice ID for free or paid tiers."""
+    global _CACHED_VOICE_ID
+    if _CACHED_VOICE_ID:
+        return _CACHED_VOICE_ID
+
+    configured = current_app.config.get('ELEVENLABS_VOICE_ID') or os.environ.get('ELEVENLABS_VOICE_ID')
+    if configured:
+        _CACHED_VOICE_ID = configured
+        return _CACHED_VOICE_ID
+
+    target_agent_id = agent_id or current_app.config.get('ELEVENLABS_AGENT_ID') or os.environ.get('ELEVENLABS_AGENT_ID')
+
+    # 1. Try to fetch the voice assigned to the user's agent
+    if target_agent_id and api_key:
+        try:
+            res = requests.get(
+                f"https://api.elevenlabs.io/v1/convai/agents/{target_agent_id}",
+                headers={"xi-api-key": api_key},
+                timeout=5
+            )
+            if res.ok:
+                agent_json = res.json()
+                v_id = (
+                    agent_json.get("conversation_config", {}).get("tts", {}).get("voice_id") or
+                    agent_json.get("tts", {}).get("voice_id")
+                )
+                if v_id:
+                    _CACHED_VOICE_ID = v_id
+                    logging.info(f"Using voice_id '{v_id}' from agent {target_agent_id}")
+                    return _CACHED_VOICE_ID
+        except Exception as e:
+            logging.warning(f"Could not read agent voice: {e}")
+
+    # 2. Query /v1/voices to find an allowed premade or account voice
+    if api_key:
+        try:
+            res = requests.get("https://api.elevenlabs.io/v1/voices", headers={"xi-api-key": api_key}, timeout=5)
+            if res.ok:
+                voices = res.json().get("voices", [])
+                premade = [v["voice_id"] for v in voices if v.get("category") == "premade"]
+                if premade:
+                    _CACHED_VOICE_ID = premade[0]
+                    logging.info(f"Using allowed premade voice '{_CACHED_VOICE_ID}'")
+                    return _CACHED_VOICE_ID
+                elif voices:
+                    _CACHED_VOICE_ID = voices[0]["voice_id"]
+                    return _CACHED_VOICE_ID
+        except Exception as e:
+            logging.warning(f"Could not query /v1/voices: {e}")
+
+    # Default fallback: Adam (premade voice permitted on all tiers)
+    _CACHED_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
+    return _CACHED_VOICE_ID
+
+
+def synthesize_speech_elevenlabs(text, voice_id=None, api_key=None, agent_id=None):
     """Synthesizes text to speech using ElevenLabs TTS API."""
     if not text:
         return None
@@ -568,25 +626,39 @@ def synthesize_speech_elevenlabs(text, voice_id=None, api_key=None):
         logging.warning("synthesize_speech_elevenlabs: No ELEVENLABS_API_KEY available.")
         return None
 
-    target_voice_id = voice_id or current_app.config.get('ELEVENLABS_VOICE_ID') or "21m00Tcm4TlvDq8ikWAM"
+    target_voice_id = voice_id or get_effective_elevenlabs_voice_id(key, agent_id=agent_id)
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75
+        }
+    }
+    headers = {
+        "xi-api-key": key,
+        "Content-Type": "application/json"
+    }
+
     try:
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{target_voice_id}?output_format=mp3_44100_128"
-        headers = {
-            "xi-api-key": key,
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "text": text,
-            "model_id": "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75
-            }
-        }
         res = requests.post(url, headers=headers, json=payload, timeout=25)
         if res.ok and len(res.content) > 100:
             return res.content
-        logging.warning(f"ElevenLabs TTS response error: {res.status_code} {res.text}")
+
+        logging.warning(f"ElevenLabs TTS response error with voice {target_voice_id}: {res.status_code} {res.text}")
+
+        # If voice was rejected (e.g. 402 paid_plan_required for library voice), retry with default premade "pNInz6obpgDQGcFmaJgB"
+        if res.status_code == 402 and target_voice_id != "pNInz6obpgDQGcFmaJgB":
+            logging.info("Retrying TTS with premade voice 'pNInz6obpgDQGcFmaJgB' for free-tier compatibility...")
+            fallback_url = "https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB?output_format=mp3_44100_128"
+            res_fb = requests.post(fallback_url, headers=headers, json=payload, timeout=25)
+            if res_fb.ok and len(res_fb.content) > 100:
+                global _CACHED_VOICE_ID
+                _CACHED_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
+                return res_fb.content
+            logging.warning(f"Fallback voice retry also failed: {res_fb.status_code} {res_fb.text}")
+
         return None
     except Exception as e:
         logging.error(f"Error synthesizing speech with ElevenLabs: {e}")
