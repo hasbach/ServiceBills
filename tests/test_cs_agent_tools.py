@@ -497,4 +497,151 @@ def test_whatsapp_ai_reply_no_unwanted_tickets(app, client, monkeypatch):
         assert "مساعد الذكاء الاصطناعي" in created_ticket.title
 
 
+def test_query_elevenlabs_conversational_ai_success(monkeypatch):
+    """query_elevenlabs_conversational_ai performs WebSocket handshake and returns cleaned reply."""
+    import cs_agent_tools
+    import json
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent_messages = []
+            self._messages_to_recv = [
+                json.dumps({"type": "conversation_initiation_metadata"}),
+                json.dumps({"type": "agent_response", "agent_response_event": {"agent_response": "[warmly] مرحبا انا يارا"}}),
+                json.dumps({"type": "ping", "ping_event": {"event_id": 42}}),
+                json.dumps({"type": "agent_response", "agent_response_event": {"agent_response": "[ودود] تكرم عينك، اشتراكك شغال وباقي 7 ايام."}})
+            ]
+            self.closed = False
+
+        def send(self, msg):
+            self.sent_messages.append(json.loads(msg))
+
+        def recv(self):
+            if self._messages_to_recv:
+                return self._messages_to_recv.pop(0)
+            raise TimeoutError("No more messages")
+
+        def settimeout(self, timeout):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    fake_ws = FakeWebSocket()
+    import websocket
+    monkeypatch.setattr(websocket, "create_connection", lambda url, timeout=10: fake_ws)
+
+    class FakeCustomer:
+        id = 99
+        name = "Hasan Salloum"
+
+    res = cs_agent_tools.query_elevenlabs_conversational_ai(
+        agent_id="agent_mock_test",
+        incoming_text="بدي اعرف كم يوم باقي لاشتراكي",
+        sender_phone="96171315744",
+        customer=FakeCustomer(),
+        recent_history=[{"direction": "in", "transcript": "مرحبا"}, {"direction": "out", "transcript": "اهلين وسهلين"}]
+    )
+
+    assert res is not None
+    assert res["intent"] == "elevenlabs_convai"
+    assert res["reply_text"] == "تكرم عينك، اشتراكك شغال وباقي 7 ايام."
+    assert fake_ws.closed is True
+
+    # Verify messages sent over WebSocket
+    assert len(fake_ws.sent_messages) >= 3
+    # 1. initiation client data
+    assert fake_ws.sent_messages[0]["type"] == "conversation_initiation_client_data"
+    dyn_vars = fake_ws.sent_messages[0]["conversation_initiation_client_data_event"]["dynamic_variables"]
+    assert dyn_vars["customer_name"] == "Hasan Salloum"
+    assert dyn_vars["customer_id"] == "99"
+    # 2. pong
+    pong_msgs = [m for m in fake_ws.sent_messages if m.get("type") == "pong"]
+    assert len(pong_msgs) == 1
+    assert pong_msgs[0]["event_id"] == 42
+    # 3. user_message with history and caller info
+    user_msgs = [m for m in fake_ws.sent_messages if m.get("type") == "user_message"]
+    assert len(user_msgs) == 1
+    assert "Hasan Salloum" in user_msgs[0]["text"]
+    assert "اهلين وسهلين" in user_msgs[0]["text"]
+
+
+def test_query_elevenlabs_conversational_ai_timeout_fallback(monkeypatch):
+    """query_elevenlabs_conversational_ai returns None on connection or socket error."""
+    import cs_agent_tools
+    import websocket
+
+    def _raise_error(*a, **kw):
+        raise ConnectionRefusedError("ElevenLabs ConvAI endpoint down")
+
+    monkeypatch.setattr(websocket, "create_connection", _raise_error)
+
+    res = cs_agent_tools.query_elevenlabs_conversational_ai(
+        agent_id="agent_mock_test",
+        incoming_text="مرحبا",
+        sender_phone="96171315744"
+    )
+    assert res is None
+
+
+def test_handle_whatsapp_cs_ai_reply_with_convai(app, client, monkeypatch):
+    """handle_whatsapp_cs_ai_reply uses ElevenLabs ConvAI reply when available and falls back gracefully."""
+    import cs_agent_tools
+    from unittest.mock import MagicMock
+
+    sent_payloads = []
+    class MockResponse:
+        ok = True
+        status_code = 200
+        text = '{"messages": [{"id": "wamid.mock"}]}'
+        def json(self):
+            return {"messages": [{"id": "wamid.mock"}]}
+
+    def mock_post(url, *args, **kwargs):
+        json_data = kwargs.get("json", {})
+        sent_payloads.append((url, json_data))
+        return MockResponse()
+
+    monkeypatch.setattr(cs_agent_tools.requests, "post", mock_post)
+
+    headers = auth_headers(client, "admin_test_convai", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_test_convai").first()
+        cust_id, _ = _setup_customer(app, tenant.id, "Nour Al-Hassan", "71112233", balance=0.0)
+        cust = appmod.db.session.get(appmod.Customer, cust_id)
+
+        settings = MagicMock()
+        settings.access_token = "mock_token"
+        settings.phone_number_id = "mock_phone_id"
+        settings.elevenlabs_agent_id = "agent_convai_123"
+        settings.api_version = "v19.0"
+
+        # Case 1: ElevenLabs ConvAI succeeds
+        monkeypatch.setattr(
+            cs_agent_tools,
+            "query_elevenlabs_conversational_ai",
+            lambda **kw: {"intent": "elevenlabs_convai", "reply_text": "اهلاً يا نور، كيف فيني ساعدك اليوم؟", "ticket_tag": "محادثة ذكاء اصطناعي", "escalate": False}
+        )
+
+        res = cs_agent_tools.handle_whatsapp_cs_ai_reply(
+            appmod, tenant.id, "96171112233", cust, "مرحبا يارا", is_voice=False, settings=settings
+        )
+        assert res["intent"] == "elevenlabs_convai"
+        assert res["reply_text"] == "اهلاً يا نور، كيف فيني ساعدك اليوم؟"
+
+        # Verify sent WhatsApp payload contains Yara's response
+        text_payloads = [p for u, p in sent_payloads if p.get("type") == "text"]
+        assert any("اهلاً يا نور" in p["text"]["body"] for p in text_payloads)
+
+        # Case 2: ElevenLabs ConvAI times out / returns None -> graceful fallback
+        monkeypatch.setattr(cs_agent_tools, "query_elevenlabs_conversational_ai", lambda **kw: None)
+
+        res_fallback = cs_agent_tools.handle_whatsapp_cs_ai_reply(
+            appmod, tenant.id, "96171112233", cust, "قديش في عليي رصيد", is_voice=False, settings=settings
+        )
+        assert res_fallback is not None
+        assert res_fallback["intent"] == "balance_inquiry"
+        assert "حسابك خالص" in res_fallback["reply_text"]
+
+
 

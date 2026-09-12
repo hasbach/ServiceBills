@@ -22,3 +22,4 @@ librouteros
 playwright
 pysnmp>=7,<8
 sentry-sdk[flask]==2.19.0
+websocket-client

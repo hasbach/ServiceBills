@@ -5,6 +5,7 @@ network diagnostics (relayed to on-premise agent), payment links,
 and human escalation.
 """
 import io
+import json
 import logging
 import os
 import re
@@ -561,10 +562,10 @@ def transcribe_voice_elevenlabs(audio_bytes, api_key=None, mime_type='audio/ogg'
 
 
 def clean_speech_tags(text):
-    """Strips TTS prompt emotion tags like [warmly], [friendly], etc. from text."""
+    """Strips TTS prompt emotion tags like [warmly], [friendly], [ودود], etc. from text."""
     if not text:
         return ""
-    cleaned = re.sub(r'\[[a-zA-Z_\s]+\]\s*', '', text)
+    cleaned = re.sub(r'\[[\w\s_-]+\]\s*', '', text, flags=re.UNICODE)
     return cleaned.strip()
 
 
@@ -779,6 +780,141 @@ def handle_whatsapp_audio_transcription(access_token, media_id, api_version='v19
     if not audio_bytes:
         return None
     return transcribe_voice_elevenlabs(audio_bytes, mime_type=mime)
+
+
+def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, customer=None, recent_history=None, timeout=18):
+    """Interacts directly with the ElevenLabs Conversational AI Agent WebSocket.
+    Allows Yara's LLM in ElevenLabs to handle the customer conversation dynamically,
+    execute webhook tools (lookup-customer, customer-status, etc.), and craft the reply.
+    """
+    if not agent_id or not incoming_text:
+        return None
+
+    try:
+        import websocket
+    except ImportError:
+        logging.warning("query_elevenlabs_conversational_ai: websocket-client package is not installed.")
+        return None
+
+    phone_digits = re.sub(r'\D', '', str(sender_phone or ''))
+    phone_8 = phone_digits[-8:] if len(phone_digits) >= 8 else phone_digits
+    customer_name = customer.name if (customer and getattr(customer, 'name', None)) else 'عميل'
+    customer_id = str(customer.id) if (customer and getattr(customer, 'id', None)) else ''
+
+    # Clean incoming message text
+    user_msg_clean = re.sub(
+        r"^\[(رسالة صوتية|AUDIO message received|audio message received|voice message received)\]:?\s*",
+        "",
+        incoming_text.strip(),
+        flags=re.IGNORECASE
+    ).strip()
+    if not user_msg_clean:
+        return None
+
+    ws = None
+    try:
+        ws_url = f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={agent_id}"
+        ws = websocket.create_connection(ws_url, timeout=10)
+
+        # 1. Send conversation initiation client data with dynamic variables
+        init_payload = {
+            "type": "conversation_initiation_client_data",
+            "conversation_initiation_client_data_event": {
+                "dynamic_variables": {
+                    "caller_id": sender_phone or phone_8,
+                    "phone": phone_8,
+                    "phone_number": sender_phone or phone_8,
+                    "customer_name": customer_name,
+                    "customer_id": customer_id
+                }
+            }
+        }
+        ws.send(json.dumps(init_payload))
+
+        # 2. Consume the initial greeting turn generated on connection
+        t_init = time.time()
+        while time.time() - t_init < 3.5:
+            try:
+                ws.settimeout(1.0)
+                raw = ws.recv()
+                if not raw:
+                    break
+                data = json.loads(raw)
+                m_type = data.get("type")
+                if m_type == "agent_response":
+                    break
+                elif m_type == "ping":
+                    p_id = data.get("ping_event", {}).get("event_id")
+                    if p_id is not None:
+                        ws.send(json.dumps({"type": "pong", "event_id": p_id}))
+            except websocket.WebSocketTimeoutException:
+                break
+            except Exception:
+                break
+
+        # 3. Format prompt with caller context and recent conversation history
+        prompt_parts = []
+        prompt_parts.append(f"[بيانات المتصل عبر واتساب - رقم الهاتف: {phone_8 or sender_phone}, اسم العميل: {customer_name}]:")
+        if recent_history:
+            prompt_parts.append("[مقتطف من المحادثة السابقة بين العميل ويارا]:")
+            for m in recent_history[-4:]:
+                role = "العميل" if m.get("direction") == "in" else "يارا"
+                txt = clean_speech_tags(m.get("transcript") or "")
+                if txt:
+                    prompt_parts.append(f"{role}: {txt}")
+            prompt_parts.append("[رسالة العميل الحالية]:")
+        prompt_parts.append(user_msg_clean)
+        full_prompt = "\n".join(prompt_parts)
+
+        # 4. Send the user message to ElevenLabs
+        ws.send(json.dumps({"type": "user_message", "text": full_prompt}))
+
+        # 5. Wait for agent response
+        t_req = time.time()
+        agent_reply = None
+        while time.time() - t_req < timeout:
+            try:
+                ws.settimeout(1.5)
+                raw = ws.recv()
+                if not raw:
+                    break
+                data = json.loads(raw)
+                m_type = data.get("type")
+                if m_type == "agent_response":
+                    resp = data.get("agent_response_event", {}).get("agent_response")
+                    if resp:
+                        agent_reply = resp
+                        break
+                elif m_type == "ping":
+                    p_id = data.get("ping_event", {}).get("event_id")
+                    if p_id is not None:
+                        ws.send(json.dumps({"type": "pong", "event_id": p_id}))
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception as ex_loop:
+                logging.warning(f"Exception during ElevenLabs ConvAI message wait: {ex_loop}")
+                break
+
+        if agent_reply:
+            cleaned = clean_speech_tags(agent_reply)
+            if cleaned:
+                logging.info(f"ElevenLabs ConvAI reply received ({round(time.time() - t_req, 2)}s): {cleaned}")
+                return {
+                    "intent": "elevenlabs_convai",
+                    "reply_text": cleaned,
+                    "ticket_tag": "محادثة ذكاء اصطناعي",
+                    "escalate": False
+                }
+    except Exception as e:
+        logging.warning(f"Error communicating with ElevenLabs ConvAI: {e}")
+    finally:
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    return None
 
 
 def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_voice=False, is_new_session=True):
@@ -1099,9 +1235,56 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     except Exception as e_sess:
         logging.warning(f"Error checking active session: {e_sess}")
 
-    ai_result = process_customer_message_ai(
-        appmod, tenant_id, customer, incoming_text, is_voice=is_voice, is_new_session=is_new_session
-    )
+    # Resolve target ElevenLabs agent ID
+    target_agent_id = getattr(settings, 'elevenlabs_agent_id', None)
+    if not target_agent_id:
+        try:
+            cs_settings = appmod.CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
+            if cs_settings and cs_settings.elevenlabs_agent_id:
+                target_agent_id = cs_settings.elevenlabs_agent_id
+        except Exception:
+            pass
+    if not target_agent_id:
+        try:
+            target_agent_id = current_app.config.get('ELEVENLABS_AGENT_ID') or os.environ.get('ELEVENLABS_AGENT_ID')
+        except Exception:
+            target_agent_id = os.environ.get('ELEVENLABS_AGENT_ID')
+
+    # Fetch recent conversation history from active session if available
+    recent_history = []
+    if session:
+        try:
+            recent_logs = appmod.CSAgentMessageLog.query.filter_by(
+                session_id=session.id
+            ).order_by(appmod.CSAgentMessageLog.id.desc()).limit(4).all()
+            for rl in reversed(recent_logs):
+                recent_history.append({
+                    "direction": rl.direction,
+                    "transcript": rl.transcript
+                })
+        except Exception as ex_hist:
+            logging.warning(f"Error fetching recent session history: {ex_hist}")
+
+    ai_result = None
+    if target_agent_id:
+        try:
+            ai_result = query_elevenlabs_conversational_ai(
+                agent_id=target_agent_id,
+                incoming_text=incoming_text,
+                sender_phone=sender_phone,
+                customer=customer,
+                recent_history=recent_history,
+                timeout=18
+            )
+        except Exception as ex_conv:
+            logging.warning(f"ElevenLabs ConvAI call failed, will fallback: {ex_conv}")
+
+    # Fallback to local rule-based AI processor if ElevenLabs ConvAI did not return a response
+    if not ai_result or not ai_result.get("reply_text"):
+        ai_result = process_customer_message_ai(
+            appmod, tenant_id, customer, incoming_text, is_voice=is_voice, is_new_session=is_new_session
+        )
+
     reply_text = ai_result.get("reply_text")
     if not reply_text:
         return None
@@ -1132,7 +1315,6 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     # 2. If customer sent voice note, try to respond with voice note too (if ElevenLabs TTS available)
     if is_voice:
         try:
-            target_agent_id = getattr(settings, 'elevenlabs_agent_id', None)
             tts_audio = synthesize_speech_elevenlabs(reply_text, agent_id=target_agent_id)
             if tts_audio:
                 sent_voice = send_whatsapp_voice(
