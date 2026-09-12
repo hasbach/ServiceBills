@@ -10,7 +10,7 @@ import app as appmod
 from tests.conftest import auth_headers
 
 
-def _setup_customer(app, tenant_id, name="Georges Khoury", phone="70123456", balance=25.0):
+def _setup_customer(app, tenant_id, name="Georges Khoury", phone="70123456", balance=-25.0):
     with app.app_context():
         plan = appmod.SubscriptionPlan(
             tenant_id=tenant_id,
@@ -149,7 +149,7 @@ def test_customer_status(app, client):
     headers = auth_headers(client, "admin_status", "pw123")
     with app.app_context():
         tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
-        cust_id, _ = _setup_customer(app, tenant.id, "Michel Aoun", "71111222", balance=35.5)
+        cust_id, _ = _setup_customer(app, tenant.id, "Michel Aoun", "71111222", balance=-35.5)
 
     res = client.get(f"/api/cs-agent/tools/customer-status?customer_id={cust_id}", headers=headers)
     assert res.status_code == 200
@@ -201,7 +201,7 @@ def test_send_payment_link(app, client):
     headers = auth_headers(client, "admin_pay", "pw123")
     with app.app_context():
         tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
-        cust_id, _ = _setup_customer(app, tenant.id, "Rami Zein", "76123456", balance=40.0)
+        cust_id, _ = _setup_customer(app, tenant.id, "Rami Zein", "76123456", balance=-40.0)
 
     res = client.post(
         "/api/cs-agent/tools/send-payment-link",
@@ -267,3 +267,107 @@ def test_multi_tenant_isolation(app, client):
     # Tenant A querying Tenant B's customer status -> 404
     res_a_stat = client.get(f"/api/cs-agent/tools/customer-status?customer_id={cust_b_id}", headers=headers_a)
     assert res_a_stat.status_code == 404
+
+
+def test_network_diagnostic_voice_safety_expired(app, client):
+    """Network diagnostic on expired subscription returns success=True immediately with clear Arabic reason."""
+    import cs_agent_tools
+    headers = auth_headers(client, "admin_test_expired", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_test_expired").first()
+        cust_id, _ = _setup_customer(app, tenant.id, "Expired Customer", "70333333")
+        cust = appmod.db.session.get(appmod.Customer, cust_id)
+        cust.subscription_expiry_date = datetime.utcnow() - timedelta(days=2)
+        cust.is_subscription_active = False
+        appmod.db.session.commit()
+
+        diag = cs_agent_tools.network_diagnostic(appmod, tenant.id, cust_id, wait_seconds=1)
+        assert diag["success"] is True
+        assert diag["status"] == "subscription_expired"
+        assert "منتهي الصلاحية" in diag["diagnosis_ar"]
+
+
+def test_process_customer_message_ai_promise_to_pay(app, client):
+    """Verifies AI recognizes Lebanese promise to pay voice/text message and acknowledges gracefully."""
+    import cs_agent_tools
+    headers = auth_headers(client, "admin_test_ptp", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_test_ptp").first()
+        cust_id, _ = _setup_customer(app, tenant.id, "Ahmad Salloum", "71315744", balance=-25.0)
+        cust = appmod.db.session.get(appmod.Customer, cust_id)
+
+        user_msg = "اهلا حبيب , اي بس طول بالك عليي هلق كم يوم لأن الوضع منو منيح بس يصير معي انا بحكيك"
+        res = cs_agent_tools.process_customer_message_ai(appmod, tenant.id, cust, user_msg)
+        assert res["intent"] == "promise_to_pay"
+        assert "طول بالك" in user_msg
+        assert "تكرم عينك" in res["reply_text"]
+        assert "وعد بالدفع" in res["ticket_tag"]
+
+
+def test_process_customer_message_ai_balance_inquiry(app, client):
+    """Verifies AI informs customer of their positive due balance and provides Whish payment option."""
+    import cs_agent_tools
+    headers = auth_headers(client, "admin_test_bal", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_test_bal").first()
+        cust_id, _ = _setup_customer(app, tenant.id, "Kareem Haddad", "71888999", balance=-30.0)
+        cust = appmod.db.session.get(appmod.Customer, cust_id)
+
+        user_msg = "مرحبا بدي اعرف قديش في عليي رصيد للفاتورة"
+        res = cs_agent_tools.process_customer_message_ai(appmod, tenant.id, cust, user_msg)
+        assert res["intent"] == "balance_inquiry"
+        assert "30.00" in res["reply_text"]
+        assert "Whish" in res["reply_text"]
+
+
+def test_handle_whatsapp_cs_ai_reply_logging(app, client, monkeypatch):
+    """handle_whatsapp_cs_ai_reply sends message via Meta API and logs session in DB."""
+    import cs_agent_tools
+    from unittest.mock import MagicMock
+
+    class MockResponse:
+        ok = True
+        status_code = 200
+        text = '{"messages": [{"id": "wamid.123"}]}'
+        def json(self):
+            return {"messages": [{"id": "wamid.123"}]}
+
+    monkeypatch.setattr(cs_agent_tools.requests, "post", lambda *a, **kw: MockResponse())
+
+    headers = auth_headers(client, "admin_test_log", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_test_log").first()
+        cust_id, _ = _setup_customer(app, tenant.id, "Salim Nassar", "70777888", balance=-15.0)
+        cust = appmod.db.session.get(appmod.Customer, cust_id)
+
+        settings = MagicMock()
+        settings.access_token = "mock_token"
+        settings.phone_number_id = "mock_phone_id"
+        settings.api_version = "v19.0"
+
+        ai_res = cs_agent_tools.handle_whatsapp_cs_ai_reply(
+            appmod,
+            tenant.id,
+            "96170777888",
+            cust,
+            "بدي اعرف شو عليي رصيد",
+            is_voice=False,
+            settings=settings
+        )
+
+        assert ai_res is not None
+        assert ai_res["intent"] == "balance_inquiry"
+
+        # Check CSAgentSession created
+        session = appmod.CSAgentSession.query.filter_by(
+            tenant_id=tenant.id,
+            channel="whatsapp",
+            caller_identifier="96170777888"
+        ).first()
+        assert session is not None
+
+        # Check CSAgentMessageLog created
+        logs = appmod.CSAgentMessageLog.query.filter_by(session_id=session.id).all()
+        assert len(logs) >= 2  # in and out logs
+
+
