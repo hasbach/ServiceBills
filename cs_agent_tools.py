@@ -231,49 +231,133 @@ def get_customer_status(appmod, tenant_id, customer_id):
     }
 
 
+def _normalize_mac(mac):
+    """Normalise a MAC address to lowercase colon-separated form for comparison."""
+    if not mac:
+        return ''
+    return mac.lower().replace('-', ':').replace('.', ':')
+
+
 def _format_diagnosis_result(operation, res, customer):
-    """Formats raw network agent job result into natural, reassuring Lebanese Arabic text."""
+    """Formats raw network agent job result into natural Lebanese Arabic text.
+
+    Returns a dict:
+        {
+            'diagnosis_ar': str,
+            'escalate': bool,       # True → ONU offline, trigger escalate_to_human
+            'home_problem': bool,   # True → ONU up but customer CPE not visible
+        }
+    """
+    base = {'escalate': False, 'home_problem': False}
+
     if not res or not isinstance(res, dict):
-        return "تم فحص الشبكة بنجاح والاتصال مستقر."
+        return {**base, 'diagnosis_ar': 'تم فحص الشبكة بنجاح والاتصال مستقر.'}
 
     if operation == 'secret_status':
         is_active = res.get('active', False)
-        disabled = res.get('disabled', False)
-        uptime = res.get('uptime')
+        disabled  = res.get('disabled', False)
+        uptime    = res.get('uptime')
         if disabled:
-            return "حساب الـ PPPoE الخاص فيك معطل على السيرفر. يرجى مراجعة الإدارة لتفعيله."
+            return {**base,
+                    'escalate': True,
+                    'diagnosis_ar': 'حساب الـ PPPoE الخاص فيك معطل على السيرفر. جاري تحويل الطلب لفريق الدعم.'}
         elif is_active:
-            return f"جلسة الإنترنت متصلة وشغالة بنجاح، ومدة الاتصال الحالية {uptime or 'مستمرة'}."
+            return {**base,
+                    'diagnosis_ar': f'جلسة الإنترنت متصلة وشغالة بنجاح، ومدة الاتصال الحالية {uptime or "مستمرة"}.'}
         else:
-            return "حسابك مش مسجل دخول على الراوتر حالياً (Offline). يرجى التأكد إنو الراوتر عندك شغال وموصول بالكهربا."
+            return {**base,
+                    'home_problem': True,
+                    'diagnosis_ar': 'حسابك مش مسجل دخول على الراوتر حالياً (Offline). '
+                                    'يرجى التأكد إنو الراوتر عندك شغال وموصول بالكهربا.'}
 
     elif operation == 'olt_status':
-        onus = res.get('onus') or []
-        target_mac = (customer.onu_mac_address or '').lower().replace('-', ':')
+        # The result from the on-premise agent is either a list (old format from
+        # agent versions that returned onus directly) or a dict with 'onus' key.
+        if isinstance(res, list):
+            onus = res
+        else:
+            onus = res.get('onus') or []
+
+        onu_mac  = _normalize_mac(customer.onu_mac_address)
+        cpe_mac  = _normalize_mac(customer.cpe_mac_address)
+
+        # --- Step 1: Find the customer's ONU in the OLT status list ---
         matched_onu = None
-        if target_mac:
+        if onu_mac:
             for o in onus:
-                if (o.get('mac') or '').lower().replace('-', ':') == target_mac:
+                candidate = _normalize_mac(o.get('mac') or o.get('mac_address') or '')
+                if candidate == onu_mac:
                     matched_onu = o
                     break
 
+        # --- Step 2: Determine ONU state ---
         if matched_onu:
-            is_online = matched_onu.get('status') == 'online'
-            rx_power = matched_onu.get('rx_power_dbm')
-            if is_online:
-                return f"جهاز الألياف (الـ ONU) متصل وشغال، وقوة الإشارة الضوئية {rx_power or 'ممتازة'} dBm."
-            else:
-                reason = matched_onu.get('last_deregister_reason') or 'غير معروف'
-                return f"جهاز الألياف الضوئية عندك غير متصل (Offline). السبب المسجل: {reason}. تأكد من لمبة الـ PON أو كابل الفايبر."
+            onu_online = matched_onu.get('status') == 'online'
+            rx_power   = matched_onu.get('rx_power_dbm')
+            onu_id     = matched_onu.get('onu_id', '')
         else:
-            online_count = sum(1 for o in onus if o.get('status') == 'online')
-            return f"محطة الفايبر شغال فيها {online_count} مشترك، وإشارتك مسجلة بالخدمة."
+            # ONU MAC not linked → fall back to summary
+            onu_online = None
+
+        # --- Step 3: ONU is OFFLINE → infrastructure fault → escalate ---
+        if matched_onu and not onu_online:
+            reason = matched_onu.get('last_deregister_reason') or 'غير معروف'
+            return {
+                'escalate': True,
+                'home_problem': False,
+                'diagnosis_ar': (
+                    f'جهاز الألياف الضوئية (ONU) الخاص بك غير متصل حالياً. '
+                    f'السبب المسجل: {reason}. '
+                    'هيدي مشكلة بالبنية التحتية وليست بالمنزل، جاري تحويل الطلب لفريق الصيانة.'
+                )
+            }
+
+        # --- Step 4: ONU is ONLINE → check CPE visibility ---
+        if matched_onu and onu_online:
+            # Check CPE using the cpe_locations data embedded in result (if present)
+            # or fall through to ONU-only diagnosis
+            cpe_seen = res.get('cpe_seen')  # set by network_diagnostic when it has CPE data
+
+            if cpe_mac:
+                if cpe_seen is True:
+                    return {**base,
+                            'diagnosis_ar': (
+                                f'جهاز الألياف (ONU {onu_id}) متصل وشغال'
+                                f'{(" وقوة الإشارة " + str(rx_power) + " dBm") if rx_power else ""}. '
+                                'والراوتر عندك مرئي على الشبكة — الاتصال شغال بشكل طبيعي.'
+                            )}
+                elif cpe_seen is False:
+                    return {
+                        'escalate': False,
+                        'home_problem': True,
+                        'diagnosis_ar': (
+                            f'جهاز الألياف (ONU {onu_id}) متصل وشغال'
+                            f'{(" بإشارة " + str(rx_power) + " dBm") if rx_power else ""}، '
+                            'لكن الراوتر عندك غير مرئي على الشبكة. المشكلة على الأرجح '
+                            'داخل المنزل: تأكد من توصيل كابل الشبكة بين الـ ONU والراوتر، '
+                            'وأعد تشغيل الراوتر من الكهربا دقيقة.'
+                        )
+                    }
+            # ONU online, no CPE data → positive result
+            return {**base,
+                    'diagnosis_ar': (
+                        f'جهاز الألياف (ONU {onu_id}) متصل وشغال'
+                        f'{(" وقوة الإشارة " + str(rx_power) + " dBm") if rx_power else ""}. '
+                        'الاتصال من جهة الشبكة سليم.'
+                    )}
+
+        # ONU MAC not linked → summary
+        online_count = sum(1 for o in onus if o.get('status') == 'online')
+        return {**base,
+                'diagnosis_ar': f'محطة الفايبر شغال فيها {online_count} مشترك متصل. '
+                                 'اشتراكك مفعّل على النظام.'}
 
     elif operation == 'device_health':
         cpu = res.get('cpu_load', 0)
-        return f"راوتر التوزيع شغال بحالة ممتازة (ضغط المعالج {cpu}%)."
+        return {**base,
+                'diagnosis_ar': f'راوتر التوزيع شغال بحالة ممتازة (ضغط المعالج {cpu}%).'}
 
-    return "تم فحص الشبكة بنجاح."
+    return {**base, 'diagnosis_ar': 'تم فحص الشبكة بنجاح.'}
 
 
 def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
@@ -345,7 +429,7 @@ def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
     ).order_by(appmod.NetworkAgentJob.id.desc()).first()
 
     if recent_job and recent_job.result:
-        diagnosis_ar = _format_diagnosis_result(operation, recent_job.result, customer)
+        diag = _format_diagnosis_result(operation, recent_job.result, customer)
         return {
             "success": True,
             "job_id": recent_job.id,
@@ -353,7 +437,9 @@ def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
             "status": "done",
             "operation": operation,
             "result": recent_job.result,
-            "diagnosis_ar": diagnosis_ar
+            "diagnosis_ar": diag['diagnosis_ar'],
+            "escalate": diag.get('escalate', False),
+            "home_problem": diag.get('home_problem', False),
         }
 
     # 3. Create NetworkAgentJob
@@ -403,14 +489,85 @@ def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
 
     # Job is 'done'
     res = completed_job.result or {}
-    diagnosis_ar = _format_diagnosis_result(operation, res, customer)
+
+    # 5. For OLT: if ONU is online and customer has a CPE mac, run a cpe_locations job
+    #    to determine whether the customer's home router is visible behind the ONU.
+    #    This distinguishes "ONU up, home router down" (home problem) from "all good".
+    if operation == 'olt_status' and customer.cpe_mac_address:
+        onu_mac_norm = _normalize_mac(customer.onu_mac_address)
+        cpe_mac_norm = _normalize_mac(customer.cpe_mac_address)
+
+        # Find the customer's ONU in the olt_status result
+        onus = res if isinstance(res, list) else (res.get('onus') or [])
+        onu_online = False
+        for o in onus:
+            candidate = _normalize_mac(o.get('mac') or o.get('mac_address') or '')
+            if onu_mac_norm and candidate == onu_mac_norm:
+                onu_online = o.get('status') == 'online'
+                break
+
+        if onu_online:
+            # Check for a recent cpe_locations job first
+            recent_cpe_job = appmod.NetworkAgentJob.query.filter(
+                appmod.NetworkAgentJob.tenant_id == tenant_id,
+                appmod.NetworkAgentJob.device_id == device.id,
+                appmod.NetworkAgentJob.operation == 'cpe_locations',
+                appmod.NetworkAgentJob.status == 'done',
+                appmod.NetworkAgentJob.created_at >= now - timedelta(minutes=5)
+            ).order_by(appmod.NetworkAgentJob.id.desc()).first()
+
+            cpe_result = None
+            if recent_cpe_job and recent_cpe_job.result:
+                cpe_result = recent_cpe_job.result
+            else:
+                # Enqueue a fresh cpe_locations job and wait for it
+                # Remaining budget after olt_status job
+                cpe_budget = min(30.0, max(3.0, deadline - time.time()))
+                cpe_job = appmod.NetworkAgentJob(
+                    tenant_id=tenant_id,
+                    device_id=device.id,
+                    operation='cpe_locations',
+                    params={},
+                    status='pending'
+                )
+                appmod.db.session.add(cpe_job)
+                appmod.db.session.commit()
+
+                cpe_deadline = time.time() + cpe_budget
+                while time.time() < cpe_deadline:
+                    appmod.db.session.expire(cpe_job)
+                    cpe_job = appmod.db.session.get(appmod.NetworkAgentJob, cpe_job.id)
+                    if cpe_job and cpe_job.status in ('done', 'failed'):
+                        break
+                    time.sleep(0.35)
+
+                if cpe_job and cpe_job.status == 'done' and cpe_job.result:
+                    cpe_result = cpe_job.result
+
+            if cpe_result and isinstance(cpe_result, dict):
+                # cpe_locations result: {cpe_mac: {onu_id, onu_mac, pon_port}}
+                # Normalize all keys for comparison
+                cpe_seen = any(
+                    _normalize_mac(k) == cpe_mac_norm
+                    for k in cpe_result.keys()
+                )
+                # Embed cpe_seen into res for _format_diagnosis_result to pick up
+                if isinstance(res, list):
+                    res = {'onus': res, 'cpe_seen': cpe_seen}
+                else:
+                    res = dict(res)
+                    res['cpe_seen'] = cpe_seen
+
+    diag = _format_diagnosis_result(operation, res, customer)
 
     return {
         "success": True,
         "job_id": job.id,
         "operation": operation,
         "result": res,
-        "diagnosis_ar": diagnosis_ar
+        "diagnosis_ar": diag['diagnosis_ar'],
+        "escalate": diag.get('escalate', False),
+        "home_problem": diag.get('home_problem', False),
     }
 
 
