@@ -1293,6 +1293,7 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     # Check if there is already an active session with messages for this phone number
     now = datetime.utcnow()
     is_new_session = True
+    session = None  # always defined; assigned inside try block below
     try:
         phone_digits = re.sub(r'\D', '', str(sender_phone or ''))
         phone_8 = phone_digits[-8:] if len(phone_digits) >= 8 else phone_digits
