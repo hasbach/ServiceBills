@@ -367,8 +367,11 @@ def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
     appmod.db.session.add(job)
     appmod.db.session.commit()
 
-    # 4. Short-poll with voice-safe timeout (default 3.5 seconds, max 4.0s)
-    poll_timeout = min(float(wait_seconds or 3.5), 4.0)
+    # 4. Short-poll waiting for the on-premise agent to claim and complete the job.
+    # Timeline: agent polls every DEFAULT_POLL_SECONDS=2s → up to 2s before claim,
+    # then 3-8s for the hardware query (Mikrotik RouterOS API / OLT SNMP).
+    # ElevenLabs allows up to 18s for webhook tool calls, so 12s is safe.
+    poll_timeout = min(float(wait_seconds or 12), 12.0)
     deadline = time.time() + max(0.5, poll_timeout)
     completed_job = job
     while time.time() < deadline:
