@@ -430,9 +430,16 @@ def test_process_customer_message_ai_greeting_uses_yara(app, client):
         assert "•" not in res["reply_text"]  # No long bulleted menu
 
         # 2. General unknown query fallback
-        res_fb = cs_agent_tools.process_customer_message_ai(appmod, tenant.id, cust, "شو الاخبار اليوم")
+        res_fb = cs_agent_tools.process_customer_message_ai(appmod, tenant.id, cust, "عندي استفسار عن موضوع تاني خالص")
         assert res_fb["intent"] == "general"
         assert "يارا" in res_fb["reply_text"]
         assert "•" not in res_fb["reply_text"]  # Concise friendly message
+
+        # 3. Ongoing session greeting does not repeat initial first_message
+        res_ongoing = cs_agent_tools.process_customer_message_ai(
+            appmod, tenant.id, cust, "مرحبا", is_new_session=False
+        )
+        assert res_ongoing["intent"] == "greeting"
+        assert "كفي مساعدتك" in res_ongoing["reply_text"] or "تفضل" in res_ongoing["reply_text"]
 
 

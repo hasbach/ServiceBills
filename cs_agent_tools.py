@@ -785,8 +785,15 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
     """Processes incoming customer WhatsApp message or voice note transcript,
     analyzing the intent and generating a friendly, accurate Lebanese Arabic reply.
     """
-    text = (incoming_text or '').strip()
-    norm = text.lower()
+    raw_text = (incoming_text or '').strip()
+    # Strip voice note audio prefixes and formatting
+    clean_text = re.sub(
+        r"^\[(رسالة صوتية|AUDIO message received|audio message received|voice message received)\]:?\s*",
+        "",
+        raw_text,
+        flags=re.IGNORECASE
+    ).strip()
+    norm = clean_text.lower()
 
     # 1. Greetings & courtesy (شكرا، يعطيك العافية، مرحبا)
     courtesy_thanks = ["شكرا", "شكرن", "يسلمو", "تسلم", "الله يعطيك العافية", "يعطيكم العافية", "مشكور", "ما قصرت"]
@@ -809,16 +816,37 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
         agent_cfg = get_elevenlabs_agent_config()
         first_msg = clean_speech_tags(agent_cfg.get("first_message"))
         name_str = f" {customer.name}" if customer else ""
-        if is_new_session and first_msg:
-            reply_text = first_msg
-        elif is_new_session:
-            reply_text = f"أهلاً وسهلاً بك{name_str}! معك يارا من الدعم الفني، كيف بقدر ساعدك اليوم؟"
+        if is_new_session:
+            reply_text = first_msg if first_msg else f"أهلاً وسهلاً بك{name_str}! معك يارا من الدعم الفني، كيف بقدر ساعدك اليوم؟"
         else:
             reply_text = f"أهلاً وسهلاً فيك{name_str}! معك يارا، تفضل كيف بقدر كفي مساعدتك؟"
         return {
             "intent": "greeting",
             "reply_text": reply_text,
             "ticket_tag": "تحية واستقبال",
+            "escalate": False
+        }
+
+    # 2b. Pleasantries / Wellbeing (كيفك، شو اخبارك، شلونك، كيف صحتك)
+    wellbeing_keywords = ["كيفك", "كيفيك", "شو الاخبار", "شو اخبارك", "شلونك", "كيف صحتك", "كيف الصحه", "كيف الحال"]
+    if any(kw in norm for kw in wellbeing_keywords) and len(norm) < 35:
+        name_str = f" {customer.name}" if customer else ""
+        reply_text = f"الحمدلله تمام الله يسلمك{name_str}! معك يارا، كيف بقدر ساعدك اليوم بخصوص خطك أو اشتراكك؟"
+        return {
+            "intent": "wellbeing",
+            "reply_text": reply_text,
+            "ticket_tag": "تحية واستقبال",
+            "escalate": False
+        }
+
+    # 2c. Identity / Persona questions (مين انتي، شو اسمك، مين معي، مع مين عم بحكي)
+    identity_keywords = ["مين انتي", "مين انت", "شو اسمك", "مين معي", "مع مين عم بحكي", "انت روبوت", "انت ذكاء اصطناعي", "انت انسان"]
+    if any(kw in norm for kw in identity_keywords) and len(norm) < 40:
+        reply_text = "أنا يارا، المساعدة الآلية لخدمة عملاء DeltaNet. بخدمتك لأي استفسار عن اشتراكك، فواتيرك، أو مشاكل النت."
+        return {
+            "intent": "identity",
+            "reply_text": reply_text,
+            "ticket_tag": "استفسار عن الهوية",
             "escalate": False
         }
 
@@ -998,17 +1026,15 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             "escalate": True
         }
 
-    # 10. Default polite fallback
-    agent_cfg = get_elevenlabs_agent_config()
-    first_msg = clean_speech_tags(agent_cfg.get("first_message"))
+    # 10. Default polite fallback (unrecognized customer question or inquiry)
+    # NEVER repeat the introductory first_message greeting here under any circumstances!
     name_str = f" {customer.name}" if customer else ""
-
-    if is_new_session and first_msg:
-        reply_text = first_msg
-    elif is_new_session:
-        reply_text = f"أهلاً وسهلاً بك{name_str}! معك يارا من الدعم الفني، كيف بقدر ساعدك اليوم؟"
+    if is_new_session:
+        reply_text = (
+            f"أهلاً وسهلاً بك{name_str}! معك يارا من الدعم الفني لـ DeltaNet. "
+            "تكرم عينك، كيف بقدر ساعدك؟ فيك تسألني عن رصيد حسابك، موعد تجديد اشتراكك، تفاصيل باقتك، أو فحص حالة النت عندك."
+        )
     else:
-        # Customer is replying in an ongoing conversation: NEVER repeat greeting!
         reply_text = (
             f"تكرم عينك{name_str}! معك يارا، كيف بقدر ساعدك بالتفصيل؟ "
             "فيك تسألني عن رصيدك والفاتورة، تجديد الاشتراك، فحص سرعة وجودة النت، أو طلب التحدث مع الدعم الفني."
@@ -1035,16 +1061,41 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     now = datetime.utcnow()
     is_new_session = True
     try:
-        session = appmod.CSAgentSession.query.filter_by(
+        phone_digits = re.sub(r'\D', '', str(sender_phone or ''))
+        phone_8 = phone_digits[-8:] if len(phone_digits) >= 8 else phone_digits
+
+        session_q = appmod.CSAgentSession.query.filter_by(
             tenant_id=tenant_id,
             channel='whatsapp',
-            caller_identifier=sender_phone,
             state='active'
-        ).first()
-        if session and session.updated_at and (now - session.updated_at < timedelta(minutes=30)):
-            has_logs = appmod.CSAgentMessageLog.query.filter_by(session_id=session.id).first() is not None
-            if has_logs:
-                is_new_session = False
+        )
+        if customer and customer.id:
+            session = session_q.filter(
+                (appmod.CSAgentSession.customer_id == customer.id) |
+                (appmod.CSAgentSession.caller_identifier == sender_phone) |
+                (appmod.CSAgentSession.caller_identifier.like(f"%{phone_8}%"))
+            ).order_by(appmod.CSAgentSession.id.desc()).first()
+        elif phone_8:
+            session = session_q.filter(
+                (appmod.CSAgentSession.caller_identifier == sender_phone) |
+                (appmod.CSAgentSession.caller_identifier.like(f"%{phone_8}%"))
+            ).order_by(appmod.CSAgentSession.id.desc()).first()
+        else:
+            session = session_q.filter_by(caller_identifier=sender_phone).order_by(appmod.CSAgentSession.id.desc()).first()
+
+        if session:
+            sess_time = getattr(session, 'last_active_at', None) or getattr(session, 'created_at', None)
+            if sess_time and (now - sess_time < timedelta(minutes=30)):
+                has_logs = appmod.CSAgentMessageLog.query.filter_by(session_id=session.id).first() is not None
+                if has_logs:
+                    is_new_session = False
+                elif customer and customer.id:
+                    recent_ticket = appmod.SupportTicket.query.filter_by(
+                        tenant_id=tenant_id,
+                        customer_id=customer.id
+                    ).filter(appmod.SupportTicket.created_at >= now - timedelta(minutes=30)).first()
+                    if recent_ticket:
+                        is_new_session = False
     except Exception as e_sess:
         logging.warning(f"Error checking active session: {e_sess}")
 
@@ -1113,12 +1164,27 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
 
     # 4. Audit in CSAgentSession and CSAgentMessageLog
     try:
-        session = appmod.CSAgentSession.query.filter_by(
+        phone_digits = re.sub(r'\D', '', str(sender_phone or ''))
+        phone_8 = phone_digits[-8:] if len(phone_digits) >= 8 else phone_digits
+
+        session_q = appmod.CSAgentSession.query.filter_by(
             tenant_id=tenant_id,
             channel='whatsapp',
-            caller_identifier=sender_phone,
             state='active'
-        ).first()
+        )
+        if customer and customer.id:
+            session = session_q.filter(
+                (appmod.CSAgentSession.customer_id == customer.id) |
+                (appmod.CSAgentSession.caller_identifier == sender_phone) |
+                (appmod.CSAgentSession.caller_identifier.like(f"%{phone_8}%"))
+            ).order_by(appmod.CSAgentSession.id.desc()).first()
+        elif phone_8:
+            session = session_q.filter(
+                (appmod.CSAgentSession.caller_identifier == sender_phone) |
+                (appmod.CSAgentSession.caller_identifier.like(f"%{phone_8}%"))
+            ).order_by(appmod.CSAgentSession.id.desc()).first()
+        else:
+            session = session_q.filter_by(caller_identifier=sender_phone).order_by(appmod.CSAgentSession.id.desc()).first()
 
         now = datetime.utcnow()
         if not session:
@@ -1135,6 +1201,9 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
             appmod.db.session.commit()
         else:
             session.last_active_at = now
+            if customer and not session.customer_id:
+                session.customer_id = customer.id
+            appmod.db.session.commit()
 
         in_log = appmod.CSAgentMessageLog(
             tenant_id=tenant_id,
