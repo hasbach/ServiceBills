@@ -12304,6 +12304,40 @@ def cs_tool_escalate():
     return jsonify(result), 200
 
 
+@app.route('/api/cs-agent/recent-tickets', methods=['GET'])
+def cs_get_recent_tickets():
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+
+    limit = min(int(request.args.get('limit', 15)), 50)
+    tickets = SupportTicket.query.filter_by(tenant_id=tenant_id).order_by(SupportTicket.id.desc()).limit(limit).all()
+    logs = CSAgentMessageLog.query.filter_by(tenant_id=tenant_id).order_by(CSAgentMessageLog.id.desc()).limit(limit).all()
+
+    return jsonify({
+        "status": "ok",
+        "tenant_id": tenant_id,
+        "tickets": [{
+            "id": t.id,
+            "customer_id": t.customer_id,
+            "title": t.title,
+            "description": t.description,
+            "status": t.status,
+            "priority": t.priority,
+            "created_at": t.created_at.strftime('%Y-%m-%d %H:%M:%S') if t.created_at else None,
+        } for t in tickets],
+        "message_logs": [{
+            "id": l.id,
+            "session_id": l.session_id,
+            "direction": l.direction,
+            "transcript": l.transcript,
+            "tool_output": l.tool_output,
+            "created_at": l.created_at.strftime('%Y-%m-%d %H:%M:%S') if l.created_at else None,
+        } for l in logs]
+    }), 200
+
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):

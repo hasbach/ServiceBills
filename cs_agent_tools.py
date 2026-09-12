@@ -526,8 +526,9 @@ def transcribe_voice_elevenlabs(audio_bytes, api_key=None, mime_type='audio/ogg'
     """Transcribes audio using ElevenLabs Speech-to-Text (Scribe) API."""
     if not audio_bytes:
         return None
-    key = api_key or current_app.config.get('ELEVENLABS_API_KEY')
+    key = api_key or current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
     if not key:
+        logging.warning("transcribe_voice_elevenlabs: No ELEVENLABS_API_KEY available.")
         return None
 
     try:
@@ -535,17 +536,20 @@ def transcribe_voice_elevenlabs(audio_bytes, api_key=None, mime_type='audio/ogg'
         headers = {
             "xi-api-key": key
         }
+        clean_mime = (mime_type or "audio/ogg").split(';')[0].strip()
+        filename = "voice_note.ogg" if "ogg" in clean_mime else "voice_note.mp3"
         files = {
-            "file": ("audio.ogg", io.BytesIO(audio_bytes), mime_type or "audio/ogg")
+            "file": (filename, io.BytesIO(audio_bytes), clean_mime)
         }
         data = {
             "model_id": "scribe_v1",
             "language_code": "ar"
         }
-        res = requests.post(url, headers=headers, files=files, data=data, timeout=15)
+        res = requests.post(url, headers=headers, files=files, data=data, timeout=20)
         if res.ok:
             res_json = res.json()
             text = res_json.get("text", "").strip()
+            logging.info(f"ElevenLabs STT transcription successful: '{text}'")
             return text if text else None
         else:
             logging.warning(f"ElevenLabs STT error: {res.status_code} {res.text}")
@@ -559,13 +563,14 @@ def synthesize_speech_elevenlabs(text, voice_id=None, api_key=None):
     """Synthesizes text to speech using ElevenLabs TTS API."""
     if not text:
         return None
-    key = api_key or current_app.config.get('ELEVENLABS_API_KEY')
+    key = api_key or current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
     if not key:
+        logging.warning("synthesize_speech_elevenlabs: No ELEVENLABS_API_KEY available.")
         return None
 
-    target_voice_id = voice_id or "21m00Tcm4TlvDq8ikWAM"
+    target_voice_id = voice_id or current_app.config.get('ELEVENLABS_VOICE_ID') or "21m00Tcm4TlvDq8ikWAM"
     try:
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{target_voice_id}"
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{target_voice_id}?output_format=mp3_44100_128"
         headers = {
             "xi-api-key": key,
             "Content-Type": "application/json"
@@ -578,10 +583,10 @@ def synthesize_speech_elevenlabs(text, voice_id=None, api_key=None):
                 "similarity_boost": 0.75
             }
         }
-        res = requests.post(url, headers=headers, json=payload, timeout=20)
+        res = requests.post(url, headers=headers, json=payload, timeout=25)
         if res.ok and len(res.content) > 100:
             return res.content
-        logging.warning(f"ElevenLabs TTS response not ok: {res.status_code}")
+        logging.warning(f"ElevenLabs TTS response error: {res.status_code} {res.text}")
         return None
     except Exception as e:
         logging.error(f"Error synthesizing speech with ElevenLabs: {e}")
@@ -596,13 +601,13 @@ def send_whatsapp_voice(access_token, phone_number_id, recipient_phone, audio_by
         upload_url = f"https://graph.facebook.com/{api_version}/{phone_number_id}/media"
         headers_upload = {"Authorization": f"Bearer {access_token}"}
         files = {
-            'file': ('voice_reply.ogg', io.BytesIO(audio_bytes), 'audio/ogg')
+            'file': ('voice_reply.mp3', io.BytesIO(audio_bytes), 'audio/mpeg')
         }
         data = {
             'messaging_product': 'whatsapp',
-            'type': 'audio/ogg'
+            'type': 'audio/mpeg'
         }
-        res_upload = requests.post(upload_url, headers=headers_upload, files=files, data=data, timeout=20)
+        res_upload = requests.post(upload_url, headers=headers_upload, files=files, data=data, timeout=25)
         if not res_upload.ok:
             logging.warning(f"Failed to upload voice note to WhatsApp: {res_upload.status_code} {res_upload.text}")
             return False
@@ -622,7 +627,9 @@ def send_whatsapp_voice(access_token, phone_number_id, recipient_phone, audio_by
             "type": "audio",
             "audio": {"id": media_id}
         }
-        res_msg = requests.post(msg_url, headers=headers_msg, json=payload, timeout=10)
+        res_msg = requests.post(msg_url, headers=headers_msg, json=payload, timeout=15)
+        if not res_msg.ok:
+            logging.warning(f"Failed to send WhatsApp audio message: {res_msg.status_code} {res_msg.text}")
         return res_msg.ok
     except Exception as e:
         logging.error(f"Error sending WhatsApp voice note: {e}")
@@ -639,17 +646,28 @@ def handle_whatsapp_audio_transcription(access_token, media_id, api_version='v19
 
 def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_voice=False):
     """Processes incoming customer WhatsApp message or voice note transcript,
-    analyzing the intent and generating a friendly, helpful Lebanese Arabic reply.
+    analyzing the intent and generating a friendly, accurate Lebanese Arabic reply.
     """
     text = (incoming_text or '').strip()
     norm = text.lower()
 
-    # 1. Promise to pay / Grace period request (طلب إمهال / وعد بالدفع)
+    # 1. Greetings & courtesy (شكرا، يعطيك العافية، مرحبا)
+    courtesy_thanks = ["شكرا", "شكرن", "يسلمو", "تسلم", "الله يعطيك العافية", "يعطيكم العافية", "مشكور", "ما قصرت"]
+    if any(kw in norm for kw in courtesy_thanks) and len(norm) < 35:
+        reply_text = "تكرم عينك والله يعافيك! نحن بخدمتكم دائماً في DeltaNet، إذا احتجت أي مساعدة نحن موجودين."
+        return {
+            "intent": "courtesy",
+            "reply_text": reply_text,
+            "ticket_tag": "شكر وتحية",
+            "escalate": False
+        }
+
+    # 2. Promise to pay / Grace period request (طلب إمهال / وعد بالدفع)
     promise_keywords = [
         "طول بالك", "طول بالكن", "اصبر", "اصبروا", "كم يوم", "يومين", "تلاتة ايام", "ثلاثة ايام",
-        "الوضع", "الظروف", "معيش", "ما معي", "بس يصير معي", "الاسبوع الجاي", "الجمعة الجاي",
+        "الوضع", "الظروف", "معيش", "معييش", "ما معي", "بس يصير معي", "الاسبوع الجاي", "الجمعة الجاي",
         "بأقرب وقت بدفع", "بدي ادفع بعدين", "تاخير", "تأخير", "امهلوني", "إمهال", "مهلة",
-        "مش متوفر هلق", "مش قادر ادفع هلق", "صبرك علينا"
+        "مش متوفر هلق", "مش قادر ادفع هلق", "صبرك علينا", "طولو بالكن"
     ]
     if any(kw in norm for kw in promise_keywords):
         reply_text = (
@@ -663,10 +681,57 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             "escalate": False
         }
 
-    # 2. Inquiry about balance / due amount (استفسار عن الرصيد / الفاتورة)
+    # 3. Expiry date / Renewal inquiry (تاريخ التجديد / انتهاء الاشتراك / إيمتى بيخلص)
+    expiry_keywords = [
+        "امتى بيخلص", "ايمتى بيخلص", "تاريخ التجديد", "تاريخ الانتهاء", "باقي للاشتراك",
+        "كم يوم باقي", "متى بيخلص", "اي ساعة بيخلص", "تجديد الاشتراك", "تجديد باقتي",
+        "كم يوم ضايل", "قديش باقي", "ايمتى بينتهي", "امتى بينتهي"
+    ]
+    if any(kw in norm for kw in expiry_keywords):
+        if customer:
+            status = get_customer_status(appmod, tenant_id, customer.id)
+            exp = status.get("expiry_date")
+            days = status.get("days_left", 0)
+            plan = status.get("plan_name", "غير محدد")
+            is_active = status.get("is_subscription_active", False)
+            if not is_active or days <= 0:
+                reply_text = f"أهلاً بك {customer.name}.\nاشتراكك منتهي الصلاحية حالياً. يرجى تجديد الاشتراك لتفعيل الخدمة فوراً."
+            else:
+                reply_text = f"أهلاً بك {customer.name}.\nاشتراكك في باقة ({plan}) ساري المفعول، باقي عليه {days} يوم، وتاريخ الانتهاء هو: {exp}."
+        else:
+            reply_text = "أهلاً بك! يرجى تزويدنا برقم الهاتف المسجل لمراجعة تاريخ تجديد اشتراكك."
+        return {
+            "intent": "expiry_inquiry",
+            "reply_text": reply_text,
+            "ticket_tag": "استفسار عن موعد التجديد",
+            "escalate": False
+        }
+
+    # 4. Plan details / Speed / Price inquiry (تفاصيل الباقة / السرعة / السعر)
+    plan_keywords = [
+        "شو باقتي", "شو سرعتي", "كم ميغا", "باقة النت", "سعر الباقة", "تفاصيل الباقة",
+        "نوع الاشتراك", "اي باقة", "سرعة الخط", "قديش السرعة", "كم السرعة"
+    ]
+    if any(kw in norm for kw in plan_keywords):
+        if customer:
+            status = get_customer_status(appmod, tenant_id, customer.id)
+            plan = status.get("plan_name", "غير محدد")
+            price = status.get("plan_price", 0.0)
+            reply_text = f"أهلاً بك {customer.name}.\nباقتك الحالية هي: {plan}، وقيمتها {price:.2f} دولار شهرياً."
+        else:
+            reply_text = "أهلاً بك! يرجى تزويدنا برقم هاتفك المسجل لمعرفة تفاصيل باقتك الحالية."
+        return {
+            "intent": "plan_inquiry",
+            "reply_text": reply_text,
+            "ticket_tag": "استفسار عن الباقة والسرعة",
+            "escalate": False
+        }
+
+    # 5. Inquiry about balance / due amount (استفسار عن الرصيد / الفاتورة)
     balance_keywords = [
         "رصيد", "فاتورة", "فواتير", "كشف", "حسابي", "قديش عليي", "شو عليي", "مستحق",
-        "كم عليي", "كام عليي", "قديه الحساب", "قديه الفاتورة", "بدي اعرف حسابي"
+        "كم عليي", "كام عليي", "قديه الحساب", "قديه الفاتورة", "بدي اعرف حسابي",
+        "قديه بدي ادفع", "المبلغ المطلوب"
     ]
     if any(kw in norm for kw in balance_keywords):
         if customer:
@@ -695,7 +760,7 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             "escalate": False
         }
 
-    # 3. How to pay / Payment link request (رابط الدفع / طريقة الدفع)
+    # 6. How to pay / Payment link request (رابط الدفع / طريقة الدفع)
     pay_link_keywords = ["رابط الدفع", "لينك الدفع", "بدي ادفع", "كيف بدفع", "طريقة الدفع", "whish", "ويش", "رابط"]
     if any(kw in norm for kw in pay_link_keywords):
         if customer:
@@ -710,10 +775,11 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             "escalate": False
         }
 
-    # 4. Connection problem / Outage / Slow internet (انقطاع / بطء / عطل)
+    # 7. Connection problem / Outage / Slow internet (انقطاع / بطء / عطل)
     conn_keywords = [
-        "انقطاع", "فاصل", "مقطوع", "ما في نت", "النت واقف", "النت فاصل", "بطيء",
-        "مش شغال", "الراوتر", "الضو الاحمر", "الضوء الأحمر", "فايبر", "معطل", "مشكلة بالنت", "عطل"
+        "انقطاع", "فاصل", "مقطوع", "ما في نت", "النت واقف", "النت فاصل", "بطيء", "بطيئ",
+        "مش شغال", "الراوتر", "الضو الاحمر", "الضوء الأحمر", "فايبر", "معطل", "مشكلة بالنت",
+        "عطل", "تقطيع", "عم يقطع", "ضعيف", "تقيل", "ping", "بنغ"
     ]
     if any(kw in norm for kw in conn_keywords):
         if customer:
@@ -734,8 +800,25 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             "escalate": False
         }
 
-    # 5. Escalation to human agent (طلب التحدث مع موظف / دعم فني)
-    escalate_keywords = ["موظف", "انسان", "إنسان", "حدا يحكيني", "تواصل مع شخص", "دعم فني", "مسؤول", "اتصل فيني", "دقلي"]
+    # 8. Location & Office hours (العنوان وساعات العمل)
+    office_keywords = [
+        "وين مركزكن", "وين المحل", "عنوانكن", "أوقات الدوام", "امتى بتفتحوا", "ساعات العمل",
+        "موقعكم", "وين موجودين", "موقع المحل"
+    ]
+    if any(kw in norm for kw in office_keywords):
+        reply_text = (
+            "أهلاً وسهلاً بك! مركز DeltaNet بخدمتكم يومياً من الساعة 9:00 صباحاً حتى 8:00 مساءً.\n"
+            "للمساعدة الفورية فيك تتواصل معنا مباشرة هون على الواتساب أو تشرفنا بالمركز."
+        )
+        return {
+            "intent": "office_info",
+            "reply_text": reply_text,
+            "ticket_tag": "استفسار عن المركز والدوام",
+            "escalate": False
+        }
+
+    # 9. Escalation to human agent (طلب التحدث مع موظف / دعم فني)
+    escalate_keywords = ["موظف", "انسان", "إنسان", "حدا يحكيني", "تواصل مع شخص", "دعم فني", "مسؤول", "اتصل فيني", "دقلي", "بدي احكي مع حدا"]
     if any(kw in norm for kw in escalate_keywords):
         cust_id = customer.id if customer else None
         esc_res = escalate_to_human(
@@ -755,14 +838,16 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             "escalate": True
         }
 
-    # 6. Default polite fallback / Greeting (تحية عامة أو استفسار آخر)
+    # 10. Default polite fallback / Greeting (تحية عامة أو استفسار آخر)
     name_str = f" {customer.name}" if customer else ""
     reply_text = (
         f"أهلاً وسهلاً بك{name_str} في مركز خدمة المشتركين!\n"
-        "كيف بقدر ساعدك اليوم؟ فيك تستفسر عن:\n"
-        "• رصيد الحساب والفاتورة المستحقة\n"
+        "كيف بقدر ساعدك اليوم؟ فيك تسألني عن:\n"
+        "• رصيد الفاتورة المستحقة\n"
+        "• تاريخ تجديد الاشتراك وباقي كم يوم\n"
+        "• تفاصيل وسرعة باقتك الحالية\n"
         "• فحص جودة وحالة خط الإنترنت\n"
-        "• الحصول على رابط الدفع السريع\n"
+        "• طلب رابط الدفع عبر Whish\n"
         "• التحدث مع أحد موظفي الدعم الفني"
     )
     return {
@@ -824,6 +909,10 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
                 )
                 if sent_voice:
                     logging.info(f"Sent CS AI voice reply to +{sender_phone} successfully!")
+                else:
+                    logging.warning(f"send_whatsapp_voice returned False for +{sender_phone}")
+            else:
+                logging.warning(f"synthesize_speech_elevenlabs returned None for +{sender_phone} (check ELEVENLABS_API_KEY).")
         except Exception as e_voice:
             logging.warning(f"Could not send voice reply to +{sender_phone}: {e_voice}")
 
