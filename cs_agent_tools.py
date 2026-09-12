@@ -927,24 +927,32 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
         }
         ws.send(json.dumps(init_payload))
 
-        # 2. Consume the initial greeting turn generated on connection
+        # 2. Consume the initial greeting turn generated on connection.
+        # ElevenLabs sends agent_response for the first_message on every new WebSocket session.
+        # We must fully consume this before sending the user's turn, otherwise
+        # ElevenLabs will process the greeting turn THEN our message, causing double-greeting.
+        # Increased to 5s window with 2s per-recv; cold starts can push greeting to ~4s.
+        greeting_received = False
         t_init = time.time()
-        while time.time() - t_init < 3.5:
+        while time.time() - t_init < 5.0:
             try:
-                ws.settimeout(1.0)
+                ws.settimeout(2.0)
                 raw = ws.recv()
                 if not raw:
                     break
                 data = json.loads(raw)
                 m_type = data.get("type")
                 if m_type == "agent_response":
+                    greeting_received = True
                     break
                 elif m_type == "ping":
                     p_id = data.get("ping_event", {}).get("event_id")
                     if p_id is not None:
                         ws.send(json.dumps({"type": "pong", "event_id": p_id}))
             except websocket.WebSocketTimeoutException:
-                break
+                if greeting_received:
+                    break
+                continue
             except Exception:
                 break
 

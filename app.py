@@ -7795,59 +7795,11 @@ def whatsapp_webhook():
 
                         logging.info(f"Incoming WhatsApp reply from {cust_name} (+{sender_phone}): {msg_text}")
 
-                        # 1. Forward message to business mobile if configured
-                        if settings and settings.forwarding_mobile and settings.access_token and settings.phone_number_id:
-                            fwd_phone = normalize_whatsapp_phone(settings.forwarding_mobile)
-                            if fwd_phone and fwd_phone == sender_phone:
-                                logging.info(f"Skipping forward: sender (+{sender_phone}) is the forwarding_mobile number itself.")
-                            if fwd_phone and fwd_phone != sender_phone:
-                                api_version = settings.api_version or 'v19.0'
-                                url = f'https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages'
-                                headers = {
-                                    'Authorization': f'Bearer {settings.access_token}',
-                                    'Content-Type': 'application/json',
-                                }
-                                # forwarding_mobile only has an open 24h session because of the daily
-                                # keep-alive template + your own auto-reply configured on that number
-                                # (see send_daily_whatsapp_keepalive below, and
-                                # docs/superpowers/specs/2026-08-12-whatsapp-forwarding-keepalive.md).
-                                # A plain text send here relies on that session staying open -- if it
-                                # ever lapses, this fails the same silent way plain-text-to-
-                                # forwarding_mobile always has (Graph API returns 200 even though
-                                # delivery fails async, error 131047; see commit 72d6316, which replaced
-                                # this with a template-only alert for exactly that reason). Deliberately
-                                # no template fallback this time -- see the spec for why.
-                                try:
-                                    sender_info = f"{cust_name} (+{sender_phone})" if (cust_name and cust_name != "Unknown Customer") else f"+{sender_phone}"
-                                    payload_text = {
-                                        'messaging_product': 'whatsapp',
-                                        'to': fwd_phone,
-                                        'type': 'text',
-                                        'text': {'body': f"{sender_info}: {msg_text}"}
-                                    }
-                                    res_text = requests.post(url, json=payload_text, headers=headers, timeout=10)
-                                    if res_text.ok:
-                                        logging.info(f"Forwarded customer reply text to +{fwd_phone}.")
-                                    else:
-                                        logging.warning(f"Could not forward customer reply text to +{fwd_phone}: {res_text.status_code} {res_text.text}")
-                                except Exception as ex_text:
-                                    logging.error(f"Error forwarding customer reply text: {ex_text}")
-
-                                # If there is an audio/voice note or media payload, forward the actual media file immediately!
-                                if media_payload:
-                                    try:
-                                        payload_media_send = {
-                                            'messaging_product': 'whatsapp',
-                                            'to': fwd_phone,
-                                            **media_payload
-                                        }
-                                        res_media = requests.post(url, json=payload_media_send, headers=headers, timeout=15)
-                                        if res_media.ok:
-                                            logging.info(f"Successfully forwarded media ({media_payload.get('type')}) to business mobile (+{fwd_phone})!")
-                                        else:
-                                            logging.warning(f"Could not forward media directly: {res_media.text}")
-                                    except Exception as ex_med:
-                                        logging.error(f"Error forwarding media: {ex_med}")
+                        # NOTE: Raw per-message forwarding to forwarding_mobile has been removed.
+                        # Notifications are sent exclusively via the approved 'customer_reply_alert'
+                        # WhatsApp template and only when the ElevenLabs agent calls escalate_to_human().
+                        # Sending plain messages to forwarding_mobile causes error 131047 when the
+                        # 24h customer-initiated session window has lapsed.
 
                         # 2. Check if CS Agent is active for this tenant
                         is_forwarding_mobile_reply = bool(
