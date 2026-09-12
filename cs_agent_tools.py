@@ -456,17 +456,29 @@ def send_payment_link(appmod, tenant_id, customer_id):
     }
 
 
-def escalate_to_human(appmod, tenant_id, customer_id, reason, summary):
-    """Escalate conversation to human support staff by creating a high-priority ticket."""
+def escalate_to_human(appmod, tenant_id, customer_id, reason, summary, phone=None):
+    """Escalate conversation to human support staff by creating a high-priority ticket
+    and sending the Meta WhatsApp template 'customer_reply_alert' to the tenant's forwarding_mobile.
+    """
     customer = None
     if customer_id:
         customer = appmod.Customer.query.filter_by(tenant_id=tenant_id, id=customer_id).first()
+    if not customer and phone:
+        candidates = normalize_lebanese_phone(phone)
+        for cand in candidates:
+            customer = appmod.Customer.query.filter_by(tenant_id=tenant_id).filter(
+                (appmod.Customer.phone == cand) | (appmod.Customer.phone.like(f"%{cand}%"))
+            ).first()
+            if customer:
+                break
 
-    customer_name = customer.name if customer else "غير معروف"
+    customer_name = customer.name if customer else "عميل"
+    customer_phone = customer.phone if customer else (str(phone or '').strip())
     ticket_title = f"[مساعد الذكاء الاصطناعي] طلب متابعة: {reason or 'استفسار من عميل'}"
     ticket_desc = (
         f"تم تحويل المحادثة من المساعد الآلي.\n\n"
-        f"العميل: {customer_name} (معرف: {customer_id or 'غير محدد'})\n"
+        f"العميل: {customer_name} (معرف: {customer.id if customer else (customer_id or 'غير محدد')})\n"
+        f"الهاتف: {customer_phone or 'غير محدد'}\n"
         f"السبب: {reason}\n"
         f"الملخص: {summary}\n"
         f"التاريخ: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
@@ -485,10 +497,94 @@ def escalate_to_human(appmod, tenant_id, customer_id, reason, summary):
     appmod.db.session.add(ticket)
     appmod.db.session.commit()
 
+    # Dispatch WhatsApp template alert ('customer_reply_alert') to forwarding_mobile
+    alert_sent = False
+    fwd_phone = None
+    try:
+        settings = None
+        if hasattr(appmod, 'WhatsAppSettings'):
+            settings = appmod.WhatsAppSettings.query.filter_by(tenant_id=tenant_id).first()
+        elif hasattr(appmod, 'TenantWhatsAppSettings'):
+            settings = appmod.TenantWhatsAppSettings.query.filter_by(tenant_id=tenant_id).first()
+
+        if settings and settings.access_token and settings.phone_number_id and settings.forwarding_mobile:
+            if hasattr(appmod, 'normalize_whatsapp_phone'):
+                fwd_phone = appmod.normalize_whatsapp_phone(settings.forwarding_mobile)
+            if not fwd_phone:
+                fwd_digits = re.sub(r'\D', '', str(settings.forwarding_mobile or ''))
+                if fwd_digits.startswith('0') and len(fwd_digits) <= 9:
+                    fwd_phone = '961' + fwd_digits[1:]
+                elif len(fwd_digits) <= 8 and not (fwd_digits.startswith('961') or fwd_digits.startswith('20') or fwd_digits.startswith('966')):
+                    fwd_phone = '961' + fwd_digits
+                else:
+                    fwd_phone = fwd_digits
+
+            if fwd_phone:
+                tmpl_name = getattr(settings, 'template_forward_alert', None) or 'customer_reply_alert'
+                lang_code = getattr(settings, 'template_language', None) or 'ar'
+                api_version = getattr(settings, 'api_version', None) or 'v19.0'
+                url = f"https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages"
+                headers = {
+                    'Authorization': f"Bearer {settings.access_token}",
+                    'Content-Type': 'application/json'
+                }
+
+                from_str = f"{customer_name} ({customer_phone})" if customer_phone else customer_name
+                msg_str = f"طلب تحويل للدعم: {reason}"
+                if summary:
+                    msg_str += f" - {summary}"
+                msg_str = msg_str[:160]
+
+                def _send_template(lang, params):
+                    payload = {
+                        'messaging_product': 'whatsapp',
+                        'to': fwd_phone,
+                        'type': 'template',
+                        'template': {
+                            'name': tmpl_name,
+                            'language': {'code': lang}
+                        }
+                    }
+                    if params:
+                        payload['template']['components'] = [{
+                            'type': 'body',
+                            'parameters': [{'type': 'text', 'text': str(p)} for p in params]
+                        }]
+                    return requests.post(url, json=payload, headers=headers, timeout=10)
+
+                attempts = [
+                    (lang_code, [from_str, msg_str]),
+                    ('en' if lang_code == 'ar' else 'ar', [from_str, msg_str]),
+                    (lang_code, [customer_name, f"+{customer_phone}" if customer_phone else "+961", msg_str]),
+                    (lang_code, [f"{from_str}: {msg_str}"]),
+                    (lang_code, None)
+                ]
+
+                for target_lang, param_list in attempts:
+                    try:
+                        res_tpl = _send_template(target_lang, param_list)
+                        if res_tpl.ok:
+                            alert_sent = True
+                            logging.info(
+                                f"Sent escalation alert template '{tmpl_name}' ({target_lang}) to forwarding_mobile (+{fwd_phone}) for ticket #{ticket.id}."
+                            )
+                            break
+                        else:
+                            logging.warning(
+                                f"Escalation alert template '{tmpl_name}' ({target_lang}) send failed: {res_tpl.status_code} {res_tpl.text}"
+                            )
+                    except Exception as ex_call:
+                        logging.warning(f"Error calling Meta API for escalation alert: {ex_call}")
+                        break
+    except Exception as ex_fwd:
+        logging.error(f"Error preparing escalation template alert to forwarding_mobile: {ex_fwd}")
+
     return {
         "success": True,
         "ticket_id": ticket.id,
         "escalated": True,
+        "alert_sent": alert_sent,
+        "forwarded_to": fwd_phone if alert_sent else None,
         "message_ar": "ولا يهمك، حولت طلبك لفريق الدعم الفني وفتحتلك تذكرة متابعة برقم " + str(ticket.id) + ". رح يتواصلوا معك بأقرب وقت ممكن."
     }
 
@@ -1148,7 +1244,8 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
         esc_res = escalate_to_human(
             appmod, tenant_id, cust_id,
             reason="طلب التحدث مع موظف عبر واتساب",
-            summary=clean_text
+            summary=clean_text,
+            phone=getattr(customer, 'phone', None)
         )
         ticket_id = esc_res.get("ticket_id", "")
         reply_text = (

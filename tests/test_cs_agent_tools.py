@@ -644,4 +644,71 @@ def test_handle_whatsapp_cs_ai_reply_with_convai(app, client, monkeypatch):
         assert "حسابك خالص" in res_fallback["reply_text"]
 
 
+def test_escalate_to_human_sends_customer_reply_alert_template(app, client, monkeypatch):
+    """escalate_to_human creates a ticket and sends customer_reply_alert template to forwarding_mobile."""
+    import cs_agent_tools
+
+    sent_templates = []
+    class MockResponse:
+        ok = True
+        status_code = 200
+        text = '{"messages": [{"id": "wamid.mock.escalate"}]}'
+        def json(self):
+            return {"messages": [{"id": "wamid.mock.escalate"}]}
+
+    def mock_post(url, *args, **kwargs):
+        json_data = kwargs.get("json", {})
+        sent_templates.append((url, json_data))
+        return MockResponse()
+
+    monkeypatch.setattr(cs_agent_tools.requests, "post", mock_post)
+
+    headers = auth_headers(client, "admin_test_esc_tmpl", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_test_esc_tmpl").first()
+        cust_id, _ = _setup_customer(app, tenant.id, "Hasan Salloum", "71315744", balance=0.0)
+
+        # Configure WhatsAppSettings with forwarding_mobile
+        ws_settings = appmod.WhatsAppSettings.query.filter_by(tenant_id=tenant.id).first()
+        if not ws_settings:
+            ws_settings = appmod.WhatsAppSettings(tenant_id=tenant.id)
+            appmod.db.session.add(ws_settings)
+        ws_settings.access_token = "test_meta_token"
+        ws_settings.phone_number_id = "1176220222243847"
+        ws_settings.forwarding_mobile = "+9613261036"
+        ws_settings.template_forward_alert = "customer_reply_alert"
+        ws_settings.template_language = "ar"
+        appmod.db.session.commit()
+
+        res = cs_agent_tools.escalate_to_human(
+            appmod=appmod,
+            tenant_id=tenant.id,
+            customer_id=cust_id,
+            reason="عطل في الراوتر",
+            summary="الضو الاحمر شغال والنت فاصل",
+            phone="71315744"
+        )
+
+        assert res["success"] is True
+        assert res["escalated"] is True
+        assert res["alert_sent"] is True
+        assert res["forwarded_to"] == "9613261036"
+
+        # Verify template payload was dispatched to Meta API
+        assert len(sent_templates) >= 1
+        url, payload = sent_templates[0]
+        assert "1176220222243847/messages" in url
+        assert payload["messaging_product"] == "whatsapp"
+        assert payload["to"] == "9613261036"
+        assert payload["type"] == "template"
+        assert payload["template"]["name"] == "customer_reply_alert"
+        assert payload["template"]["language"]["code"] == "ar"
+
+        # Check template components
+        body_params = payload["template"]["components"][0]["parameters"]
+        param_texts = [p["text"] for p in body_params]
+        assert any("Hasan Salloum" in t for t in param_texts)
+        assert any("عطل في الراوتر" in t for t in param_texts)
+
+
 

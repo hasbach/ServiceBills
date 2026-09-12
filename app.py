@@ -12305,7 +12305,14 @@ def cs_tool_escalate():
     reason = data.get('reason') or request.args.get('reason') or 'Customer requested assistance'
     summary = data.get('summary') or request.args.get('summary') or ''
 
-    result = cs_agent_tools.escalate_to_human(appmod, tenant_id, customer_id, reason, summary)
+    phone = (
+        data.get('phone') or request.args.get('phone') or
+        data.get('phone_number') or request.args.get('phone_number') or
+        data.get('caller_id') or request.args.get('caller_id') or
+        data.get('number') or request.args.get('number')
+    )
+
+    result = cs_agent_tools.escalate_to_human(appmod, tenant_id, customer_id, reason, summary, phone=phone)
     return jsonify(result), 200
 
 
