@@ -6,6 +6,7 @@ and human escalation.
 """
 import io
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta
@@ -559,61 +560,138 @@ def transcribe_voice_elevenlabs(audio_bytes, api_key=None, mime_type='audio/ogg'
         return None
 
 
-_CACHED_VOICE_ID = None
+_CACHED_AGENT_CONFIG = {}
+_CACHED_AGENT_CONFIG_TIME = 0
 
-def get_effective_elevenlabs_voice_id(api_key, agent_id=None):
-    """Finds an authorized ElevenLabs voice ID for free or paid tiers."""
-    global _CACHED_VOICE_ID
-    if _CACHED_VOICE_ID:
-        return _CACHED_VOICE_ID
+def get_elevenlabs_agent_config(api_key=None, agent_id=None):
+    """Fetches the agent configuration directly from ElevenLabs Conversational AI API.
+    Extracts the agent's name, voice_id, model_id, and first_message.
+    Caches results for 300 seconds to minimize latency and avoid API rate limits.
+    """
+    global _CACHED_AGENT_CONFIG, _CACHED_AGENT_CONFIG_TIME
+    import time
+    now = time.time()
+    if _CACHED_AGENT_CONFIG and (now - _CACHED_AGENT_CONFIG_TIME < 300):
+        return _CACHED_AGENT_CONFIG
 
-    # 1. Configured voice ID (defaults to 'albaa6OioIhKtKdCEkQw' - laloosh female voice)
-    configured = current_app.config.get('ELEVENLABS_VOICE_ID') or os.environ.get('ELEVENLABS_VOICE_ID') or "albaa6OioIhKtKdCEkQw"
-    if configured:
-        _CACHED_VOICE_ID = configured
-        return _CACHED_VOICE_ID
-
-    target_agent_id = agent_id or current_app.config.get('ELEVENLABS_AGENT_ID') or os.environ.get('ELEVENLABS_AGENT_ID')
-
-    # 2. Try to fetch the voice assigned to the user's agent
-    if target_agent_id and api_key:
+    target_agent_id = agent_id
+    if not target_agent_id:
         try:
-            res = requests.get(
-                f"https://api.elevenlabs.io/v1/convai/agents/{target_agent_id}",
-                headers={"xi-api-key": api_key},
-                timeout=5
-            )
-            if res.ok:
-                agent_json = res.json()
-                v_id = (
-                    agent_json.get("conversation_config", {}).get("tts", {}).get("voice_id") or
-                    agent_json.get("tts", {}).get("voice_id")
-                )
-                if v_id:
-                    _CACHED_VOICE_ID = v_id
-                    logging.info(f"Using voice_id '{v_id}' from agent {target_agent_id}")
-                    return _CACHED_VOICE_ID
-        except Exception as e:
-            logging.warning(f"Could not read agent voice: {e}")
+            target_agent_id = current_app.config.get('ELEVENLABS_AGENT_ID') or os.environ.get('ELEVENLABS_AGENT_ID')
+        except Exception:
+            target_agent_id = os.environ.get('ELEVENLABS_AGENT_ID')
 
-    # Fallback to laloosh
-    _CACHED_VOICE_ID = "albaa6OioIhKtKdCEkQw"
-    return _CACHED_VOICE_ID
+    key = api_key
+    if not key:
+        try:
+            key = current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
+        except Exception:
+            key = os.environ.get('ELEVENLABS_API_KEY')
+
+    if not target_agent_id or not key:
+        return _CACHED_AGENT_CONFIG or {}
+
+    try:
+        url = f"https://api.elevenlabs.io/v1/convai/agents/{target_agent_id}"
+        res = requests.get(url, headers={"xi-api-key": key}, timeout=6)
+        if res.ok:
+            data = res.json()
+            conv_cfg = data.get("conversation_config", {})
+            tts_cfg = conv_cfg.get("tts", {})
+            agent_cfg = conv_cfg.get("agent", {})
+
+            voice_id = tts_cfg.get("voice_id") or data.get("tts", {}).get("voice_id") or ""
+            model_id = tts_cfg.get("model_id") or "eleven_multilingual_v2"
+            first_msg = (agent_cfg.get("first_message") or "").strip()
+            name = (data.get("name") or "يارا").strip()
+
+            _CACHED_AGENT_CONFIG = {
+                "agent_id": target_agent_id,
+                "name": name,
+                "voice_id": voice_id,
+                "model_id": model_id,
+                "first_message": first_msg
+            }
+            _CACHED_AGENT_CONFIG_TIME = now
+            logging.info(
+                f"Synced ElevenLabs agent '{name}' ({target_agent_id}): voice_id={voice_id}, model={model_id}, first_message='{first_msg}'"
+            )
+            return _CACHED_AGENT_CONFIG
+        else:
+            logging.warning(f"Could not fetch ElevenLabs agent config ({res.status_code}): {res.text}")
+    except Exception as e:
+        logging.warning(f"Error fetching ElevenLabs agent config: {e}")
+
+    return _CACHED_AGENT_CONFIG or {}
+
+
+def get_effective_elevenlabs_voice_id(api_key=None, agent_id=None):
+    """Finds the effective ElevenLabs voice ID.
+    Priority:
+    1. Voice configured on the ElevenLabs agent itself (via ConvAI agent config)
+    2. Explicit ELEVENLABS_VOICE_ID from config / environment variable
+    3. User's account voices via /v1/voices
+    Note: Never hardcodes a voice ID and never defaults to a male voice.
+    """
+    key = api_key
+    if not key:
+        try:
+            key = current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
+        except Exception:
+            key = os.environ.get('ELEVENLABS_API_KEY')
+
+    # 1. Fetch the default voice assigned in the ElevenLabs agent's configuration
+    agent_cfg = get_elevenlabs_agent_config(api_key=key, agent_id=agent_id)
+    if agent_cfg.get("voice_id"):
+        return agent_cfg["voice_id"]
+
+    # 2. Check if explicitly set in config/env (without hardcoded defaults)
+    try:
+        configured = (current_app.config.get('ELEVENLABS_VOICE_ID') or os.environ.get('ELEVENLABS_VOICE_ID') or "").strip()
+    except Exception:
+        configured = (os.environ.get('ELEVENLABS_VOICE_ID') or "").strip()
+
+    if configured:
+        return configured
+
+    # 3. Query /v1/voices to find an authorized voice on the account
+    if key:
+        try:
+            res = requests.get("https://api.elevenlabs.io/v1/voices", headers={"xi-api-key": key}, timeout=5)
+            if res.ok:
+                voices = res.json().get("voices", [])
+                if voices:
+                    return voices[0]["voice_id"]
+        except Exception as e:
+            logging.warning(f"Could not query /v1/voices: {e}")
+
+    return None
 
 
 def synthesize_speech_elevenlabs(text, voice_id=None, api_key=None, agent_id=None):
-    """Synthesizes text to speech using ElevenLabs TTS API."""
+    """Synthesizes text to speech using ElevenLabs TTS API with the agent's configured voice."""
     if not text:
         return None
-    key = api_key or current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
+    key = api_key
+    if not key:
+        try:
+            key = current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
+        except Exception:
+            key = os.environ.get('ELEVENLABS_API_KEY')
     if not key:
         logging.warning("synthesize_speech_elevenlabs: No ELEVENLABS_API_KEY available.")
         return None
 
-    target_voice_id = voice_id or get_effective_elevenlabs_voice_id(key, agent_id=agent_id)
+    agent_cfg = get_elevenlabs_agent_config(api_key=key, agent_id=agent_id)
+    target_voice_id = voice_id or agent_cfg.get("voice_id") or get_effective_elevenlabs_voice_id(key, agent_id=agent_id)
+    if not target_voice_id:
+        logging.warning("synthesize_speech_elevenlabs: No voice ID available from ElevenLabs agent configuration.")
+        return None
+
+    model_id = agent_cfg.get("model_id") or "eleven_multilingual_v2"
     payload = {
         "text": text,
-        "model_id": "eleven_multilingual_v2",
+        "model_id": model_id,
         "voice_settings": {
             "stability": 0.5,
             "similarity_boost": 0.75
@@ -631,18 +709,6 @@ def synthesize_speech_elevenlabs(text, voice_id=None, api_key=None, agent_id=Non
             return res.content
 
         logging.warning(f"ElevenLabs TTS response error with voice {target_voice_id}: {res.status_code} {res.text}")
-
-        # If voice was rejected (e.g. 402 paid_plan_required for library voice), retry with default premade "pNInz6obpgDQGcFmaJgB"
-        if res.status_code == 402 and target_voice_id != "pNInz6obpgDQGcFmaJgB":
-            logging.info("Retrying TTS with premade voice 'pNInz6obpgDQGcFmaJgB' for free-tier compatibility...")
-            fallback_url = "https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB?output_format=mp3_44100_128"
-            res_fb = requests.post(fallback_url, headers=headers, json=payload, timeout=25)
-            if res_fb.ok and len(res_fb.content) > 100:
-                global _CACHED_VOICE_ID
-                _CACHED_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
-                return res_fb.content
-            logging.warning(f"Fallback voice retry also failed: {res_fb.status_code} {res_fb.text}")
-
         return None
     except Exception as e:
         logging.error(f"Error synthesizing speech with ElevenLabs: {e}")
@@ -710,11 +776,32 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
     # 1. Greetings & courtesy (شكرا، يعطيك العافية، مرحبا)
     courtesy_thanks = ["شكرا", "شكرن", "يسلمو", "تسلم", "الله يعطيك العافية", "يعطيكم العافية", "مشكور", "ما قصرت"]
     if any(kw in norm for kw in courtesy_thanks) and len(norm) < 35:
-        reply_text = "تكرم عينك والله يعافيك! نحن بخدمتكم دائماً في DeltaNet، إذا احتجت أي مساعدة نحن موجودين."
+        reply_text = "تكرم عينك والله يعافيك! معك يارا من الدعم الفني، إذا احتجت أي مساعدة نحن موجودين دائماً."
         return {
             "intent": "courtesy",
             "reply_text": reply_text,
             "ticket_tag": "شكر وتحية",
+            "escalate": False
+        }
+
+    # 2. Direct greetings (مرحبا، أهلاً، سلام، هاي، صباح الخير، الو)
+    greeting_keywords = [
+        "مرحبا", "مرحب", "مرمرحبا", "هاي", "أهلاً", "اهلاً", "اهلين", "أهلين",
+        "السلام عليكم", "سلام عليكم", "صباح الخير", "مساء الخير", "صباحو", "مساء النور",
+        "الو", "ألو", "alo", "hello", "hi", "hey"
+    ]
+    if any(kw in norm for kw in greeting_keywords) and len(norm) < 40:
+        agent_cfg = get_elevenlabs_agent_config()
+        first_msg = agent_cfg.get("first_message")
+        if first_msg:
+            reply_text = first_msg
+        else:
+            name_str = f" {customer.name}" if customer else ""
+            reply_text = f"أهلاً وسهلاً بك{name_str}! معك يارا من الدعم الفني، كيف بقدر ساعدك اليوم؟"
+        return {
+            "intent": "greeting",
+            "reply_text": reply_text,
+            "ticket_tag": "تحية واستقبال",
             "escalate": False
         }
 
@@ -894,18 +981,15 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             "escalate": True
         }
 
-    # 10. Default polite fallback / Greeting (تحية عامة أو استفسار آخر)
-    name_str = f" {customer.name}" if customer else ""
-    reply_text = (
-        f"أهلاً وسهلاً بك{name_str} في مركز خدمة المشتركين!\n"
-        "كيف بقدر ساعدك اليوم؟ فيك تسألني عن:\n"
-        "• رصيد الفاتورة المستحقة\n"
-        "• تاريخ تجديد الاشتراك وباقي كم يوم\n"
-        "• تفاصيل وسرعة باقتك الحالية\n"
-        "• فحص جودة وحالة خط الإنترنت\n"
-        "• طلب رابط الدفع عبر Whish\n"
-        "• التحدث مع أحد موظفي الدعم الفني"
-    )
+    # 10. Default polite fallback / Greeting
+    agent_cfg = get_elevenlabs_agent_config()
+    first_msg = agent_cfg.get("first_message")
+    if first_msg:
+        reply_text = first_msg
+    else:
+        name_str = f" {customer.name}" if customer else ""
+        reply_text = f"أهلاً وسهلاً بك{name_str}! معك يارا من الدعم الفني، كيف بقدر ساعدك اليوم؟"
+
     return {
         "intent": "general",
         "reply_text": reply_text,
@@ -954,7 +1038,8 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     # 2. If customer sent voice note, try to respond with voice note too (if ElevenLabs TTS available)
     if is_voice:
         try:
-            tts_audio = synthesize_speech_elevenlabs(reply_text)
+            target_agent_id = getattr(settings, 'elevenlabs_agent_id', None)
+            tts_audio = synthesize_speech_elevenlabs(reply_text, agent_id=target_agent_id)
             if tts_audio:
                 sent_voice = send_whatsapp_voice(
                     settings.access_token,

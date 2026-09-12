@@ -371,3 +371,68 @@ def test_handle_whatsapp_cs_ai_reply_logging(app, client, monkeypatch):
         assert len(logs) >= 2  # in and out logs
 
 
+def test_elevenlabs_agent_config_sync(app, monkeypatch):
+    """Verifies get_elevenlabs_agent_config reads voice_id and first_message directly from ElevenLabs."""
+    import cs_agent_tools
+    from unittest.mock import MagicMock
+
+    # Reset cache
+    cs_agent_tools._CACHED_AGENT_CONFIG = {}
+    cs_agent_tools._CACHED_AGENT_CONFIG_TIME = 0
+
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "agent_id": "agent_test_yara",
+        "name": "yara",
+        "conversation_config": {
+            "agent": {
+                "first_message": "مرحبا! معك يارا من دلتانت كيف بقدر ساعدك؟"
+            },
+            "tts": {
+                "voice_id": "albaa6OioIhKtKdCEkQw",
+                "model_id": "eleven_turbo_v2_5"
+            }
+        }
+    }
+
+    monkeypatch.setattr(cs_agent_tools.requests, "get", lambda *a, **kw: mock_resp)
+
+    cfg = cs_agent_tools.get_elevenlabs_agent_config(api_key="mock_key", agent_id="agent_test_yara")
+    assert cfg["name"] == "yara"
+    assert cfg["voice_id"] == "albaa6OioIhKtKdCEkQw"
+    assert cfg["model_id"] == "eleven_turbo_v2_5"
+    assert "يارا" in cfg["first_message"]
+
+    # Effective voice id uses agent's voice
+    effective_voice = cs_agent_tools.get_effective_elevenlabs_voice_id(api_key="mock_key", agent_id="agent_test_yara")
+    assert effective_voice == "albaa6OioIhKtKdCEkQw"
+
+
+def test_process_customer_message_ai_greeting_uses_yara(app, client):
+    """Greetings return concise Yara persona instead of long rigid menus."""
+    import cs_agent_tools
+    # Reset cache to test fallback greeting
+    cs_agent_tools._CACHED_AGENT_CONFIG = {}
+    cs_agent_tools._CACHED_AGENT_CONFIG_TIME = 0
+
+    headers = auth_headers(client, "admin_test_yara", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_test_yara").first()
+        cust_id, _ = _setup_customer(app, tenant.id, "Nour Kassir", "71444555")
+        cust = appmod.db.session.get(appmod.Customer, cust_id)
+
+        # 1. Greeting message (مرحبا)
+        res = cs_agent_tools.process_customer_message_ai(appmod, tenant.id, cust, "مرحبا يعطيكم العافية")
+        assert res["intent"] in ["greeting", "courtesy"]
+        assert "يارا" in res["reply_text"]
+        assert "•" not in res["reply_text"]  # No long bulleted menu
+
+        # 2. General unknown query fallback
+        res_fb = cs_agent_tools.process_customer_message_ai(appmod, tenant.id, cust, "شو الاخبار اليوم")
+        assert res_fb["intent"] == "general"
+        assert "يارا" in res_fb["reply_text"]
+        assert "•" not in res_fb["reply_text"]  # Concise friendly message
+
+
