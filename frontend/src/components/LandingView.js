@@ -2,7 +2,8 @@ import React from 'react';
 import { Box, Typography, Button, Container, Grid, Card, CardContent, Chip, Stack } from '@mui/material';
 import {
     CheckCircle as CheckIcon, Groups as GroupsIcon, WhatsApp as WhatsAppIcon,
-    ReceiptLong as ReceiptIcon,
+    ReceiptLong as ReceiptIcon, AccountTree as AccountTreeIcon, Map as MapIcon,
+    Router as RouterIcon
 } from '@mui/icons-material';
 import { Link } from 'react-router-dom';
 
@@ -10,6 +11,9 @@ const FEATURES = [
     { icon: <GroupsIcon color="primary" />, title: 'Customers & subscriptions', desc: 'Track subscribers, plans, resellers and balances in one place.' },
     { icon: <ReceiptIcon color="primary" />, title: 'Payments & receipts', desc: 'Automated billing cycles, payment collection, and printable receipts.' },
     { icon: <WhatsAppIcon color="primary" />, title: 'WhatsApp notifications', desc: 'Payment reminders and alerts via WhatsApp — manual or Cloud API.' },
+    { icon: <AccountTreeIcon color="primary" />, title: 'Network Topology Tree', desc: 'Real-time visibility into your OLTs, PON ports, ONUs, and customer CPE status.' },
+    { icon: <MapIcon color="primary" />, title: 'Fiber & Geo Map', desc: 'Visualize device locations, fiber routes, and customer distribution on a live map.' },
+    { icon: <RouterIcon color="primary" />, title: 'On-Premise Agent', desc: 'Securely fetch live status from your local hardware without opening inbound firewall ports.' },
 ];
 
 const PLANS = [
@@ -29,11 +33,11 @@ const LandingView = () => (
         {/* Hero */}
         <Container maxWidth="md" sx={{ textAlign: 'center', py: { xs: 6, md: 10 } }}>
             <Typography variant="h3" sx={{ fontWeight: 800, mb: 2, fontSize: { xs: '2rem', md: '3rem' } }}>
-                Billing & subscription management for service providers
+                Complete billing & network management for service providers
             </Typography>
             <Typography variant="h6" sx={{ color: 'text.secondary', fontWeight: 400, mb: 4 }}>
                 servicesBills helps ISPs and resellers manage customers, automate billing,
-                collect payments, and notify subscribers — all in one place.
+                collect payments, and monitor network hardware in real-time — all in one unified platform.
             </Typography>
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} justifyContent="center">
                 <Button component={Link} to="/register" variant="contained" size="large" sx={{ px: 4, py: 1.3 }}>
