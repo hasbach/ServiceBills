@@ -1136,15 +1136,18 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
         # 4. Send the user message to ElevenLabs
         ws.send(json.dumps({"type": "user_message", "text": full_prompt}))
 
-        # 5. Wait for agent response
-        # ElevenLabs may send multiple agent_response events:
-        # - Intermediate ones while tool calls are executing ("just a second...")
-        # - A final one with the actual answer after tools complete
-        # We must keep collecting until conversation_ended or a long silence,
-        # and use the LAST reply received.
+        # 5. Wait for final agent response
+        # ElevenLabs flow when agent uses a tool:
+        #   a) Sends intermediate agent_response ("just a second...")
+        #   b) Makes HTTP tool call to our webhook (can take 5-15s)
+        #   c) Sends FINAL agent_response with the actual tool result
+        # We must NOT stop after the first reply. We keep listening until:
+        #   - conversation_ended event is received, OR
+        #   - 10s of silence AFTER getting at least one reply, OR
+        #   - overall timeout is reached
         t_req = time.time()
         agent_reply = None
-        last_reply_at = time.time()
+        last_activity_at = time.time()  # tracks any activity, not just replies
         while time.time() - t_req < timeout:
             try:
                 ws.settimeout(2.0)
@@ -1153,24 +1156,24 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
                     break
                 data = json.loads(raw)
                 m_type = data.get("type")
+                last_activity_at = time.time()  # reset on ANY message received
                 if m_type == "agent_response":
                     resp = data.get("agent_response_event", {}).get("agent_response")
                     if resp:
                         agent_reply = resp   # keep updating - we want the LAST one
-                        last_reply_at = time.time()
+                        logging.info(f"ElevenLabs intermediate/final reply: {resp[:80]}")
                 elif m_type == "conversation_ended":
-                    break  # ElevenLabs says session is done - use whatever we have
+                    break  # ElevenLabs closed the session - use last reply we have
                 elif m_type == "ping":
                     p_id = data.get("ping_event", {}).get("event_id")
                     if p_id is not None:
                         ws.send(json.dumps({"type": "pong", "event_id": p_id}))
-                # If we already have a reply and 4s of silence, assume we're done
-                if agent_reply and (time.time() - last_reply_at > 4.0):
-                    break
             except websocket.WebSocketTimeoutException:
-                # If we have a reply and no new data in 2s, we're done
-                if agent_reply:
+                # 2s of silence. If we have a reply AND 10s have passed since last
+                # activity (meaning the tool call + final answer should be done), stop.
+                if agent_reply and (time.time() - last_activity_at > 10.0):
                     break
+                # Otherwise keep waiting - tool call may still be in progress
                 continue
             except Exception as ex_loop:
                 logging.warning(f"Exception during ElevenLabs ConvAI message wait: {ex_loop}")
@@ -1565,7 +1568,7 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
                 sender_phone=sender_phone,
                 customer=customer,
                 recent_history=recent_history,
-                timeout=18,
+                timeout=35,
                 is_admin=is_admin
             )
         except Exception as ex_conv:
