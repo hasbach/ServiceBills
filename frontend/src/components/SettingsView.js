@@ -188,7 +188,61 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
         try {
             const res = await apiService.createNetworkAgent({ name: 'Network Agent' });
             setAgents([res.data.agent]);
-            setRevealedToken(res.data.token);
+            const token = res.data.token;
+            setRevealedToken(token);
+            
+            // Auto-generate and download the installer script
+            const script = `
+# ServiceBills On-Premise Agent Installer
+$installDir = "C:\\ProgramData\\ServiceBillsAgent"
+$binDir = "C:\\ServiceBills"
+$repoUrl = "https://raw.githubusercontent.com/hasbach/ServiceBills/main"
+
+Write-Host "Creating directories..."
+New-Item -ItemType Directory -Force -Path $installDir -ErrorAction SilentlyContinue | Out-Null
+New-Item -ItemType Directory -Force -Path $binDir -ErrorAction SilentlyContinue | Out-Null
+New-Item -ItemType Directory -Force -Path "$binDir\\agent" -ErrorAction SilentlyContinue | Out-Null
+
+Write-Host "Downloading agent files..."
+Invoke-WebRequest -Uri "$repoUrl/agent/servicebills_agent.py" -OutFile "$binDir\\agent\\servicebills_agent.py"
+Invoke-WebRequest -Uri "$repoUrl/mikrotik.py" -OutFile "$binDir\\mikrotik.py"
+Invoke-WebRequest -Uri "$repoUrl/vsol_olt.py" -OutFile "$binDir\\vsol_olt.py"
+
+$tomlPath = "$installDir\\agent.toml"
+if (-not (Test-Path $tomlPath)) {
+    Write-Host "Creating agent.toml configuration..."
+    $tomlContent = @"
+cloud_url = "${API_BASE_URL}"
+token = "${token}"
+poll_seconds = 2
+
+# Add your devices below
+# [[device]]
+# id = 1
+# host = "192.168.1.1"
+# username = "admin"
+# password = "password"
+"@
+    Set-Content -Path $tomlPath -Value $tomlContent
+}
+
+Write-Host "=========================================================="
+Write-Host "Agent files installed successfully to $binDir"
+Write-Host "Configuration file created at $tomlPath"
+Write-Host "Please open $tomlPath in notepad to edit your devices."
+Write-Host "=========================================================="
+Read-Host -Prompt "Press Enter to exit"
+`;
+            const blob = new Blob([script], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'Install-ServiceBillsAgent.ps1';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
             setTokenDialogOpen(true);
         } catch (err) {
             const detail = err?.response?.data?.error || 'Failed to create agent';
@@ -574,7 +628,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                                                 </Typography>
                                                 <Button variant="contained" onClick={handleCreateAgent} disabled={agentActionLoading}
                                                     sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
-                                                    {agentActionLoading ? 'Creating…' : 'Create Agent'}
+                                                    {agentActionLoading ? 'Creating…' : 'Add local agent'}
                                                 </Button>
                                             </Box>
                                         )}
@@ -1074,13 +1128,22 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 handleCloseTokenDialog); there is no way to see this value again
                 anywhere in the app afterwards. */}
             <Dialog open={tokenDialogOpen} onClose={handleCloseTokenDialog} fullWidth maxWidth="sm">
-                <DialogTitle>Agent Token</DialogTitle>
+                <DialogTitle>Agent Installation Required</DialogTitle>
                 <DialogContent>
-                    <Alert severity="warning" sx={{ mb: 2, borderRadius: '12px' }}>
-                        This token will not be shown again. Copy it now and paste it into <code>agent.toml</code> on
-                        the on-prem box that runs the agent. If it's lost, the only recovery is to regenerate a new
-                        one, which immediately invalidates this one.
+                    <Alert severity="success" sx={{ mb: 2, borderRadius: '12px' }}>
+                        An installer script (<strong>Install-ServiceBillsAgent.ps1</strong>) has been downloaded to your computer.
+                        Please run this script on the server that can reach your local devices.
                     </Alert>
+                    <Typography variant="body2" sx={{ mb: 2 }}>
+                        The script will automatically download the required files and place them in their specific places (<code>C:\ServiceBills</code>).
+                    </Typography>
+                    <Typography variant="body2" sx={{ mb: 2 }}>
+                        After it finishes, please open <strong>C:\ProgramData\ServiceBillsAgent\agent.toml</strong> in Notepad to add your device IP addresses and passwords.
+                    </Typography>
+                    <Divider sx={{ my: 2 }} />
+                    <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                        If you need to configure it manually, your agent token is:
+                    </Typography>
                     <TextField
                         fullWidth
                         value={revealedToken || ''}

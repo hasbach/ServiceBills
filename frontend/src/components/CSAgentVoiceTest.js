@@ -9,12 +9,14 @@ import {
     MicOff as MicOffIcon,
     CallEnd as CallEndIcon,
     PhoneInTalk as PhoneInTalkIcon,
-    Save as SaveIcon
+    Save as SaveIcon,
+    Edit as EditIcon
 } from '@mui/icons-material';
 import axios from 'axios';
 
 export default function CSAgentVoiceTest() {
     const [agentId, setAgentId] = useState('');
+    const [isEditingAgentId, setIsEditingAgentId] = useState(false);
     const [status, setStatus] = useState('idle'); // idle | connecting | connected | speaking | listening | error
     const [errorMessage, setErrorMessage] = useState('');
     const [isMuted, setIsMuted] = useState(false);
@@ -82,11 +84,11 @@ export default function CSAgentVoiceTest() {
             const token = localStorage.getItem('token');
             await axios.post('/api/cs-agent/config', {
                 elevenlabs_agent_id: agentId.trim()
-            }, {
-                headers: token ? { Authorization: `Bearer ${token}` } : {}
-            });
-            setSaveSuccess('تم حفظ معرف الوكيل بنجاح لهذا المشترك!');
-            setTimeout(() => setSaveSuccess(''), 4000);
+            }, { headers: { Authorization: `Bearer ${token}` } });
+            
+            setSaveSuccess('تم حفظ إعدادات الـ Agent بنجاح!');
+            setIsEditingAgentId(false);
+            setTimeout(() => setSaveSuccess(''), 3000);
         } catch (err) {
             setErrorMessage('فشل حفظ إعدادات الوكيل: ' + (err.response?.data?.error || err.message));
         } finally {
@@ -474,8 +476,21 @@ export default function CSAgentVoiceTest() {
                                     value={agentId}
                                     onChange={(e) => setAgentId(e.target.value)}
                                     placeholder="agent_..."
-                                    disabled={status !== 'idle' && status !== 'error'}
+                                    disabled={!isEditingAgentId || (status !== 'idle' && status !== 'error')}
                                     sx={{ minWidth: 260, flexGrow: 1 }}
+                                    InputProps={{
+                                        endAdornment: (
+                                            <InputAdornment position="end">
+                                                <IconButton 
+                                                    onClick={() => setIsEditingAgentId(true)} 
+                                                    disabled={status !== 'idle' && status !== 'error'}
+                                                    edge="end"
+                                                >
+                                                    <EditIcon fontSize="small" />
+                                                </IconButton>
+                                            </InputAdornment>
+                                        )
+                                    }}
                                 />
 
                                 <Button
