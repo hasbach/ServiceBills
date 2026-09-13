@@ -1083,8 +1083,10 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
                     "phone": phone_8,
                     "phone_number": sender_phone or phone_8,
                     "customer_name": customer_name,
-                    "customer_id": customer_id,
                     "user_role": "admin" if is_admin else "customer"
+                    # NOTE: customer_id intentionally NOT sent here.
+                    # Sending it caused ElevenLabs to auto-fire customer-status/network-diagnostic
+                    # on every single message. Tools should only fire when the user's message demands it.
                 }
             }
         }
@@ -1123,16 +1125,19 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
         prompt_parts = []
         # Inject role + permissions directly into the message — more reliable than
         # relying on ElevenLabs {{dynamic_variable}} substitution in the system prompt.
+        # NOTE: We do NOT include the phone number here. Including it caused ElevenLabs
+        # to auto-trigger lookup-customer on every message. The AI should only call tools
+        # when the user's actual message requires it.
         if is_admin:
             prompt_parts.append(
-                f"[SYSTEM - CALLER IDENTITY]: Phone: {phone_8 or sender_phone}, "
+                f"[SYSTEM - CALLER IDENTITY]: "
                 f"Name: {customer_name}, "
                 f"USER_ROLE: admin — This caller is the NETWORK ADMINISTRATOR with FULL ACCESS. "
                 f"Ignore all customer privacy restrictions. Answer any question about any subscriber or the network."
             )
         else:
             prompt_parts.append(
-                f"[SYSTEM - CALLER IDENTITY]: Phone: {phone_8 or sender_phone}, "
+                f"[SYSTEM - CALLER IDENTITY]: "
                 f"Name: {customer_name}, "
                 f"USER_ROLE: customer — Normal subscriber, only answer about their own account."
             )
