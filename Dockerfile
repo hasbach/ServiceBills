@@ -35,4 +35,4 @@ ENV RUN_SCHEDULER=1
 # regardless of any platform command override, so the schema is always built.
 # Startup: migrate; create the super-admin if SA_USERNAME/SA_PASSWORD are set
 # (self-guarded + idempotent — no-op if unset or already exists); then serve.
-CMD ["sh", "-c", "flask db upgrade && (flask create-superadmin || true) && exec gunicorn -w ${WEB_CONCURRENCY:-1} -b 0.0.0.0:${PORT:-8000} --timeout 120 app:app"]
+CMD ["sh", "-c", "flask db upgrade && (flask create-superadmin || true) && exec gunicorn -w ${WEB_CONCURRENCY:-1} -k gevent -b 0.0.0.0:${PORT:-8000} --timeout 120 app:app"]
