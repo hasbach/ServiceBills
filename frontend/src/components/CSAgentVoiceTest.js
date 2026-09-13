@@ -16,7 +16,9 @@ import axios from 'axios';
 
 export default function CSAgentVoiceTest() {
     const [agentId, setAgentId] = useState('');
+    const [adminMobile, setAdminMobile] = useState('');
     const [isEditingAgentId, setIsEditingAgentId] = useState(false);
+    const [isEditingAdminMobile, setIsEditingAdminMobile] = useState(false);
     const [status, setStatus] = useState('idle'); // idle | connecting | connected | speaking | listening | error
     const [errorMessage, setErrorMessage] = useState('');
     const [isMuted, setIsMuted] = useState(false);
@@ -49,8 +51,9 @@ export default function CSAgentVoiceTest() {
             headers: token ? { Authorization: `Bearer ${token}` } : {}
         })
             .then(res => {
-                if (res.data && res.data.elevenlabs_agent_id) {
-                    setAgentId(res.data.elevenlabs_agent_id);
+                if (res.data) {
+                    if (res.data.elevenlabs_agent_id) setAgentId(res.data.elevenlabs_agent_id);
+                    if (res.data.admin_mobile_number) setAdminMobile(res.data.admin_mobile_number);
                 }
             })
             .catch(() => {
@@ -74,7 +77,7 @@ export default function CSAgentVoiceTest() {
 
     const handleSaveAgentId = async () => {
         if (!agentId.trim()) {
-            setErrorMessage('يرجى إدخال ElevenLabs Agent ID قبل الحفظ.');
+            setErrorMessage('يجب إدخال ElevenLabs Agent ID لحفظ الإعدادات.');
             return;
         }
         setSavingConfig(true);
@@ -83,14 +86,15 @@ export default function CSAgentVoiceTest() {
         try {
             const token = localStorage.getItem('token');
             await axios.post('/api/cs-agent/config', {
-                elevenlabs_agent_id: agentId.trim()
+                elevenlabs_agent_id: agentId.trim(),
+                admin_mobile_number: adminMobile.trim()
             }, { headers: { Authorization: `Bearer ${token}` } });
             
             setSaveSuccess('تم حفظ إعدادات الـ Agent بنجاح!');
             setIsEditingAgentId(false);
-            setTimeout(() => setSaveSuccess(''), 3000);
+            setIsEditingAdminMobile(false);
         } catch (err) {
-            setErrorMessage('فشل حفظ إعدادات الوكيل: ' + (err.response?.data?.error || err.message));
+            setErrorMessage(err.response?.data?.error || 'حدث خطأ أثناء الحفظ.');
         } finally {
             setSavingConfig(false);
         }
@@ -501,9 +505,36 @@ export default function CSAgentVoiceTest() {
                                     disabled={savingConfig || !agentId.trim()}
                                     sx={{ whiteSpace: 'nowrap' }}
                                 >
-                                    حفظ للمشترك
+                                    حفظ للمستأجر
                                 </Button>
+                            </Box>
 
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 4, flexWrap: 'wrap' }}>
+                                <TextField
+                                    size="small"
+                                    label="Network Admin Mobile (WhatsApp)"
+                                    value={adminMobile}
+                                    onChange={(e) => setAdminMobile(e.target.value)}
+                                    placeholder="e.g. 70123456"
+                                    disabled={!isEditingAdminMobile || (status !== 'idle' && status !== 'error')}
+                                    sx={{ minWidth: 260, flexGrow: 1 }}
+                                    InputProps={{
+                                        endAdornment: (
+                                            <InputAdornment position="end">
+                                                <IconButton 
+                                                    onClick={() => setIsEditingAdminMobile(true)} 
+                                                    disabled={status !== 'idle' && status !== 'error'}
+                                                    edge="end"
+                                                >
+                                                    <EditIcon fontSize="small" />
+                                                </IconButton>
+                                            </InputAdornment>
+                                        )
+                                    }}
+                                />
+                            </Box>
+
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2, flexWrap: 'wrap' }}>
                                 <Chip
                                     label={
                                         status === 'idle' ? 'جاهز' :

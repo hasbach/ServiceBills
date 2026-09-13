@@ -1040,7 +1040,7 @@ def handle_whatsapp_audio_transcription(access_token, media_id, api_version='v19
     return transcribe_voice_elevenlabs(audio_bytes, mime_type=mime)
 
 
-def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, customer=None, recent_history=None, timeout=18):
+def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, customer=None, recent_history=None, timeout=18, is_admin=False):
     """Interacts directly with the ElevenLabs Conversational AI Agent WebSocket.
     Allows Yara's LLM in ElevenLabs to handle the customer conversation dynamically,
     execute webhook tools (lookup-customer, customer-status, etc.), and craft the reply.
@@ -1083,7 +1083,8 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
                     "phone": phone_8,
                     "phone_number": sender_phone or phone_8,
                     "customer_name": customer_name,
-                    "customer_id": customer_id
+                    "customer_id": customer_id,
+                    "user_role": "admin" if is_admin else "customer"
                 }
             }
         }
@@ -1503,15 +1504,22 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     except Exception as e_sess:
         logging.warning(f"Error checking active session: {e_sess}")
 
-    # Resolve target ElevenLabs agent ID
+    # Resolve target ElevenLabs agent ID and admin permissions
     target_agent_id = getattr(settings, 'elevenlabs_agent_id', None)
-    if not target_agent_id:
-        try:
-            cs_settings = appmod.CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
-            if cs_settings and cs_settings.elevenlabs_agent_id:
+    is_admin = False
+    
+    try:
+        cs_settings = appmod.CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
+        if cs_settings:
+            if cs_settings.elevenlabs_agent_id:
                 target_agent_id = cs_settings.elevenlabs_agent_id
-        except Exception:
-            pass
+            if cs_settings.admin_mobile_number:
+                admin_phone_clean = re.sub(r'\D', '', str(cs_settings.admin_mobile_number))
+                if phone_digits and admin_phone_clean and (phone_digits == admin_phone_clean or phone_digits.endswith(admin_phone_clean) or admin_phone_clean.endswith(phone_digits)):
+                    is_admin = True
+    except Exception:
+        pass
+        
     if not target_agent_id:
         try:
             target_agent_id = current_app.config.get('ELEVENLABS_AGENT_ID') or os.environ.get('ELEVENLABS_AGENT_ID')
@@ -1542,7 +1550,8 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
                 sender_phone=sender_phone,
                 customer=customer,
                 recent_history=recent_history,
-                timeout=18
+                timeout=18,
+                is_admin=is_admin
             )
         except Exception as ex_conv:
             logging.warning(f"ElevenLabs ConvAI call failed, will fallback: {ex_conv}")

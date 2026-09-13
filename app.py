@@ -1551,6 +1551,7 @@ class CSAgentSettings(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, unique=True, index=True)
     elevenlabs_agent_id = db.Column(db.String(100), nullable=True)
+    admin_mobile_number = db.Column(db.String(50), nullable=True)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -1560,8 +1561,9 @@ class CSAgentSettings(db.Model):
             'id': self.id,
             'tenant_id': self.tenant_id,
             'elevenlabs_agent_id': self.elevenlabs_agent_id or '',
+            'admin_mobile_number': self.admin_mobile_number or '',
             'is_active': self.is_active,
-            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
         }
 
@@ -12113,6 +12115,8 @@ def cs_agent_config():
 
             if 'elevenlabs_agent_id' in data:
                 settings.elevenlabs_agent_id = (data.get('elevenlabs_agent_id') or '').strip()
+            if 'admin_mobile_number' in data:
+                settings.admin_mobile_number = (data.get('admin_mobile_number') or '').strip()
             db.session.commit()
             return jsonify(status='ok', settings=settings.to_dict()), 200
         except Exception as e:
@@ -12120,11 +12124,13 @@ def cs_agent_config():
             return jsonify(error=f"Database error: {str(e)}"), 500
 
     agent_id = ''
+    admin_mobile_number = ''
     if tenant_id:
         try:
             settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
-            if settings and settings.elevenlabs_agent_id:
-                agent_id = settings.elevenlabs_agent_id
+            if settings:
+                agent_id = settings.elevenlabs_agent_id or ''
+                admin_mobile_number = settings.admin_mobile_number or ''
         except Exception:
             db.session.rollback()
 
@@ -12134,6 +12140,7 @@ def cs_agent_config():
     return jsonify({
         'status': 'ok',
         'elevenlabs_agent_id': agent_id,
+        'admin_mobile_number': admin_mobile_number,
         'has_agent_id': bool(agent_id),
         'ws_url': f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={agent_id}" if agent_id else None
     }), 200
