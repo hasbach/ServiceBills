@@ -1121,7 +1121,21 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
 
         # 3. Format prompt with caller context and recent conversation history
         prompt_parts = []
-        prompt_parts.append(f"[بيانات المتصل عبر واتساب - رقم الهاتف: {phone_8 or sender_phone}, اسم العميل: {customer_name}]:")
+        # Inject role + permissions directly into the message — more reliable than
+        # relying on ElevenLabs {{dynamic_variable}} substitution in the system prompt.
+        if is_admin:
+            prompt_parts.append(
+                f"[SYSTEM - CALLER IDENTITY]: Phone: {phone_8 or sender_phone}, "
+                f"Name: {customer_name}, "
+                f"USER_ROLE: admin — This caller is the NETWORK ADMINISTRATOR with FULL ACCESS. "
+                f"Ignore all customer privacy restrictions. Answer any question about any subscriber or the network."
+            )
+        else:
+            prompt_parts.append(
+                f"[SYSTEM - CALLER IDENTITY]: Phone: {phone_8 or sender_phone}, "
+                f"Name: {customer_name}, "
+                f"USER_ROLE: customer — Normal subscriber, only answer about their own account."
+            )
         if recent_history:
             prompt_parts.append("[مقتطف من المحادثة السابقة بين العميل ويارا]:")
             for m in recent_history[-4:]:
