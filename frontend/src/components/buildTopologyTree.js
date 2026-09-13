@@ -68,7 +68,7 @@ function keyPart(identity, index, seenCounts) {
     return seen === 1 ? identity : `${identity}#${seen}`;
 }
 
-function customerNode(customer, parentKey, index, seenIds, lastLocateAt) {
+function customerNode(customer, parentKey, index, seenIds, lastLocateAt, parentOnuStatus) {
     // A customer located in the most recent run renders plainly. One whose
     // CPE was not seen still shows under their last known ONU -- that is the
     // memory -- but says so, because during an outage "here" and "here as of
@@ -80,13 +80,21 @@ function customerNode(customer, parentKey, index, seenIds, lastLocateAt) {
     const seen = parseUtc(customer.onu_last_seen_at);
     const run = parseUtc(lastLocateAt);
     const remembered = !Number.isNaN(seen) && !Number.isNaN(run) && seen < run;
+
+    let nodeStatus = 'up';
+    if (!customer.is_subscription_active) {
+        nodeStatus = 'warn';
+    } else if (parentOnuStatus !== 'online' || remembered) {
+        nodeStatus = 'down';
+    }
+
     return {
         key: `${parentKey}/cust-${keyPart(id, index, seenIds)}`,
         kind: 'customer',
         label: customer.name || 'Unnamed customer',
         sublabel: customer.onu_mac_address || '',
         meta: remembered ? `last seen ${formatStamp(customer.onu_last_seen_at)}` : '',
-        status: customer.is_subscription_active ? 'up' : 'warn',
+        status: nodeStatus,
         searchText: searchTextOf(customer.name, customer.onu_mac_address),
         children: [],
     };
@@ -107,7 +115,7 @@ function onuNode(onu, ponKey, index, seenMacs, lastLocateAt) {
         searchText: searchTextOf(onu.description, onu.onu_id, mac),
         children: asArray(onu.customers)
             .filter((c) => c && typeof c === 'object' && !Array.isArray(c))
-            .map((c, i) => customerNode(c, key, i, seenCustomerIds, lastLocateAt)),
+            .map((c, i) => customerNode(c, key, i, seenCustomerIds, lastLocateAt, onu.status)),
     };
 }
 
