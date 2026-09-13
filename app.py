@@ -7817,21 +7817,32 @@ def whatsapp_webhook():
                         ticket = None
                         if cs_agent_active and getattr(settings, 'auto_reply_enabled', True) and not is_forwarding_mobile_reply:
                             # 3a. CS AI Agent handles the message autonomously.
-                            # Routine messages (greetings, inquiries, status checks) do NOT create open support tickets.
-                            # Support tickets are ONLY opened if the agent decides to escalate to human staff.
+                            # IMPORTANT: spawn as a background greenlet so the webhook returns 200 OK
+                            # immediately. WhatsApp retries the webhook if it doesn't get a 200 within
+                            # ~20 seconds — causing the same message to be processed multiple times.
+                            # gevent.spawn detaches the work from the request/response cycle.
                             try:
-                                cs_agent_tools.handle_whatsapp_cs_ai_reply(
-                                    appmod=sys.modules[__name__],
-                                    tenant_id=resolved_tenant_id,
-                                    sender_phone=sender_phone,
-                                    customer=cust_obj,
-                                    incoming_text=msg_text,
-                                    is_voice=bool(msg_type in ['audio', 'voice']),
-                                    settings=settings,
+                                import gevent
+                                _appmod = sys.modules[__name__]
+                                _tenant_id = resolved_tenant_id
+                                _sender = sender_phone
+                                _cust = cust_obj
+                                _text = msg_text
+                                _is_voice = bool(msg_type in ['audio', 'voice'])
+                                _settings = settings
+                                gevent.spawn(
+                                    cs_agent_tools.handle_whatsapp_cs_ai_reply,
+                                    appmod=_appmod,
+                                    tenant_id=_tenant_id,
+                                    sender_phone=_sender,
+                                    customer=_cust,
+                                    incoming_text=_text,
+                                    is_voice=_is_voice,
+                                    settings=_settings,
                                     ticket=None
                                 )
                             except Exception as ex_ai:
-                                logging.error(f"Error executing CS AI reply: {ex_ai}")
+                                logging.error(f"Error spawning CS AI reply greenlet: {ex_ai}")
                         elif not is_forwarding_mobile_reply:
                             # 3b. CS Agent is inactive/disabled: create support ticket for human staff follow-up
                             if cust_obj:
