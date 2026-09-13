@@ -1543,6 +1543,7 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
 
     ai_result = None
     if target_agent_id:
+        logging.info(f"DEBUG ADMIN LOGIC: sender={sender_phone}, admin_phone={getattr(cs_settings, 'admin_mobile_number', None) if 'cs_settings' in locals() else None}, is_admin={is_admin}")
         try:
             ai_result = query_elevenlabs_conversational_ai(
                 agent_id=target_agent_id,
