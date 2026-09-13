@@ -1137,11 +1137,17 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
         ws.send(json.dumps({"type": "user_message", "text": full_prompt}))
 
         # 5. Wait for agent response
+        # ElevenLabs may send multiple agent_response events:
+        # - Intermediate ones while tool calls are executing ("just a second...")
+        # - A final one with the actual answer after tools complete
+        # We must keep collecting until conversation_ended or a long silence,
+        # and use the LAST reply received.
         t_req = time.time()
         agent_reply = None
+        last_reply_at = time.time()
         while time.time() - t_req < timeout:
             try:
-                ws.settimeout(1.5)
+                ws.settimeout(2.0)
                 raw = ws.recv()
                 if not raw:
                     break
@@ -1150,13 +1156,21 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
                 if m_type == "agent_response":
                     resp = data.get("agent_response_event", {}).get("agent_response")
                     if resp:
-                        agent_reply = resp
-                        break
+                        agent_reply = resp   # keep updating - we want the LAST one
+                        last_reply_at = time.time()
+                elif m_type == "conversation_ended":
+                    break  # ElevenLabs says session is done - use whatever we have
                 elif m_type == "ping":
                     p_id = data.get("ping_event", {}).get("event_id")
                     if p_id is not None:
                         ws.send(json.dumps({"type": "pong", "event_id": p_id}))
+                # If we already have a reply and 4s of silence, assume we're done
+                if agent_reply and (time.time() - last_reply_at > 4.0):
+                    break
             except websocket.WebSocketTimeoutException:
+                # If we have a reply and no new data in 2s, we're done
+                if agent_reply:
+                    break
                 continue
             except Exception as ex_loop:
                 logging.warning(f"Exception during ElevenLabs ConvAI message wait: {ex_loop}")
