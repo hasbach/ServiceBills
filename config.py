@@ -15,6 +15,13 @@ class Config:
     elif _db_url.startswith("postgresql://"):
         _db_url = _db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
     SQLALCHEMY_DATABASE_URI = _db_url
+    if "postgres" in _db_url:
+        SQLALCHEMY_ENGINE_OPTIONS = {
+            "pool_size": 4,          # Small pool to stay under Supabase's 15-client limit across multiple workers
+            "max_overflow": 2,       # Hard cap preventing connection explosion
+            "pool_timeout": 30,
+            "pool_pre_ping": True,
+        }
     # Comma-separated allowlist; defaults to the local React dev server.
     CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
 

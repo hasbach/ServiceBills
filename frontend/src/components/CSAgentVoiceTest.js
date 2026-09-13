@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
     Box, Card, CardContent, Typography, TextField, Button,
     Chip, Stack, IconButton, CircularProgress,
-    Alert, Paper, Grid, Switch, FormControlLabel, LinearProgress
+    Alert, Paper, Grid, Switch, FormControlLabel, LinearProgress, InputAdornment
 } from '@mui/material';
 import {
     Mic as MicIcon,
