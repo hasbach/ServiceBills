@@ -1270,8 +1270,14 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
                     break
                 data = json.loads(raw)
                 m_type = data.get("type")
-                last_activity_at = time.time()  # reset on ANY message received
                 if m_type == "agent_response":
+                    # Only a real reply counts as "activity" for the trailing-silence
+                    # check below. `ping` is just a websocket keepalive ElevenLabs sends
+                    # regardless of whether a tool call is in progress -- treating it as
+                    # activity was resetting the 10s idle clock on every ping, so a
+                    # conversation with no tool call at all still waited out almost the
+                    # entire `timeout` instead of returning as soon as the reply arrived.
+                    last_activity_at = time.time()
                     resp = data.get("agent_response_event", {}).get("agent_response")
                     if resp:
                         agent_reply = resp   # keep updating - we want the LAST one
@@ -1681,7 +1687,14 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
                 sender_phone=sender_phone,
                 customer=customer,
                 recent_history=recent_history,
-                timeout=35,
+                # A diagnostic request can now take TWO sequential tool calls (the
+                # agent asks for the caller's phone number since it's no longer in
+                # context, then looks the customer up, then runs network_diagnostic
+                # -- itself capped at NETWORK_DIAGNOSTIC_LATENCY_CEILING=20s). 35s
+                # was measured cutting that chain off mid-tool-call, returning the
+                # "checking now" filler instead of the real answer; 55s gives that
+                # chain realistic headroom.
+                timeout=55,
                 is_admin=is_admin
             )
         except Exception as ex_conv:
