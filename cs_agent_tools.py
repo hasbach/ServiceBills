@@ -1261,7 +1261,7 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
         #   - overall timeout is reached
         t_req = time.time()
         agent_reply = None
-        last_activity_at = time.time()  # tracks any activity, not just replies
+        last_activity_at = time.time()  # tracks real replies, not other traffic
         while time.time() - t_req < timeout:
             try:
                 ws.settimeout(2.0)
@@ -1271,12 +1271,6 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
                 data = json.loads(raw)
                 m_type = data.get("type")
                 if m_type == "agent_response":
-                    # Only a real reply counts as "activity" for the trailing-silence
-                    # check below. `ping` is just a websocket keepalive ElevenLabs sends
-                    # regardless of whether a tool call is in progress -- treating it as
-                    # activity was resetting the 10s idle clock on every ping, so a
-                    # conversation with no tool call at all still waited out almost the
-                    # entire `timeout` instead of returning as soon as the reply arrived.
                     last_activity_at = time.time()
                     resp = data.get("agent_response_event", {}).get("agent_response")
                     if resp:
@@ -1289,14 +1283,19 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
                     if p_id is not None:
                         ws.send(json.dumps({"type": "pong", "event_id": p_id}))
             except websocket.WebSocketTimeoutException:
-                # 2s of silence. If we have a reply AND 10s have passed since last
-                # activity (meaning the tool call + final answer should be done), stop.
-                if agent_reply and (time.time() - last_activity_at > 10.0):
-                    break
-                # Otherwise keep waiting - tool call may still be in progress
-                continue
+                pass
             except Exception as ex_loop:
                 logging.warning(f"Exception during ElevenLabs ConvAI message wait: {ex_loop}")
+                break
+
+            # Checked every iteration -- NOT only inside the timeout-exception branch
+            # above. ElevenLabs can send other traffic (pings, etc.) more often than
+            # our 2s recv timeout, which means ws.recv() keeps succeeding and this
+            # loop never actually hits WebSocketTimeoutException -- so a check placed
+            # only in that except branch (the original bug) never runs, and we end up
+            # waiting out the full `timeout` even when the real answer arrived early.
+            # Checking here, after every message (or lack of one), catches that.
+            if agent_reply and (time.time() - last_activity_at > 10.0):
                 break
 
         if agent_reply:
