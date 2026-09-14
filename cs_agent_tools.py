@@ -383,6 +383,74 @@ def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
             "diagnosis_ar": "اشتراكك منتهي الصلاحية أو غير مفعّل، وهيدا سبب انقطاع الخدمة. بمجرد تجديد الاشتراك أو دفع الفاتورة بيرجع الخط فوراً."
         }
 
+    # 2. Upstream bridge check — takes priority over Mikrotik/OLT device queries.
+    # If the customer is managed via an upstream RADIUS portal (e.g. Krypton), we read
+    # the last-synced upstream status directly from the DB. No router query needed.
+    # IMPORTANT: We always use ServiceBills subscription_expiry_date for the expiry date
+    # shown to the customer — NOT the upstream expiry, which may differ.
+    if getattr(customer, 'upstream_username', None):
+        upstream_status = getattr(customer, 'upstream_last_status', None)  # 'online'|'offline'|'expired'|None
+        upstream_synced_at = getattr(customer, 'upstream_last_synced_at', None)
+
+        # ServiceBills expiry date (source of truth for customer-facing expiry)
+        sb_expiry = customer.subscription_expiry_date
+        expiry_str = sb_expiry.strftime('%Y-%m-%d') if sb_expiry else None
+        expiry_ar = f" الاشتراك مسجل لغاية {expiry_str}." if expiry_str else ""
+
+        # How fresh is the upstream sync? (warn if stale > 60 min)
+        stale_note = ""
+        if upstream_synced_at:
+            age_min = (now - upstream_synced_at).total_seconds() / 60
+            if age_min > 60:
+                stale_note = f" (آخر مزامنة منذ {int(age_min)} دقيقة)"
+
+        if upstream_status == 'online':
+            return {
+                "success": True,
+                "status": "online",
+                "source": "upstream",
+                "expiry_date": expiry_str,
+                "diagnosis_ar": f"خطك شغال وأونلاين على الشبكة.{expiry_ar}{stale_note}"
+            }
+        elif upstream_status == 'offline':
+            return {
+                "success": True,
+                "status": "offline",
+                "source": "upstream",
+                "expiry_date": expiry_str,
+                "diagnosis_ar": (
+                    f"خطك مطفي حالياً على شبكة المزوّد.{expiry_ar}{stale_note} "
+                    f"اشتراكك مفعّل من جهتنا — المشكلة على الأرجح بجهاز الراوتر أو الكيبل. "
+                    f"جرب تعيد تشغيل الراوتر بالكهربا دقيقتين، وإذا ما رجع تواصل مع الدعم الفني."
+                ),
+                "escalate": True
+            }
+        elif upstream_status == 'expired':
+            return {
+                "success": True,
+                "status": "expired",
+                "source": "upstream",
+                "expiry_date": expiry_str,
+                "diagnosis_ar": (
+                    f"خطك منتهي الصلاحية على شبكة المزوّد.{expiry_ar}{stale_note} "
+                    f"بمجرد تجديد الاشتراك بيرجع الخط فوراً."
+                )
+            }
+        else:
+            # upstream_status is None — never synced or unknown
+            return {
+                "success": True,
+                "status": "unknown",
+                "source": "upstream",
+                "expiry_date": expiry_str,
+                "diagnosis_ar": (
+                    f"اشتراكك مفعّل من جهتنا.{expiry_ar} "
+                    f"ما في معلومات حديثة عن حالة الخط على شبكة المزوّد. "
+                    f"تواصل مع الدعم الفني إذا الإنترنت مش شغال."
+                )
+            }
+
+    # 3. No upstream username — fall through to Mikrotik / OLT device diagnostic
     device_id = customer.network_device_id
     if not device_id:
         # Check if there is an active OLT or Mikrotik on this tenant
