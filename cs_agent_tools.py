@@ -1253,12 +1253,18 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
         # 5. Wait for final agent response
         # ElevenLabs flow when agent uses a tool:
         #   a) Sends intermediate agent_response ("just a second...")
-        #   b) Makes HTTP tool call to our webhook (can take 5-15s)
+        #   b) Makes HTTP tool call to our webhook (network_diagnostic itself can
+        #      legitimately take up to NETWORK_DIAGNOSTIC_LATENCY_CEILING=20s)
         #   c) Sends FINAL agent_response with the actual tool result
         # We must NOT stop after the first reply. We keep listening until:
         #   - conversation_ended event is received, OR
-        #   - 10s of silence AFTER getting at least one reply, OR
+        #   - IDLE_EXIT_SECONDS of silence AFTER getting at least one reply, OR
         #   - overall timeout is reached
+        # IDLE_EXIT_SECONDS must comfortably exceed our own tool's worst-case
+        # latency: a live test with the old 10s threshold cut the conversation
+        # off while network_diagnostic was still running, sending an
+        # intermediate "checking now" filler to WhatsApp as if it were final.
+        IDLE_EXIT_SECONDS = NETWORK_DIAGNOSTIC_LATENCY_CEILING + 8.0
         t_req = time.time()
         agent_reply = None
         last_activity_at = time.time()  # tracks real replies, not other traffic
@@ -1295,7 +1301,7 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
             # only in that except branch (the original bug) never runs, and we end up
             # waiting out the full `timeout` even when the real answer arrived early.
             # Checking here, after every message (or lack of one), catches that.
-            if agent_reply and (time.time() - last_activity_at > 10.0):
+            if agent_reply and (time.time() - last_activity_at > IDLE_EXIT_SECONDS):
                 break
 
         if agent_reply:
