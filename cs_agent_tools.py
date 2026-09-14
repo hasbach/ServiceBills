@@ -15,6 +15,24 @@ import requests
 from flask import request, jsonify, current_app
 from flask_jwt_extended import verify_jwt_in_request, get_jwt
 
+# Hard ceiling (seconds) on total network_diagnostic latency -- the olt_status/
+# secret_status job wait PLUS the cpe_locations follow-up combined. ElevenLabs'
+# own tool-webhook timeout is well under a minute; a diagnosis that arrives
+# after the platform has already given up is worse than a fast, slightly less
+# precise fallback answer. Keep this comfortably below that timeout.
+NETWORK_DIAGNOSTIC_LATENCY_CEILING = 20.0
+
+
+def _poll_sleep(elapsed_iterations):
+    """Backoff schedule for job-status poll loops: start responsive, then back
+    off so a long wait doesn't hammer the DB with a query every 0.35s (a 15s
+    wait was previously ~43 round trips; this cuts that by roughly half)."""
+    if elapsed_iterations < 4:
+        return 0.35
+    if elapsed_iterations < 10:
+        return 0.6
+    return 1.0
+
 
 def normalize_lebanese_phone(raw_phone):
     """Normalize various representations of Lebanese phone numbers.
@@ -524,18 +542,20 @@ def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
     # 4. Short-poll waiting for the on-premise agent to claim and complete the job.
     # Timeline: agent polls every DEFAULT_POLL_SECONDS=2s → up to 2s before claim,
     # then 3-8s for the hardware query (Mikrotik RouterOS API / OLT SNMP).
-    # Customers willingly wait several minutes for a real diagnosis.
-    # ElevenLabs allows up to ~30s for webhook tool calls; 60s is the max we'd
-    # ever need in practice (most jobs complete in under 15s with 4 workers).
-    poll_timeout = min(float(wait_seconds or 60), 60.0)
-    deadline = time.time() + max(0.5, poll_timeout)
+    # `overall_deadline` is the total budget for THIS call, including the
+    # cpe_locations follow-up below -- capped at NETWORK_DIAGNOSTIC_LATENCY_CEILING
+    # so we never return later than ElevenLabs' own tool-call timeout allows.
+    poll_timeout = min(float(wait_seconds or NETWORK_DIAGNOSTIC_LATENCY_CEILING), NETWORK_DIAGNOSTIC_LATENCY_CEILING)
+    overall_deadline = time.time() + max(0.5, poll_timeout)
     completed_job = job
-    while time.time() < deadline:
+    _iter = 0
+    while time.time() < overall_deadline:
         appmod.db.session.expire(completed_job)
         completed_job = appmod.db.session.get(appmod.NetworkAgentJob, job.id)
         if completed_job and completed_job.status in ('done', 'failed'):
             break
-        time.sleep(0.35)
+        time.sleep(_poll_sleep(_iter))
+        _iter += 1
 
     if not completed_job or completed_job.status in ('pending', 'claimed'):
         return {
@@ -588,29 +608,36 @@ def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
             if recent_cpe_job and recent_cpe_job.result:
                 cpe_result = recent_cpe_job.result
             else:
-                # Enqueue a fresh cpe_locations job and wait for it
-                # Remaining budget after olt_status job
-                cpe_budget = min(30.0, max(3.0, deadline - time.time()))
-                cpe_job = appmod.NetworkAgentJob(
-                    tenant_id=tenant_id,
-                    device_id=device.id,
-                    operation='cpe_locations',
-                    params={},
-                    status='pending'
-                )
-                appmod.db.session.add(cpe_job)
-                appmod.db.session.commit()
+                # Enqueue a fresh cpe_locations job and wait for it, but only with
+                # whatever's left of the SAME overall_deadline the olt_status job
+                # drew from -- never a fresh budget on top of it. If there's
+                # nothing meaningful left, skip the follow-up: an ONU-only answer
+                # that arrives on time beats a more precise one that arrives after
+                # ElevenLabs has already given up on the tool call.
+                cpe_budget = overall_deadline - time.time()
+                if cpe_budget >= 1.5:
+                    cpe_job = appmod.NetworkAgentJob(
+                        tenant_id=tenant_id,
+                        device_id=device.id,
+                        operation='cpe_locations',
+                        params={},
+                        status='pending'
+                    )
+                    appmod.db.session.add(cpe_job)
+                    appmod.db.session.commit()
 
-                cpe_deadline = time.time() + cpe_budget
-                while time.time() < cpe_deadline:
-                    appmod.db.session.expire(cpe_job)
-                    cpe_job = appmod.db.session.get(appmod.NetworkAgentJob, cpe_job.id)
-                    if cpe_job and cpe_job.status in ('done', 'failed'):
-                        break
-                    time.sleep(0.35)
+                    cpe_deadline = time.time() + cpe_budget
+                    _cpe_iter = 0
+                    while time.time() < cpe_deadline:
+                        appmod.db.session.expire(cpe_job)
+                        cpe_job = appmod.db.session.get(appmod.NetworkAgentJob, cpe_job.id)
+                        if cpe_job and cpe_job.status in ('done', 'failed'):
+                            break
+                        time.sleep(_poll_sleep(_cpe_iter))
+                        _cpe_iter += 1
 
-                if cpe_job and cpe_job.status == 'done' and cpe_job.result:
-                    cpe_result = cpe_job.result
+                    if cpe_job and cpe_job.status == 'done' and cpe_job.result:
+                        cpe_result = cpe_job.result
 
             if cpe_result and isinstance(cpe_result, dict):
                 # cpe_locations result: {cpe_mac: {onu_id, onu_mac, pon_port}}
@@ -1647,7 +1674,6 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
 
     ai_result = None
     if target_agent_id:
-        logging.info(f"DEBUG ADMIN LOGIC: sender={sender_phone}, admin_phone={getattr(cs_settings, 'admin_mobile_number', None) if 'cs_settings' in locals() else None}, is_admin={is_admin}")
         try:
             ai_result = query_elevenlabs_conversational_ai(
                 agent_id=target_agent_id,

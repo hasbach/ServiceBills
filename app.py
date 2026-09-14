@@ -1,4 +1,25 @@
 import os
+
+# Gunicorn's gevent worker (see Dockerfile) monkey-patches the stdlib socket/ssl/
+# threading modules so `requests` and `websocket-client` calls yield cooperatively,
+# but psycopg2 talks to libpq through its own C-level sockets that patch misses
+# entirely. Without this, every DB query blocks the whole single-process event
+# loop -- freezing all other in-flight greenlets (other requests, WhatsApp AI
+# replies) for the query's full duration. This must run before any psycopg2
+# connection is opened, so it happens before any other import below.
+try:
+    import gevent
+    from gevent.pool import Pool as _GeventPool
+    from psycogreen.gevent import patch_psycopg
+    patch_psycopg()
+    # Bounds how many WhatsApp CS-AI-reply greenlets can run at once, so a burst
+    # of inbound messages (e.g. many customers texting during a real outage)
+    # can't open unbounded concurrent DB connections / ElevenLabs sessions.
+    AI_REPLY_GREENLET_POOL = _GeventPool(20)
+except ImportError:
+    gevent = None
+    AI_REPLY_GREENLET_POOL = None
+
 import re
 import difflib
 import hmac
@@ -7823,7 +7844,6 @@ def whatsapp_webhook():
                             # We wrap in a closure that pushes an app context, because gevent greenlets
                             # run outside Flask's request context and DB queries would fail otherwise.
                             try:
-                                import gevent
                                 _flask_app = app  # capture the Flask app object for the closure
                                 _appmod = sys.modules[__name__]
                                 _tenant_id = resolved_tenant_id
@@ -7851,7 +7871,17 @@ def whatsapp_webhook():
                                             ticket=None
                                         )
 
-                                gevent.spawn(_run_ai_reply_with_ctx)
+                                # Spawn through the bounded pool rather than a bare gevent.spawn():
+                                # this caps how many AI-reply greenlets (and their DB connections /
+                                # ElevenLabs sessions) can run concurrently. If the pool is already
+                                # at capacity, .spawn() cooperatively waits for a free slot -- it
+                                # only delays *this* webhook's 200 OK, not other in-flight requests.
+                                if AI_REPLY_GREENLET_POOL is not None:
+                                    AI_REPLY_GREENLET_POOL.spawn(_run_ai_reply_with_ctx)
+                                elif gevent is not None:
+                                    gevent.spawn(_run_ai_reply_with_ctx)
+                                else:
+                                    _run_ai_reply_with_ctx()
                             except Exception as ex_ai:
                                 logging.error(f"Error spawning CS AI reply greenlet: {ex_ai}")
                         elif not is_forwarding_mobile_reply:
