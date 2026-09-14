@@ -7820,9 +7820,11 @@ def whatsapp_webhook():
                             # IMPORTANT: spawn as a background greenlet so the webhook returns 200 OK
                             # immediately. WhatsApp retries the webhook if it doesn't get a 200 within
                             # ~20 seconds — causing the same message to be processed multiple times.
-                            # gevent.spawn detaches the work from the request/response cycle.
+                            # We wrap in a closure that pushes an app context, because gevent greenlets
+                            # run outside Flask's request context and DB queries would fail otherwise.
                             try:
                                 import gevent
+                                _flask_app = app  # capture the Flask app object for the closure
                                 _appmod = sys.modules[__name__]
                                 _tenant_id = resolved_tenant_id
                                 _sender = sender_phone
@@ -7830,17 +7832,26 @@ def whatsapp_webhook():
                                 _text = msg_text
                                 _is_voice = bool(msg_type in ['audio', 'voice'])
                                 _settings = settings
-                                gevent.spawn(
-                                    cs_agent_tools.handle_whatsapp_cs_ai_reply,
-                                    appmod=_appmod,
-                                    tenant_id=_tenant_id,
-                                    sender_phone=_sender,
-                                    customer=_cust,
-                                    incoming_text=_text,
-                                    is_voice=_is_voice,
-                                    settings=_settings,
-                                    ticket=None
-                                )
+
+                                def _run_ai_reply_with_ctx(
+                                    flask_app=_flask_app, appmod=_appmod,
+                                    tenant_id=_tenant_id, sender=_sender,
+                                    cust=_cust, text=_text,
+                                    is_voice=_is_voice, stgs=_settings
+                                ):
+                                    with flask_app.app_context():
+                                        cs_agent_tools.handle_whatsapp_cs_ai_reply(
+                                            appmod=appmod,
+                                            tenant_id=tenant_id,
+                                            sender_phone=sender,
+                                            customer=cust,
+                                            incoming_text=text,
+                                            is_voice=is_voice,
+                                            settings=stgs,
+                                            ticket=None
+                                        )
+
+                                gevent.spawn(_run_ai_reply_with_ctx)
                             except Exception as ex_ai:
                                 logging.error(f"Error spawning CS AI reply greenlet: {ex_ai}")
                         elif not is_forwarding_mobile_reply:
