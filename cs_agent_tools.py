@@ -506,13 +506,28 @@ def network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=3.5):
 
     # 2. Check for recent completed job in last 5 minutes to return immediately
     recent_cutoff = now - timedelta(minutes=5)
-    recent_job = appmod.NetworkAgentJob.query.filter(
+    recent_candidates = appmod.NetworkAgentJob.query.filter(
         appmod.NetworkAgentJob.tenant_id == tenant_id,
         appmod.NetworkAgentJob.device_id == device.id,
         appmod.NetworkAgentJob.operation == operation,
         appmod.NetworkAgentJob.status == 'done',
         appmod.NetworkAgentJob.created_at >= recent_cutoff
-    ).order_by(appmod.NetworkAgentJob.id.desc()).first()
+    ).order_by(appmod.NetworkAgentJob.id.desc()).limit(20).all()
+
+    # secret_status results are per-PPPoE-account, not device-wide: a Mikrotik
+    # CCR serves many customers on one device_id, so a cached job must match
+    # THIS customer's pppoe_username or we silently hand back a different
+    # customer's online/offline state as "theirs" -- confirmed live: a
+    # customer whose line was actually online got told it was down because
+    # another customer's stale secret_status job on the same device was
+    # reused. olt_status/device_health are device-wide (no per-customer
+    # params), so no extra match is needed for those.
+    recent_job = None
+    for candidate in recent_candidates:
+        if operation == 'secret_status' and (candidate.params or {}).get('pppoe_username') != customer.pppoe_username:
+            continue
+        recent_job = candidate
+        break
 
     if recent_job and recent_job.result:
         diag = _format_diagnosis_result(operation, recent_job.result, customer)
