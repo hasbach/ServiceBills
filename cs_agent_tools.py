@@ -1294,16 +1294,40 @@ def _gemini_tools():
     ])]
 
 
+def _require_customer_id(tool_args):
+    """Coerces the 'customer_id' tool arg to int, or returns an error dict if
+    it's missing/None/non-numeric. Gemini (especially the flash-lite fallback
+    model) can omit this before it has looked the customer up -- surfacing an
+    error here lets it retry with a corrected call instead of raising and
+    aborting the whole tool-dispatch loop."""
+    raw_customer_id = tool_args.get('customer_id')
+    if raw_customer_id is None:
+        return None, {'error': 'Missing required argument: customer_id'}
+    try:
+        return int(raw_customer_id), None
+    except (TypeError, ValueError):
+        return None, {'error': f'Invalid customer_id: {raw_customer_id!r}'}
+
+
 def _dispatch_gemini_tool(appmod, tenant_id, sender_phone, tool_name, tool_args):
     tool_args = tool_args or {}
     if tool_name == 'lookup_customer':
         return lookup_customer(appmod, tenant_id, tool_args.get('phone') or sender_phone)
     if tool_name == 'get_customer_status':
-        return get_customer_status(appmod, tenant_id, int(tool_args.get('customer_id')))
+        customer_id, error = _require_customer_id(tool_args)
+        if error:
+            return error
+        return get_customer_status(appmod, tenant_id, customer_id)
     if tool_name == 'network_diagnostic':
-        return network_diagnostic(appmod, tenant_id, int(tool_args.get('customer_id')), wait_seconds=15)
+        customer_id, error = _require_customer_id(tool_args)
+        if error:
+            return error
+        return network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=15)
     if tool_name == 'send_payment_link':
-        return send_payment_link(appmod, tenant_id, int(tool_args.get('customer_id')))
+        customer_id, error = _require_customer_id(tool_args)
+        if error:
+            return error
+        return send_payment_link(appmod, tenant_id, customer_id)
     if tool_name == 'escalate_to_human':
         raw_customer_id = tool_args.get('customer_id')
         return escalate_to_human(
@@ -1379,14 +1403,14 @@ def query_gemini_agent(appmod, tenant_id, api_key, incoming_text, sender_phone, 
     )
 
     candidate_models = [model or GEMINI_MODEL_PRIMARY, GEMINI_MODEL_FALLBACK]
+    roundtrips_remaining = GEMINI_MAX_TOOL_ROUNDTRIPS
     for attempt, candidate_model in enumerate(candidate_models):
         try:
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(model=candidate_model, contents=list(contents), config=config)
 
-            for _ in range(GEMINI_MAX_TOOL_ROUNDTRIPS):
-                if not response.function_calls:
-                    break
+            while response.function_calls and roundtrips_remaining > 0:
+                roundtrips_remaining -= 1
                 contents.append(response.candidates[0].content)
                 response_parts = []
                 for fc in response.function_calls:
