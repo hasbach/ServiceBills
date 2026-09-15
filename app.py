@@ -1573,6 +1573,8 @@ class CSAgentSettings(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, unique=True, index=True)
     elevenlabs_agent_id = db.Column(db.String(100), nullable=True)
     admin_mobile_number = db.Column(db.String(50), nullable=True)
+    gemini_api_key = db.Column(EncryptedString, nullable=True)   # tenant's own free-tier key; encrypted at rest
+    gemini_model = db.Column(db.String(50), nullable=True)       # optional override; None -> default Flash/Flash-Lite chain
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -1583,6 +1585,8 @@ class CSAgentSettings(db.Model):
             'tenant_id': self.tenant_id,
             'elevenlabs_agent_id': self.elevenlabs_agent_id or '',
             'admin_mobile_number': self.admin_mobile_number or '',
+            'gemini_api_key': self.gemini_api_key or '',
+            'gemini_model': self.gemini_model or '',
             'is_active': self.is_active,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
@@ -1639,6 +1643,40 @@ class CSAgentMessageLog(db.Model):
             'tool_output': self.tool_output,
             'transcript': self.transcript,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+        }
+
+
+class CSAgentKnowledgeEntry(db.Model):
+    """Tenant-curated question/answer pairs the Gemini brain draws on for that
+    tenant's recurring questions. Only admin-added or admin-approved entries
+    land here -- never raw, unreviewed conversation logs (see
+    docs/superpowers/specs/2026-09-16-cs-agent-gemini-brain-design.md)."""
+    __tablename__ = "cs_agent_knowledge_entry"
+    __table_args__ = (
+        db.Index('ix_cs_agent_knowledge_entry_tenant_active', 'tenant_id', 'is_active'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    question_text = db.Column(db.Text, nullable=False)
+    answer_text = db.Column(db.Text, nullable=False)
+    source = db.Column(db.String(20), nullable=False, default='manual')  # 'manual' | 'conversation_log'
+    source_log_id = db.Column(db.Integer, db.ForeignKey('cs_agent_message_log.id'), nullable=True)
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'tenant_id': self.tenant_id,
+            'question_text': self.question_text,
+            'answer_text': self.answer_text,
+            'source': self.source,
+            'source_log_id': self.source_log_id,
+            'is_active': self.is_active,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
         }
 
 

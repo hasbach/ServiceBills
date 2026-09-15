@@ -711,4 +711,39 @@ def test_escalate_to_human_sends_customer_reply_alert_template(app, client, monk
         assert any("عطل في الراوتر" in t for t in param_texts)
 
 
+def test_cs_agent_settings_gemini_fields_round_trip(app, client):
+    """CSAgentSettings persists and returns gemini_api_key / gemini_model."""
+    auth_headers(client, "admin_gemini_fields", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        settings = appmod.CSAgentSettings(tenant_id=tenant.id)
+        settings.gemini_api_key = 'AIzaTestKey123'
+        settings.gemini_model = 'gemini-2.5-flash-lite'
+        appmod.db.session.add(settings)
+        appmod.db.session.commit()
+
+        reloaded = appmod.CSAgentSettings.query.filter_by(tenant_id=tenant.id).first()
+        assert reloaded.gemini_api_key == 'AIzaTestKey123'
+        assert reloaded.to_dict()['gemini_model'] == 'gemini-2.5-flash-lite'
+
+
+def test_cs_agent_knowledge_entry_tenant_scoped(app, client):
+    """A CSAgentKnowledgeEntry belongs to exactly one tenant and round-trips."""
+    auth_headers(client, "admin_knowledge_scoped", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        entry = appmod.CSAgentKnowledgeEntry(
+            tenant_id=tenant.id,
+            question_text='شو بواقي اشتراكي؟',
+            answer_text='بواقيك 25 دولار، تنتهي بعد 20 يوم.',
+            source='manual'
+        )
+        appmod.db.session.add(entry)
+        appmod.db.session.commit()
+
+        reloaded = appmod.CSAgentKnowledgeEntry.query.filter_by(tenant_id=tenant.id).first()
+        assert reloaded.question_text == 'شو بواقي اشتراكي؟'
+        assert reloaded.is_active is True
+        assert reloaded.to_dict()['source'] == 'manual'
+
 
