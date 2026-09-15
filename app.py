@@ -12410,6 +12410,85 @@ def cs_get_recent_tickets():
     }), 200
 
 
+@app.route('/api/cs-agent/memory', methods=['GET', 'POST'])
+def cs_agent_memory():
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        question_text = (data.get('question_text') or '').strip()
+        answer_text = (data.get('answer_text') or '').strip()
+        if not question_text or not answer_text:
+            return jsonify(error="question_text and answer_text are required"), 400
+
+        created_by_id = None
+        try:
+            verify_jwt_in_request(optional=True)
+            claims = get_jwt()
+            if claims and claims.get('user_id'):
+                created_by_id = int(claims['user_id'])
+        except Exception:
+            pass
+
+        source = data.get('source') or 'manual'
+        source_log_id = data.get('source_log_id')
+        entry = cs_agent_tools.add_knowledge_entry(
+            appmod, tenant_id, question_text, answer_text,
+            source=source, source_log_id=source_log_id, created_by_id=created_by_id
+        )
+        return jsonify(status='ok', entry=entry.to_dict()), 200
+
+    entries = cs_agent_tools.list_knowledge_entries(appmod, tenant_id)
+    return jsonify(status='ok', entries=[e.to_dict() for e in entries]), 200
+
+
+@app.route('/api/cs-agent/memory/recent-logs', methods=['GET'])
+def cs_agent_memory_recent_logs():
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+
+    limit = min(int(request.args.get('limit', 50)), 100)
+    logs = CSAgentMessageLog.query.filter_by(tenant_id=tenant_id).order_by(
+        CSAgentMessageLog.id.desc()
+    ).limit(limit).all()
+    return jsonify(status='ok', logs=[l.to_dict() for l in logs]), 200
+
+
+@app.route('/api/cs-agent/memory/<int:entry_id>', methods=['PUT'])
+def cs_agent_memory_update(entry_id):
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+
+    data = request.get_json(silent=True) or {}
+    if 'is_active' not in data:
+        return jsonify(error="is_active is required"), 400
+
+    ok = cs_agent_tools.set_knowledge_entry_active(appmod, tenant_id, entry_id, bool(data['is_active']))
+    if not ok:
+        return jsonify(error="Entry not found"), 404
+    return jsonify(status='ok'), 200
+
+
+@app.route('/api/cs-agent/memory/<int:entry_id>', methods=['DELETE'])
+def cs_agent_memory_delete(entry_id):
+    appmod = sys.modules[__name__]
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized or tenant_id required"), 401
+
+    ok = cs_agent_tools.delete_knowledge_entry(appmod, tenant_id, entry_id)
+    if not ok:
+        return jsonify(error="Entry not found"), 404
+    return jsonify(status='ok'), 200
+
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):

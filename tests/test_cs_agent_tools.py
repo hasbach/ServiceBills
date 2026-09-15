@@ -840,3 +840,72 @@ def test_add_list_and_deactivate_knowledge_entry(app, client):
         assert results == []
 
 
+def test_memory_endpoints_crud(app, client):
+    """POST creates, GET lists, PUT deactivates, DELETE removes -- all tenant-scoped."""
+    headers = auth_headers(client, "admin_memory_crud", "pw123")
+
+    create_res = client.post(
+        "/api/cs-agent/memory",
+        json={"question_text": "شو بدل التركيب؟", "answer_text": "50 دولار تركيب لمرة وحدة."},
+        headers=headers
+    )
+    assert create_res.status_code == 200
+    entry_id = create_res.get_json()["entry"]["id"]
+    assert create_res.get_json()["entry"]["source"] == "manual"
+
+    list_res = client.get("/api/cs-agent/memory", headers=headers)
+    assert list_res.status_code == 200
+    assert any(e["id"] == entry_id for e in list_res.get_json()["entries"])
+
+    deactivate_res = client.put(
+        f"/api/cs-agent/memory/{entry_id}", json={"is_active": False}, headers=headers
+    )
+    assert deactivate_res.status_code == 200
+
+    delete_res = client.delete(f"/api/cs-agent/memory/{entry_id}", headers=headers)
+    assert delete_res.status_code == 200
+
+    list_after = client.get("/api/cs-agent/memory", headers=headers)
+    assert not any(e["id"] == entry_id for e in list_after.get_json()["entries"])
+
+
+def test_memory_endpoints_are_tenant_isolated(app, client):
+    """A tenant can't see, edit, or delete another tenant's memory entries."""
+    headers_a = auth_headers(client, "admin_memory_a", "pw123")
+    create_res = client.post(
+        "/api/cs-agent/memory",
+        json={"question_text": "سؤال تينانت A", "answer_text": "جواب تينانت A"},
+        headers=headers_a
+    )
+    entry_id = create_res.get_json()["entry"]["id"]
+
+    headers_b = auth_headers(client, "admin_memory_b", "pw123")
+    list_res_b = client.get("/api/cs-agent/memory", headers=headers_b)
+    assert not any(e["id"] == entry_id for e in list_res_b.get_json()["entries"])
+
+    # Tenant B can't deactivate or delete tenant A's entry
+    put_res = client.put(f"/api/cs-agent/memory/{entry_id}", json={"is_active": False}, headers=headers_b)
+    assert put_res.status_code == 404
+    delete_res = client.delete(f"/api/cs-agent/memory/{entry_id}", headers=headers_b)
+    assert delete_res.status_code == 404
+
+
+def test_memory_recent_logs_endpoint(app, client):
+    """GET /api/cs-agent/memory/recent-logs returns this tenant's recent CS agent message logs."""
+    headers = auth_headers(client, "admin_recent_logs", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        appmod.db.session.add(appmod.CSAgentMessageLog(
+            tenant_id=tenant.id, direction='in', transcript='شو رصيدي؟'
+        ))
+        appmod.db.session.add(appmod.CSAgentMessageLog(
+            tenant_id=tenant.id, direction='out', transcript='رصيدك 25 دولار.'
+        ))
+        appmod.db.session.commit()
+
+    res = client.get("/api/cs-agent/memory/recent-logs", headers=headers)
+    assert res.status_code == 200
+    logs = res.get_json()["logs"]
+    assert len(logs) >= 2
+    assert any(l["transcript"] == 'شو رصيدي؟' for l in logs)
+
