@@ -75,6 +75,74 @@ def normalize_lebanese_phone(raw_phone):
     return {c for c in candidates if c}
 
 
+def search_knowledge_entries(appmod, tenant_id, query_text, limit=5):
+    """Keyword-matches active CSAgentKnowledgeEntry rows for this tenant against
+    query_text, ranked by number of matched words. No embeddings/vector store --
+    see docs/superpowers/specs/2026-09-16-cs-agent-gemini-brain-design.md for why.
+    """
+    words = [w for w in re.findall(r'\w+', (query_text or ''), re.UNICODE) if len(w) >= 3]
+    if not words:
+        return []
+
+    entry_model = appmod.CSAgentKnowledgeEntry
+    conditions = [entry_model.question_text.ilike(f'%{w}%') for w in words[:10]]
+    candidates = entry_model.query.filter_by(tenant_id=tenant_id, is_active=True).filter(
+        appmod.db.or_(*conditions)
+    ).limit(limit * 3).all()
+
+    lowered_words = [w.lower() for w in words]
+
+    def _score(entry):
+        qt = (entry.question_text or '').lower()
+        return sum(1 for w in lowered_words if w in qt)
+
+    candidates.sort(key=_score, reverse=True)
+    return candidates[:limit]
+
+
+def add_knowledge_entry(appmod, tenant_id, question_text, answer_text, source='manual', source_log_id=None, created_by_id=None):
+    """Creates a CSAgentKnowledgeEntry row. Used by both the manual-add form and
+    the promote-from-conversation-log flow."""
+    entry = appmod.CSAgentKnowledgeEntry(
+        tenant_id=tenant_id,
+        question_text=(question_text or '').strip(),
+        answer_text=(answer_text or '').strip(),
+        source=source,
+        source_log_id=source_log_id,
+        created_by_id=created_by_id,
+    )
+    appmod.db.session.add(entry)
+    appmod.db.session.commit()
+    return entry
+
+
+def list_knowledge_entries(appmod, tenant_id):
+    """All entries (active and inactive) for a tenant, newest first."""
+    return appmod.CSAgentKnowledgeEntry.query.filter_by(
+        tenant_id=tenant_id
+    ).order_by(appmod.CSAgentKnowledgeEntry.id.desc()).all()
+
+
+def set_knowledge_entry_active(appmod, tenant_id, entry_id, is_active):
+    """Activates/deactivates an entry. Returns False if it doesn't belong to this tenant."""
+    entry = appmod.CSAgentKnowledgeEntry.query.filter_by(id=entry_id, tenant_id=tenant_id).first()
+    if not entry:
+        return False
+    entry.is_active = bool(is_active)
+    appmod.db.session.commit()
+    return True
+
+
+def delete_knowledge_entry(appmod, tenant_id, entry_id):
+    """Permanently deletes an entry. Returns False if it doesn't belong to this tenant."""
+    entry = appmod.CSAgentKnowledgeEntry.query.filter_by(id=entry_id, tenant_id=tenant_id).first()
+    if not entry:
+        return False
+    appmod.db.session.delete(entry)
+    appmod.db.session.commit()
+    return True
+
+
 def resolve_tenant_id(appmod):
     """Resolve tenant_id from JWT claims or request parameters / header.
     Returns (tenant_id, is_jwt_authenticated).

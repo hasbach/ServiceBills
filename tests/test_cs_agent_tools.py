@@ -780,3 +780,63 @@ def test_cs_agent_knowledge_entry_tenant_scoped(app, client):
         assert reloaded.to_dict()['source'] == 'manual'
 
 
+def test_search_knowledge_entries_keyword_match_and_tenant_isolation(app, client):
+    """Keyword search finds a relevant entry for the right tenant, and never for another tenant."""
+    import cs_agent_tools
+
+    auth_headers(client, "admin_knowledge_t1", "pw123")
+    with app.app_context():
+        t1_id = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first().id
+
+    auth_headers(client, "admin_knowledge_t2", "pw123")
+    with app.app_context():
+        t2_id = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first().id
+        assert t2_id != t1_id
+
+        appmod.db.session.add(appmod.CSAgentKnowledgeEntry(
+            tenant_id=t1_id, question_text="كيف بدي جدد اشتراكي؟", answer_text="ابعتلك رابط دفع فوراً."
+        ))
+        appmod.db.session.add(appmod.CSAgentKnowledgeEntry(
+            tenant_id=t2_id, question_text="كيف بدي جدد اشتراكي؟", answer_text="جواب تينانت تاني ما لازم يظهر."
+        ))
+        appmod.db.session.commit()
+
+        results = cs_agent_tools.search_knowledge_entries(appmod, t1_id, "بدي جدد اشتراكي شو بعمل", limit=5)
+        assert len(results) == 1
+        assert results[0].answer_text == "ابعتلك رابط دفع فوراً."
+
+
+def test_search_knowledge_entries_no_match_returns_empty(app, client):
+    """An unrelated question, or a tenant with zero entries, returns an empty list -- not an error."""
+    import cs_agent_tools
+    auth_headers(client, "admin_knowledge_empty", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        results = cs_agent_tools.search_knowledge_entries(appmod, tenant.id, "شي غير موجود إطلاقاً", limit=5)
+        assert results == []
+
+
+def test_add_list_and_deactivate_knowledge_entry(app, client):
+    """Manual add, list, and deactivate round-trip correctly."""
+    import cs_agent_tools
+    auth_headers(client, "admin_knowledge_crud", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        entry = cs_agent_tools.add_knowledge_entry(
+            appmod, tenant.id, "شو أوقات الدعم الفني؟", "من 9 الصبح لـ 9 الليل كل يوم."
+        )
+        assert entry.id is not None
+
+        entries = cs_agent_tools.list_knowledge_entries(appmod, tenant.id)
+        assert any(e.id == entry.id for e in entries)
+
+        ok = cs_agent_tools.set_knowledge_entry_active(appmod, tenant.id, entry.id, False)
+        assert ok is True
+        reloaded = appmod.CSAgentKnowledgeEntry.query.get(entry.id)
+        assert reloaded.is_active is False
+
+        # Deactivated entries never come back from search
+        results = cs_agent_tools.search_knowledge_entries(appmod, tenant.id, "شو أوقات الدعم الفني", limit=5)
+        assert results == []
+
+
