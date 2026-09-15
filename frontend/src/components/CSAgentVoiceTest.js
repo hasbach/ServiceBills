@@ -19,6 +19,8 @@ export default function CSAgentVoiceTest() {
     const [adminMobile, setAdminMobile] = useState('');
     const [isEditingAgentId, setIsEditingAgentId] = useState(false);
     const [isEditingAdminMobile, setIsEditingAdminMobile] = useState(false);
+    const [geminiApiKey, setGeminiApiKey] = useState('');
+    const [isEditingGeminiKey, setIsEditingGeminiKey] = useState(false);
     const [status, setStatus] = useState('idle'); // idle | connecting | connected | speaking | listening | error
     const [errorMessage, setErrorMessage] = useState('');
     const [isMuted, setIsMuted] = useState(false);
@@ -54,6 +56,7 @@ export default function CSAgentVoiceTest() {
                 if (res.data) {
                     if (res.data.elevenlabs_agent_id) setAgentId(res.data.elevenlabs_agent_id);
                     if (res.data.admin_mobile_number) setAdminMobile(res.data.admin_mobile_number);
+                    if (res.data.gemini_api_key) setGeminiApiKey(res.data.gemini_api_key);
                 }
             })
             .catch(() => {
@@ -87,12 +90,14 @@ export default function CSAgentVoiceTest() {
             const token = localStorage.getItem('token');
             await axios.post('/api/cs-agent/config', {
                 elevenlabs_agent_id: agentId.trim(),
-                admin_mobile_number: adminMobile.trim()
+                admin_mobile_number: adminMobile.trim(),
+                gemini_api_key: geminiApiKey.trim()
             }, { headers: { Authorization: `Bearer ${token}` } });
-            
+
             setSaveSuccess('تم حفظ إعدادات الـ Agent بنجاح!');
             setIsEditingAgentId(false);
             setIsEditingAdminMobile(false);
+            setIsEditingGeminiKey(false);
         } catch (err) {
             setErrorMessage(err.response?.data?.error || 'حدث خطأ أثناء الحفظ.');
         } finally {
@@ -521,8 +526,41 @@ export default function CSAgentVoiceTest() {
                                     InputProps={{
                                         endAdornment: (
                                             <InputAdornment position="end">
-                                                <IconButton 
-                                                    onClick={() => setIsEditingAdminMobile(true)} 
+                                                <IconButton
+                                                    onClick={() => setIsEditingAdminMobile(true)}
+                                                    disabled={status !== 'idle' && status !== 'error'}
+                                                    edge="end"
+                                                >
+                                                    <EditIcon fontSize="small" />
+                                                </IconButton>
+                                            </InputAdornment>
+                                        )
+                                    }}
+                                />
+                            </Box>
+
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 4, flexWrap: 'wrap' }}>
+                                <TextField
+                                    size="small"
+                                    label="Gemini API Key (free tier)"
+                                    value={geminiApiKey}
+                                    onChange={(e) => setGeminiApiKey(e.target.value)}
+                                    placeholder="AIza..."
+                                    disabled={!isEditingGeminiKey || (status !== 'idle' && status !== 'error')}
+                                    helperText={
+                                        <span>
+                                            بيحل محل ElevenLabs كـ"دماغ" الرد على الواتساب مجاناً.{' '}
+                                            <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">
+                                                احصل على مفتاح مجاني من هون
+                                            </a>
+                                        </span>
+                                    }
+                                    sx={{ minWidth: 260, flexGrow: 1 }}
+                                    InputProps={{
+                                        endAdornment: (
+                                            <InputAdornment position="end">
+                                                <IconButton
+                                                    onClick={() => setIsEditingGeminiKey(true)}
                                                     disabled={status !== 'idle' && status !== 'error'}
                                                     edge="end"
                                                 >
