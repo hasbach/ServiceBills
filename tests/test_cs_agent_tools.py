@@ -584,8 +584,11 @@ def test_query_elevenlabs_conversational_ai_timeout_fallback(monkeypatch):
     assert res is None
 
 
-def test_handle_whatsapp_cs_ai_reply_with_convai(app, client, monkeypatch):
-    """handle_whatsapp_cs_ai_reply uses ElevenLabs ConvAI reply when available and falls back gracefully."""
+def test_handle_whatsapp_cs_ai_reply_with_gemini(app, client, monkeypatch):
+    """handle_whatsapp_cs_ai_reply uses the Gemini brain reply when available
+    (tenant has a gemini_api_key configured) and falls back gracefully when
+    Gemini returns None. Supersedes the old ElevenLabs-ConvAI-in-WhatsApp-path
+    test now that Task 6 has replaced that wiring with query_gemini_agent."""
     import cs_agent_tools
     from unittest.mock import MagicMock
 
@@ -610,31 +613,35 @@ def test_handle_whatsapp_cs_ai_reply_with_convai(app, client, monkeypatch):
         cust_id, _ = _setup_customer(app, tenant.id, "Nour Al-Hassan", "71112233", balance=0.0)
         cust = appmod.db.session.get(appmod.Customer, cust_id)
 
+        cs_settings = appmod.CSAgentSettings(tenant_id=tenant.id, gemini_api_key="fake-gemini-key")
+        appmod.db.session.add(cs_settings)
+        appmod.db.session.commit()
+
         settings = MagicMock()
         settings.access_token = "mock_token"
         settings.phone_number_id = "mock_phone_id"
         settings.elevenlabs_agent_id = "agent_convai_123"
         settings.api_version = "v19.0"
 
-        # Case 1: ElevenLabs ConvAI succeeds
+        # Case 1: Gemini brain succeeds
         monkeypatch.setattr(
             cs_agent_tools,
-            "query_elevenlabs_conversational_ai",
-            lambda **kw: {"intent": "elevenlabs_convai", "reply_text": "اهلاً يا نور، كيف فيني ساعدك اليوم؟", "ticket_tag": "محادثة ذكاء اصطناعي", "escalate": False}
+            "query_gemini_agent",
+            lambda *a, **kw: {"intent": "gemini_agent", "reply_text": "اهلاً يا نور، كيف فيني ساعدك اليوم؟", "ticket_tag": "محادثة ذكاء اصطناعي", "escalate": False}
         )
 
         res = cs_agent_tools.handle_whatsapp_cs_ai_reply(
             appmod, tenant.id, "96171112233", cust, "مرحبا يارا", is_voice=False, settings=settings
         )
-        assert res["intent"] == "elevenlabs_convai"
+        assert res["intent"] == "gemini_agent"
         assert res["reply_text"] == "اهلاً يا نور، كيف فيني ساعدك اليوم؟"
 
         # Verify sent WhatsApp payload contains Yara's response
         text_payloads = [p for u, p in sent_payloads if p.get("type") == "text"]
         assert any("اهلاً يا نور" in p["text"]["body"] for p in text_payloads)
 
-        # Case 2: ElevenLabs ConvAI times out / returns None -> graceful fallback
-        monkeypatch.setattr(cs_agent_tools, "query_elevenlabs_conversational_ai", lambda **kw: None)
+        # Case 2: Gemini brain returns None -> graceful fallback to rule-based processor
+        monkeypatch.setattr(cs_agent_tools, "query_gemini_agent", lambda *a, **kw: None)
 
         res_fallback = cs_agent_tools.handle_whatsapp_cs_ai_reply(
             appmod, tenant.id, "96171112233", cust, "قديش في عليي رصيد", is_voice=False, settings=settings
@@ -968,4 +975,63 @@ def test_memory_endpoint_unauthenticated_has_null_created_by_id(app, client):
 
     # Verify created_by_id is None when not authenticated with JWT
     assert entry_data["created_by_id"] is None
+
+
+def test_whatsapp_reply_uses_gemini_when_tenant_key_configured(app, client):
+    """handle_whatsapp_cs_ai_reply calls query_gemini_agent (not ElevenLabs
+    ConvAI) when the tenant has a gemini_api_key configured."""
+    import cs_agent_tools
+    from unittest.mock import patch, MagicMock
+
+    auth_headers(client, "admin_wa_gemini", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        settings = appmod.CSAgentSettings(tenant_id=tenant.id, gemini_api_key="fake-key")
+        appmod.db.session.add(settings)
+
+        wa_settings = MagicMock()
+        wa_settings.access_token = "wa-token"
+        wa_settings.phone_number_id = "123"
+        wa_settings.api_version = "v19.0"
+        appmod.db.session.commit()
+
+        with patch("cs_agent_tools.query_gemini_agent") as mock_gemini, \
+             patch("cs_agent_tools.query_elevenlabs_conversational_ai") as mock_convai, \
+             patch("requests.post"):
+            mock_gemini.return_value = {
+                "intent": "gemini_agent", "reply_text": "جواب من جيميناي",
+                "ticket_tag": "محادثة ذكاء اصطناعي", "escalate": False
+            }
+            cs_agent_tools.handle_whatsapp_cs_ai_reply(
+                appmod, tenant.id, "70123456", None, "شو رصيدي؟",
+                is_voice=False, settings=wa_settings
+            )
+
+        mock_gemini.assert_called_once()
+        mock_convai.assert_not_called()
+
+
+def test_whatsapp_reply_falls_back_to_rule_based_without_gemini_key(app, client):
+    """With no gemini_api_key configured, query_gemini_agent is never called
+    and the rule-based processor answers instead."""
+    import cs_agent_tools
+    from unittest.mock import patch, MagicMock
+
+    auth_headers(client, "admin_wa_no_gemini", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+
+        wa_settings = MagicMock()
+        wa_settings.access_token = "wa-token"
+        wa_settings.phone_number_id = "123"
+        wa_settings.api_version = "v19.0"
+
+        with patch("cs_agent_tools.query_gemini_agent") as mock_gemini, \
+             patch("requests.post"):
+            cs_agent_tools.handle_whatsapp_cs_ai_reply(
+                appmod, tenant.id, "70123456", None, "مرحبا",
+                is_voice=False, settings=wa_settings
+            )
+
+        mock_gemini.assert_not_called()
 

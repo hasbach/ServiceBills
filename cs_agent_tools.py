@@ -1953,10 +1953,12 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     except Exception as e_sess:
         logging.warning(f"Error checking active session: {e_sess}")
 
-    # Resolve target ElevenLabs agent ID and admin permissions
+    # Resolve target ElevenLabs agent ID (still used for TTS voice selection)
+    # and admin permissions, and this tenant's own Gemini key (the brain).
     target_agent_id = getattr(settings, 'elevenlabs_agent_id', None)
     is_admin = False
-    
+    cs_settings = None
+
     try:
         cs_settings = appmod.CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
         if cs_settings:
@@ -1968,7 +1970,7 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
                     is_admin = True
     except Exception:
         pass
-        
+
     if not target_agent_id:
         try:
             target_agent_id = current_app.config.get('ELEVENLABS_AGENT_ID') or os.environ.get('ELEVENLABS_AGENT_ID')
@@ -1991,26 +1993,16 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
             logging.warning(f"Error fetching recent session history: {ex_hist}")
 
     ai_result = None
-    if target_agent_id:
+    gemini_key = getattr(cs_settings, 'gemini_api_key', None) if cs_settings else None
+    if gemini_key:
         try:
-            ai_result = query_elevenlabs_conversational_ai(
-                agent_id=target_agent_id,
-                incoming_text=incoming_text,
-                sender_phone=sender_phone,
-                customer=customer,
-                recent_history=recent_history,
-                # A diagnostic request can now take TWO sequential tool calls (the
-                # agent asks for the caller's phone number since it's no longer in
-                # context, then looks the customer up, then runs network_diagnostic
-                # -- itself capped at NETWORK_DIAGNOSTIC_LATENCY_CEILING=20s). 35s
-                # was measured cutting that chain off mid-tool-call, returning the
-                # "checking now" filler instead of the real answer; 55s gives that
-                # chain realistic headroom.
-                timeout=55,
-                is_admin=is_admin
+            ai_result = query_gemini_agent(
+                appmod, tenant_id, gemini_key, incoming_text, sender_phone,
+                customer=customer, recent_history=recent_history,
+                model=getattr(cs_settings, 'gemini_model', None), is_admin=is_admin
             )
-        except Exception as ex_conv:
-            logging.warning(f"ElevenLabs ConvAI call failed, will fallback: {ex_conv}")
+        except Exception as ex_gemini:
+            logging.warning(f"Gemini agent call failed, will fallback: {ex_gemini}")
 
     # Fallback to local rule-based AI processor if ElevenLabs ConvAI did not return a response
     if not ai_result or not ai_result.get("reply_text"):
