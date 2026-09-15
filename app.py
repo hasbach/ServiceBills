@@ -12207,6 +12207,10 @@ def cs_agent_config():
                 settings.elevenlabs_agent_id = (data.get('elevenlabs_agent_id') or '').strip()
             if 'admin_mobile_number' in data:
                 settings.admin_mobile_number = (data.get('admin_mobile_number') or '').strip()
+            if 'gemini_api_key' in data:
+                settings.gemini_api_key = (data.get('gemini_api_key') or '').strip()
+            if 'gemini_model' in data:
+                settings.gemini_model = (data.get('gemini_model') or '').strip()
             db.session.commit()
             return jsonify(status='ok', settings=settings.to_dict()), 200
         except Exception as e:
@@ -12215,12 +12219,16 @@ def cs_agent_config():
 
     agent_id = ''
     admin_mobile_number = ''
+    gemini_api_key = ''
+    gemini_model = ''
     if tenant_id:
         try:
             settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
             if settings:
                 agent_id = settings.elevenlabs_agent_id or ''
                 admin_mobile_number = settings.admin_mobile_number or ''
+                gemini_api_key = settings.gemini_api_key or ''
+                gemini_model = settings.gemini_model or ''
         except Exception:
             db.session.rollback()
 
@@ -12231,6 +12239,9 @@ def cs_agent_config():
         'status': 'ok',
         'elevenlabs_agent_id': agent_id,
         'admin_mobile_number': admin_mobile_number,
+        'gemini_api_key': gemini_api_key,
+        'gemini_model': gemini_model,
+        'has_gemini_key': bool(gemini_api_key),
         'has_agent_id': bool(agent_id),
         'ws_url': f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={agent_id}" if agent_id else None
     }), 200

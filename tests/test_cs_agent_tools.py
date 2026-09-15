@@ -727,6 +727,39 @@ def test_cs_agent_settings_gemini_fields_round_trip(app, client):
         assert reloaded.to_dict()['gemini_model'] == 'gemini-2.5-flash-lite'
 
 
+def test_cs_agent_config_saves_gemini_key(app, client):
+    """POST /api/cs-agent/config saves a tenant's Gemini API key and model, and GET returns them."""
+    headers = auth_headers(client, "admin_gemini_config", "pw123")
+
+    save_res = client.post(
+        "/api/cs-agent/config",
+        json={
+            "elevenlabs_agent_id": "agent_keep_existing",
+            "gemini_api_key": "AIzaSyTestKeyForTenant",
+            "gemini_model": "gemini-2.5-flash-lite"
+        },
+        headers=headers
+    )
+    assert save_res.status_code == 200
+    assert save_res.get_json()["settings"]["gemini_api_key"] == "AIzaSyTestKeyForTenant"
+
+    get_res = client.get("/api/cs-agent/config", headers=headers)
+    assert get_res.status_code == 200
+    data = get_res.get_json()
+    assert data["gemini_api_key"] == "AIzaSyTestKeyForTenant"
+    assert data["gemini_model"] == "gemini-2.5-flash-lite"
+    assert data["has_gemini_key"] is True
+
+
+def test_cs_agent_config_no_gemini_key_by_default(app, client):
+    """A tenant that never set a Gemini key gets has_gemini_key: False, never another tenant's key."""
+    headers = auth_headers(client, "admin_no_gemini", "pw123")
+    get_res = client.get("/api/cs-agent/config", headers=headers)
+    data = get_res.get_json()
+    assert data["gemini_api_key"] == ""
+    assert data["has_gemini_key"] is False
+
+
 def test_cs_agent_knowledge_entry_tenant_scoped(app, client):
     """A CSAgentKnowledgeEntry belongs to exactly one tenant and round-trips."""
     auth_headers(client, "admin_knowledge_scoped", "pw123")
