@@ -909,3 +909,63 @@ def test_memory_recent_logs_endpoint(app, client):
     assert len(logs) >= 2
     assert any(l["transcript"] == 'شو رصيدي؟' for l in logs)
 
+
+def test_memory_endpoint_creates_entry_with_authenticated_user_id(app, client):
+    """POST /api/cs-agent/memory with JWT auth sets created_by_id to the authenticated user's ID."""
+    username = "admin_memory_user_id"
+    password = "pw123"
+    headers = auth_headers(client, username, password)
+
+    with app.app_context():
+        # Get the authenticated user's ID
+        user = appmod.User.query.filter_by(username=username).first()
+        assert user is not None
+        expected_user_id = user.id
+
+    # POST to create a memory entry with JWT authentication
+    create_res = client.post(
+        "/api/cs-agent/memory",
+        json={"question_text": "شو بدل التركيب؟", "answer_text": "50 دولار تركيب لمرة وحدة."},
+        headers=headers
+    )
+    assert create_res.status_code == 200
+    entry_data = create_res.get_json()["entry"]
+    entry_id = entry_data["id"]
+
+    # Verify created_by_id is set to the authenticated user's ID
+    assert entry_data["created_by_id"] == expected_user_id
+
+    # Verify in database that created_by_id is persisted
+    with app.app_context():
+        entry = appmod.CSAgentKnowledgeEntry.query.get(entry_id)
+        assert entry is not None
+        assert entry.created_by_id == expected_user_id
+
+
+def test_memory_endpoint_unauthenticated_has_null_created_by_id(app, client):
+    """POST /api/cs-agent/memory without JWT auth has created_by_id as None."""
+    app.config["CS_AGENT_SECRET"] = "test_secret_key_xyz"
+
+    # Set up a tenant using auth_headers, then make an unauthenticated request with agent secret
+    auth_headers(client, "admin_memory_no_jwt", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_memory_no_jwt").first()
+        assert tenant is not None
+        tenant_id = tenant.id
+
+    # POST with agent secret (not JWT) should have created_by_id as None
+    create_res = client.post(
+        "/api/cs-agent/memory",
+        json={
+            "question_text": "سؤال بدون تحقق",
+            "answer_text": "جواب بدون تحقق",
+            "tenant_id": tenant_id
+        },
+        headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}
+    )
+    assert create_res.status_code == 200
+    entry_data = create_res.get_json()["entry"]
+
+    # Verify created_by_id is None when not authenticated with JWT
+    assert entry_data["created_by_id"] is None
+

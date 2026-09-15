@@ -1674,6 +1674,7 @@ class CSAgentKnowledgeEntry(db.Model):
             'answer_text': self.answer_text,
             'source': self.source,
             'source_log_id': self.source_log_id,
+            'created_by_id': self.created_by_id,
             'is_active': self.is_active,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
@@ -12427,9 +12428,11 @@ def cs_agent_memory():
         created_by_id = None
         try:
             verify_jwt_in_request(optional=True)
-            claims = get_jwt()
-            if claims and claims.get('user_id'):
-                created_by_id = int(claims['user_id'])
+            current_username = get_jwt_identity()
+            if current_username:
+                current_user = User.query.filter_by(username=current_username).first()
+                if current_user:
+                    created_by_id = current_user.id
         except Exception:
             pass
 
