@@ -526,11 +526,7 @@ export default function CSAgentVoiceTest() {
                                     InputProps={{
                                         endAdornment: (
                                             <InputAdornment position="end">
-                                                <IconButton
-                                                    onClick={() => setIsEditingAdminMobile(true)}
-                                                    disabled={status !== 'idle' && status !== 'error'}
-                                                    edge="end"
-                                                >
+                                                <IconButton onClick={() => setIsEditingAdminMobile(true)}>
                                                     <EditIcon fontSize="small" />
                                                 </IconButton>
                                             </InputAdornment>
