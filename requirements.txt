@@ -25,3 +25,4 @@ sentry-sdk[flask]==2.19.0
 websocket-client
 gevent
 psycogreen
+google-genai

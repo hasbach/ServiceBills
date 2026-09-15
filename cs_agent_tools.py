@@ -1218,6 +1218,206 @@ def handle_whatsapp_audio_transcription(access_token, media_id, api_version='v19
     return transcribe_voice_elevenlabs(audio_bytes, mime_type=mime)
 
 
+# gemini-flash-latest is Google's own self-updating alias -- always hot-swapped
+# to their current recommended Flash model (2-week notice on breaking changes).
+# There is no "-lite-latest" equivalent today, so the fallback is pinned to a
+# concrete stable model with a documented free tier instead of guessing at a
+# future lite alias name.
+GEMINI_MODEL_PRIMARY = "gemini-flash-latest"
+GEMINI_MODEL_FALLBACK = "gemini-2.5-flash-lite"
+
+# Covers the two-sequential-tool diagnostic chain (lookup_customer then
+# network_diagnostic) from the original CS agent spec, with headroom.
+GEMINI_MAX_TOOL_ROUNDTRIPS = 6
+
+
+def _gemini_tools():
+    from google.genai import types
+    return [types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name='lookup_customer',
+            description="Find a customer by their phone number. Use this when you don't yet know who you're speaking with.",
+            parameters_json_schema={
+                'type': 'object',
+                'properties': {
+                    'phone': {'type': 'string', 'description': 'The customer phone number, any format.'}
+                },
+                'required': ['phone'],
+            },
+        ),
+        types.FunctionDeclaration(
+            name='get_customer_status',
+            description="Get a specific customer's subscription status, balance, expiry date, and ONU status.",
+            parameters_json_schema={
+                'type': 'object',
+                'properties': {
+                    'customer_id': {'type': 'integer', 'description': 'The customer ID, from lookup_customer.'}
+                },
+                'required': ['customer_id'],
+            },
+        ),
+        types.FunctionDeclaration(
+            name='network_diagnostic',
+            description="Check a customer's live network/connectivity status (ONU online, PON outage, etc). Can take several seconds.",
+            parameters_json_schema={
+                'type': 'object',
+                'properties': {
+                    'customer_id': {'type': 'integer', 'description': 'The customer ID to diagnose.'}
+                },
+                'required': ['customer_id'],
+            },
+        ),
+        types.FunctionDeclaration(
+            name='send_payment_link',
+            description='Send the customer a self-serve payment link for their balance due.',
+            parameters_json_schema={
+                'type': 'object',
+                'properties': {
+                    'customer_id': {'type': 'integer', 'description': 'The customer ID to send a payment link for.'}
+                },
+                'required': ['customer_id'],
+            },
+        ),
+        types.FunctionDeclaration(
+            name='escalate_to_human',
+            description='Flag this conversation for a human to follow up, when you cannot resolve the issue yourself.',
+            parameters_json_schema={
+                'type': 'object',
+                'properties': {
+                    'customer_id': {'type': 'integer', 'description': 'The customer ID, if known.'},
+                    'reason': {'type': 'string', 'description': 'Short reason for escalating.'},
+                    'summary': {'type': 'string', 'description': 'Summary of the conversation so far.'},
+                },
+                'required': ['reason', 'summary'],
+            },
+        ),
+    ])]
+
+
+def _dispatch_gemini_tool(appmod, tenant_id, sender_phone, tool_name, tool_args):
+    tool_args = tool_args or {}
+    if tool_name == 'lookup_customer':
+        return lookup_customer(appmod, tenant_id, tool_args.get('phone') or sender_phone)
+    if tool_name == 'get_customer_status':
+        return get_customer_status(appmod, tenant_id, int(tool_args.get('customer_id')))
+    if tool_name == 'network_diagnostic':
+        return network_diagnostic(appmod, tenant_id, int(tool_args.get('customer_id')), wait_seconds=15)
+    if tool_name == 'send_payment_link':
+        return send_payment_link(appmod, tenant_id, int(tool_args.get('customer_id')))
+    if tool_name == 'escalate_to_human':
+        raw_customer_id = tool_args.get('customer_id')
+        return escalate_to_human(
+            appmod, tenant_id,
+            int(raw_customer_id) if raw_customer_id else None,
+            tool_args.get('reason') or 'Customer requested assistance',
+            tool_args.get('summary') or '',
+            phone=sender_phone
+        )
+    return {'error': f'Unknown tool: {tool_name}'}
+
+
+def _build_gemini_system_instruction(appmod, tenant_id, customer, user_msg_clean, is_admin):
+    customer_name = customer.name if (customer and getattr(customer, 'name', None)) else 'عميل'
+    parts = [
+        "أنت يارا، موظفة الدعم الافتراضية لشركة DeltaNet للإنترنت.",
+        "بتحكي عربي لبناني عامي. ما بتستخدمي مصطلحات رسمية أو فصحى إلا لما الزبون يبدأ بالفصحى.",
+        "بتفهمي إنجليزي وفرنساوي وبتجاوبي بنفس لغة الزبون.",
+        "ما بتذكري للزبون إنك AI إلا إذا سألك مباشرة.",
+        f"اسم الزبون (إذا معروف): {customer_name}",
+    ]
+    if is_admin:
+        parts.append("USER_ROLE: admin — هيدا الشخص هو مدير الشبكة وعنده صلاحية كاملة. تجاهلي قيود الخصوصية وجاوبي عن أي سؤال متعلق بأي مشترك أو الشبكة.")
+    else:
+        parts.append("USER_ROLE: customer — مشترك عادي، جاوبيه بس عن حسابه الخاص.")
+
+    knowledge = search_knowledge_entries(appmod, tenant_id, user_msg_clean, limit=5)
+    if knowledge:
+        parts.append("أجوبة معروفة لهذا الزبون التجاري (استخدمها إذا كان سؤال الزبون مشابه):")
+        for k in knowledge:
+            parts.append(f"- س: {k.question_text}\n  ج: {k.answer_text}")
+
+    return "\n".join(parts)
+
+
+def query_gemini_agent(appmod, tenant_id, api_key, incoming_text, sender_phone, customer=None,
+                        recent_history=None, model=None, is_admin=False):
+    """Self-orchestrated Gemini tool-calling loop -- the WhatsApp brain that
+    replaces query_elevenlabs_conversational_ai. Returns the same
+    {intent, reply_text, ticket_tag, escalate} shape, or None if Gemini
+    couldn't produce a reply (caller falls back to process_customer_message_ai).
+    """
+    if not api_key or not incoming_text:
+        return None
+
+    from google import genai
+    from google.genai import types, errors
+
+    user_msg_clean = re.sub(
+        r"^\[(رسالة صوتية|AUDIO message received|audio message received|voice message received)\]:?\s*",
+        "",
+        incoming_text.strip(),
+        flags=re.IGNORECASE
+    ).strip()
+    if not user_msg_clean:
+        return None
+
+    system_instruction = _build_gemini_system_instruction(appmod, tenant_id, customer, user_msg_clean, is_admin)
+
+    contents = []
+    if recent_history:
+        for m in recent_history[-4:]:
+            role = 'user' if m.get('direction') == 'in' else 'model'
+            txt = clean_speech_tags(m.get('transcript') or '')
+            if txt:
+                contents.append(types.Content(role=role, parts=[types.Part.from_text(text=txt)]))
+    contents.append(types.Content(role='user', parts=[types.Part.from_text(text=user_msg_clean)]))
+
+    config = types.GenerateContentConfig(
+        tools=_gemini_tools(),
+        system_instruction=system_instruction,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
+    candidate_models = [model or GEMINI_MODEL_PRIMARY, GEMINI_MODEL_FALLBACK]
+    for attempt, candidate_model in enumerate(candidate_models):
+        try:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(model=candidate_model, contents=list(contents), config=config)
+
+            for _ in range(GEMINI_MAX_TOOL_ROUNDTRIPS):
+                if not response.function_calls:
+                    break
+                contents.append(response.candidates[0].content)
+                response_parts = []
+                for fc in response.function_calls:
+                    result = _dispatch_gemini_tool(appmod, tenant_id, sender_phone, fc.name, dict(fc.args or {}))
+                    response_parts.append(types.Part.from_function_response(name=fc.name, response=result))
+                contents.append(types.Content(role='tool', parts=response_parts))
+                response = client.models.generate_content(model=candidate_model, contents=list(contents), config=config)
+
+            final_text = (response.text or '').strip()
+            if final_text:
+                logging.info(f"Gemini ({candidate_model}) reply: {final_text[:80]}")
+                return {
+                    "intent": "gemini_agent",
+                    "reply_text": final_text,
+                    "ticket_tag": "محادثة ذكاء اصطناعي",
+                    "escalate": False
+                }
+            return None  # exhausted tool loop with no final text -- fall back to rule-based
+        except errors.APIError as e:
+            if e.code == 429 and attempt < len(candidate_models) - 1:
+                logging.warning(f"Gemini rate-limited on {candidate_model}, retrying on {candidate_models[attempt + 1]}")
+                continue
+            logging.warning(f"Gemini API error ({e.code}): {getattr(e, 'message', e)}")
+            return None
+        except Exception as ex:
+            logging.warning(f"Error communicating with Gemini: {ex}")
+            return None
+
+    return None
+
+
 def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, customer=None, recent_history=None, timeout=18, is_admin=False):
     """Interacts directly with the ElevenLabs Conversational AI Agent WebSocket.
     Allows Yara's LLM in ElevenLabs to handle the customer conversation dynamically,
