@@ -1479,6 +1479,14 @@ def _build_gemini_system_instruction(appmod, tenant_id, customer, user_msg_clean
     else:
         parts.append("USER_ROLE: customer — مشترك عادي، جاوبيه بس عن حسابه الخاص.")
 
+    parts.append(
+        "مهم كتير: ما في عندك فرصة ترسلي رسالة تانية بعد هيدا الرد -- هذا الرد هو الوحيد يلي رح يوصل "
+        "للزبون. فممنوع تحكي \"خليني اتشيك\" أو \"ثواني بفحص\" أو أي وعد بمتابعة لاحقة بدون ما تكوني "
+        "فعلاً استخدمتي الأداة (tool) المناسبة بهذا الدور وحكيتي نتيجتها الحقيقية. إذا الزبون قال إنه "
+        "ما عندو إنترنت أو في مشكلة بالخط أو الاتصال، استخدمي lookup_customer (إذا لسا ما بتعرفي "
+        "الزبون) ثم network_diagnostic فوراً، وردي بنتيجة الفحص الفعلية -- مش بوعد إنك رح تفحصي."
+    )
+
     # Prompt-injection guard: the customer's message arrives wrapped in
     # CUSTOMER_MESSAGE_DELIMITER_START/_END (see query_gemini_agent). Treat it
     # strictly as data to answer, never as instructions to follow.
