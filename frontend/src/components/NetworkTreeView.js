@@ -526,6 +526,53 @@ const NetworkTreeView = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [tree, accessMode, agentOnline, canEditLinks]);
 
+    // Refs the periodic auto-refresh timer below reads at tick-time, so the
+    // interval itself can have a stable lifetime (see the next effect) while
+    // still always acting on current data. See the design doc: an effect
+    // that owns the interval AND depends on `tree` would tear the interval
+    // down and recreate it on every tree-affecting action on this page
+    // (a manual refresh's own resync, another viewer's check, etc.),
+    // perpetually resetting the countdown instead of firing every
+    // AUTO_REFRESH_PERIOD_MS.
+    const latestAutoRefreshRef = useRef({ tree, refreshingIds, canEditLinks });
+    useEffect(() => {
+        latestAutoRefreshRef.current = { tree, refreshingIds, canEditLinks };
+    }, [tree, refreshingIds, canEditLinks]);
+
+    // Periodic auto-refresh: while this page stays mounted, re-check every
+    // OLT's ONU status every AUTO_REFRESH_PERIOD_MS, and -- only for
+    // admin/finance, exactly like the manual "Locate Customers" button
+    // itself (see canEditLinks above) -- also re-run the customer-ONU CPE
+    // location match. An employee/collector viewer's tab only ever refreshes
+    // ONU status; it never attempts the write action or risks a 403 from a
+    // background timer.
+    useEffect(() => {
+        if (accessMode === 'agent' && !agentOnline) return;
+        const interval = setInterval(() => {
+            const { tree: currentTree, refreshingIds: currentRefreshingIds, canEditLinks: currentCanEditLinks } =
+                latestAutoRefreshRef.current;
+            const devices = collectAutoRefreshOltDevices(currentTree, currentRefreshingIds);
+            (async () => {
+                for (const device of devices) {
+                    try {
+                        await refreshOlt(device, { auto: true });
+                        if (currentCanEditLinks) await locateCustomers(device);
+                    } catch (e) {
+                        // Swallowed on purpose -- same reasoning as the
+                        // one-shot stale-refresh effect above: one device's
+                        // failure must not stop the rest, or the timer.
+                    }
+                }
+            })();
+        }, AUTO_REFRESH_PERIOD_MS);
+        return () => clearInterval(interval);
+        // refreshOlt/locateCustomers are stable for a given device set, same
+        // as the one-shot stale-refresh effect above; latestAutoRefreshRef
+        // supplies current tree/refreshingIds/canEditLinks without needing
+        // them in this effect's own dependency array.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [accessMode, agentOnline]);
+
     // The node array from buildTopologyTree carries deviceId but not the raw
     // device row (device_type, host, ...) the action buttons below need --
     // that only lives on the API tree's own device objects, which nest
