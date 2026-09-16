@@ -1598,7 +1598,12 @@ def query_gemini_agent(appmod, tenant_id, api_key, incoming_text, sender_phone, 
                         customer=customer, is_admin=is_admin, known_customer_ids=known_customer_ids
                     )
                     response_parts.append(types.Part.from_function_response(name=fc.name, response=result))
-                contents.append(types.Content(role='tool', parts=response_parts))
+                # 'tool' is not a valid Content role for the Gemini API (only
+                # 'user'/'model' are, per google.genai.types.Content and
+                # confirmed live: gemini-3.5-flash-lite 400s with "Role 'tool'
+                # is not supported"). Function-response parts go back as role
+                # 'user', same as the API's own documented convention.
+                contents.append(types.Content(role='user', parts=response_parts))
                 response = client.models.generate_content(model=candidate_model, contents=list(contents), config=config)
 
             final_text = (response.text or '').strip()
