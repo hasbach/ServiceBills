@@ -103,16 +103,24 @@ Rather than a second dialog component, the same one gains a `mode` field
 
 ## Testing
 
-- Frontend unit tests (this project has no `@testing-library/react`, so —
-  matching `NetworkTreeView.js`'s established pattern — any pure/testable
-  logic here is small: the synthetic-ONU-option computation is the one
-  piece worth extracting as a plain, exported, unit-tested function rather
-  than inline JSX logic).
-- Manual/live verification (this project's established pattern, since a
-  real component render isn't exercised by this test suite): start the
-  frontend dev server, open the network map as admin, edit an existing
-  junction node to `kind: 'onu'` with a real unplaced ONU selected, confirm
-  it saves and re-renders with the new marker style; edit an ONU node back
-  to `junction` and confirm the marker/onu_mac clear correctly; attempt to
-  set a second node to `root` and confirm the exact backend rejection
-  message surfaces.
+`NetworkMapView.test.js` already has full `@testing-library/react` coverage
+(real component renders, a mocked `react-leaflet` that records the props
+that matter, `mockApiGet/Post/Put/Delete`) — unlike `NetworkTreeView.js`,
+which has no RTL suite. New behavior here gets real RTL tests in that same
+file, following its established patterns (`markerPropsFor`, `mockApiPut`,
+opening the dialog via a rendered click, asserting on `mockApiPut`'s exact
+call args), not a separate pure-function test file:
+
+- Clicking "Edit" on a node's Popup opens the dialog pre-filled with that
+  node's current kind/label/onu_mac.
+- Saving an edit issues `PUT /network-map/nodes/<id>` with exactly
+  `{ kind, label, onu_mac }` (no latitude/longitude/parent_node_id).
+- Changing kind away from `'onu'` sends `onu_mac: null`.
+- A backend validation error (e.g. root-uniqueness) on save surfaces the
+  exact server message via the snackbar, same as the existing create-flow
+  test for a 409 on delete already does for that path.
+- The ONU autocomplete includes the node's own current `onu_mac` as an
+  option when editing (the synthetic-option case), and offers every
+  unplaced ONU otherwise.
+- An employee/collector sees no "Edit" control (same `canEdit` gate already
+  proven for "Draw from here"/"Delete"/dragging).
