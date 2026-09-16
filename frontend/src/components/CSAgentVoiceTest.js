@@ -13,6 +13,7 @@ import {
     Edit as EditIcon
 } from '@mui/icons-material';
 import axios from 'axios';
+import AgentMemoryManager from './AgentMemoryManager';
 
 export default function CSAgentVoiceTest() {
     const [agentId, setAgentId] = useState('');
@@ -899,6 +900,7 @@ export default function CSAgentVoiceTest() {
                     </Stack>
                 </Grid>
             </Grid>
+            <AgentMemoryManager />
         </Box>
     );
 }
