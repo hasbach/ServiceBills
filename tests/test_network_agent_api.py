@@ -699,3 +699,86 @@ def test_polling_past_the_rate_limit_is_rejected(app, client):
         # tests hitting the same endpoint (test_network_agent_program.py, in
         # particular, runs after this file alphabetically).
         appmod.limiter.storage.reset()
+
+
+def test_a_scheduled_cpe_locations_result_auto_applies(app, client):
+    make_tenant(client, "Api Auto A", "api_auto_a_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api Auto A")
+    with app.app_context():
+        plan = appmod.SubscriptionPlan(
+            tenant_id=tenant_id, name="Plan A", price=10.0, billing_cycle="monthly")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(
+            tenant_id=tenant_id, name="Auto Customer", phone="1", address="a",
+            subscription_plan_id=plan.id, subscription_expiry_date=appmod.datetime(2026, 12, 31),
+            cpe_mac_address="aa:aa:aa:aa:aa:aa")
+        appmod.db.session.add(customer)
+        job = appmod.NetworkAgentJob(
+            tenant_id=tenant_id, device_id=device_id, operation="cpe_locations",
+            params={'_scheduled': True})
+        appmod.db.session.add(job)
+        appmod.db.session.commit()
+        job_id = job.id
+    client.get("/api/agent/jobs", headers=auth(token))  # claims the job
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token), json={
+        "ok": True,
+        "result": {"aa:aa:aa:aa:aa:aa": {"onu_mac": "11:22:33:44:55:66"}},
+        "error": None,
+    })
+    assert r.status_code == 200
+    with app.app_context():
+        customer = appmod.Customer.query.filter_by(tenant_id=tenant_id).first()
+        assert customer.onu_mac_address == "11:22:33:44:55:66"
+
+
+def test_a_human_triggered_cpe_locations_result_does_not_auto_apply(app, client):
+    make_tenant(client, "Api Auto B", "api_auto_b_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api Auto B")
+    with app.app_context():
+        plan = appmod.SubscriptionPlan(
+            tenant_id=tenant_id, name="Plan B", price=10.0, billing_cycle="monthly")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        customer = appmod.Customer(
+            tenant_id=tenant_id, name="Manual Customer", phone="2", address="b",
+            subscription_plan_id=plan.id, subscription_expiry_date=appmod.datetime(2026, 12, 31),
+            cpe_mac_address="bb:bb:bb:bb:bb:bb")
+        appmod.db.session.add(customer)
+        # No _scheduled marker -- same as locate_customers's own job creation.
+        job = appmod.NetworkAgentJob(
+            tenant_id=tenant_id, device_id=device_id, operation="cpe_locations")
+        appmod.db.session.add(job)
+        appmod.db.session.commit()
+        job_id = job.id
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token), json={
+        "ok": True,
+        "result": {"bb:bb:bb:bb:bb:bb": {"onu_mac": "11:22:33:44:55:66"}},
+        "error": None,
+    })
+    with app.app_context():
+        customer = appmod.Customer.query.filter_by(tenant_id=tenant_id).first()
+        # Existing behavior unchanged: no auto-apply without the marker --
+        # a human must still call apply_customer_locations separately.
+        assert customer.onu_mac_address is None
+
+
+def test_a_scheduled_olt_status_result_never_auto_applies(app, client):
+    make_tenant(client, "Api Auto C", "api_auto_c_admin")
+    token, device_id, tenant_id = make_agent_and_device(app, "Api Auto C")
+    job_id = make_job(app, tenant_id, device_id, operation="olt_status")
+    with app.app_context():
+        job = appmod.NetworkAgentJob.query.get(job_id)
+        job.params = {'_scheduled': True}
+        appmod.db.session.commit()
+    client.get("/api/agent/jobs", headers=auth(token))
+
+    r = client.post(f"/api/agent/jobs/{job_id}/result", headers=auth(token), json={
+        "ok": True, "result": [], "error": None,
+    })
+    # Just confirms no crash/side effect from the new hook on a non-cpe_locations
+    # operation -- olt_status has its own, pre-existing handling, untouched.
+    assert r.status_code == 200

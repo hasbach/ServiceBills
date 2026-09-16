@@ -10544,6 +10544,19 @@ def agent_post_result(job_id):
     # docstring; this is only the happy-path call site.)
     _complete_write_audit(job)
     db.session.commit()
+    if job.operation == 'cpe_locations' and not job.error and (job.params or {}).get('_scheduled'):
+        # Scheduler-created jobs (see _create_scheduled_device_job) have no
+        # human waiting to click a separate "apply" button -- auto-apply
+        # here, in the agent's own result-POST request. A human-triggered
+        # cpe_locations job (no _scheduled marker) is unaffected: it still
+        # requires the separate, JWT-gated apply_customer_locations call the
+        # frontend already makes. Any failure here must not turn into a
+        # failure response to the agent -- the job itself already completed
+        # successfully; only the auto-apply step's own outcome is at risk.
+        try:
+            _apply_cpe_locations(job.result, tenant_id=job.tenant_id)
+        except Exception as e:
+            logging.error(f"Auto-apply of scheduled cpe_locations job {job.id} failed: {e}")
     return jsonify({'message': 'Recorded'}), 200
 
 
