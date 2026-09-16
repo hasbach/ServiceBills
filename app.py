@@ -11066,7 +11066,7 @@ def apply_onu_label_matches(device_id):
         return jsonify({'error': str(e)}), 400
 
 
-def _apply_cpe_locations(result):
+def _apply_cpe_locations(result, tenant_id=None):
     """Write each located customer's remembered ONU. Returns counts.
 
     Deliberately never clears: a customer whose CPE was not in this result is
@@ -11087,12 +11087,23 @@ def _apply_cpe_locations(result):
     it cannot correspond to real hardware, and storing it unnormalised would
     both risk overflowing the column on a backend that enforces its length
     and stop matching get_onu_label_matches's "already linked" check.
+
+    `tenant_id`: when given, scopes the customer lookup explicitly to this
+    tenant via a plain filter_by, instead of tenant_query()'s JWT-derived
+    current_tenant_id() -- required for a caller with no Flask-JWT in scope
+    (the scheduler, or agent_post_result's agent-token auth). Omitted (every
+    existing call site), behavior is identical to before this parameter
+    existed.
     """
     if not isinstance(result, dict):
         return {'located': 0, 'moved': 0, 'unmatched': 0}
 
+    customers_query = (
+        Customer.query.filter_by(tenant_id=tenant_id)
+        if tenant_id is not None else tenant_query(Customer)
+    )
     by_cpe = {}
-    for customer in tenant_query(Customer).filter(
+    for customer in customers_query.filter(
             Customer.cpe_mac_address.isnot(None)).all():
         by_cpe[_normalize_mac(customer.cpe_mac_address)] = customer
 

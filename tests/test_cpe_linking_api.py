@@ -538,3 +538,49 @@ def test_never_located_customer_reports_onu_last_seen_at_as_none_not_absent(
     customer = polled["result"][0]["customers"][0]
     assert "onu_last_seen_at" in customer
     assert customer["onu_last_seen_at"] is None
+
+
+def test_apply_cpe_locations_with_explicit_tenant_id_needs_no_request_context(app):
+    """Mirrors tests/test_iso_scheduler.py's regression test for the same
+    class of bug: a caller with no Flask-JWT (the scheduler, or
+    agent_post_result's agent-token auth) must be able to scope this by an
+    explicit tenant_id instead of tenant_query()'s JWT-derived one."""
+    with app.app_context():
+        tenant_a = appmod.Tenant(name="Api Explicit A", slug="api-explicit-a")
+        tenant_b = appmod.Tenant(name="Api Explicit B", slug="api-explicit-b")
+        appmod.db.session.add_all([tenant_a, tenant_b])
+        appmod.db.session.commit()
+
+        # Create subscription plans for each tenant
+        plan_a = appmod.SubscriptionPlan(
+            tenant_id=tenant_a.id, name="Plan A", price=10.0, billing_cycle="monthly")
+        plan_b = appmod.SubscriptionPlan(
+            tenant_id=tenant_b.id, name="Plan B", price=10.0, billing_cycle="monthly")
+        appmod.db.session.add_all([plan_a, plan_b])
+        appmod.db.session.commit()
+
+        customer_a = appmod.Customer(
+            tenant_id=tenant_a.id, name="A Customer", phone="1", address="a",
+            subscription_plan_id=plan_a.id, subscription_start_date=appmod.datetime(2026, 1, 1),
+            subscription_expiry_date=appmod.datetime(2026, 12, 31),
+            cpe_mac_address="aa:aa:aa:aa:aa:aa")
+        customer_b = appmod.Customer(
+            tenant_id=tenant_b.id, name="B Customer", phone="2", address="b",
+            subscription_plan_id=plan_b.id, subscription_start_date=appmod.datetime(2026, 1, 1),
+            subscription_expiry_date=appmod.datetime(2026, 12, 31),
+            cpe_mac_address="bb:bb:bb:bb:bb:bb")
+        appmod.db.session.add_all([customer_a, customer_b])
+        appmod.db.session.commit()
+
+        # No request context anywhere in this test -- tenant_query() would
+        # abort 401 here if this code path still used it.
+        result = appmod._apply_cpe_locations(
+            {"aa:aa:aa:aa:aa:aa": {"onu_mac": "11:22:33:44:55:66"}},
+            tenant_id=tenant_a.id,
+        )
+        assert result == {"located": 1, "moved": 1, "unmatched": 0}
+
+        appmod.db.session.refresh(customer_a)
+        appmod.db.session.refresh(customer_b)
+        assert customer_a.onu_mac_address == "11:22:33:44:55:66"
+        assert customer_b.onu_mac_address is None  # untouched, different tenant
