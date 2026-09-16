@@ -1566,6 +1566,19 @@ class UpgradeRequest(db.Model):
         }
 
 
+def _mask_secret_key(key):
+    """Never echo a raw secret (e.g. a tenant's Gemini API key) back to a
+    client. Returns '' when unset, otherwise the first 6 and last 4
+    characters with the middle elided so the owner can recognize which key
+    is on file without the full value ever leaving the server."""
+    if not key:
+        return ''
+    key = str(key)
+    if len(key) <= 10:
+        return '***'
+    return f"{key[:6]}...{key[-4:]}"
+
+
 class CSAgentSettings(db.Model):
     """Tenant-scoped settings for Customer Service AI Agent."""
     __tablename__ = "cs_agent_settings"
@@ -1573,6 +1586,8 @@ class CSAgentSettings(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, unique=True, index=True)
     elevenlabs_agent_id = db.Column(db.String(100), nullable=True)
     admin_mobile_number = db.Column(db.String(50), nullable=True)
+    gemini_api_key = db.Column(EncryptedString, nullable=True)   # tenant's own free-tier key; encrypted at rest
+    gemini_model = db.Column(db.String(50), nullable=True)       # optional override; None -> default Flash/Flash-Lite chain
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -1583,6 +1598,11 @@ class CSAgentSettings(db.Model):
             'tenant_id': self.tenant_id,
             'elevenlabs_agent_id': self.elevenlabs_agent_id or '',
             'admin_mobile_number': self.admin_mobile_number or '',
+            # Never the raw key -- see _mask_secret_key. has_gemini_key (added
+            # by the /api/cs-agent/config endpoint) is what callers should use
+            # to check "is one configured".
+            'gemini_api_key': _mask_secret_key(self.gemini_api_key),
+            'gemini_model': self.gemini_model or '',
             'is_active': self.is_active,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
@@ -1639,6 +1659,41 @@ class CSAgentMessageLog(db.Model):
             'tool_output': self.tool_output,
             'transcript': self.transcript,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+        }
+
+
+class CSAgentKnowledgeEntry(db.Model):
+    """Tenant-curated question/answer pairs the Gemini brain draws on for that
+    tenant's recurring questions. Only admin-added or admin-approved entries
+    land here -- never raw, unreviewed conversation logs (see
+    docs/superpowers/specs/2026-09-16-cs-agent-gemini-brain-design.md)."""
+    __tablename__ = "cs_agent_knowledge_entry"
+    __table_args__ = (
+        db.Index('ix_cs_agent_knowledge_entry_tenant_active', 'tenant_id', 'is_active'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    question_text = db.Column(db.Text, nullable=False)
+    answer_text = db.Column(db.Text, nullable=False)
+    source = db.Column(db.String(20), nullable=False, default='manual')  # 'manual' | 'conversation_log'
+    source_log_id = db.Column(db.Integer, db.ForeignKey('cs_agent_message_log.id'), nullable=True)
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'tenant_id': self.tenant_id,
+            'question_text': self.question_text,
+            'answer_text': self.answer_text,
+            'source': self.source,
+            'source_log_id': self.source_log_id,
+            'created_by_id': self.created_by_id,
+            'is_active': self.is_active,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
         }
 
 
@@ -12146,18 +12201,17 @@ def fix_employee_balance(employee_id):
 
 @app.route('/api/cs-agent/config', methods=['GET', 'POST'])
 def cs_agent_config():
-    """Returns or updates CS agent configuration (tenant-scoped with env fallback)."""
+    """Returns or updates CS agent configuration. Admin-UI-only endpoint --
+    both GET and POST require a real JWT and always resolve tenant_id from
+    its claims (never from a query-string/body tenant_id), since the GET
+    response includes a tenant's own Gemini API key (masked; see
+    _mask_secret_key) and other tenant-private config."""
     appmod = sys.modules[__name__]
-    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    tenant_id = _require_authenticated_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized"), 401
 
     if request.method == 'POST':
-        if not is_jwt:
-            verify_jwt_in_request()
-            claims = get_jwt()
-            tenant_id = int(claims.get('tenant_id')) if claims else None
-        if not tenant_id:
-            return jsonify(error="Unauthorized"), 401
-
         data = request.get_json(silent=True) or {}
         try:
             settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
@@ -12169,6 +12223,10 @@ def cs_agent_config():
                 settings.elevenlabs_agent_id = (data.get('elevenlabs_agent_id') or '').strip()
             if 'admin_mobile_number' in data:
                 settings.admin_mobile_number = (data.get('admin_mobile_number') or '').strip()
+            if 'gemini_api_key' in data:
+                settings.gemini_api_key = (data.get('gemini_api_key') or '').strip()
+            if 'gemini_model' in data:
+                settings.gemini_model = (data.get('gemini_model') or '').strip()
             db.session.commit()
             return jsonify(status='ok', settings=settings.to_dict()), 200
         except Exception as e:
@@ -12177,14 +12235,17 @@ def cs_agent_config():
 
     agent_id = ''
     admin_mobile_number = ''
-    if tenant_id:
-        try:
-            settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
-            if settings:
-                agent_id = settings.elevenlabs_agent_id or ''
-                admin_mobile_number = settings.admin_mobile_number or ''
-        except Exception:
-            db.session.rollback()
+    gemini_api_key_raw = ''
+    gemini_model = ''
+    try:
+        settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
+        if settings:
+            agent_id = settings.elevenlabs_agent_id or ''
+            admin_mobile_number = settings.admin_mobile_number or ''
+            gemini_api_key_raw = settings.gemini_api_key or ''
+            gemini_model = settings.gemini_model or ''
+    except Exception:
+        db.session.rollback()
 
     if not agent_id:
         agent_id = app.config.get('ELEVENLABS_AGENT_ID', '')
@@ -12193,6 +12254,10 @@ def cs_agent_config():
         'status': 'ok',
         'elevenlabs_agent_id': agent_id,
         'admin_mobile_number': admin_mobile_number,
+        # Masked -- never the raw key. Use has_gemini_key to know one is set.
+        'gemini_api_key': _mask_secret_key(gemini_api_key_raw),
+        'gemini_model': gemini_model,
+        'has_gemini_key': bool(gemini_api_key_raw),
         'has_agent_id': bool(agent_id),
         'ws_url': f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={agent_id}" if agent_id else None
     }), 200
@@ -12359,6 +12424,108 @@ def cs_get_recent_tickets():
             "created_at": l.created_at.strftime('%Y-%m-%d %H:%M:%S') if l.created_at else None,
         } for l in logs]
     }), 200
+
+
+def _require_authenticated_tenant_id(appmod):
+    """Resolves tenant_id from a real JWT's claims only -- never from a
+    query-string/body tenant_id or the CS_AGENT_SECRET fallback that
+    resolve_tenant_id() otherwise allows. Used by the memory CRUD and config
+    endpoints below: unlike the tool-webhook endpoints (which legitimately
+    need the secret-based path for server-to-server calls with no user
+    session), these are admin-UI-only and read/write tenant-private data
+    (Gemini system-prompt content, API keys), so they must require the same
+    real authentication as any other admin page. Returns tenant_id, or None
+    if there's no valid JWT (caller should then return 401)."""
+    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    if not is_jwt:
+        try:
+            verify_jwt_in_request()
+        except Exception:
+            return None
+        claims = get_jwt()
+        tenant_id = int(claims.get('tenant_id')) if claims and claims.get('tenant_id') else None
+    return tenant_id
+
+
+@app.route('/api/cs-agent/memory', methods=['GET', 'POST'])
+def cs_agent_memory():
+    appmod = sys.modules[__name__]
+    tenant_id = _require_authenticated_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized"), 401
+
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        question_text = (data.get('question_text') or '').strip()
+        answer_text = (data.get('answer_text') or '').strip()
+        if not question_text or not answer_text:
+            return jsonify(error="question_text and answer_text are required"), 400
+
+        created_by_id = None
+        try:
+            verify_jwt_in_request(optional=True)
+            current_username = get_jwt_identity()
+            if current_username:
+                current_user = User.query.filter_by(username=current_username).first()
+                if current_user:
+                    created_by_id = current_user.id
+        except Exception:
+            pass
+
+        source = data.get('source') or 'manual'
+        source_log_id = data.get('source_log_id')
+        entry = cs_agent_tools.add_knowledge_entry(
+            appmod, tenant_id, question_text, answer_text,
+            source=source, source_log_id=source_log_id, created_by_id=created_by_id
+        )
+        return jsonify(status='ok', entry=entry.to_dict()), 200
+
+    entries = cs_agent_tools.list_knowledge_entries(appmod, tenant_id)
+    return jsonify(status='ok', entries=[e.to_dict() for e in entries]), 200
+
+
+@app.route('/api/cs-agent/memory/recent-logs', methods=['GET'])
+def cs_agent_memory_recent_logs():
+    appmod = sys.modules[__name__]
+    tenant_id = _require_authenticated_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized"), 401
+
+    limit = min(int(request.args.get('limit', 50)), 100)
+    logs = CSAgentMessageLog.query.filter_by(tenant_id=tenant_id).order_by(
+        CSAgentMessageLog.id.desc()
+    ).limit(limit).all()
+    return jsonify(status='ok', logs=[l.to_dict() for l in logs]), 200
+
+
+@app.route('/api/cs-agent/memory/<int:entry_id>', methods=['PUT'])
+def cs_agent_memory_update(entry_id):
+    appmod = sys.modules[__name__]
+    tenant_id = _require_authenticated_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized"), 401
+
+    data = request.get_json(silent=True) or {}
+    if 'is_active' not in data:
+        return jsonify(error="is_active is required"), 400
+
+    ok = cs_agent_tools.set_knowledge_entry_active(appmod, tenant_id, entry_id, bool(data['is_active']))
+    if not ok:
+        return jsonify(error="Entry not found"), 404
+    return jsonify(status='ok'), 200
+
+
+@app.route('/api/cs-agent/memory/<int:entry_id>', methods=['DELETE'])
+def cs_agent_memory_delete(entry_id):
+    appmod = sys.modules[__name__]
+    tenant_id = _require_authenticated_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized"), 401
+
+    ok = cs_agent_tools.delete_knowledge_entry(appmod, tenant_id, entry_id)
+    if not ok:
+        return jsonify(error="Entry not found"), 404
+    return jsonify(status='ok'), 200
 
 
 @app.route('/', defaults={'path': ''})

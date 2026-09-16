@@ -56,19 +56,27 @@ def test_normalize_lebanese_phone():
 
 
 def test_cs_agent_config(app, client):
-    """GET /api/cs-agent/config returns agent settings with env fallback, and POST saves per-tenant ID."""
+    """GET /api/cs-agent/config requires a real JWT (no more query/env-based
+    tenant resolution -- see the memory-endpoint auth fix), and once
+    authenticated returns agent settings with env fallback; POST saves
+    per-tenant ID."""
     app.config["ELEVENLABS_AGENT_ID"] = "agent_test_123"
-    
-    # 1. Without tenant settings, falls back to env var
+
+    # 1. Unauthenticated GET is rejected -- no tenant_id, no config leak.
     res = client.get("/api/cs-agent/config")
+    assert res.status_code == 401
+
+    # 2. Authenticated tenant saves custom agent ID
+    headers = auth_headers(client, "admin_agent_config", "pw123")
+
+    # Without tenant settings yet, falls back to env var
+    res = client.get("/api/cs-agent/config", headers=headers)
     assert res.status_code == 200
     data = res.get_json()
     assert data["status"] == "ok"
     assert data["elevenlabs_agent_id"] == "agent_test_123"
     assert "agent_test_123" in data["ws_url"]
 
-    # 2. Authenticated tenant saves custom agent ID
-    headers = auth_headers(client, "admin_agent_config", "pw123")
     save_res = client.post(
         "/api/cs-agent/config",
         json={"elevenlabs_agent_id": "tenant_custom_agent_999"},
@@ -584,8 +592,11 @@ def test_query_elevenlabs_conversational_ai_timeout_fallback(monkeypatch):
     assert res is None
 
 
-def test_handle_whatsapp_cs_ai_reply_with_convai(app, client, monkeypatch):
-    """handle_whatsapp_cs_ai_reply uses ElevenLabs ConvAI reply when available and falls back gracefully."""
+def test_handle_whatsapp_cs_ai_reply_with_gemini(app, client, monkeypatch):
+    """handle_whatsapp_cs_ai_reply uses the Gemini brain reply when available
+    (tenant has a gemini_api_key configured) and falls back gracefully when
+    Gemini returns None. Supersedes the old ElevenLabs-ConvAI-in-WhatsApp-path
+    test now that Task 6 has replaced that wiring with query_gemini_agent."""
     import cs_agent_tools
     from unittest.mock import MagicMock
 
@@ -610,31 +621,35 @@ def test_handle_whatsapp_cs_ai_reply_with_convai(app, client, monkeypatch):
         cust_id, _ = _setup_customer(app, tenant.id, "Nour Al-Hassan", "71112233", balance=0.0)
         cust = appmod.db.session.get(appmod.Customer, cust_id)
 
+        cs_settings = appmod.CSAgentSettings(tenant_id=tenant.id, gemini_api_key="fake-gemini-key")
+        appmod.db.session.add(cs_settings)
+        appmod.db.session.commit()
+
         settings = MagicMock()
         settings.access_token = "mock_token"
         settings.phone_number_id = "mock_phone_id"
         settings.elevenlabs_agent_id = "agent_convai_123"
         settings.api_version = "v19.0"
 
-        # Case 1: ElevenLabs ConvAI succeeds
+        # Case 1: Gemini brain succeeds
         monkeypatch.setattr(
             cs_agent_tools,
-            "query_elevenlabs_conversational_ai",
-            lambda **kw: {"intent": "elevenlabs_convai", "reply_text": "اهلاً يا نور، كيف فيني ساعدك اليوم؟", "ticket_tag": "محادثة ذكاء اصطناعي", "escalate": False}
+            "query_gemini_agent",
+            lambda *a, **kw: {"intent": "gemini_agent", "reply_text": "اهلاً يا نور، كيف فيني ساعدك اليوم؟", "ticket_tag": "محادثة ذكاء اصطناعي", "escalate": False}
         )
 
         res = cs_agent_tools.handle_whatsapp_cs_ai_reply(
             appmod, tenant.id, "96171112233", cust, "مرحبا يارا", is_voice=False, settings=settings
         )
-        assert res["intent"] == "elevenlabs_convai"
+        assert res["intent"] == "gemini_agent"
         assert res["reply_text"] == "اهلاً يا نور، كيف فيني ساعدك اليوم؟"
 
         # Verify sent WhatsApp payload contains Yara's response
         text_payloads = [p for u, p in sent_payloads if p.get("type") == "text"]
         assert any("اهلاً يا نور" in p["text"]["body"] for p in text_payloads)
 
-        # Case 2: ElevenLabs ConvAI times out / returns None -> graceful fallback
-        monkeypatch.setattr(cs_agent_tools, "query_elevenlabs_conversational_ai", lambda **kw: None)
+        # Case 2: Gemini brain returns None -> graceful fallback to rule-based processor
+        monkeypatch.setattr(cs_agent_tools, "query_gemini_agent", lambda *a, **kw: None)
 
         res_fallback = cs_agent_tools.handle_whatsapp_cs_ai_reply(
             appmod, tenant.id, "96171112233", cust, "قديش في عليي رصيد", is_voice=False, settings=settings
@@ -711,4 +726,362 @@ def test_escalate_to_human_sends_customer_reply_alert_template(app, client, monk
         assert any("عطل في الراوتر" in t for t in param_texts)
 
 
+def test_cs_agent_settings_gemini_fields_round_trip(app, client):
+    """CSAgentSettings persists and returns gemini_api_key / gemini_model."""
+    auth_headers(client, "admin_gemini_fields", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        settings = appmod.CSAgentSettings(tenant_id=tenant.id)
+        settings.gemini_api_key = 'AIzaTestKey123'
+        settings.gemini_model = 'gemini-2.5-flash-lite'
+        appmod.db.session.add(settings)
+        appmod.db.session.commit()
+
+        reloaded = appmod.CSAgentSettings.query.filter_by(tenant_id=tenant.id).first()
+        assert reloaded.gemini_api_key == 'AIzaTestKey123'
+        assert reloaded.to_dict()['gemini_model'] == 'gemini-2.5-flash-lite'
+
+
+def test_cs_agent_config_saves_gemini_key(app, client):
+    """POST /api/cs-agent/config saves a tenant's Gemini API key and model.
+    Neither the POST response nor a subsequent GET ever echoes the raw key
+    back -- only a masked form plus has_gemini_key, even though the real
+    value is what's persisted to the database."""
+    headers = auth_headers(client, "admin_gemini_config", "pw123")
+    raw_key = "AIzaSyTestKeyForTenant"
+
+    save_res = client.post(
+        "/api/cs-agent/config",
+        json={
+            "elevenlabs_agent_id": "agent_keep_existing",
+            "gemini_api_key": raw_key,
+            "gemini_model": "gemini-2.5-flash-lite"
+        },
+        headers=headers
+    )
+    assert save_res.status_code == 200
+    saved_masked = save_res.get_json()["settings"]["gemini_api_key"]
+    assert saved_masked != raw_key
+    assert raw_key not in save_res.get_data(as_text=True)
+    assert saved_masked.startswith("AIzaSy") and "..." in saved_masked
+
+    get_res = client.get("/api/cs-agent/config", headers=headers)
+    assert get_res.status_code == 200
+    data = get_res.get_json()
+    assert data["gemini_api_key"] != raw_key
+    assert raw_key not in get_res.get_data(as_text=True)
+    assert data["gemini_api_key"].startswith("AIzaSy") and "..." in data["gemini_api_key"]
+    assert data["gemini_model"] == "gemini-2.5-flash-lite"
+    assert data["has_gemini_key"] is True
+
+    # The real key is still what's actually persisted and usable server-side.
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        settings = appmod.CSAgentSettings.query.filter_by(tenant_id=tenant.id).first()
+        assert settings.gemini_api_key == raw_key
+
+
+def test_cs_agent_config_no_gemini_key_by_default(app, client):
+    """A tenant that never set a Gemini key gets has_gemini_key: False, never another tenant's key."""
+    headers = auth_headers(client, "admin_no_gemini", "pw123")
+    get_res = client.get("/api/cs-agent/config", headers=headers)
+    data = get_res.get_json()
+    assert data["gemini_api_key"] == ""
+    assert data["has_gemini_key"] is False
+
+
+def test_cs_agent_knowledge_entry_tenant_scoped(app, client):
+    """A CSAgentKnowledgeEntry belongs to exactly one tenant and round-trips."""
+    auth_headers(client, "admin_knowledge_scoped", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        entry = appmod.CSAgentKnowledgeEntry(
+            tenant_id=tenant.id,
+            question_text='شو بواقي اشتراكي؟',
+            answer_text='بواقيك 25 دولار، تنتهي بعد 20 يوم.',
+            source='manual'
+        )
+        appmod.db.session.add(entry)
+        appmod.db.session.commit()
+
+        reloaded = appmod.CSAgentKnowledgeEntry.query.filter_by(tenant_id=tenant.id).first()
+        assert reloaded.question_text == 'شو بواقي اشتراكي؟'
+        assert reloaded.is_active is True
+        assert reloaded.to_dict()['source'] == 'manual'
+
+
+def test_search_knowledge_entries_keyword_match_and_tenant_isolation(app, client):
+    """Keyword search finds a relevant entry for the right tenant, and never for another tenant."""
+    import cs_agent_tools
+
+    auth_headers(client, "admin_knowledge_t1", "pw123")
+    with app.app_context():
+        t1_id = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first().id
+
+    auth_headers(client, "admin_knowledge_t2", "pw123")
+    with app.app_context():
+        t2_id = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first().id
+        assert t2_id != t1_id
+
+        appmod.db.session.add(appmod.CSAgentKnowledgeEntry(
+            tenant_id=t1_id, question_text="كيف بدي جدد اشتراكي؟", answer_text="ابعتلك رابط دفع فوراً."
+        ))
+        appmod.db.session.add(appmod.CSAgentKnowledgeEntry(
+            tenant_id=t2_id, question_text="كيف بدي جدد اشتراكي؟", answer_text="جواب تينانت تاني ما لازم يظهر."
+        ))
+        appmod.db.session.commit()
+
+        results = cs_agent_tools.search_knowledge_entries(appmod, t1_id, "بدي جدد اشتراكي شو بعمل", limit=5)
+        assert len(results) == 1
+        assert results[0].answer_text == "ابعتلك رابط دفع فوراً."
+
+
+def test_search_knowledge_entries_no_match_returns_empty(app, client):
+    """An unrelated question, or a tenant with zero entries, returns an empty list -- not an error."""
+    import cs_agent_tools
+    auth_headers(client, "admin_knowledge_empty", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        results = cs_agent_tools.search_knowledge_entries(appmod, tenant.id, "شي غير موجود إطلاقاً", limit=5)
+        assert results == []
+
+
+def test_add_list_and_deactivate_knowledge_entry(app, client):
+    """Manual add, list, and deactivate round-trip correctly."""
+    import cs_agent_tools
+    auth_headers(client, "admin_knowledge_crud", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        entry = cs_agent_tools.add_knowledge_entry(
+            appmod, tenant.id, "شو أوقات الدعم الفني؟", "من 9 الصبح لـ 9 الليل كل يوم."
+        )
+        assert entry.id is not None
+
+        entries = cs_agent_tools.list_knowledge_entries(appmod, tenant.id)
+        assert any(e.id == entry.id for e in entries)
+
+        ok = cs_agent_tools.set_knowledge_entry_active(appmod, tenant.id, entry.id, False)
+        assert ok is True
+        reloaded = appmod.CSAgentKnowledgeEntry.query.get(entry.id)
+        assert reloaded.is_active is False
+
+        # Deactivated entries never come back from search
+        results = cs_agent_tools.search_knowledge_entries(appmod, tenant.id, "شو أوقات الدعم الفني", limit=5)
+        assert results == []
+
+
+def test_memory_endpoints_crud(app, client):
+    """POST creates, GET lists, PUT deactivates, DELETE removes -- all tenant-scoped."""
+    headers = auth_headers(client, "admin_memory_crud", "pw123")
+
+    create_res = client.post(
+        "/api/cs-agent/memory",
+        json={"question_text": "شو بدل التركيب؟", "answer_text": "50 دولار تركيب لمرة وحدة."},
+        headers=headers
+    )
+    assert create_res.status_code == 200
+    entry_id = create_res.get_json()["entry"]["id"]
+    assert create_res.get_json()["entry"]["source"] == "manual"
+
+    list_res = client.get("/api/cs-agent/memory", headers=headers)
+    assert list_res.status_code == 200
+    assert any(e["id"] == entry_id for e in list_res.get_json()["entries"])
+
+    deactivate_res = client.put(
+        f"/api/cs-agent/memory/{entry_id}", json={"is_active": False}, headers=headers
+    )
+    assert deactivate_res.status_code == 200
+
+    delete_res = client.delete(f"/api/cs-agent/memory/{entry_id}", headers=headers)
+    assert delete_res.status_code == 200
+
+    list_after = client.get("/api/cs-agent/memory", headers=headers)
+    assert not any(e["id"] == entry_id for e in list_after.get_json()["entries"])
+
+
+def test_memory_endpoints_are_tenant_isolated(app, client):
+    """A tenant can't see, edit, or delete another tenant's memory entries."""
+    headers_a = auth_headers(client, "admin_memory_a", "pw123")
+    create_res = client.post(
+        "/api/cs-agent/memory",
+        json={"question_text": "سؤال تينانت A", "answer_text": "جواب تينانت A"},
+        headers=headers_a
+    )
+    entry_id = create_res.get_json()["entry"]["id"]
+
+    headers_b = auth_headers(client, "admin_memory_b", "pw123")
+    list_res_b = client.get("/api/cs-agent/memory", headers=headers_b)
+    assert not any(e["id"] == entry_id for e in list_res_b.get_json()["entries"])
+
+    # Tenant B can't deactivate or delete tenant A's entry
+    put_res = client.put(f"/api/cs-agent/memory/{entry_id}", json={"is_active": False}, headers=headers_b)
+    assert put_res.status_code == 404
+    delete_res = client.delete(f"/api/cs-agent/memory/{entry_id}", headers=headers_b)
+    assert delete_res.status_code == 404
+
+
+def test_memory_recent_logs_endpoint(app, client):
+    """GET /api/cs-agent/memory/recent-logs returns this tenant's recent CS agent message logs."""
+    headers = auth_headers(client, "admin_recent_logs", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        appmod.db.session.add(appmod.CSAgentMessageLog(
+            tenant_id=tenant.id, direction='in', transcript='شو رصيدي؟'
+        ))
+        appmod.db.session.add(appmod.CSAgentMessageLog(
+            tenant_id=tenant.id, direction='out', transcript='رصيدك 25 دولار.'
+        ))
+        appmod.db.session.commit()
+
+    res = client.get("/api/cs-agent/memory/recent-logs", headers=headers)
+    assert res.status_code == 200
+    logs = res.get_json()["logs"]
+    assert len(logs) >= 2
+    assert any(l["transcript"] == 'شو رصيدي؟' for l in logs)
+
+
+def test_memory_endpoint_creates_entry_with_authenticated_user_id(app, client):
+    """POST /api/cs-agent/memory with JWT auth sets created_by_id to the authenticated user's ID."""
+    username = "admin_memory_user_id"
+    password = "pw123"
+    headers = auth_headers(client, username, password)
+
+    with app.app_context():
+        # Get the authenticated user's ID
+        user = appmod.User.query.filter_by(username=username).first()
+        assert user is not None
+        expected_user_id = user.id
+
+    # POST to create a memory entry with JWT authentication
+    create_res = client.post(
+        "/api/cs-agent/memory",
+        json={"question_text": "شو بدل التركيب؟", "answer_text": "50 دولار تركيب لمرة وحدة."},
+        headers=headers
+    )
+    assert create_res.status_code == 200
+    entry_data = create_res.get_json()["entry"]
+    entry_id = entry_data["id"]
+
+    # Verify created_by_id is set to the authenticated user's ID
+    assert entry_data["created_by_id"] == expected_user_id
+
+    # Verify in database that created_by_id is persisted
+    with app.app_context():
+        entry = appmod.CSAgentKnowledgeEntry.query.get(entry_id)
+        assert entry is not None
+        assert entry.created_by_id == expected_user_id
+
+
+def test_memory_endpoints_reject_cs_agent_secret_without_jwt(app, client):
+    """Unlike the tool-webhook endpoints, the memory CRUD endpoints are
+    admin-UI-only: they must reject the CS_AGENT_SECRET / body-tenant_id path
+    resolve_tenant_id() otherwise allows, and require a real JWT. A request
+    that only presents the shared secret (no bearer token) must get 401, not
+    silently resolve to whatever tenant_id it named in the body -- otherwise
+    an unauthenticated caller who knows (or guesses) CS_AGENT_SECRET, or any
+    caller at all when it's unset (its production default), could read or
+    plant "known answers" in any tenant's Gemini system prompt."""
+    app.config["CS_AGENT_SECRET"] = "test_secret_key_xyz"
+
+    auth_headers(client, "admin_memory_no_jwt", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_memory_no_jwt").first()
+        assert tenant is not None
+        tenant_id = tenant.id
+
+    # POST with only the agent secret (no JWT) must be rejected.
+    create_res = client.post(
+        "/api/cs-agent/memory",
+        json={
+            "question_text": "سؤال بدون تحقق",
+            "answer_text": "جواب بدون تحقق",
+            "tenant_id": tenant_id
+        },
+        headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}
+    )
+    assert create_res.status_code == 401
+
+    # Same for GET (list), PUT, and DELETE -- no JWT, no access.
+    assert client.get("/api/cs-agent/memory", headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}).status_code == 401
+    assert client.get("/api/cs-agent/memory/recent-logs", headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}).status_code == 401
+    assert client.put(
+        "/api/cs-agent/memory/1", json={"is_active": False},
+        headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}
+    ).status_code == 401
+    assert client.delete(
+        "/api/cs-agent/memory/1", headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}
+    ).status_code == 401
+
+
+def test_memory_endpoints_reject_no_auth_at_all(app, client):
+    """With CS_AGENT_SECRET unset (its production default -- see config.py;
+    forced empty here too, since app.config is process-global and another
+    test in this file may have set it), resolve_tenant_id() would otherwise
+    trust a bare tenant_id from the request with no authentication
+    whatsoever. The memory endpoints must still require a JWT."""
+    app.config["CS_AGENT_SECRET"] = ""
+    assert client.get("/api/cs-agent/memory").status_code == 401
+    assert client.post(
+        "/api/cs-agent/memory",
+        json={"question_text": "q", "answer_text": "a", "tenant_id": 1}
+    ).status_code == 401
+
+
+def test_whatsapp_reply_uses_gemini_when_tenant_key_configured(app, client):
+    """handle_whatsapp_cs_ai_reply calls query_gemini_agent (not ElevenLabs
+    ConvAI) when the tenant has a gemini_api_key configured."""
+    import cs_agent_tools
+    from unittest.mock import patch, MagicMock
+
+    auth_headers(client, "admin_wa_gemini", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        settings = appmod.CSAgentSettings(tenant_id=tenant.id, gemini_api_key="fake-key")
+        appmod.db.session.add(settings)
+
+        wa_settings = MagicMock()
+        wa_settings.access_token = "wa-token"
+        wa_settings.phone_number_id = "123"
+        wa_settings.api_version = "v19.0"
+        appmod.db.session.commit()
+
+        with patch("cs_agent_tools.query_gemini_agent") as mock_gemini, \
+             patch("cs_agent_tools.query_elevenlabs_conversational_ai") as mock_convai, \
+             patch("requests.post"):
+            mock_gemini.return_value = {
+                "intent": "gemini_agent", "reply_text": "جواب من جيميناي",
+                "ticket_tag": "محادثة ذكاء اصطناعي", "escalate": False
+            }
+            cs_agent_tools.handle_whatsapp_cs_ai_reply(
+                appmod, tenant.id, "70123456", None, "شو رصيدي؟",
+                is_voice=False, settings=wa_settings
+            )
+
+        mock_gemini.assert_called_once()
+        mock_convai.assert_not_called()
+
+
+def test_whatsapp_reply_falls_back_to_rule_based_without_gemini_key(app, client):
+    """With no gemini_api_key configured, query_gemini_agent is never called
+    and the rule-based processor answers instead."""
+    import cs_agent_tools
+    from unittest.mock import patch, MagicMock
+
+    auth_headers(client, "admin_wa_no_gemini", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+
+        wa_settings = MagicMock()
+        wa_settings.access_token = "wa-token"
+        wa_settings.phone_number_id = "123"
+        wa_settings.api_version = "v19.0"
+
+        with patch("cs_agent_tools.query_gemini_agent") as mock_gemini, \
+             patch("requests.post"):
+            cs_agent_tools.handle_whatsapp_cs_ai_reply(
+                appmod, tenant.id, "70123456", None, "مرحبا",
+                is_voice=False, settings=wa_settings
+            )
+
+        mock_gemini.assert_not_called()
 
