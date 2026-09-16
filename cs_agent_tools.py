@@ -1330,28 +1330,50 @@ def _require_customer_id(tool_args, required=True):
         return None, None
 
 
-def _customer_id_mismatch_error(customer_id, customer, is_admin):
-    """Enforces that a non-admin caller can only ever act on the customer
-    already identified for this conversation (via an earlier lookup_customer
-    call). Returns an error dict if `customer_id` (an argument Gemini itself
-    supplied, and therefore untrusted -- an LLM can be talked into calling a
-    tool with an arbitrary ID by a crafted customer message) doesn't match
-    the already-known customer.id, else None.
+def _customer_id_mismatch_error(customer_id, customer, is_admin, known_customer_ids=None):
+    """Enforces that a non-admin caller can only ever act on a customer this
+    conversation has legitimately identified for the sender. Returns an error
+    dict if `customer_id` (an argument Gemini itself supplied, and therefore
+    untrusted -- an LLM can be talked into calling a tool with an arbitrary ID
+    by a crafted customer message) doesn't match, else None.
 
-    Deliberately permissive when no customer is identified yet (`customer`
-    is None): a normal conversation legitimately calls lookup_customer first,
-    then get_customer_status/network_diagnostic/send_payment_link with the
-    customer_id it just learned -- that must keep working. Only an
-    *already-known* customer being contradicted by a different ID is refused.
+    Two cases:
+    - `customer` is already known (identified by WhatsApp sender phone at the
+      start of the conversation): `customer_id` must equal `customer.id`.
+    - `customer` is None (the sender's phone wasn't a registered customer at
+      conversation start): the normal flow is that Gemini calls
+      lookup_customer first and learns a real id for the sender's own phone,
+      then uses that id in a follow-up tool call -- that must keep working.
+      `known_customer_ids` is the set of id(s) THIS conversation's own
+      lookup_customer call(s) actually returned for the sender's own phone
+      (populated by _dispatch_gemini_tool/query_gemini_agent, never by
+      anything the model merely claims). `customer_id` must be one of them;
+      otherwise -- including when no lookup_customer call has happened yet --
+      the call is refused. This is what closes the gap where an unidentified
+      sender could ask the model to act on an arbitrary invented customer_id.
     """
     if is_admin:
         return None
-    if customer is not None and getattr(customer, 'id', None) is not None and customer_id != customer.id:
-        return {'error': "Not authorized to access a different customer's account"}
-    return None
+    if customer is not None and getattr(customer, 'id', None) is not None:
+        if customer_id != customer.id:
+            return {'error': "Not authorized to access a different customer's account"}
+        return None
+    if known_customer_ids and customer_id in known_customer_ids:
+        return None
+    return {'error': "Not authorized to access a different customer's account"}
 
 
-def _dispatch_gemini_tool(appmod, tenant_id, sender_phone, tool_name, tool_args, customer=None, is_admin=False):
+def _dispatch_gemini_tool(appmod, tenant_id, sender_phone, tool_name, tool_args, customer=None, is_admin=False,
+                           known_customer_ids=None):
+    """`known_customer_ids` is a mutable set (created once per
+    query_gemini_agent() call and threaded through every dispatch in that
+    conversation's tool loop) tracking which customer id(s) THIS conversation
+    has legitimately learned belong to the sender's own phone, via a real
+    lookup_customer() result -- see _customer_id_mismatch_error. Callers that
+    don't need the extra protection (e.g. direct/legacy callers, tests) can
+    omit it; it then behaves as an empty set for the `customer is None`
+    non-admin case.
+    """
     tool_args = tool_args or {}
     if tool_name == 'lookup_customer':
         # Non-admin callers can never search by an arbitrary phone number
@@ -1359,12 +1381,24 @@ def _dispatch_gemini_tool(appmod, tenant_id, sender_phone, tool_name, tool_args,
         # use the real sender's own phone. Admins keep the original
         # fallback-to-sender-phone behavior for looking up other numbers.
         phone = (tool_args.get('phone') or sender_phone) if is_admin else sender_phone
-        return lookup_customer(appmod, tenant_id, phone)
+        result = lookup_customer(appmod, tenant_id, phone)
+        # Record the real customer id(s) this lookup found -- but only when
+        # the phone actually searched was the sender's own phone for this
+        # conversation. For non-admin callers `phone` is always forced to
+        # `sender_phone` above, so this is automatically satisfied; for an
+        # admin looking up a different number, it deliberately is not, since
+        # that result says nothing about the sender's own identity.
+        if known_customer_ids is not None and phone == sender_phone and result.get('found'):
+            for m in (result.get('matches') or []):
+                mid = m.get('id')
+                if mid is not None:
+                    known_customer_ids.add(mid)
+        return result
     if tool_name == 'get_customer_status':
         customer_id, error = _require_customer_id(tool_args)
         if error:
             return error
-        mismatch = _customer_id_mismatch_error(customer_id, customer, is_admin)
+        mismatch = _customer_id_mismatch_error(customer_id, customer, is_admin, known_customer_ids)
         if mismatch:
             return mismatch
         return get_customer_status(appmod, tenant_id, customer_id)
@@ -1372,7 +1406,7 @@ def _dispatch_gemini_tool(appmod, tenant_id, sender_phone, tool_name, tool_args,
         customer_id, error = _require_customer_id(tool_args)
         if error:
             return error
-        mismatch = _customer_id_mismatch_error(customer_id, customer, is_admin)
+        mismatch = _customer_id_mismatch_error(customer_id, customer, is_admin, known_customer_ids)
         if mismatch:
             return mismatch
         return network_diagnostic(appmod, tenant_id, customer_id, wait_seconds=15)
@@ -1380,7 +1414,7 @@ def _dispatch_gemini_tool(appmod, tenant_id, sender_phone, tool_name, tool_args,
         customer_id, error = _require_customer_id(tool_args)
         if error:
             return error
-        mismatch = _customer_id_mismatch_error(customer_id, customer, is_admin)
+        mismatch = _customer_id_mismatch_error(customer_id, customer, is_admin, known_customer_ids)
         if mismatch:
             return mismatch
         return send_payment_link(appmod, tenant_id, customer_id)
@@ -1479,6 +1513,15 @@ def query_gemini_agent(appmod, tenant_id, api_key, incoming_text, sender_phone, 
 
     candidate_models = [model or GEMINI_MODEL_PRIMARY, GEMINI_MODEL_FALLBACK]
     roundtrips_remaining = GEMINI_MAX_TOOL_ROUNDTRIPS
+    # Customer id(s) THIS conversation's own lookup_customer call(s) have
+    # actually found for the sender's own phone -- created once per
+    # query_gemini_agent() call and threaded through every tool dispatch
+    # below (including across the primary/fallback model retry), so an
+    # unidentified (customer is None) non-admin sender can only ever act on
+    # an id this conversation itself legitimately learned, never an
+    # arbitrary id the model is talked into inventing. See
+    # _customer_id_mismatch_error.
+    known_customer_ids = set()
 
     try:
         # _build_gemini_system_instruction() queries CSAgentKnowledgeEntry
@@ -1534,7 +1577,7 @@ def query_gemini_agent(appmod, tenant_id, api_key, incoming_text, sender_phone, 
                 for fc in response.function_calls:
                     result = _dispatch_gemini_tool(
                         appmod, tenant_id, sender_phone, fc.name, dict(fc.args or {}),
-                        customer=customer, is_admin=is_admin
+                        customer=customer, is_admin=is_admin, known_customer_ids=known_customer_ids
                     )
                     response_parts.append(types.Part.from_function_response(name=fc.name, response=result))
                 contents.append(types.Content(role='tool', parts=response_parts))

@@ -216,7 +216,12 @@ def test_query_gemini_agent_roundtrip_budget_is_global_across_model_fallback(moc
 
         result = cs_agent_tools.query_gemini_agent(
             appmod, tenant_id=7, api_key="fake-key",
-            incoming_text="شو رصيدي؟", sender_phone="70123456"
+            incoming_text="شو رصيدي؟", sender_phone="70123456",
+            # Identified customer (id matches the fake function call's
+            # customer_id=42) so this test's tool calls exercise the
+            # round-trip budget in isolation, not the (unrelated)
+            # customer-id-mismatch security check covered elsewhere.
+            customer=MagicMock(id=42)
         )
 
     # Budget exhausted without ever getting a final text reply -> caller
@@ -364,20 +369,122 @@ def test_dispatch_gemini_tool_allows_matching_customer_id_for_non_admin(mock_get
 
 
 @patch("cs_agent_tools.network_diagnostic")
-def test_dispatch_gemini_tool_allows_unidentified_customer_id_for_non_admin(mock_diag):
-    """Before lookup_customer has run (customer is still None), a non-admin
-    caller supplying customer_id is the NORMAL flow -- Gemini just learned
-    the ID from an earlier lookup_customer call in the same conversation --
-    and must not be blocked. Only a mismatch against an ALREADY-KNOWN
-    customer is refused."""
-    mock_diag.return_value = {"success": True}
+def test_dispatch_gemini_tool_blocks_unidentified_customer_id_with_no_prior_lookup(mock_diag):
+    """Before lookup_customer has run in this conversation (customer is still
+    None and known_customer_ids is empty/not supplied), a non-admin caller
+    supplying an arbitrary customer_id must be BLOCKED -- this is the gap a
+    prior round left open: with no real identity to compare against, an
+    arbitrary WhatsApp sender could otherwise ask the model to act on any
+    customer_id it invents."""
     result = cs_agent_tools._dispatch_gemini_tool(
         appmod, tenant_id=1, sender_phone="70123456",
         tool_name="network_diagnostic", tool_args={"customer_id": 99},
         customer=None, is_admin=False
     )
+    assert "error" in result
+    mock_diag.assert_not_called()
+
+
+@patch("cs_agent_tools.network_diagnostic")
+def test_dispatch_gemini_tool_allows_customer_id_learned_from_lookup_customer_this_conversation(mock_diag):
+    """Once lookup_customer has legitimately found an id for the sender's own
+    phone in THIS conversation (tracked via known_customer_ids), a follow-up
+    tool call using that same real id must be allowed -- the normal flow."""
+    mock_diag.return_value = {"success": True}
+    known_customer_ids = {99}
+    result = cs_agent_tools._dispatch_gemini_tool(
+        appmod, tenant_id=1, sender_phone="70123456",
+        tool_name="network_diagnostic", tool_args={"customer_id": 99},
+        customer=None, is_admin=False, known_customer_ids=known_customer_ids
+    )
     mock_diag.assert_called_once_with(appmod, 1, 99, wait_seconds=15)
     assert result == {"success": True}
+
+
+@patch("cs_agent_tools.get_customer_status")
+def test_dispatch_gemini_tool_blocks_customer_id_not_matching_this_conversations_lookup(mock_get_status):
+    """lookup_customer found id 5 for this sender's own phone in this
+    conversation -- a follow-up call trying a DIFFERENT id (6) must still be
+    blocked, even though the sender is unidentified (customer is None) and
+    even though this conversation did have a legitimate lookup."""
+    known_customer_ids = {5}
+    result = cs_agent_tools._dispatch_gemini_tool(
+        appmod, tenant_id=1, sender_phone="70123456",
+        tool_name="get_customer_status", tool_args={"customer_id": 6},
+        customer=None, is_admin=False, known_customer_ids=known_customer_ids
+    )
+    assert "error" in result
+    mock_get_status.assert_not_called()
+
+
+@patch("cs_agent_tools.lookup_customer")
+def test_dispatch_gemini_tool_lookup_customer_populates_known_customer_ids(mock_lookup):
+    """_dispatch_gemini_tool must record the real id(s) lookup_customer found
+    for the sender's own phone into known_customer_ids -- not ids the model
+    merely claims -- so a later tool call in the same conversation can be
+    validated against them."""
+    mock_lookup.return_value = {
+        "found": True,
+        "matches": [{"id": 5, "name": "Georges"}],
+    }
+    known_customer_ids = set()
+    cs_agent_tools._dispatch_gemini_tool(
+        appmod, tenant_id=1, sender_phone="70123456",
+        tool_name="lookup_customer", tool_args={},
+        customer=None, is_admin=False, known_customer_ids=known_customer_ids
+    )
+    assert known_customer_ids == {5}
+
+
+@patch("cs_agent_tools.search_knowledge_entries", return_value=[])
+@patch("cs_agent_tools.network_diagnostic")
+@patch("cs_agent_tools.lookup_customer")
+def test_query_gemini_agent_end_to_end_lookup_then_status_for_unidentified_sender(
+    mock_lookup, mock_diag, mock_search
+):
+    """Full query_gemini_agent() loop for an unidentified (customer=None)
+    non-admin sender: Gemini calls lookup_customer first, gets a real
+    customer id back for the sender's own phone, then calls
+    network_diagnostic with that same id in the same conversation -- this
+    must be allowed end-to-end (the normal flow), proving known_customer_ids
+    is correctly threaded through query_gemini_agent's own loop, not just
+    the dispatcher in isolation."""
+    mock_lookup.return_value = {
+        "found": True,
+        "matches": [{"id": 5, "name": "Georges"}],
+    }
+    mock_diag.return_value = {"success": True, "message_ar": "الشبكة تمام"}
+
+    lookup_call = MagicMock()
+    lookup_call.name = "lookup_customer"
+    lookup_call.args = {}
+
+    diag_call = MagicMock()
+    diag_call.name = "network_diagnostic"
+    diag_call.args = {"customer_id": 5}
+
+    first_response = MagicMock()
+    first_response.function_calls = [lookup_call]
+    first_response.candidates = [MagicMock(content="model-turn-lookup")]
+
+    second_response = MagicMock()
+    second_response.function_calls = [diag_call]
+    second_response.candidates = [MagicMock(content="model-turn-diagnostic")]
+
+    third_response = _text_only_response("الشبكة تمام، ما في مشكلة عندك.")
+
+    with patch("google.genai.Client") as MockClient:
+        instance = MockClient.return_value
+        instance.models.generate_content.side_effect = [first_response, second_response, third_response]
+
+        result = cs_agent_tools.query_gemini_agent(
+            appmod, tenant_id=1, api_key="fake-key",
+            incoming_text="ما عندي نت", sender_phone="70123456",
+            customer=None, is_admin=False
+        )
+
+    assert result["reply_text"] == "الشبكة تمام، ما في مشكلة عندك."
+    mock_diag.assert_called_once_with(appmod, 1, 5, wait_seconds=15)
 
 
 @patch("cs_agent_tools.send_payment_link")
