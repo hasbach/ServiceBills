@@ -3221,6 +3221,51 @@ def check_pro_plan_expirations_with_context():
                 logging.error(f"Pro-plan expiration check failed for tenant {t.id}: {e}")
 
 
+# --- Scheduled ONU/CPE-location freshness for agent-mode tenants ------------
+# See docs/superpowers/specs/2026-09-17-network-tree-scheduled-freshness-design.md.
+# The Network Tree page's own client-side auto-refresh only runs while
+# someone has the page open, and its CPE-location write only for admin/
+# finance viewers -- this keeps both fresh for agent-mode tenants regardless
+# of who (if anyone) is looking.
+NETWORK_FRESHNESS_OPERATIONS = ('olt_status', 'cpe_locations')
+
+
+def refresh_agent_mode_network_status_for_tenant(tenant_id):
+    """Enqueue a fresh olt_status + cpe_locations job for every OLT this
+    tenant owns, skipping a device+operation pair that already has a
+    pending/claimed job outstanding -- an agent offline for a while (or the
+    scheduler firing twice in quick succession on deploy, see Dockerfile)
+    must not accumulate an unbounded backlog of duplicate jobs. A no-op for
+    a tenant not in 'agent' mode: _create_scheduled_device_job's own
+    offline check would refuse anyway, but skipping the query entirely here
+    avoids the wasted work for direct-mode tenants on every 15-minute tick."""
+    settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).first()
+    if not settings or settings.network_access_mode != 'agent':
+        return
+    devices = NetworkDevice.query.filter_by(tenant_id=tenant_id, device_type='vsol_olt').all()
+    for device in devices:
+        for operation in NETWORK_FRESHNESS_OPERATIONS:
+            outstanding = NetworkAgentJob.query.filter(
+                NetworkAgentJob.tenant_id == tenant_id,
+                NetworkAgentJob.device_id == device.id,
+                NetworkAgentJob.operation == operation,
+                NetworkAgentJob.status.in_(('pending', 'claimed')),
+            ).first()
+            if outstanding:
+                continue
+            _create_scheduled_device_job(device, operation)
+
+
+def refresh_agent_mode_network_status_with_context():
+    with app.app_context():
+        for t in Tenant.query.filter_by(status="active").all():
+            try:
+                refresh_agent_mode_network_status_for_tenant(t.id)
+            except Exception as e:
+                db.session.rollback()
+                logging.error(f"Scheduled network freshness refresh failed for tenant {t.id}: {e}")
+
+
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
@@ -3255,6 +3300,7 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     # not a change to this "fire immediately" pattern itself.
     scheduler.add_job(func=auto_sync_upstream_status_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.add_job(func=check_pro_plan_expirations_with_context, trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=refresh_agent_mode_network_status_with_context, trigger="interval", minutes=15, next_run_time=datetime.now())
     scheduler.start()
  
     

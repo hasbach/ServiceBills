@@ -58,3 +58,67 @@ def test_create_scheduled_device_job_rejects_unsupported_operation_for_device_ty
         job, error = appmod._create_scheduled_device_job(device, 'device_health')
         assert job is None
         assert 'cannot perform' in error
+
+
+def test_refresh_creates_both_jobs_for_an_agent_mode_olt(app, client):
+    tenant_id, device_id = _make_agent_mode_tenant_with_olt(app, client, "Sched D", "sched_d_admin")
+    with app.app_context():
+        appmod.refresh_agent_mode_network_status_for_tenant(tenant_id)
+        jobs = appmod.NetworkAgentJob.query.filter_by(tenant_id=tenant_id, device_id=device_id).all()
+        operations = sorted(j.operation for j in jobs)
+        assert operations == ['cpe_locations', 'olt_status']
+        assert all(j.params == {'_scheduled': True} for j in jobs)
+
+
+def test_refresh_skips_a_device_operation_with_an_outstanding_job(app, client):
+    tenant_id, device_id = _make_agent_mode_tenant_with_olt(app, client, "Sched E", "sched_e_admin")
+    with app.app_context():
+        existing = appmod.NetworkAgentJob(
+            tenant_id=tenant_id, device_id=device_id, operation='olt_status',
+            status='pending')
+        appmod.db.session.add(existing)
+        appmod.db.session.commit()
+
+        appmod.refresh_agent_mode_network_status_for_tenant(tenant_id)
+
+        olt_status_jobs = appmod.NetworkAgentJob.query.filter_by(
+            tenant_id=tenant_id, device_id=device_id, operation='olt_status').all()
+        assert len(olt_status_jobs) == 1  # no duplicate created
+        cpe_jobs = appmod.NetworkAgentJob.query.filter_by(
+            tenant_id=tenant_id, device_id=device_id, operation='cpe_locations').all()
+        assert len(cpe_jobs) == 1  # this one still gets created
+
+
+def test_refresh_is_a_noop_for_a_direct_mode_tenant(app, client):
+    make_tenant(client, "Sched F", "sched_f_admin")  # network_access_mode defaults to 'direct'
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Sched F").first()
+        device = appmod.NetworkDevice(
+            tenant_id=tenant.id, name="EPON OLT", host="192.168.8.101",
+            username="", password="unused", device_type="vsol_olt", api_port=161)
+        appmod.db.session.add(device)
+        appmod.db.session.commit()
+
+        appmod.refresh_agent_mode_network_status_for_tenant(tenant.id)
+
+        assert appmod.NetworkAgentJob.query.filter_by(tenant_id=tenant.id).count() == 0
+
+
+def test_refresh_with_context_isolates_one_tenants_failure(app, client, monkeypatch):
+    tenant_a_id, _ = _make_agent_mode_tenant_with_olt(app, client, "Sched G", "sched_g_admin")
+    tenant_b_id, device_b_id = _make_agent_mode_tenant_with_olt(app, client, "Sched H", "sched_h_admin")
+
+    original = appmod.refresh_agent_mode_network_status_for_tenant
+
+    def boom(tenant_id):
+        if tenant_id == tenant_a_id:
+            raise RuntimeError("simulated failure")
+        return original(tenant_id)
+
+    monkeypatch.setattr(appmod, "refresh_agent_mode_network_status_for_tenant", boom)
+
+    with app.app_context():
+        appmod.refresh_agent_mode_network_status_with_context()
+        # Tenant B's job still got created despite tenant A's failure.
+        jobs = appmod.NetworkAgentJob.query.filter_by(tenant_id=tenant_b_id, device_id=device_b_id).all()
+        assert len(jobs) == 2
