@@ -10672,6 +10672,46 @@ def _create_device_job(device, operation, params=None, commit=True):
     return job, None
 
 
+def _create_scheduled_device_job(device, operation):
+    """Agent-mode-only sibling of _create_device_job for the periodic
+    freshness scheduler (see docs/superpowers/specs/
+    2026-09-17-network-tree-scheduled-freshness-design.md). Never called
+    from a request -- there is no JWT to derive a tenant or current user
+    from, so this uses device.tenant_id directly instead of
+    _tenant_access_mode()/tenant_query(NetworkAgent), and always stamps
+    requested_by_user_id=None with params={'_scheduled': True} so
+    agent_post_result knows to auto-apply a completed cpe_locations job's
+    result instead of waiting for a human's separate apply click.
+
+    Returns (job, None) on success or (None, message) -- same shape as
+    _create_device_job -- when the device can't perform this operation or
+    its tenant's agent is offline. Only ever called for an agent-mode
+    tenant's OLT (the scheduler already filters to that before calling
+    this), so there is no 'direct' mode branch here at all.
+    """
+    if operation not in AGENT_OPERATIONS:
+        return None, 'Unsupported operation: {}'.format(operation)
+    permitted = DEVICE_TYPE_OPERATIONS.get(device.device_type, ())
+    if operation not in permitted:
+        return None, 'A {} device cannot perform {}.'.format(
+            device.device_type, operation)
+
+    agent = NetworkAgent.query.filter_by(tenant_id=device.tenant_id).first()
+    if not agent or not agent.is_online():
+        last = agent.last_seen_at.strftime('%Y-%m-%d %H:%M:%S') if (agent and agent.last_seen_at) else 'never'
+        return None, 'Agent offline (last seen {}). Start the agent on your network and try again.'.format(last)
+
+    job = NetworkAgentJob(
+        tenant_id=device.tenant_id, device_id=device.id,
+        operation=operation, params={'_scheduled': True},
+        requested_by_user_id=None,
+    )
+    _prune_stale_agent_jobs(device.tenant_id)
+    db.session.add(job)
+    db.session.commit()
+    return job, None
+
+
 def _record_write_audit(customer, device, action, outcome, message=None,
                         job_id=None, user_id=None, username=None):
     """Record one PPPoE write. Added to the session, not committed -- the
