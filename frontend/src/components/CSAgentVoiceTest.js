@@ -10,7 +10,8 @@ import {
     CallEnd as CallEndIcon,
     PhoneInTalk as PhoneInTalkIcon,
     Save as SaveIcon,
-    Edit as EditIcon
+    Edit as EditIcon,
+    CheckCircle as CheckCircleIcon
 } from '@mui/icons-material';
 import axios from 'axios';
 import AgentMemoryManager from './AgentMemoryManager';
@@ -557,43 +558,48 @@ export default function CSAgentVoiceTest() {
                                 />
                             </Box>
 
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 4, flexWrap: 'wrap' }}>
-                                <TextField
-                                    size="small"
-                                    label="Gemini API Key (free tier)"
-                                    value={geminiApiKey}
-                                    onChange={(e) => setGeminiApiKey(e.target.value)}
-                                    placeholder={hasGeminiKey ? 'اتركه فارغاً للإبقاء على المفتاح الحالي' : 'AIza...'}
-                                    disabled={!isEditingGeminiKey || (status !== 'idle' && status !== 'error')}
-                                    helperText={
-                                        <span>
-                                            بيحل محل ElevenLabs كـ"دماغ" الرد على الواتساب مجاناً.{' '}
-                                            <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">
-                                                احصل على مفتاح مجاني من هون
-                                            </a>
-                                            {hasGeminiKey && !geminiApiKey.trim() && (
-                                                <>
-                                                    <br />
-                                                    المفتاح الحالي: {geminiKeyMask || '(مخفي)'}
-                                                </>
-                                            )}
-                                        </span>
-                                    }
-                                    sx={{ minWidth: 260, flexGrow: 1 }}
-                                    InputProps={{
-                                        endAdornment: (
-                                            <InputAdornment position="end">
-                                                <IconButton
-                                                    onClick={() => setIsEditingGeminiKey(true)}
-                                                    disabled={status !== 'idle' && status !== 'error'}
-                                                    edge="end"
-                                                >
-                                                    <EditIcon fontSize="small" />
-                                                </IconButton>
-                                            </InputAdornment>
-                                        )
-                                    }}
-                                />
+                            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, mb: 4 }}>
+                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
+                                    <TextField
+                                        size="small"
+                                        label="Gemini API Key (free tier)"
+                                        value={geminiApiKey}
+                                        onChange={(e) => setGeminiApiKey(e.target.value)}
+                                        placeholder={hasGeminiKey ? 'اتركه فارغاً للإبقاء على المفتاح الحالي' : 'AIza...'}
+                                        disabled={!isEditingGeminiKey || (status !== 'idle' && status !== 'error')}
+                                        helperText={
+                                            <span>
+                                                بيحل محل ElevenLabs كـ"دماغ" الرد على الواتساب مجاناً.{' '}
+                                                <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">
+                                                    احصل على مفتاح مجاني من هون
+                                                </a>
+                                            </span>
+                                        }
+                                        sx={{ minWidth: 260, flexGrow: 1 }}
+                                        InputProps={{
+                                            endAdornment: (
+                                                <InputAdornment position="end">
+                                                    <IconButton
+                                                        onClick={() => setIsEditingGeminiKey(true)}
+                                                        disabled={status !== 'idle' && status !== 'error'}
+                                                        edge="end"
+                                                    >
+                                                        <EditIcon fontSize="small" />
+                                                    </IconButton>
+                                                </InputAdornment>
+                                            )
+                                        }}
+                                    />
+                                    {hasGeminiKey && !geminiApiKey.trim() && (
+                                        <Chip
+                                            icon={<CheckCircleIcon />}
+                                            color="success"
+                                            variant="filled"
+                                            label={`مفتاح Gemini محفوظ: ${geminiKeyMask || '(مخفي)'}`}
+                                            sx={{ fontWeight: 700 }}
+                                        />
+                                    )}
+                                </Box>
                             </Box>
 
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2, flexWrap: 'wrap' }}>
