@@ -29,6 +29,15 @@ import { formatStamp, parseUtc } from './formatStamp';
 // lost by waiting longer before the page fires one on its own.
 const STALE_AFTER_MS = 30 * 60 * 1000;
 
+// How often the page re-checks every OLT while it stays open, independent of
+// STALE_AFTER_MS above (which only governs the one-shot "catch up on mount if
+// very stale" effect). DeltaNet's own tenant runs in 'agent' mode, so this
+// does not block the shared web worker the way a 5-minute interval would in
+// 'direct' mode -- see the design doc. Bump to 15 * 60 * 1000 if on-prem-agent
+// or OLT load becomes a concern later; this is the only place the interval
+// is defined.
+export const AUTO_REFRESH_PERIOD_MS = 5 * 60 * 1000;
+
 /** '2026-09-05 12:00:00' (UTC, as the API emits it) -> "4 min ago". */
 export function describeAge(stamp, now = Date.now()) {
     if (!stamp) return 'never checked';
@@ -52,6 +61,27 @@ export function isStale(stamp, now = Date.now()) {
     if (!stamp) return true;
     const then = parseUtc(stamp);
     return Number.isNaN(then) || (now - then) > STALE_AFTER_MS;
+}
+
+/**
+ * Every OLT device in `tree` that isn't already mid-refresh -- the set the
+ * periodic auto-refresh timer (see NetworkTreeView below) acts on for one
+ * tick. Same recursive children-walk the one-shot stale-refresh effect
+ * already uses. Pure and exported so it is unit-tested without mounting the
+ * component or touching real hardware.
+ */
+export function collectAutoRefreshOltDevices(tree, refreshingIds) {
+    const result = [];
+    (tree || []).forEach((root) => {
+        const walk = (device) => {
+            if (device.device_type === 'vsol_olt' && !refreshingIds[device.id]) {
+                result.push(device);
+            }
+            (device.children || []).forEach(walk);
+        };
+        walk(root);
+    });
+    return result;
 }
 
 /**
