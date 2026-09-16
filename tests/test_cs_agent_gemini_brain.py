@@ -115,14 +115,68 @@ def test_query_gemini_agent_falls_back_to_lite_model_on_rate_limit(mock_search):
 
 
 @patch("cs_agent_tools.search_knowledge_entries", return_value=[])
-def test_query_gemini_agent_returns_none_on_non_rate_limit_error(mock_search):
-    """Any other API error (not 429) returns None immediately -- caller falls
-    back to the rule-based processor, no retry on the fallback model."""
-    server_error = _fake_api_error(500, "internal error")
+def test_query_gemini_agent_falls_back_to_lite_model_on_server_overload(mock_search):
+    """A 503 ("high demand") on the primary model also retries on the
+    fallback model -- confirmed live in production: gemini-flash-latest
+    returned a 503 and the reply silently degraded to the rule-based
+    processor without ever trying gemini-2.5-flash-lite, because only 429
+    used to trigger this retry."""
+    overload_error = _fake_api_error(503, "This model is currently experiencing high demand.")
 
     with patch("google.genai.Client") as MockClient:
         instance = MockClient.return_value
-        instance.models.generate_content.side_effect = [server_error]
+        instance.models.generate_content.side_effect = [
+            overload_error,
+            _text_only_response("جواب من الموديل الاحتياطي."),
+        ]
+
+        result = cs_agent_tools.query_gemini_agent(
+            appmod, tenant_id=1, api_key="fake-key",
+            incoming_text="شو رصيدي؟", sender_phone="70123456"
+        )
+
+    assert result["reply_text"] == "جواب من الموديل الاحتياطي."
+    assert instance.models.generate_content.call_count == 2
+    second_call_model = instance.models.generate_content.call_args_list[1].kwargs.get("model")
+    assert second_call_model == cs_agent_tools.GEMINI_MODEL_FALLBACK
+
+
+@patch("cs_agent_tools.search_knowledge_entries", return_value=[])
+def test_query_gemini_agent_falls_back_to_lite_model_on_deadline_exceeded(mock_search):
+    """A 504 ("deadline expired") on the primary model also retries on the
+    fallback model -- also confirmed live in production, same gap as the 503
+    case above."""
+    deadline_error = _fake_api_error(504, "Deadline expired before operation could complete.")
+
+    with patch("google.genai.Client") as MockClient:
+        instance = MockClient.return_value
+        instance.models.generate_content.side_effect = [
+            deadline_error,
+            _text_only_response("جواب من الموديل الاحتياطي."),
+        ]
+
+        result = cs_agent_tools.query_gemini_agent(
+            appmod, tenant_id=1, api_key="fake-key",
+            incoming_text="شو رصيدي؟", sender_phone="70123456"
+        )
+
+    assert result["reply_text"] == "جواب من الموديل الاحتياطي."
+    assert instance.models.generate_content.call_count == 2
+    second_call_model = instance.models.generate_content.call_args_list[1].kwargs.get("model")
+    assert second_call_model == cs_agent_tools.GEMINI_MODEL_FALLBACK
+
+
+@patch("cs_agent_tools.search_knowledge_entries", return_value=[])
+def test_query_gemini_agent_returns_none_on_non_retryable_error(mock_search):
+    """A genuinely non-retryable error (e.g. 400 bad request) returns None
+    immediately -- caller falls back to the rule-based processor, no retry
+    on the fallback model, since retrying an identical bad request would
+    just fail the same way."""
+    bad_request_error = _fake_api_error(400, "invalid argument")
+
+    with patch("google.genai.Client") as MockClient:
+        instance = MockClient.return_value
+        instance.models.generate_content.side_effect = [bad_request_error]
 
         result = cs_agent_tools.query_gemini_agent(
             appmod, tenant_id=1, api_key="fake-key",

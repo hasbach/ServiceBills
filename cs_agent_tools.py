@@ -1240,6 +1240,16 @@ GEMINI_MAX_TOOL_ROUNDTRIPS = 6
 # in MILLISECONDS (see google.genai.types.HttpOptions).
 GEMINI_HTTP_TIMEOUT_MS = 30_000
 
+# Transient, server-side errors worth trying the fallback model for instead
+# of giving up immediately -- confirmed live in production: a 503 ("high
+# demand") and a 504 ("deadline expired") on gemini-flash-latest each fell
+# straight through to the rule-based processor without ever trying
+# gemini-2.5-flash-lite, because only 429 triggered the fallback-model retry.
+# Matches Google's own retry guidance (429 RESOURCE_EXHAUSTED, 503
+# UNAVAILABLE, and by the same logic 500/504 -- all indicate the request
+# itself was fine and should be retried, not that anything is wrong with it).
+GEMINI_RETRYABLE_ERROR_CODES = {429, 500, 503, 504}
+
 
 def _gemini_tools():
     from google.genai import types
@@ -1594,8 +1604,8 @@ def query_gemini_agent(appmod, tenant_id, api_key, incoming_text, sender_phone, 
                 }
             return None  # exhausted tool loop with no final text -- fall back to rule-based
         except errors.APIError as e:
-            if e.code == 429 and attempt < len(candidate_models) - 1:
-                logging.warning(f"Gemini rate-limited on {candidate_model}, retrying on {candidate_models[attempt + 1]}")
+            if e.code in GEMINI_RETRYABLE_ERROR_CODES and attempt < len(candidate_models) - 1:
+                logging.warning(f"Gemini error {e.code} on {candidate_model}, retrying on {candidate_models[attempt + 1]}")
                 continue
             logging.warning(f"Gemini API error ({e.code}): {getattr(e, 'message', e)}")
             return None
