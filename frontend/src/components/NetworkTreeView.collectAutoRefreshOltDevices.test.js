@@ -49,4 +49,9 @@ describe('collectAutoRefreshOltDevices', () => {
         const oltB = { id: 2, device_type: 'vsol_olt', children: [] };
         expect(collectAutoRefreshOltDevices([oltA, oltB], {})).toEqual([oltA, oltB]);
     });
+
+    it('treats a missing/undefined refreshingIds as empty', () => {
+        const olt = { id: 1, device_type: 'vsol_olt', children: [] };
+        expect(collectAutoRefreshOltDevices([olt], undefined)).toEqual([olt]);
+    });
 });

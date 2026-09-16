@@ -36,7 +36,7 @@ const STALE_AFTER_MS = 30 * 60 * 1000;
 // 'direct' mode -- see the design doc. Bump to 15 * 60 * 1000 if on-prem-agent
 // or OLT load becomes a concern later; this is the only place the interval
 // is defined.
-export const AUTO_REFRESH_PERIOD_MS = 5 * 60 * 1000;
+const AUTO_REFRESH_PERIOD_MS = 5 * 60 * 1000;
 
 /** '2026-09-05 12:00:00' (UTC, as the API emits it) -> "4 min ago". */
 export function describeAge(stamp, now = Date.now()) {
@@ -74,7 +74,7 @@ export function collectAutoRefreshOltDevices(tree, refreshingIds) {
     const result = [];
     (tree || []).forEach((root) => {
         const walk = (device) => {
-            if (device.device_type === 'vsol_olt' && !refreshingIds[device.id]) {
+            if (device.device_type === 'vsol_olt' && !(refreshingIds || {})[device.id]) {
                 result.push(device);
             }
             (device.children || []).forEach(walk);
@@ -254,9 +254,20 @@ const NetworkTreeView = () => {
 
     useEffect(() => {
         if (accessMode !== 'agent') return;
-        apiService.fetchNetworkAgents()
-            .then((res) => setAgent((res.data || [])[0] || null))
-            .catch(() => {}); // Advisory only -- a failed fetch just leaves the chip/buttons as if no agent exists.
+        const fetchAgent = () => {
+            apiService.fetchNetworkAgents()
+                .then((res) => setAgent((res.data || [])[0] || null))
+                .catch(() => {}); // Advisory only -- a failed fetch just leaves the chip/buttons as if no agent exists.
+        };
+        fetchAgent();
+        // Keep agentOnline current for as long as this tab stays open -- without
+        // this, a real agent disconnect after page load would never be reflected
+        // in state, and the periodic auto-refresh effect below (which correctly
+        // stops itself when agentOnline goes false) would keep firing against a
+        // dead agent forever. Same cadence as the auto-refresh timer -- there's
+        // no reason for the two to drift.
+        const interval = setInterval(fetchAgent, AUTO_REFRESH_PERIOD_MS);
+        return () => clearInterval(interval);
     }, [accessMode]);
 
     const agentOnline = !!(agent && agent.is_online);
@@ -358,7 +369,7 @@ const NetworkTreeView = () => {
     // record -- see _apply_cpe_locations's docstring on the backend. Only a
     // successful apply is worth a resync, so loadTree(false) sits inside that
     // branch rather than unconditionally after the poll, unlike refreshOlt.
-    const locateCustomers = useCallback(async (device) => {
+    const locateCustomers = useCallback(async (device, { auto = false } = {}) => {
         const seq = (refreshSeqRef.current[device.id] || 0) + 1;
         refreshSeqRef.current[device.id] = seq;
 
@@ -376,12 +387,21 @@ const NetworkTreeView = () => {
                     if (job.status === 'done' && !job.error) {
                         try {
                             const applied = await apiService.applyCustomerLocations(device.id, res.data.job_id);
-                            setSnackbar({
-                                open: true, severity: 'success',
-                                message: `Located ${applied.data.located} customers `
-                                    + `(${applied.data.moved} moved). `
-                                    + `${applied.data.unmatched} devices matched no customer.`,
-                            });
+                            // Only a manual click should pop a success toast --
+                            // the background auto-refresh timer (auto=true)
+                            // re-runs this same apply every AUTO_REFRESH_PERIOD_MS
+                            // for as long as the tab stays open, and an
+                            // unsolicited green snackbar every 5 minutes would
+                            // be pure noise to an admin/finance user who just
+                            // left the page open.
+                            if (!auto) {
+                                setSnackbar({
+                                    open: true, severity: 'success',
+                                    message: `Located ${applied.data.located} customers `
+                                        + `(${applied.data.moved} moved). `
+                                        + `${applied.data.unmatched} devices matched no customer.`,
+                                });
+                            }
                             // Pulls the freshly-written onu_mac_address/
                             // onu_last_seen_at placements back into the tree --
                             // only reached on a successful apply, since a
@@ -539,6 +559,17 @@ const NetworkTreeView = () => {
         latestAutoRefreshRef.current = { tree, refreshingIds, canEditLinks };
     }, [tree, refreshingIds, canEditLinks]);
 
+    // Guards against a tick starting while the previous one is still
+    // working through its device list. Each tick's loop does two sequential
+    // round trips per OLT device (refreshOlt's job+poll, then
+    // locateCustomers's job+poll+apply); with several OLTs, or slow
+    // hardware, that loop can plausibly take longer than
+    // AUTO_REFRESH_PERIOD_MS. Without this guard, the next tick would start
+    // on top of it, doubling load and racing the shared per-device
+    // refreshSeqRef. Ref, not state -- flipping it must never itself
+    // trigger a render.
+    const tickRunningRef = useRef(false);
+
     // Periodic auto-refresh: while this page stays mounted, re-check every
     // OLT's ONU status every AUTO_REFRESH_PERIOD_MS, and -- only for
     // admin/finance, exactly like the manual "Locate Customers" button
@@ -549,19 +580,35 @@ const NetworkTreeView = () => {
     useEffect(() => {
         if (accessMode === 'agent' && !agentOnline) return;
         const interval = setInterval(() => {
+            if (tickRunningRef.current) return;
+            tickRunningRef.current = true;
             const { tree: currentTree, refreshingIds: currentRefreshingIds, canEditLinks: currentCanEditLinks } =
                 latestAutoRefreshRef.current;
             const devices = collectAutoRefreshOltDevices(currentTree, currentRefreshingIds);
             (async () => {
-                for (const device of devices) {
-                    try {
-                        await refreshOlt(device, { auto: true });
-                        if (currentCanEditLinks) await locateCustomers(device);
-                    } catch (e) {
-                        // Swallowed on purpose -- same reasoning as the
-                        // one-shot stale-refresh effect above: one device's
-                        // failure must not stop the rest, or the timer.
+                try {
+                    for (const device of devices) {
+                        // Re-check the CURRENT refreshingIds (not this tick's
+                        // start-of-batch snapshot) immediately before acting
+                        // on each device. A device that became busy (a
+                        // manual click, or another cause) since this tick's
+                        // batch was collected must not have its result
+                        // clobbered by the background timer -- acting on it
+                        // anyway would bump the shared refreshSeqRef and
+                        // discard the user's own in-flight result out from
+                        // under their spinner.
+                        if (latestAutoRefreshRef.current.refreshingIds[device.id]) continue;
+                        try {
+                            await refreshOlt(device, { auto: true });
+                            if (currentCanEditLinks) await locateCustomers(device, { auto: true });
+                        } catch (e) {
+                            // Swallowed on purpose -- same reasoning as the
+                            // one-shot stale-refresh effect above: one device's
+                            // failure must not stop the rest, or the timer.
+                        }
                     }
+                } finally {
+                    tickRunningRef.current = false;
                 }
             })();
         }, AUTO_REFRESH_PERIOD_MS);
