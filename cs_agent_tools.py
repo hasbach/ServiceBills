@@ -1224,7 +1224,7 @@ def handle_whatsapp_audio_transcription(access_token, media_id, api_version='v19
 # concrete stable model with a documented free tier instead of guessing at a
 # future lite alias name.
 GEMINI_MODEL_PRIMARY = "gemini-flash-latest"
-GEMINI_MODEL_FALLBACK = "gemini-2.5-flash-lite"
+GEMINI_MODEL_FALLBACK = "gemini-3.5-flash-lite"
 
 # Covers the two-sequential-tool diagnostic chain (lookup_customer then
 # network_diagnostic) from the original CS agent spec, with headroom.
