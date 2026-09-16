@@ -60,16 +60,44 @@ None`, since that could in principle also be `None` for an edge case on the
 human path (e.g. a valid JWT whose user record was deleted between token
 issue and this call), and an explicit marker costs nothing extra to add.
 
-### `_create_device_job` must tolerate a non-request-context caller
+### The scheduler cannot call `_create_device_job` or `_apply_cpe_locations` as-is
 
-Currently (`app.py:10635-10639`) this function unconditionally calls
-`get_jwt_identity()` to stamp `requested_by_user_id`, which requires an
-active, verified JWT context — calling it from a scheduler thread (no
-request, no JWT) throws. It needs a code path that skips this lookup
-entirely when there is no request context, leaving `requested_by_user_id`
-`None` for a scheduled call, exactly as it already is for any caller with no
-current user. No behavior change for every existing (human, JWT-authenticated)
-call site.
+Both functions depend on `tenant_query()` (`tenancy.py:27-29`), which derives
+the tenant from the current Flask-JWT (`current_tenant_id()` calls
+`get_jwt()`, which requires `verify_jwt_in_request()` to have already run).
+A scheduler thread has no JWT at all. This isn't limited to the
+`requested_by_user_id` stamp: `_create_device_job`'s access-mode check
+(`_tenant_access_mode()`) and its agent lookup (`tenant_query(NetworkAgent)`,
+`app.py:10661`) both go through the same JWT-derived path, and
+`_apply_cpe_locations`'s customer lookup (`tenant_query(Customer)`,
+`app.py:11095`) does too. Calling either function unmodified from the
+scheduler — or from `agent_post_result`, which authenticates via a separate
+agent-token mechanism (`agent_token_required()`) that also carries no JWT —
+would throw.
+
+Every existing scheduled job in this file already solves the equivalent
+problem the same way: the per-tenant work function takes an explicit
+`tenant_id` parameter and queries with plain `Model.query.filter_by(tenant_id=
+tenant_id)`, never `tenant_query()` (see `check_pro_plan_expirations_for_tenant`,
+`app.py:3179-3211`, called with `t.id` by its `_with_context` wrapper). This
+spec follows the same pattern, and deliberately does **not** modify
+`_create_device_job` or `_apply_cpe_locations` themselves — both are shared,
+heavily-used, security-relevant (multi-tenant-isolation) functions, and every
+existing call site of each must stay exactly as it behaves today:
+
+- A new, scheduler-only function covers just the agent-mode job-creation path
+  (the only path this feature needs, since it's already scoped to
+  agent-mode tenants) using explicit `device.tenant_id`-based queries instead
+  of `_tenant_access_mode()`/`tenant_query(NetworkAgent)`. `_create_device_job`
+  itself is untouched.
+- `_apply_cpe_locations` gains one new optional parameter,
+  `tenant_id=None` — when provided, it queries
+  `Customer.query.filter_by(tenant_id=tenant_id, ...)` directly instead of
+  `tenant_query(Customer)`; when omitted (every existing call site), behavior
+  is byte-for-byte identical to today. This is the one small, additive,
+  backward-compatible touch to shared code this feature needs — a new
+  scheduler/agent-token call site can now pass its own known tenant_id
+  explicitly, since there is no JWT to derive one from.
 
 ### The new scheduled job
 
@@ -85,7 +113,8 @@ a 15-minute interval rather than daily. On each run:
       been offline for a while must not accumulate an unbounded backlog of
       duplicate jobs every 15 minutes.
    b. Otherwise, create an `olt_status` job and a `cpe_locations` job via
-      `_create_device_job`, both with `params={'_scheduled': True}`.
+      the new scheduler-only job-creation function, both with
+      `params={'_scheduled': True}`.
 3. **Failure isolation, following the correct existing precedent, not the
    gap.** `check_pro_plan_expirations_with_context` (`app.py:3217-3221`)
    wraps each tenant's work in its own `try/except` so one tenant's failure
@@ -96,15 +125,17 @@ a 15-minute interval rather than daily. On each run:
    the run for other tenants/devices.
 
 This job never waits for a result — enqueuing is fire-and-forget, matching
-how `_create_device_job` already behaves for agent-mode operations.
+how `_create_device_job` already behaves for agent-mode operations (the new
+function mirrors only that same insert-and-return behavior).
 
 ### Auto-applying a completed system-triggered CPE-location job
 
 In `agent_post_result` (`app.py:10424`), immediately after a `cpe_locations`
 job is marked `done` with a valid result (`app.py:10490-10491`, the
 `job.result = result; job.error = None` branch): if
-`job.params.get('_scheduled')` is true, call `_apply_cpe_locations(job.result)`
-directly and let its own result be logged (there's no human waiting on an
+`job.params.get('_scheduled')` is true, call
+`_apply_cpe_locations(job.result, tenant_id=job.tenant_id)` directly and let
+its own result be logged (there's no human waiting on an
 HTTP response to show a snackbar to — this runs inside the agent's own
 result-POST request, not a browser's). A human-triggered `cpe_locations` job
 (no `_scheduled` marker) is completely unaffected: it still requires the
@@ -137,12 +168,14 @@ regardless of who created it, and any tree viewer (or the CS-agent's own
   agent-mode tenants' OLTs only (not direct-mode), skips a device with an
   already-outstanding pending/claimed job for that operation, isolates one
   tenant's failure from the rest, stamps `params={'_scheduled': True}`.
-- Unit tests for `_create_device_job`'s non-request-context path: does not
-  raise outside a request context, leaves `requested_by_user_id` `None`.
+- Unit tests for `_apply_cpe_locations`'s new `tenant_id` parameter: an
+  explicit `tenant_id` scopes the customer lookup to that tenant with no
+  JWT/request context required; omitting it (every existing call site)
+  behaves exactly as today.
 - Unit tests for `agent_post_result`: a `_scheduled` `cpe_locations` job's
-  successful result triggers `_apply_cpe_locations`; a non-`_scheduled` one
-  does not (existing behavior unchanged); an `olt_status` job never
-  triggers it regardless of the marker.
+  successful result triggers `_apply_cpe_locations(..., tenant_id=job.tenant_id)`;
+  a non-`_scheduled` one does not (existing behavior unchanged); an
+  `olt_status` job never triggers it regardless of the marker.
 - Live verification (this project's established pattern): after deploy,
   confirm via Render logs that the new job fires on its 15-minute interval
   for DeltaNet's own tenant (agent mode), and that `Customer.onu_mac_address`
