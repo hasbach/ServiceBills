@@ -3238,22 +3238,51 @@ def refresh_agent_mode_network_status_for_tenant(tenant_id):
     must not accumulate an unbounded backlog of duplicate jobs. A no-op for
     a tenant not in 'agent' mode: _create_scheduled_device_job's own
     offline check would refuse anyway, but skipping the query entirely here
-    avoids the wasted work for direct-mode tenants on every 15-minute tick."""
+    avoids the wasted work for direct-mode tenants on every 15-minute tick.
+
+    An "outstanding" job is given the same lazy-expiry chance any
+    human-polled job already gets (_expire_job_if_stale) before it blocks a
+    fresh one: nobody ever polls a scheduler-created job the way a human's
+    browser polls one it created, so without this an agent that claimed a
+    job and then never reported back (a network blip on its result-POST, a
+    power cut, a restart) would wedge this device+operation out of ever
+    getting a fresh check again, forever.
+
+    Each device's work is isolated in its own try/except so one device's
+    failure does not abort the rest of this tenant's devices -- refresh_
+    agent_mode_network_status_with_context already does the same at the
+    tenant level, above this."""
     settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).first()
     if not settings or settings.network_access_mode != 'agent':
         return
+    _prune_scheduled_agent_jobs(tenant_id)
     devices = NetworkDevice.query.filter_by(tenant_id=tenant_id, device_type='vsol_olt').all()
+    created = 0
     for device in devices:
-        for operation in NETWORK_FRESHNESS_OPERATIONS:
-            outstanding = NetworkAgentJob.query.filter(
-                NetworkAgentJob.tenant_id == tenant_id,
-                NetworkAgentJob.device_id == device.id,
-                NetworkAgentJob.operation == operation,
-                NetworkAgentJob.status.in_(('pending', 'claimed')),
-            ).first()
-            if outstanding:
-                continue
-            _create_scheduled_device_job(device, operation)
+        try:
+            for operation in NETWORK_FRESHNESS_OPERATIONS:
+                outstanding = NetworkAgentJob.query.filter(
+                    NetworkAgentJob.tenant_id == tenant_id,
+                    NetworkAgentJob.device_id == device.id,
+                    NetworkAgentJob.operation == operation,
+                    NetworkAgentJob.status.in_(('pending', 'claimed')),
+                ).first()
+                if outstanding:
+                    _expire_job_if_stale(outstanding)
+                    if outstanding.status in ('pending', 'claimed'):
+                        continue
+                job, error = _create_scheduled_device_job(device, operation)
+                if error:
+                    logging.warning(
+                        f"Scheduled {operation} for device {device.id} (tenant {tenant_id}) "
+                        f"not created: {error}")
+                elif job:
+                    created += 1
+        except Exception as e:
+            db.session.rollback()
+            logging.error(f"Scheduled network freshness refresh failed for device {device.id} (tenant {tenant_id}): {e}")
+    if created:
+        logging.info(f"Scheduled network freshness: created {created} job(s) for tenant {tenant_id}")
 
 
 def refresh_agent_mode_network_status_with_context():
@@ -3300,7 +3329,15 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     # not a change to this "fire immediately" pattern itself.
     scheduler.add_job(func=auto_sync_upstream_status_with_context, trigger="interval", days=1, next_run_time=datetime.now())
     scheduler.add_job(func=check_pro_plan_expirations_with_context, trigger="interval", days=1, next_run_time=datetime.now())
-    scheduler.add_job(func=refresh_agent_mode_network_status_with_context, trigger="interval", minutes=15, next_run_time=datetime.now())
+    # misfire_grace_time=600: this executor is single-threaded (max_workers=1,
+    # shared with the daily jobs above), and auto_sync_upstream_status_with_context
+    # can run for an unbounded duration. APScheduler 3.x's default
+    # misfire_grace_time is 1 second, so a 15-minute tick that has to wait
+    # behind a long-running daily job would otherwise be skipped entirely
+    # (logged as a missed run), not deferred. 600s (10 min) comfortably
+    # survives sitting behind a slow daily job without stacking indefinitely.
+    scheduler.add_job(func=refresh_agent_mode_network_status_with_context, trigger="interval", minutes=15,
+                       next_run_time=datetime.now(), misfire_grace_time=600)
     scheduler.start()
  
     
@@ -10556,6 +10593,7 @@ def agent_post_result(job_id):
         try:
             _apply_cpe_locations(job.result, tenant_id=job.tenant_id)
         except Exception as e:
+            db.session.rollback()
             logging.error(f"Auto-apply of scheduled cpe_locations job {job.id} failed: {e}")
     return jsonify({'message': 'Recorded'}), 200
 
@@ -10658,6 +10696,28 @@ def _prune_stale_agent_jobs(tenant_id):
     cutoff = datetime.utcnow() - timedelta(days=NETWORK_AGENT_JOB_RETENTION_DAYS)
     NetworkAgentJob.query.filter(
         NetworkAgentJob.tenant_id == tenant_id,
+        NetworkAgentJob.status.in_(('done', 'failed', 'expired')),
+        NetworkAgentJob.created_at < cutoff,
+    ).delete(synchronize_session=False)
+
+
+def _prune_scheduled_agent_jobs(tenant_id):
+    """Scheduler-created jobs (see _create_scheduled_device_job) have no
+    human audit value -- nobody ever opens one -- and accumulate at a much
+    higher rate than human-triggered jobs (every 15 minutes, forever, vs.
+    on-demand). Pruned on a much shorter window than
+    NETWORK_AGENT_JOB_RETENTION_DAYS to protect the 500 MB production
+    storage cap (see that constant's own docstring) from an unbounded 24/7
+    producer. requested_by_user_id IS NULL is used as the "system-created"
+    signal rather than querying the JSON params column, which SQLite and
+    Postgres handle very differently for containment and isn't indexed here
+    -- every job this feature creates has no requested_by_user_id, and no
+    other code path creates an olt_status/cpe_locations job that way."""
+    cutoff = datetime.utcnow() - timedelta(days=1)
+    NetworkAgentJob.query.filter(
+        NetworkAgentJob.tenant_id == tenant_id,
+        NetworkAgentJob.requested_by_user_id.is_(None),
+        NetworkAgentJob.operation.in_(NETWORK_FRESHNESS_OPERATIONS),
         NetworkAgentJob.status.in_(('done', 'failed', 'expired')),
         NetworkAgentJob.created_at < cutoff,
     ).delete(synchronize_session=False)

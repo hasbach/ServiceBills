@@ -122,3 +122,70 @@ def test_refresh_with_context_isolates_one_tenants_failure(app, client, monkeypa
         # Tenant B's job still got created despite tenant A's failure.
         jobs = appmod.NetworkAgentJob.query.filter_by(tenant_id=tenant_b_id, device_id=device_b_id).all()
         assert len(jobs) == 2
+
+
+def test_prune_scheduled_agent_jobs_deletes_old_terminal_scheduled_jobs_only(app, client):
+    tenant_id, device_id = _make_agent_mode_tenant_with_olt(app, client, "Sched I", "sched_i_admin")
+    with app.app_context():
+        old_cutoff = appmod.datetime.utcnow() - appmod.timedelta(days=2)
+        old_scheduled = appmod.NetworkAgentJob(
+            tenant_id=tenant_id, device_id=device_id, operation='olt_status',
+            status='done', requested_by_user_id=None, created_at=old_cutoff)
+        recent_scheduled = appmod.NetworkAgentJob(
+            tenant_id=tenant_id, device_id=device_id, operation='olt_status',
+            status='done', requested_by_user_id=None,
+            created_at=appmod.datetime.utcnow())
+        appmod.db.session.add_all([old_scheduled, recent_scheduled])
+        appmod.db.session.commit()
+        old_id, recent_id = old_scheduled.id, recent_scheduled.id
+
+        appmod._prune_scheduled_agent_jobs(tenant_id)
+
+        remaining_ids = {j.id for j in appmod.NetworkAgentJob.query.filter_by(tenant_id=tenant_id).all()}
+        assert old_id not in remaining_ids
+        assert recent_id in remaining_ids
+
+
+def test_refresh_creates_fresh_jobs_when_previous_jobs_are_terminal(app, client):
+    """The behavior that makes this 'every 15 minutes' rather than 'once':
+    a device whose previous jobs already finished (successfully or not)
+    must get a fresh pair on the next tick, not be blocked forever."""
+    tenant_id, device_id = _make_agent_mode_tenant_with_olt(app, client, "Sched J", "sched_j_admin")
+    with app.app_context():
+        appmod.db.session.add_all([
+            appmod.NetworkAgentJob(tenant_id=tenant_id, device_id=device_id,
+                                    operation='olt_status', status='done'),
+            appmod.NetworkAgentJob(tenant_id=tenant_id, device_id=device_id,
+                                    operation='cpe_locations', status='failed'),
+        ])
+        appmod.db.session.commit()
+
+        appmod.refresh_agent_mode_network_status_for_tenant(tenant_id)
+
+        pending = appmod.NetworkAgentJob.query.filter_by(
+            tenant_id=tenant_id, device_id=device_id, status='pending').all()
+        assert sorted(j.operation for j in pending) == ['cpe_locations', 'olt_status']
+
+
+def test_refresh_does_not_permanently_block_on_a_stale_claimed_job(app, client):
+    """Regression test for the Critical finding: an agent that claimed a job
+    and never reported back must not wedge this device+operation forever."""
+    tenant_id, device_id = _make_agent_mode_tenant_with_olt(app, client, "Sched K", "sched_k_admin")
+    with app.app_context():
+        stale_claimed_at = appmod.datetime.utcnow() - appmod.timedelta(
+            seconds=appmod.JOB_RESULT_TIMEOUT_SECONDS + 10)
+        stuck = appmod.NetworkAgentJob(
+            tenant_id=tenant_id, device_id=device_id, operation='olt_status',
+            status='claimed', claimed_at=stale_claimed_at)
+        appmod.db.session.add(stuck)
+        appmod.db.session.commit()
+        stuck_id = stuck.id
+
+        appmod.refresh_agent_mode_network_status_for_tenant(tenant_id)
+
+        stuck_reloaded = appmod.db.session.get(appmod.NetworkAgentJob, stuck_id)
+        assert stuck_reloaded.status == 'failed'  # expired out by _expire_job_if_stale
+        fresh = appmod.NetworkAgentJob.query.filter_by(
+            tenant_id=tenant_id, device_id=device_id, operation='olt_status',
+            status='pending').all()
+        assert len(fresh) == 1  # a new job was created, not permanently blocked
