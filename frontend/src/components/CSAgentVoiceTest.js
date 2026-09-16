@@ -21,6 +21,8 @@ export default function CSAgentVoiceTest() {
     const [isEditingAgentId, setIsEditingAgentId] = useState(false);
     const [isEditingAdminMobile, setIsEditingAdminMobile] = useState(false);
     const [geminiApiKey, setGeminiApiKey] = useState('');
+    const [geminiKeyMask, setGeminiKeyMask] = useState('');
+    const [hasGeminiKey, setHasGeminiKey] = useState(false);
     const [isEditingGeminiKey, setIsEditingGeminiKey] = useState(false);
     const [status, setStatus] = useState('idle'); // idle | connecting | connected | speaking | listening | error
     const [errorMessage, setErrorMessage] = useState('');
@@ -57,7 +59,11 @@ export default function CSAgentVoiceTest() {
                 if (res.data) {
                     if (res.data.elevenlabs_agent_id) setAgentId(res.data.elevenlabs_agent_id);
                     if (res.data.admin_mobile_number) setAdminMobile(res.data.admin_mobile_number);
-                    if (res.data.gemini_api_key) setGeminiApiKey(res.data.gemini_api_key);
+                    // The server now sends a masked form (e.g. "AIza...xxxx"), never
+                    // the real key -- leave the editable field blank and just show
+                    // the mask as a hint that a key is already on file.
+                    setHasGeminiKey(!!res.data.has_gemini_key);
+                    setGeminiKeyMask(res.data.gemini_api_key || '');
                 }
             })
             .catch(() => {
@@ -89,11 +95,26 @@ export default function CSAgentVoiceTest() {
         setErrorMessage('');
         try {
             const token = localStorage.getItem('token');
-            await axios.post('/api/cs-agent/config', {
+            const payload = {
                 elevenlabs_agent_id: agentId.trim(),
                 admin_mobile_number: adminMobile.trim(),
-                gemini_api_key: geminiApiKey.trim()
-            }, { headers: { Authorization: `Bearer ${token}` } });
+            };
+            // Only send gemini_api_key if the user actually typed a new one --
+            // the field holds the masked value (or is blank), never the real
+            // key, so resubmitting it unconditionally would overwrite the
+            // real key on file with the mask itself.
+            if (geminiApiKey.trim()) {
+                payload.gemini_api_key = geminiApiKey.trim();
+            }
+            const res = await axios.post('/api/cs-agent/config', payload, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+
+            if (res.data && res.data.settings) {
+                setHasGeminiKey(!!res.data.settings.gemini_api_key);
+                setGeminiKeyMask(res.data.settings.gemini_api_key || '');
+            }
+            setGeminiApiKey('');
 
             setSaveSuccess('تم حفظ إعدادات الـ Agent بنجاح!');
             setIsEditingAgentId(false);
@@ -542,7 +563,7 @@ export default function CSAgentVoiceTest() {
                                     label="Gemini API Key (free tier)"
                                     value={geminiApiKey}
                                     onChange={(e) => setGeminiApiKey(e.target.value)}
-                                    placeholder="AIza..."
+                                    placeholder={hasGeminiKey ? 'اتركه فارغاً للإبقاء على المفتاح الحالي' : 'AIza...'}
                                     disabled={!isEditingGeminiKey || (status !== 'idle' && status !== 'error')}
                                     helperText={
                                         <span>
@@ -550,6 +571,12 @@ export default function CSAgentVoiceTest() {
                                             <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">
                                                 احصل على مفتاح مجاني من هون
                                             </a>
+                                            {hasGeminiKey && !geminiApiKey.trim() && (
+                                                <>
+                                                    <br />
+                                                    المفتاح الحالي: {geminiKeyMask || '(مخفي)'}
+                                                </>
+                                            )}
                                         </span>
                                     }
                                     sx={{ minWidth: 260, flexGrow: 1 }}

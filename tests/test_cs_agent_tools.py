@@ -56,19 +56,27 @@ def test_normalize_lebanese_phone():
 
 
 def test_cs_agent_config(app, client):
-    """GET /api/cs-agent/config returns agent settings with env fallback, and POST saves per-tenant ID."""
+    """GET /api/cs-agent/config requires a real JWT (no more query/env-based
+    tenant resolution -- see the memory-endpoint auth fix), and once
+    authenticated returns agent settings with env fallback; POST saves
+    per-tenant ID."""
     app.config["ELEVENLABS_AGENT_ID"] = "agent_test_123"
-    
-    # 1. Without tenant settings, falls back to env var
+
+    # 1. Unauthenticated GET is rejected -- no tenant_id, no config leak.
     res = client.get("/api/cs-agent/config")
+    assert res.status_code == 401
+
+    # 2. Authenticated tenant saves custom agent ID
+    headers = auth_headers(client, "admin_agent_config", "pw123")
+
+    # Without tenant settings yet, falls back to env var
+    res = client.get("/api/cs-agent/config", headers=headers)
     assert res.status_code == 200
     data = res.get_json()
     assert data["status"] == "ok"
     assert data["elevenlabs_agent_id"] == "agent_test_123"
     assert "agent_test_123" in data["ws_url"]
 
-    # 2. Authenticated tenant saves custom agent ID
-    headers = auth_headers(client, "admin_agent_config", "pw123")
     save_res = client.post(
         "/api/cs-agent/config",
         json={"elevenlabs_agent_id": "tenant_custom_agent_999"},
@@ -735,27 +743,42 @@ def test_cs_agent_settings_gemini_fields_round_trip(app, client):
 
 
 def test_cs_agent_config_saves_gemini_key(app, client):
-    """POST /api/cs-agent/config saves a tenant's Gemini API key and model, and GET returns them."""
+    """POST /api/cs-agent/config saves a tenant's Gemini API key and model.
+    Neither the POST response nor a subsequent GET ever echoes the raw key
+    back -- only a masked form plus has_gemini_key, even though the real
+    value is what's persisted to the database."""
     headers = auth_headers(client, "admin_gemini_config", "pw123")
+    raw_key = "AIzaSyTestKeyForTenant"
 
     save_res = client.post(
         "/api/cs-agent/config",
         json={
             "elevenlabs_agent_id": "agent_keep_existing",
-            "gemini_api_key": "AIzaSyTestKeyForTenant",
+            "gemini_api_key": raw_key,
             "gemini_model": "gemini-2.5-flash-lite"
         },
         headers=headers
     )
     assert save_res.status_code == 200
-    assert save_res.get_json()["settings"]["gemini_api_key"] == "AIzaSyTestKeyForTenant"
+    saved_masked = save_res.get_json()["settings"]["gemini_api_key"]
+    assert saved_masked != raw_key
+    assert raw_key not in save_res.get_data(as_text=True)
+    assert saved_masked.startswith("AIzaSy") and "..." in saved_masked
 
     get_res = client.get("/api/cs-agent/config", headers=headers)
     assert get_res.status_code == 200
     data = get_res.get_json()
-    assert data["gemini_api_key"] == "AIzaSyTestKeyForTenant"
+    assert data["gemini_api_key"] != raw_key
+    assert raw_key not in get_res.get_data(as_text=True)
+    assert data["gemini_api_key"].startswith("AIzaSy") and "..." in data["gemini_api_key"]
     assert data["gemini_model"] == "gemini-2.5-flash-lite"
     assert data["has_gemini_key"] is True
+
+    # The real key is still what's actually persisted and usable server-side.
+    with app.app_context():
+        tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        settings = appmod.CSAgentSettings.query.filter_by(tenant_id=tenant.id).first()
+        assert settings.gemini_api_key == raw_key
 
 
 def test_cs_agent_config_no_gemini_key_by_default(app, client):
@@ -949,18 +972,24 @@ def test_memory_endpoint_creates_entry_with_authenticated_user_id(app, client):
         assert entry.created_by_id == expected_user_id
 
 
-def test_memory_endpoint_unauthenticated_has_null_created_by_id(app, client):
-    """POST /api/cs-agent/memory without JWT auth has created_by_id as None."""
+def test_memory_endpoints_reject_cs_agent_secret_without_jwt(app, client):
+    """Unlike the tool-webhook endpoints, the memory CRUD endpoints are
+    admin-UI-only: they must reject the CS_AGENT_SECRET / body-tenant_id path
+    resolve_tenant_id() otherwise allows, and require a real JWT. A request
+    that only presents the shared secret (no bearer token) must get 401, not
+    silently resolve to whatever tenant_id it named in the body -- otherwise
+    an unauthenticated caller who knows (or guesses) CS_AGENT_SECRET, or any
+    caller at all when it's unset (its production default), could read or
+    plant "known answers" in any tenant's Gemini system prompt."""
     app.config["CS_AGENT_SECRET"] = "test_secret_key_xyz"
 
-    # Set up a tenant using auth_headers, then make an unauthenticated request with agent secret
     auth_headers(client, "admin_memory_no_jwt", "pw123")
     with app.app_context():
         tenant = appmod.Tenant.query.filter_by(name="admin_memory_no_jwt").first()
         assert tenant is not None
         tenant_id = tenant.id
 
-    # POST with agent secret (not JWT) should have created_by_id as None
+    # POST with only the agent secret (no JWT) must be rejected.
     create_res = client.post(
         "/api/cs-agent/memory",
         json={
@@ -970,11 +999,32 @@ def test_memory_endpoint_unauthenticated_has_null_created_by_id(app, client):
         },
         headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}
     )
-    assert create_res.status_code == 200
-    entry_data = create_res.get_json()["entry"]
+    assert create_res.status_code == 401
 
-    # Verify created_by_id is None when not authenticated with JWT
-    assert entry_data["created_by_id"] is None
+    # Same for GET (list), PUT, and DELETE -- no JWT, no access.
+    assert client.get("/api/cs-agent/memory", headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}).status_code == 401
+    assert client.get("/api/cs-agent/memory/recent-logs", headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}).status_code == 401
+    assert client.put(
+        "/api/cs-agent/memory/1", json={"is_active": False},
+        headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}
+    ).status_code == 401
+    assert client.delete(
+        "/api/cs-agent/memory/1", headers={"X-CS-Agent-Secret": "test_secret_key_xyz"}
+    ).status_code == 401
+
+
+def test_memory_endpoints_reject_no_auth_at_all(app, client):
+    """With CS_AGENT_SECRET unset (its production default -- see config.py;
+    forced empty here too, since app.config is process-global and another
+    test in this file may have set it), resolve_tenant_id() would otherwise
+    trust a bare tenant_id from the request with no authentication
+    whatsoever. The memory endpoints must still require a JWT."""
+    app.config["CS_AGENT_SECRET"] = ""
+    assert client.get("/api/cs-agent/memory").status_code == 401
+    assert client.post(
+        "/api/cs-agent/memory",
+        json={"question_text": "q", "answer_text": "a", "tenant_id": 1}
+    ).status_code == 401
 
 
 def test_whatsapp_reply_uses_gemini_when_tenant_key_configured(app, client):
