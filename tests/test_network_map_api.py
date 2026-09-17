@@ -679,6 +679,21 @@ def test_changing_kind_from_onu_to_junction_clears_onu_mac(app, client):
     assert r.get_json()['kind'] == 'junction'
 
 
+def test_changing_kind_from_junction_to_onu_assigns_a_new_mac(app, client):
+    make_tenant(client, 'DeltaNet', 'admin')
+    admin = auth_headers(client, 'admin', 'pw', role='admin')
+    olt = _olt(client, admin)
+    root = _node(client, admin, olt, kind='root', label='CR').get_json()['id']
+    junction = _node(client, admin, olt, kind='junction', parent_node_id=root).get_json()['id']
+    r = client.put(f'/api/network-map/nodes/{junction}', headers=admin,
+                   json={'kind': 'onu', 'onu_mac': 'AA-BB-CC-DD-EE-FF'})
+    assert r.status_code == 200
+    assert r.get_json()['kind'] == 'onu'
+    # Canonicalised, same as add_customer/update_customer/apply_onu_label_matches --
+    # _validate_node_payload runs any changing onu_mac through _canonical_mac.
+    assert r.get_json()['onu_mac'] == 'aa:bb:cc:dd:ee:ff'
+
+
 # --- FINDING 6: a partial update must not be blocked by a pre-existing cycle
 
 def test_a_partial_update_succeeds_inside_an_existing_cycle(app, client):

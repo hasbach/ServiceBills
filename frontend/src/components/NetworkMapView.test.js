@@ -649,7 +649,7 @@ test('editing a node from onu to junction sends onu_mac: null', async () => {
 
 test('a validation error on save surfaces the exact backend message', async () => {
   mockApiPut.mockRejectedValue({
-    response: { status: 400, data: { message: 'this OLT already has a root node' } },
+    response: { status: 400, data: { message: 'that ONU is already placed as "Villa Khoury"' } },
   });
   render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
   await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
@@ -667,7 +667,7 @@ test('a validation error on save surfaces the exact backend message', async () =
   await waitFor(() => expect(mockSetSnackbar).toHaveBeenCalledWith(
     expect.objectContaining({
       severity: 'error',
-      message: 'this OLT already has a root node',
+      message: 'that ONU is already placed as "Villa Khoury"',
     })));
 });
 

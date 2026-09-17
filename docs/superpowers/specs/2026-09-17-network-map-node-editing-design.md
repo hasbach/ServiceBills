@@ -47,21 +47,26 @@ Rather than a second dialog component, the same one gains a `mode` field
 ### Dialog changes for edit mode
 
 - Title: `'Edit node'` when `mode === 'edit'`, else today's existing logic.
-- Kind selector: shown whenever `mode === 'edit'` (not just when
-  `kind !== 'root'`, which was specifically the create-flow's
-  "first node on this OLT must be the root" restriction) and includes a
-  `root` option too — the backend's own root-uniqueness check is the
-  authority on whether that's actually allowed; a rejected attempt surfaces
-  the exact backend message ("this OLT already has a root node") the same
-  way every other validation error on this page already does.
+- Kind selector: shown under the same `kind !== 'root'` condition the
+  create-flow already used — **correction, found during final review**:
+  the edit PUT never sends `parent_node_id`, so the backend always keeps
+  the node's current parent (`_validate_node_payload`'s field-by-field
+  defaulting). That makes any kind change involving `root` a guaranteed
+  100% rejection in both directions — a non-root node still has a parent,
+  which `root` forbids; a root node still has none, which every other kind
+  requires. There is no version of a `root` option in this dialog that
+  could ever succeed without also building the reparenting UI this feature
+  put in Non-goals, so the selector must stay hidden entirely for a `root`
+  node (its kind cannot change at all through this dialog), and must never
+  offer `root` as a destination for any other node either.
 - ONU autocomplete: reuses `unplacedFiltered` (nodes not yet placed) with
   one addition — when editing an existing `onu` node, its own current
   `onu_mac` won't appear in `unplacedFiltered` (it's already placed, on
-  itself), so a small synthetic option
-  `{ mac_address: dialog.onuMac, description: dialog.label }` is prepended
-  to the options list whenever `mode === 'edit' && dialog.onuMac` and it
-  isn't already present, so the current selection displays and re-submitting
-  unchanged works.
+  itself), so a small synthetic option is kept available, keyed off the
+  node's *original* onu_mac captured once when the dialog opens (not the
+  live, kind-change-resettable selection) so toggling kind away from `onu`
+  and back doesn't strand the user with no way to re-select their own
+  node's ONU.
 - Submit button label: `'Save'` in edit mode, vs. today's `'Place node'`.
 
 ### Submit logic
@@ -100,6 +105,15 @@ Rather than a second dialog component, the same one gains a `mode` field
   `tests/test_network_map_api.py` per the project's own history).
 - No permission change. Edit stays admin/finance-only, exactly like create
   and delete already are on this same page.
+- **Accepted gap, found during final review**: reclassifying a node that
+  has children into `kind: 'onu'` is permitted by both this feature and the
+  backend validator (neither has an opinion on leaf-ness), producing a
+  physically-nonsensical "ONU with downstream nodes." This does not corrupt
+  anything — the map still renders and computes fault status correctly, and
+  it's fully reversible through the same dialog — so it's accepted as-is
+  rather than adding a confirmation prompt. A future iteration could warn
+  when the target node has children in `data.nodes`, if this proves
+  confusing in practice.
 
 ## Testing
 

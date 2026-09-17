@@ -174,7 +174,8 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
 
   const openEditDialog = (node) => {
     setDialog({ mode: 'edit', nodeId: node.id, kind: node.kind,
-                label: node.label, onuMac: node.onu_mac || '' });
+                label: node.label, onuMac: node.onu_mac || '',
+                originalOnuMac: node.onu_mac || '' });
   };
 
   const submitDialog = async () => {
@@ -284,6 +285,20 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
   const layer = TILE_LAYERS.find((l) => l.key === layerKey) || TILE_LAYERS[0];
   const boundary = spans.filter((s) => s.is_fault_boundary);
   const pendingParent = pendingParentId != null ? byId[pendingParentId] : null;
+
+  // The node's own onu_mac (fixed at dialog-open time via originalOnuMac,
+  // NOT the live dialog.onuMac, which gets cleared to '' on every kind
+  // change) is never in unplacedFiltered -- it's already placed, on itself.
+  // Keeping it available as a synthetic option means toggling kind away
+  // from 'onu' and back doesn't strand the user with no way to re-select
+  // their own node's original ONU.
+  const editSyntheticOnuOption = (dialog?.mode === 'edit' && dialog.originalOnuMac
+      && !unplacedFiltered.some((o) => o.mac_address === dialog.originalOnuMac))
+    ? { mac_address: dialog.originalOnuMac, description: dialog.label }
+    : null;
+  const onuAutocompleteOptions = editSyntheticOnuOption
+    ? [editSyntheticOnuOption, ...unplacedFiltered]
+    : unplacedFiltered;
 
   return (
     <Box>
@@ -453,12 +468,9 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
           </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2} sx={{ mt: 1 }}>
-              {(dialog.mode === 'edit' || dialog.kind !== 'root') && (
+              {dialog.kind !== 'root' && (
                 <TextField select label="Kind" value={dialog.kind}
                   onChange={(e) => setDialog((d) => ({ ...d, kind: e.target.value, onuMac: '' }))}>
-                  {dialog.mode === 'edit' && (
-                    <MenuItem value="root">Root (control room)</MenuItem>
-                  )}
                   <MenuItem value="junction">Junction (pole / splitter)</MenuItem>
                   <MenuItem value="onu">ONU (subscriber)</MenuItem>
                 </TextField>
@@ -467,23 +479,16 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
                 onChange={(e) => setDialog((d) => ({ ...d, label: e.target.value }))} />
               {dialog.kind === 'onu' && (
                 <Autocomplete
-                  options={
-                    dialog.mode === 'edit' && dialog.onuMac
-                        && !unplacedFiltered.some((o) => o.mac_address === dialog.onuMac)
-                      ? [{ mac_address: dialog.onuMac, description: dialog.label }, ...unplacedFiltered]
-                      : unplacedFiltered
-                  }
+                  options={onuAutocompleteOptions}
+                  isOptionEqualToValue={(o, v) => o.mac_address === v.mac_address}
                   getOptionLabel={(o) =>
                     `${o.mac_address}${o.description ? ` — ${o.description}` : ''}` +
                     (o.customers && o.customers.length
                       ? ` (${o.customers.map((c) => c.name).join(', ')})`
                       : '')}
-                  value={
-                    (dialog.mode === 'edit' && dialog.onuMac
-                        && !unplacedFiltered.some((o) => o.mac_address === dialog.onuMac))
-                      ? { mac_address: dialog.onuMac, description: dialog.label }
-                      : (unplacedFiltered.find((o) => o.mac_address === dialog.onuMac) || null)
-                  }
+                  value={dialog.onuMac
+                    ? (onuAutocompleteOptions.find((o) => o.mac_address === dialog.onuMac) || null)
+                    : null}
                   onChange={(e, val) => setDialog((d) => ({
                     ...d,
                     onuMac: val ? val.mac_address : '',
