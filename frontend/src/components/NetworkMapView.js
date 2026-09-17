@@ -152,7 +152,7 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
     if (nodes.length === 0) {
       // The API enforces one root per OLT; with none placed yet, root is
       // the only offered kind, so the dialog doesn't even show a selector.
-      setDialog({ kind: 'root', label: 'Control room', onuMac: '',
+      setDialog({ mode: 'create', kind: 'root', label: 'Control room', onuMac: '',
                   parentId: null, lat: latlng.lat, lng: latlng.lng });
       return;
     }
@@ -161,7 +161,7 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
         'Select a placed node and click "Draw from here" before placing the next one.' });
       return;
     }
-    setDialog({ kind: 'junction', label: '', onuMac: '',
+    setDialog({ mode: 'create', kind: 'junction', label: '', onuMac: '',
                 parentId: pendingParentId, lat: latlng.lat, lng: latlng.lng });
   }, [canEdit, addMode, data, pendingParentId, setSnackbar]);
 
@@ -170,6 +170,11 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
     setAddMode(true);
     setSnackbar({ open: true, severity: 'info', message:
       `Click the map to place the next node down the line from "${node.label}".` });
+  };
+
+  const openEditDialog = (node) => {
+    setDialog({ mode: 'edit', nodeId: node.id, kind: node.kind,
+                label: node.label, onuMac: node.onu_mac || '' });
   };
 
   const submitDialog = async () => {
@@ -185,16 +190,25 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
     }
     setSaving(true);
     try {
-      await apiService.api.post('/network-map/nodes', {
-        olt_device_id: oltDeviceId,
-        kind: dialog.kind,
-        label,
-        latitude: dialog.lat,
-        longitude: dialog.lng,
-        parent_node_id: dialog.parentId,
-        ...(dialog.kind === 'onu' ? { onu_mac: dialog.onuMac } : {}),
-      });
-      setSnackbar({ open: true, severity: 'success', message: 'Node placed.' });
+      if (dialog.mode === 'edit') {
+        await apiService.api.put(`/network-map/nodes/${dialog.nodeId}`, {
+          kind: dialog.kind,
+          label,
+          onu_mac: dialog.kind === 'onu' ? dialog.onuMac : null,
+        });
+        setSnackbar({ open: true, severity: 'success', message: 'Node updated.' });
+      } else {
+        await apiService.api.post('/network-map/nodes', {
+          olt_device_id: oltDeviceId,
+          kind: dialog.kind,
+          label,
+          latitude: dialog.lat,
+          longitude: dialog.lng,
+          parent_node_id: dialog.parentId,
+          ...(dialog.kind === 'onu' ? { onu_mac: dialog.onuMac } : {}),
+        });
+        setSnackbar({ open: true, severity: 'success', message: 'Node placed.' });
+      }
       setDialog(null);
       setAddMode(false);
       setPendingParentId(null);
@@ -205,7 +219,8 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
       await load();
       await loadUnplaced();
     } catch (err) {
-      const message = err?.response?.data?.message || 'Could not place the node.';
+      const message = err?.response?.data?.message ||
+        (dialog.mode === 'edit' ? 'Could not update the node.' : 'Could not place the node.');
       setSnackbar({ open: true, severity: 'error', message });
     } finally {
       setSaving(false);
@@ -378,6 +393,9 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
                       {node.kind} — {status}{node.onu_mac ? ` — ${node.onu_mac}` : ''}
                     </Typography>
                     <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+                      <Button size="small" onClick={() => openEditDialog(node)}>
+                        Edit
+                      </Button>
                       <Button size="small" onClick={() => startDrawFromHere(node)}>
                         Draw from here
                       </Button>
@@ -429,13 +447,18 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
       {dialog && (
         <Dialog open onClose={closeDialog} fullWidth maxWidth="sm">
           <DialogTitle>
-            {dialog.kind === 'root' ? 'Place the control room' : 'Add node'}
+            {dialog.mode === 'edit'
+              ? 'Edit node'
+              : (dialog.kind === 'root' ? 'Place the control room' : 'Add node')}
           </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2} sx={{ mt: 1 }}>
-              {dialog.kind !== 'root' && (
+              {(dialog.mode === 'edit' || dialog.kind !== 'root') && (
                 <TextField select label="Kind" value={dialog.kind}
                   onChange={(e) => setDialog((d) => ({ ...d, kind: e.target.value, onuMac: '' }))}>
+                  {dialog.mode === 'edit' && (
+                    <MenuItem value="root">Root (control room)</MenuItem>
+                  )}
                   <MenuItem value="junction">Junction (pole / splitter)</MenuItem>
                   <MenuItem value="onu">ONU (subscriber)</MenuItem>
                 </TextField>
@@ -444,13 +467,23 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
                 onChange={(e) => setDialog((d) => ({ ...d, label: e.target.value }))} />
               {dialog.kind === 'onu' && (
                 <Autocomplete
-                  options={unplacedFiltered}
+                  options={
+                    dialog.mode === 'edit' && dialog.onuMac
+                        && !unplacedFiltered.some((o) => o.mac_address === dialog.onuMac)
+                      ? [{ mac_address: dialog.onuMac, description: dialog.label }, ...unplacedFiltered]
+                      : unplacedFiltered
+                  }
                   getOptionLabel={(o) =>
                     `${o.mac_address}${o.description ? ` — ${o.description}` : ''}` +
                     (o.customers && o.customers.length
                       ? ` (${o.customers.map((c) => c.name).join(', ')})`
                       : '')}
-                  value={unplacedFiltered.find((o) => o.mac_address === dialog.onuMac) || null}
+                  value={
+                    (dialog.mode === 'edit' && dialog.onuMac
+                        && !unplacedFiltered.some((o) => o.mac_address === dialog.onuMac))
+                      ? { mac_address: dialog.onuMac, description: dialog.label }
+                      : (unplacedFiltered.find((o) => o.mac_address === dialog.onuMac) || null)
+                  }
                   onChange={(e, val) => setDialog((d) => ({
                     ...d,
                     onuMac: val ? val.mac_address : '',
@@ -464,7 +497,7 @@ export default function NetworkMapView({ oltDeviceId, userRole }) {
           <DialogActions>
             <Button onClick={closeDialog} disabled={saving}>Cancel</Button>
             <Button variant="contained" onClick={submitDialog} disabled={saving}>
-              {saving ? 'Saving…' : 'Place node'}
+              {saving ? 'Saving…' : (dialog.mode === 'edit' ? 'Save' : 'Place node')}
             </Button>
           </DialogActions>
         </Dialog>

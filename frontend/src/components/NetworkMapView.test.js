@@ -579,3 +579,110 @@ test('FINDING 8: a grey/unknown node is not rendered red', async () => {
   expect(html).toContain(hexToRgbaForTest(greyStyle.color, greyStyle.fillOpacity));
   expect(html).not.toContain(hexToRgbaForTest(redStyle.color, redStyle.fillOpacity));
 });
+
+test('clicking Edit on a node opens the dialog pre-filled with its current kind/label/onu_mac', async () => {
+  render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+
+  const marker = screen.getAllByTestId('marker')
+    .find((node) => within(node).queryAllByText(/Villa Eid/).length > 0);
+  await act(async () => {
+    fireEvent.click(within(marker).getByRole('button', { name: /^edit$/i }));
+  });
+
+  const dialog = screen.getByRole('dialog');
+  expect(within(dialog).getByText(/edit node/i)).toBeInTheDocument();
+  expect(within(dialog).getByDisplayValue('Villa Eid')).toBeInTheDocument();
+});
+
+test('an employee sees no Edit control on a node', async () => {
+  render(<NetworkMapView oltDeviceId={1} userRole="employee" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+  expect(screen.queryByRole('button', { name: /^edit$/i })).toBeNull();
+});
+
+test('saving an edit PUTs exactly {kind, label, onu_mac} with no coordinates or parent', async () => {
+  mockApiPut.mockResolvedValue({ data: {} });
+  render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+
+  const marker = screen.getAllByTestId('marker')
+    .find((node) => within(node).queryAllByText(/Villa Eid/).length > 0);
+  await act(async () => {
+    fireEvent.click(within(marker).getByRole('button', { name: /^edit$/i }));
+  });
+  const dialog = screen.getByRole('dialog');
+  await act(async () => {
+    fireEvent.click(within(dialog).getByRole('button', { name: /^save$/i }));
+  });
+
+  expect(mockApiPut).toHaveBeenCalledWith('/network-map/nodes/2', {
+    kind: 'onu', label: 'Villa Eid', onu_mac: 'aa:aa:aa:aa:aa:aa',
+  });
+});
+
+test('editing a node from onu to junction sends onu_mac: null', async () => {
+  mockApiPut.mockResolvedValue({ data: {} });
+  render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+
+  const marker = screen.getAllByTestId('marker')
+    .find((node) => within(node).queryAllByText(/Villa Eid/).length > 0);
+  await act(async () => {
+    fireEvent.click(within(marker).getByRole('button', { name: /^edit$/i }));
+  });
+  const dialog = screen.getByRole('dialog');
+  await act(async () => {
+    fireEvent.mouseDown(within(dialog).getByLabelText(/kind/i));
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole('option', { name: /junction/i }));
+  });
+  await act(async () => {
+    fireEvent.click(within(dialog).getByRole('button', { name: /^save$/i }));
+  });
+
+  expect(mockApiPut).toHaveBeenCalledWith('/network-map/nodes/2', {
+    kind: 'junction', label: 'Villa Eid', onu_mac: null,
+  });
+});
+
+test('a validation error on save surfaces the exact backend message', async () => {
+  mockApiPut.mockRejectedValue({
+    response: { status: 400, data: { message: 'this OLT already has a root node' } },
+  });
+  render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+
+  const marker = screen.getAllByTestId('marker')
+    .find((node) => within(node).queryAllByText(/Villa Eid/).length > 0);
+  await act(async () => {
+    fireEvent.click(within(marker).getByRole('button', { name: /^edit$/i }));
+  });
+  const dialog = screen.getByRole('dialog');
+  await act(async () => {
+    fireEvent.click(within(dialog).getByRole('button', { name: /^save$/i }));
+  });
+
+  await waitFor(() => expect(mockSetSnackbar).toHaveBeenCalledWith(
+    expect.objectContaining({
+      severity: 'error',
+      message: 'this OLT already has a root node',
+    })));
+});
+
+test('the ONU autocomplete offers the node\'s own current onu_mac when editing it', async () => {
+  render(<NetworkMapView oltDeviceId={1} userRole="admin" />);
+  await waitFor(() => expect(screen.getByTestId('map')).toBeInTheDocument());
+
+  // Node 2 ("Villa Eid") is onu_mac 'aa:aa:aa:aa:aa:aa', which is NOT in
+  // UNPLACED (it's already placed, on itself) -- proving the synthetic
+  // option is what makes it show up here, not the unplaced list.
+  const marker = screen.getAllByTestId('marker')
+    .find((node) => within(node).queryAllByText(/Villa Eid/).length > 0);
+  await act(async () => {
+    fireEvent.click(within(marker).getByRole('button', { name: /^edit$/i }));
+  });
+  const dialog = screen.getByRole('dialog');
+  expect(within(dialog).getByDisplayValue(/aa:aa:aa:aa:aa:aa/i)).toBeInTheDocument();
+});
