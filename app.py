@@ -8830,6 +8830,101 @@ def get_collector_progress():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/reports/daily-cash', methods=['GET'])
+@jwt_required()
+def get_daily_cash_report():
+    """Cash reconciliation for one calendar day: how much cash each field
+    collector collected, plus an 'Office / Direct' bucket for payments with
+    no field collector. See docs/superpowers/specs/2026-09-22-daily-cash-report-design.md.
+    """
+    try:
+        current_username = get_jwt_identity()
+        current_user = User.query.filter_by(username=current_username).first()
+        roles = [r.strip().lower() for r in current_user.role.split(',')]
+        if 'admin' not in roles and 'finance' not in roles:
+            return jsonify({'message': 'Unauthorized. Only finance or admin can view the daily cash report.'}), 403
+
+        start_date_str = request.args.get('start_date')
+        end_date_str = request.args.get('end_date')
+        if not start_date_str or not end_date_str:
+            return jsonify({'error': 'start_date and end_date are required'}), 400
+
+        # The caller (the frontend's localDayRange()) already computed the
+        # exact local-day boundary -- unlike get_collector_progress, this
+        # endpoint must NOT reinterpret/override the time component.
+        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
+        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
+
+        payments = tenant_query(Payment).filter(
+            Payment.paid == True,
+            Payment.collected_via.is_(None),   # cash: everything that isn't Whish
+            Payment.is_gratis == False,
+            Payment.is_refund == False,
+            Payment.reverted_at.is_(None),
+            func.coalesce(Payment.collected_at, Payment.paid_at) >= start_date,
+            func.coalesce(Payment.collected_at, Payment.paid_at) < end_date,
+        ).options(
+            db.joinedload(Payment.customer),
+            db.joinedload(Payment.collected_by),
+        ).all()
+
+        groups = {}
+        grand_total = 0.0
+        for p in payments:
+            # fx_rate_to_reporting is NOT NULL (default 1) -- see Global
+            # Constraints, no missing-rate case to handle.
+            reporting_amount = p.amount * float(p.fx_rate_to_reporting)
+
+            if p.collected_by_id:
+                key = p.collected_by_id
+                name = p.collected_by.username if p.collected_by else 'Unknown'
+                is_office = False
+            else:
+                key = 'office'
+                name = 'Office / Direct'
+                is_office = True
+
+            group = groups.setdefault(key, {
+                'collector_id': p.collected_by_id,
+                'collector_name': name,
+                'is_office': is_office,
+                'total': 0.0,
+                'payment_count': 0,
+                'payments': [],
+            })
+            when = p.collected_at or p.paid_at
+            group['total'] += reporting_amount
+            group['payment_count'] += 1
+            group['payments'].append({
+                'id': p.id,
+                'customer_name': p.customer.name if p.customer else None,
+                'amount': p.amount,
+                'currency': p.currency,
+                'reporting_amount': reporting_amount,
+                'time': when.strftime('%Y-%m-%d %H:%M:%S') if when else None,
+            })
+            grand_total += reporting_amount
+
+        # Highest-collecting field collector first; Office / Direct always last,
+        # regardless of its own total -- it's a different kind of bucket, not
+        # another collector to rank (spec: Frontend section).
+        group_list = sorted(groups.values(), key=lambda g: (g['is_office'], -g['total']))
+
+        settings = tenant_query(BusinessSettings).first()
+        reporting_currency = settings.reporting_currency if settings else 'USD'
+
+        return jsonify({
+            'date_start': start_date_str,
+            'date_end': end_date_str,
+            'grand_total': grand_total,
+            'reporting_currency': reporting_currency,
+            'groups': group_list,
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/reports/financial', methods=['GET'])
 @jwt_required()
 def get_financial_report():
