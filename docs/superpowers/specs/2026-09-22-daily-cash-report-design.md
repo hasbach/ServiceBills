@@ -42,10 +42,11 @@ payments = tenant_query(Payment).filter(
 ).all()
 ```
 
-Grouped in Python (small daily row count, no need to push grouping into SQL) by `payment.collected_by_id or payment.received_by_id`:
+Grouped in Python (small daily row count, no need to push grouping into SQL):
 
 - A group with a `collected_by_id` is labeled by that `User.username` (a field collector).
-- A group with **no** `collected_by_id` but a `received_by_id` is labeled `"Office / Direct"` — money paid straight to the office rather than physically collected by a field agent.
+- A group with **no** `collected_by_id` but a `received_by_id` **or** `pre_payment=True` is labeled `"Office / Direct"` — money paid straight to the office (confirmed by a staff member) or a genuine standalone cash prepayment (`add_payment` sets `pre_payment=True` but never `received_by_id`).
+- A payment with **none** of `collected_by_id`, `received_by_id`, or `pre_payment=True` is **excluded entirely** — this is not "no attribution," it's no cash movement at all: `apply_customer_balance_to_unpaid_payments()` marks a bill `paid=True` when it's auto-settled from a customer's pre-existing credit balance, touching none of those three fields. Counting that as office cash would inflate the very number this report exists to get right (caught in the final whole-branch review; see the implementation plan's fix commit).
 - Each payment's contribution to the group total is `amount * fx_rate_to_reporting` (same conversion `get_collector_progress`/`get_financial_report` already use), so mixed-currency cash rolls into one reporting-currency total per group. `Payment.fx_rate_to_reporting` is a `NOT NULL` column defaulting to `1` (`app.py:1110`), so there is no "missing rate" case to defend against — an opted-out (single-currency) tenant's payments are always `amount * 1`.
 
 **Response shape**:

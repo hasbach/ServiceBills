@@ -8835,7 +8835,12 @@ def get_collector_progress():
 def get_daily_cash_report():
     """Cash reconciliation for one calendar day: how much cash each field
     collector collected, plus an 'Office / Direct' bucket for payments with
-    no field collector. See docs/superpowers/specs/2026-09-22-daily-cash-report-design.md.
+    no field collector but a confirming staff member (received_by_id) or a
+    genuine standalone prepayment (pre_payment=True). A payment with none of
+    collected_by_id/received_by_id/pre_payment -- e.g. a bill auto-settled
+    from a customer's existing credit balance -- is excluded entirely, since
+    no cash actually changed hands. See
+    docs/superpowers/specs/2026-09-22-daily-cash-report-design.md.
     """
     try:
         current_username = get_jwt_identity()
