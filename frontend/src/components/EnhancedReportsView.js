@@ -51,6 +51,7 @@ const EnhancedReportsView = () => {
   });
   const [endDate, setEndDate] = useState(new Date());
   const [reportType, setReportType] = useState('financial');
+  const [cashDate, setCashDate] = useState(new Date());
   const [reportData, setReportData] = useState(null);
   const [reportError, setReportError] = useState(null);
   const [overduePayments, setOverduePayments] = useState([]);
@@ -61,14 +62,14 @@ const EnhancedReportsView = () => {
     fetchReportData();
     fetchOverduePayments();
     fetchCustomerMetrics();
-  }, [startDate, endDate, reportType]);
+  }, [startDate, endDate, reportType, cashDate]);
 
   const fetchReportData = async () => {
     setReportData(null);
     setReportError(null);
     try {
       if (reportType === 'daily-cash') {
-        const { startIso, endIso } = localDayRange(startDate);
+        const { startIso, endIso } = localDayRange(cashDate);
         const token = localStorage.getItem('token');
         const response = await fetch(`/api/reports/daily-cash?start_date=${startIso}&end_date=${endIso}`, {
           headers: { 'Authorization': `Bearer ${token}` }
@@ -77,6 +78,7 @@ const EnhancedReportsView = () => {
         if (!response.ok) {
           throw new Error(data?.error || data?.message || `Failed to load report (HTTP ${response.status})`);
         }
+        setExpandedCashGroups({});
         setReportData(data);
         return;
       }
@@ -437,7 +439,7 @@ const EnhancedReportsView = () => {
                                   {group.payments.map((p) => (
                                     <TableRow key={p.id}>
                                       <TableCell>{p.customer_name}</TableCell>
-                                      <TableCell align="right">{p.amount}</TableCell>
+                                      <TableCell align="right">{p.amount.toFixed(2)}</TableCell>
                                       <TableCell>{p.currency}</TableCell>
                                       <TableCell align="right">{p.reporting_amount.toFixed(2)}</TableCell>
                                       <TableCell>{p.time}</TableCell>
@@ -476,7 +478,7 @@ const EnhancedReportsView = () => {
                       const newType = e.target.value;
                       setReportType(newType);
                       if (newType === 'daily-cash') {
-                        setStartDate(new Date());
+                        setCashDate(new Date());
                       }
                     }}
                   >
@@ -494,8 +496,8 @@ const EnhancedReportsView = () => {
                 <LocalizationProvider dateAdapter={AdapterDateFns}>
                   <DatePicker
                     label={reportType === 'daily-cash' ? 'Date' : 'Start Date'}
-                    value={startDate}
-                    onChange={setStartDate}
+                    value={reportType === 'daily-cash' ? cashDate : startDate}
+                    onChange={reportType === 'daily-cash' ? setCashDate : setStartDate}
                     renderInput={(params) => <TextField {...params} fullWidth />}
                   />
                 </LocalizationProvider>

@@ -186,3 +186,50 @@ def test_daily_cash_requires_start_and_end_date(app, client):
     a = make_tenant(client, "Biz A", "a_cash7")
     r = client.get("/api/reports/daily-cash", headers=a, query_string={"start_date": "2026-06-15T00:00:00.000Z"})
     assert r.status_code == 400
+
+
+def test_daily_cash_excludes_bills_auto_settled_from_customer_balance(app, client):
+    a = make_tenant(client, "Biz A", "a_cash8")
+    plan = _make_plan(client, a, price=25)
+    cust = _make_customer(client, a, plan)
+
+    with flask_app.app_context():
+        tenant_id = Customer.query.filter_by(id=cust).first().tenant_id
+        now = datetime.utcnow()
+        row = Payment(tenant_id=tenant_id, customer_id=cust, amount=25, currency='USD',
+                       fx_rate_to_reporting=1, paid=True, paid_at=now,
+                       pre_payment=False)
+        db.session.add(row)
+        db.session.commit()
+
+    start, end = _today_range()
+    r = client.get("/api/reports/daily-cash", headers=a,
+                    query_string={"start_date": start, "end_date": end})
+    body = r.get_json()
+    assert body["grand_total"] == 0
+    assert body["groups"] == []
+
+
+def test_daily_cash_includes_genuine_standalone_prepayment_as_office(app, client):
+    a = make_tenant(client, "Biz A", "a_cash9")
+    plan = _make_plan(client, a, price=35)
+    cust = _make_customer(client, a, plan)
+
+    with flask_app.app_context():
+        tenant_id = Customer.query.filter_by(id=cust).first().tenant_id
+        now = datetime.utcnow()
+        row = Payment(tenant_id=tenant_id, customer_id=cust, amount=35, currency='USD',
+                       fx_rate_to_reporting=1, paid=True, paid_at=now,
+                       pre_payment=True)
+        db.session.add(row)
+        db.session.commit()
+
+    start, end = _today_range()
+    r = client.get("/api/reports/daily-cash", headers=a,
+                    query_string={"start_date": start, "end_date": end})
+    body = r.get_json()
+    assert body["grand_total"] == 35
+    assert len(body["groups"]) == 1
+    group = body["groups"][0]
+    assert group["is_office"] is True
+    assert group["total"] == 35

@@ -8879,10 +8879,18 @@ def get_daily_cash_report():
                 key = p.collected_by_id
                 name = p.collected_by.username if p.collected_by else 'Unknown'
                 is_office = False
-            else:
+            elif p.received_by_id or p.pre_payment:
                 key = 'office'
                 name = 'Office / Direct'
                 is_office = True
+            else:
+                # No field collector, no confirming staff member, and not a
+                # standalone prepayment -- e.g. a recurring bill silently
+                # auto-settled from the customer's existing credit balance
+                # (apply_customer_balance_to_unpaid_payments). No cash
+                # actually changed hands on this day; exclude it entirely
+                # rather than counting it as office cash.
+                continue
 
             group = groups.setdefault(key, {
                 'collector_id': p.collected_by_id,
