@@ -18,7 +18,7 @@ A daily cash-reconciliation report: for a given calendar day, how much cash each
 
 New route in `app.py`, placed alongside the other `/api/reports/*` routes (near `get_collector_progress` at `app.py:8791`).
 
-**Query params**: `start_datetime` and `end_datetime` — full ISO instants marking the selected day's local-midnight-to-next-local-midnight window, exactly as `get_collector_progress` already accepts `start_date`/`end_date` (`app.py:8795-8803`). The frontend computes these from the browser's local timezone (see Frontend section) — the backend does no timezone math of its own, avoiding a hardcoded Beirut UTC offset that would be wrong for a different deployment or a future DST change. This mirrors how `formatStamp.js` already fixed the "3-hours-behind UTC" display bug by trusting the browser's local timezone rather than hardcoding an offset server-side.
+**Query params**: `start_date` and `end_date` — the same param names `get_collector_progress`/`get_revenue_report` already use, but here carrying the selected day's exact local-midnight-to-next-local-midnight instants (not date-only strings) — parsed the same way `get_revenue_report` already does (`app.py:8096-8097`: `datetime.fromisoformat(s.replace('Z', '+00:00')).replace(tzinfo=None)`), with no backend-side end-of-day reinterpretation (unlike `get_collector_progress`, which forces `end_date` to `23:59:59` — this endpoint must NOT do that, since the frontend already sends the exact exclusive boundary). The frontend computes these from the browser's local timezone (see Frontend section) — the backend does no timezone math of its own, avoiding a hardcoded Beirut UTC offset that would be wrong for a different deployment or a future DST change. This mirrors how `formatStamp.js` already fixed the "3-hours-behind UTC" display bug by trusting the browser's local timezone rather than hardcoding an offset server-side.
 
 **Auth**: `@jwt_required()` plus the same role check `mark_payment_gratis` uses (`app.py:4963-4965`) — `admin` or `finance` only:
 
@@ -37,8 +37,8 @@ payments = tenant_query(Payment).filter(
     Payment.is_gratis == False,
     Payment.is_refund == False,
     Payment.reverted_at.is_(None),
-    func.coalesce(Payment.collected_at, Payment.paid_at) >= start_datetime,
-    func.coalesce(Payment.collected_at, Payment.paid_at) < end_datetime,
+    func.coalesce(Payment.collected_at, Payment.paid_at) >= start_date,
+    func.coalesce(Payment.collected_at, Payment.paid_at) < end_date,
 ).all()
 ```
 
@@ -46,7 +46,7 @@ Grouped in Python (small daily row count, no need to push grouping into SQL) by 
 
 - A group with a `collected_by_id` is labeled by that `User.username` (a field collector).
 - A group with **no** `collected_by_id` but a `received_by_id` is labeled `"Office / Direct"` — money paid straight to the office rather than physically collected by a field agent.
-- Each payment's contribution to the group total is `amount * fx_rate_to_reporting` (same conversion `get_collector_progress`/`get_financial_report` already use), so mixed-currency cash rolls into one reporting-currency total per group. A payment with a `fx_rate_to_reporting` of `None` (shouldn't happen post multi-currency migration, but defensively) is included at its raw `amount` and flagged `rate_missing: true` in its payment entry, so the frontend can visually call it out instead of silently mis-totaling.
+- Each payment's contribution to the group total is `amount * fx_rate_to_reporting` (same conversion `get_collector_progress`/`get_financial_report` already use), so mixed-currency cash rolls into one reporting-currency total per group. `Payment.fx_rate_to_reporting` is a `NOT NULL` column defaulting to `1` (`app.py:1110`), so there is no "missing rate" case to defend against — an opted-out (single-currency) tenant's payments are always `amount * 1`.
 
 **Response shape**:
 
@@ -65,7 +65,7 @@ Grouped in Python (small daily row count, no need to push grouping into SQL) by 
       "payment_count": 12,
       "payments": [
         {"id": 501, "customer_name": "...", "amount": 65.0, "currency": "USD",
-         "reporting_amount": 65.0, "rate_missing": false,
+         "reporting_amount": 65.0,
          "time": "2026-09-22T14:03:00"}
       ]
     },
@@ -83,18 +83,19 @@ Grouped in Python (small daily row count, no need to push grouping into SQL) by 
 
 `reporting_currency` comes from the tenant's existing reporting-currency setting (same source `get_financial_report` already reads, per the multi-currency spec).
 
-## Frontend: new "Daily Cash" tab in `EnhancedReportsView.js`
+## Frontend: new "Daily Cash Report" option in `EnhancedReportsView.js`
 
-- A date picker (MUI, matching the existing report tabs' style), defaulting to today.
-- On change/load, the picker's selected calendar date is converted to a local-midnight `Date` and a next-local-midnight `Date` (`new Date(y, m, d, 0, 0, 0)` / `+1 day`), each sent via `.toISOString()` as `start_datetime`/`end_datetime`. This is what makes the report use the *browser's* local day boundary (Beirut, for this app's actual users) without the backend needing to know a timezone.
+This file's report chooser is a `Select`/`MenuItem` dropdown (`reportType` state), not tabs — a new `<MenuItem value="daily-cash">Daily Cash Report</MenuItem>` is added alongside the existing options (`frontend/src/components/EnhancedReportsView.js:373-378`).
+
+- A single date picker, defaulting to today (reusing the existing `startDate` state; the existing `endDate` picker is hidden while `reportType === 'daily-cash'`, since this report has no range — see Frontend Details below for exactly how).
+- On change/load, the picker's selected calendar date is converted to a local-midnight `Date` and a next-local-midnight `Date` (`new Date(y, m, d, 0, 0, 0)` / `+1 day`), each sent via `.toISOString()` as `start_date`/`end_date`. This is what makes the report use the *browser's* local day boundary (Beirut, for this app's actual users) without the backend needing to know a timezone.
 - A grand-total banner at the top (`grand_total` + `reporting_currency`).
-- One row per group, sorted by `total` descending with "Office / Direct" always last regardless of its total (it's a different kind of bucket, not another collector to rank), showing name + total + payment count, expandable (existing expand/collapse pattern already used elsewhere in this file) to a table of that group's individual payments: customer name, amount (original currency), reporting amount, time. A payment with `rate_missing: true` is visually flagged (e.g. a warning icon/tooltip) rather than silently included.
+- One row per group, sorted by `total` descending with "Office / Direct" always last regardless of its total (it's a different kind of bucket, not another collector to rank), showing name + total + payment count, expandable (MUI's standard collapsible-table-row pattern — `Collapse` + an expand/collapse `IconButton` per row — this file has no existing expand/collapse to reuse, so this introduces the pattern fresh) to a table of that group's individual payments: customer name, amount (original currency), reporting amount, time.
 - Empty state: a day with zero cash payments shows "No cash payments collected on this day" rather than an empty table.
 
 ## Testing
 
 - Backend test seeding: two collectors with cash payments, one office-direct payment (`received_by_id` set, `collected_by_id` null), one Whish payment (`collected_via='whish'`, must be excluded), one refunded payment (`is_refund=True`, excluded), one gratis payment (excluded), one reverted payment (`reverted_at` set, excluded), and payments just inside/outside the day window (boundary test) — asserting correct grouping, exclusions, and totals.
-- A payment with `fx_rate_to_reporting=None` (defensive path) — asserts it's included with `rate_missing: true` rather than raising.
 - Role check: a non-admin/finance user gets 403.
 - Tenant isolation: a payment belonging to another tenant never appears (standard `tenant_query`/`current_tenant_id()` scoping, verified the same way other report tests already do).
 - Manual check against the live dev DB with real payment data before shipping, per this project's established pattern of verifying reports against real data rather than trusting tests alone.
