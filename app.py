@@ -8383,6 +8383,9 @@ def whatsapp_webhook():
 
         return jsonify({'status': 'ok'}), 200
 
+import whatsapp_inbox_routes
+whatsapp_inbox_routes.register_inbox_routes(app, sys.modules[__name__])
+
 @app.route('/api/reports/revenue', methods=['GET'])
 @jwt_required()
 def get_revenue_report():
