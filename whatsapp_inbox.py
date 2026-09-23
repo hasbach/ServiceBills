@@ -281,6 +281,28 @@ def window_open(conv, now=None):
     return bool(conv.last_inbound_at and now < conv.last_inbound_at + WINDOW)
 
 
+def notify_conversation(appmod, conv, body=None, now=None):
+    """Web-push this conversation to the tenant's admins, at most once per
+    PUSH_THROTTLE per conversation. Commits last_push_at. Never raises."""
+    now = now or _now()
+    if conv.last_push_at and now - conv.last_push_at < PUSH_THROTTLE:
+        return False
+    conv.last_push_at = now
+    appmod.db.session.commit()
+    title = (conv.customer.name if conv.customer_id and conv.customer else None) or conv.contact_name or f"+{conv.wa_phone}"
+    if body is None:
+        label = REASON_LABELS.get(conv.attention_reason, 'New WhatsApp message')
+        preview = conv.last_message_preview or ''
+        body = f"{label}: {preview}" if preview else label
+    payload = {'title': title, 'body': body[:180], 'tag': f"wa-conv-{conv.id}",
+               'url': f"/?view=messaging&inbox={conv.id}", 'conversation_id': conv.id}
+    try:
+        appmod.send_push_notification(payload, tenant_id=conv.tenant_id, roles=['admin'], topic='whatsapp_inbox')
+    except Exception:
+        logging.exception("whatsapp_inbox push failed")
+    return True
+
+
 def apply_status(appmod, tenant_id, status):
     wamid = status.get('id')
     new = status.get('status')

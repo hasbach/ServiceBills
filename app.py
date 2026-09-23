@@ -76,6 +76,8 @@ if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
     except Exception as e:
         print("Warning: Could not load VAPID keys.", e)
 
+VAPID_CLAIM_EMAIL = os.environ.get('VAPID_CLAIM_EMAIL', 'admin@example.com')
+
 # static_url_path is a parked prefix (NOT '/') so Flask's built-in static handler
 # doesn't shadow client-side routes like /login. The serve() catch-all below serves
 # build/ files and falls back to index.html for SPA routes (fixes 404 on refresh).
@@ -7364,51 +7366,133 @@ def update_service_status(customer_id):
     db.session.commit()
     return jsonify({'message': 'Service status updated successfully'})
 
-def send_push_notification(payload_dict):
+def _webpush_one(sub, payload_dict):
+    """Send one push; prune the subscription when the push service says it's gone."""
+    try:
+        webpush(
+            subscription_info=json.loads(sub.subscription_info),
+            data=json.dumps(payload_dict),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims={"sub": f"mailto:{VAPID_CLAIM_EMAIL}"}
+        )
+        return True
+    except Exception as e:
+        print(f"Failed to send push to user {sub.user_id}:", e)
+        if "410" in str(e) or "404" in str(e):
+            db.session.delete(sub)
+            db.session.commit()
+        return False
+
+
+def _user_has_any_role(user, roles):
+    wanted = {r.lower() for r in roles}
+    return bool(wanted & {r.strip().lower() for r in (user.role or '').split(',')})
+
+
+def send_push_notification(payload_dict, tenant_id=None, roles=None, topic=None):
+    """Push to a tenant's subscriptions. tenant_id defaults to the request's
+    JWT tenant (so the webhook/scheduler, which have no JWT, pass it
+    explicitly); roles limits to users holding any of them; topic limits to
+    subscriptions that opted into it. Returns how many pushes went out."""
     if not VAPID_PRIVATE_KEY:
         print("Push notification failed: VAPID keys not configured.")
-        return
-        
-    subs = tenant_query(PushSubscription).all()
-    for sub in subs:
-        try:
-            sub_info = json.loads(sub.subscription_info)
-            webpush(
-                subscription_info=sub_info,
-                data=json.dumps(payload_dict),
-                vapid_private_key=VAPID_PRIVATE_KEY,
-                vapid_claims={"sub": "mailto:admin@example.com"}
-            )
-        except Exception as e:
-            print(f"Failed to send push to user {sub.user_id}:", e)
-            # Optionally remove invalid subscriptions
-            if "410 Gone" in str(e) or "404 Not Found" in str(e):
-                db.session.delete(sub)
-                db.session.commit()
+        return 0
+    tid = tenant_id if tenant_id is not None else current_tenant_id()
+    q = PushSubscription.query.filter_by(tenant_id=tid)
+    if roles:
+        user_ids = [u.id for u in User.query.filter_by(tenant_id=tid).all() if _user_has_any_role(u, roles)]
+        if not user_ids:
+            return 0
+        q = q.filter(PushSubscription.user_id.in_(user_ids))
+    sent = 0
+    for sub in q.all():
+        if topic and topic not in sub.topic_list():
+            continue
+        if _webpush_one(sub, payload_dict):
+            sent += 1
+    return sent
+
+
+def _current_user():
+    return User.query.filter_by(username=get_jwt_identity()).first()
+
+
+def _my_subscription(user, endpoint):
+    if not endpoint:
+        return None
+    for sub in tenant_query(PushSubscription).filter_by(user_id=user.id).all():
+        if sub.endpoint() == endpoint:
+            return sub
+    return None
+
 
 @app.route('/api/vapid-public-key', methods=['GET'])
 def get_vapid_public_key():
     return jsonify({"public_key": VAPID_PUBLIC_KEY})
 
+
 @app.route('/api/push-subscribe', methods=['POST'])
 @jwt_required()
 def push_subscribe():
-    data = request.json
-    current_username = get_jwt_identity()
-    user = User.query.filter_by(username=current_username).first()
+    data = request.json or {}
+    user = _current_user()
     if not user:
         return jsonify({"msg": "User not found"}), 404
-        
-    sub_info_str = json.dumps(data.get('subscription'))
-    
-    # Check if this exact subscription already exists for this user
-    existing = tenant_query(PushSubscription).filter_by(user_id=user.id, subscription_info=sub_info_str).first()
-    if not existing:
-        new_sub = PushSubscription(user_id=user.id, subscription_info=sub_info_str)
-        db.session.add(new_sub)
-        db.session.commit()
-        
+    subscription = data.get('subscription') or {}
+    existing = _my_subscription(user, subscription.get('endpoint'))
+    if existing:
+        existing.subscription_info = json.dumps(subscription)  # keys may rotate
+    else:
+        db.session.add(PushSubscription(user_id=user.id, subscription_info=json.dumps(subscription)))
+    db.session.commit()
     return jsonify({"msg": "Subscribed successfully"}), 200
+
+
+@app.route('/api/push-unsubscribe', methods=['POST'])
+@jwt_required()
+def push_unsubscribe():
+    user = _current_user()
+    sub = _my_subscription(user, (request.json or {}).get('endpoint')) if user else None
+    if sub:
+        db.session.delete(sub)
+        db.session.commit()
+    return jsonify({"msg": "Unsubscribed"}), 200
+
+
+@app.route('/api/push-subscription/topics', methods=['GET', 'PUT'])
+@jwt_required()
+def push_subscription_topics():
+    user = _current_user()
+    if not user:
+        return jsonify({"msg": "User not found"}), 404
+    if request.method == 'GET':
+        sub = _my_subscription(user, request.args.get('endpoint'))
+        return jsonify({"subscribed": bool(sub), "topics": sub.topic_list() if sub else []})
+    data = request.json or {}
+    topics = data.get('topics')
+    if not isinstance(topics, list) or any(t not in DEFAULT_PUSH_TOPICS for t in topics):
+        return jsonify({"msg": f"topics must be a list drawn from {list(DEFAULT_PUSH_TOPICS)}"}), 400
+    sub = _my_subscription(user, data.get('endpoint'))
+    if not sub:
+        return jsonify({"msg": "This device is not subscribed"}), 404
+    sub.topics = json.dumps(topics)
+    db.session.commit()
+    return jsonify({"subscribed": True, "topics": sub.topic_list()})
+
+
+@app.route('/api/push-test', methods=['POST'])
+@jwt_required()
+def push_test():
+    user = _current_user()
+    sub = _my_subscription(user, (request.json or {}).get('endpoint')) if user else None
+    if not sub:
+        return jsonify({"msg": "This device is not subscribed"}), 404
+    if not VAPID_PRIVATE_KEY:
+        return jsonify({"msg": "Push is not configured on the server"}), 503
+    ok = _webpush_one(sub, {"title": "Test notification", "body": "Notifications are working on this device.",
+                            "tag": "push-test", "url": "/?view=messaging"})
+    return (jsonify({"msg": "Sent"}), 200) if ok else (jsonify({"msg": "Push service rejected the message"}), 502)
+
 
 @app.route('/api/support-tickets', methods=['POST'])
 @jwt_required()
@@ -7447,7 +7531,7 @@ def create_support_ticket():
             "body": f"{data['title']} (Priority: {data['priority']})",
             "url": "/?view=service"
         }
-        send_push_notification(payload)
+        send_push_notification(payload, topic='tickets')
     except Exception as e:
         print("Push notification error:", e)
 
