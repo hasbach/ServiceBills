@@ -37,7 +37,7 @@ def upgrade():
         sa.Column('unread_count', sa.Integer(), nullable=False, server_default='0'),
         sa.Column('last_push_at', sa.DateTime(), nullable=True),
         sa.ForeignKeyConstraint(['tenant_id'], ['tenant.id'], name=op.f('fk_whatsapp_conversation_tenant_id_tenant')),
-        sa.ForeignKeyConstraint(['customer_id'], ['customer.id'], name=op.f('fk_whatsapp_conversation_customer_id_customer')),
+        sa.ForeignKeyConstraint(['customer_id'], ['customer.id'], name=op.f('fk_whatsapp_conversation_customer_id_customer'), ondelete='SET NULL'),
         sa.PrimaryKeyConstraint('id', name=op.f('pk_whatsapp_conversation')),
         sa.UniqueConstraint('tenant_id', 'wa_phone', name='uq_whatsapp_conversation_tenant_phone'),
     )
@@ -72,7 +72,7 @@ def upgrade():
         sa.Column('created_at', sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(['tenant_id'], ['tenant.id'], name=op.f('fk_whatsapp_message_tenant_id_tenant')),
         sa.ForeignKeyConstraint(['conversation_id'], ['whatsapp_conversation.id'], name=op.f('fk_whatsapp_message_conversation_id_whatsapp_conversation')),
-        sa.ForeignKeyConstraint(['sent_by_user_id'], ['user.id'], name=op.f('fk_whatsapp_message_sent_by_user_id_user')),
+        sa.ForeignKeyConstraint(['sent_by_user_id'], ['user.id'], name=op.f('fk_whatsapp_message_sent_by_user_id_user'), ondelete='SET NULL'),
         sa.PrimaryKeyConstraint('id', name=op.f('pk_whatsapp_message')),
         sa.UniqueConstraint('tenant_id', 'wa_message_id', name='uq_whatsapp_message_tenant_wamid'),
     )

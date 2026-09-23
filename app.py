@@ -1735,7 +1735,8 @@ class WhatsAppConversation(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     wa_phone = db.Column(db.String(20), nullable=False)
-    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True)
+    # SET NULL: deleting a customer must unlink, not block on, their chat.
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id', ondelete='SET NULL'), nullable=True)
     contact_name = db.Column(db.String(120), nullable=True)
     needs_attention = db.Column(db.Boolean, nullable=False, default=False, index=True)
     attention_reason = db.Column(db.String(30), nullable=True)
@@ -1782,7 +1783,8 @@ class WhatsAppMessage(db.Model):
     conversation_id = db.Column(db.Integer, db.ForeignKey('whatsapp_conversation.id'), nullable=False, index=True)
     direction = db.Column(db.String(3), nullable=False)          # 'in' | 'out'
     sender = db.Column(db.String(10), nullable=False)            # 'customer' | 'ai' | 'admin' | 'system'
-    sent_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    # SET NULL: deleting a staff account keeps the messages they sent.
+    sent_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
     msg_type = db.Column(db.String(20), nullable=False)
     text = db.Column(db.Text, nullable=True)
     transcript = db.Column(db.Text, nullable=True)
@@ -2833,7 +2835,11 @@ def delete_user(user_id):
     current_username = get_jwt_identity()
     if user.username == current_username:
         return jsonify({"msg": "Cannot delete your own account"}), 400
-            
+
+    # Keep inbox messages this admin sent; just drop the author link (the FK
+    # is ondelete='SET NULL' too -- this also covers SQLite in tests).
+    WhatsAppMessage.query.filter_by(sent_by_user_id=user.id).update(
+        {'sent_by_user_id': None}, synchronize_session=False)
     db.session.delete(user)
     db.session.commit()
     return jsonify({"msg": "User deleted successfully"}), 200
@@ -4160,6 +4166,12 @@ def update_customer(customer_id):
 def _delete_customer_core(customer):
     """Delete one customer (cascade handles related records). Caller commits
     and triggers recalculate_estimated_profit."""
+    # The inbox conversation outlives the customer: unlink it explicitly (the
+    # FK's ondelete='SET NULL' covers Postgres; this also covers SQLite, which
+    # doesn't enforce FKs by default, and keeps the ORM from ever issuing a
+    # DELETE that the constraint would reject).
+    WhatsAppConversation.query.filter_by(customer_id=customer.id).update(
+        {'customer_id': None}, synchronize_session=False)
     db.session.delete(customer)
 
 
