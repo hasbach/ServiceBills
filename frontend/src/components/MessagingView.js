@@ -12,6 +12,7 @@ import {
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext';
 import InboxView from './inbox/InboxView';
+import Composer from './inbox/Composer';
 
 const MessagingView = ({ openConversationId = null }) => {
     const { apiService, setSnackbar } = useAppContext();
@@ -232,7 +233,8 @@ const MessagingView = ({ openConversationId = null }) => {
                 </Tabs>
 
                 {activeTab === 0 ? (
-                    <InboxView openConversationId={openConversationId} />
+                    <InboxView openConversationId={openConversationId}
+                        renderComposer={(props) => <Composer {...props} />} />
                 ) : (
                 <Box sx={{ p: 4 }}>
                     {activeTab === 1 ? (
