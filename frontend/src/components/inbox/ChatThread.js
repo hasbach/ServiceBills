@@ -104,9 +104,9 @@ const ChatThread = ({ conversation, messages, hasMore, onLoadOlder, onBack, onRe
     const windowOpen = describeWindow(conversation.window_expires_at).open;
     return (
         <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-            <Stack direction="row" alignItems="center" spacing={1} sx={{ p: 1.5, borderBottom: 1, borderColor: 'divider' }}>
+            <Stack direction="row" alignItems="center" spacing={1} useFlexGap sx={{ p: 1.5, borderBottom: 1, borderColor: 'divider', flexWrap: 'wrap', rowGap: 1 }}>
                 {onBack && <IconButton onClick={onBack}><BackIcon /></IconButton>}
-                <Box sx={{ flex: 1, minWidth: 0 }}>
+                <Box sx={{ flex: '1 1 160px', minWidth: 0 }}>
                     <Typography fontWeight={800} noWrap>{cust?.name || conversation.contact_name || `+${conversation.wa_phone}`}</Typography>
                     <Typography variant="caption" color="text.secondary" noWrap display="block">
                         +{conversation.wa_phone}{cust ? ` · ${cust.plan || ''} · ${cust.status} · balance ${cust.balance}` : ' · not linked to a customer'}
@@ -115,9 +115,9 @@ const ChatThread = ({ conversation, messages, hasMore, onLoadOlder, onBack, onRe
                 {conversation.needs_attention && conversation.attention_reason && (
                     <Chip size="small" color={REASON_META[conversation.attention_reason]?.color} label={REASON_META[conversation.attention_reason]?.label} />
                 )}
-                {!conversation.ai_paused && <Button size="small" startIcon={<PauseIcon />} onClick={onPause}>Pause AI</Button>}
+                {!conversation.ai_paused && <Button size="small" startIcon={<PauseIcon />} onClick={onPause} sx={{ whiteSpace: 'nowrap' }}>Pause AI</Button>}
                 {(conversation.needs_attention || conversation.ai_paused) && (
-                    <Button size="small" variant="contained" startIcon={<ResolveIcon />} onClick={onResolve}>Resolve</Button>
+                    <Button size="small" variant="contained" startIcon={<ResolveIcon />} onClick={onResolve} sx={{ whiteSpace: 'nowrap' }}>Resolve</Button>
                 )}
             </Stack>
             <Box sx={{ flex: 1, overflowY: 'auto', p: 2, bgcolor: '#efeae2' }}>
