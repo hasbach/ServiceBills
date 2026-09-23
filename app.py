@@ -46,6 +46,8 @@ import signal
 import sys
 import json
 import cs_agent_tools
+import functools
+import whatsapp_inbox
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager, verify_jwt_in_request
 try:
@@ -8093,18 +8095,30 @@ def whatsapp_webhook():
                     # Delivery/read/failure receipts for messages WE sent (e.g. the forwarded
                     # alert to forwarding_mobile). Meta reports these separately from inbound
                     # "messages" -- log them so a silent delivery failure is diagnosable.
+                    _appmod = sys.modules[__name__]
                     for st in val.get('statuses', []):
                         st_status = st.get('status')
                         st_recipient = st.get('recipient_id')
                         if st_status == 'failed':
-                            errors = st.get('errors', [])
-                            logging.warning(f"WhatsApp message to {st_recipient} FAILED: {errors}")
+                            logging.warning(f"WhatsApp message to {st_recipient} FAILED: {st.get('errors', [])}")
                         else:
                             logging.info(f"WhatsApp message status update: to={st_recipient} status={st_status}")
+                        try:
+                            _st_msg, _st_flagged = whatsapp_inbox.apply_status(_appmod, resolved_tenant_id, st)
+                            db.session.commit()
+                            if _st_flagged is not None:
+                                whatsapp_inbox.notify_conversation(_appmod, _st_flagged)
+                        except Exception as ex_st:
+                            db.session.rollback()
+                            logging.warning(f"WhatsApp inbox: could not apply status {st.get('id')}: {ex_st}")
 
                     for msg in messages:
                         sender_phone = msg.get('from', '')
                         msg_type = msg.get('type', '')
+                        wamid = msg.get('id')
+                        if wamid and whatsapp_inbox.is_duplicate(_appmod, resolved_tenant_id, wamid):
+                            logging.info(f"WhatsApp webhook: duplicate delivery of {wamid}; skipping.")
+                            continue
                         msg_text = ''
                         media_payload = None
                         
@@ -8154,6 +8168,30 @@ def whatsapp_webhook():
                         if cust_obj:
                             cust_name = cust_obj.name or cust_name
 
+                        is_forwarding_mobile_reply = bool(
+                            settings and settings.forwarding_mobile and
+                            normalize_whatsapp_phone(settings.forwarding_mobile) == sender_phone
+                        )
+
+                        # --- Admin inbox persistence (before the AI, so nothing is lost) ---
+                        inbox_conv = inbox_msg = None
+                        if not is_forwarding_mobile_reply:
+                            try:
+                                _profile = contacts[0].get('profile', {}).get('name') if contacts else None
+                                inbox_conv = whatsapp_inbox.upsert_conversation(_appmod, resolved_tenant_id, sender_phone, _profile)
+                                inbox_msg = whatsapp_inbox.record_inbound(
+                                    _appmod, resolved_tenant_id, inbox_conv, whatsapp_inbox.parse_inbound(msg))
+                                db.session.commit()
+                            except Exception as ex_inbox:
+                                db.session.rollback()
+                                inbox_conv = inbox_msg = None
+                                logging.error(f"WhatsApp inbox: could not persist inbound {wamid}: {ex_inbox}")
+                        if inbox_msg is not None and inbox_msg.wa_media_id and settings.access_token:
+                            whatsapp_inbox.run_background(app, functools.partial(
+                                whatsapp_inbox.store_inbound_media, _appmod, inbox_msg.id,
+                                settings.access_token, settings.api_version or 'v19.0'),
+                                pool=whatsapp_inbox.media_pool())
+
                         # If voice note or audio, transcribe with ElevenLabs STT
                         if msg_type in ['audio', 'voice'] and media_payload and settings and settings.access_token:
                             try:
@@ -8164,6 +8202,9 @@ def whatsapp_webhook():
                                     )
                                     if transcript:
                                         msg_text = f"[رسالة صوتية]: {transcript}"
+                                        if inbox_msg is not None:
+                                            inbox_msg.transcript = transcript
+                                            db.session.commit()
                                         logging.info(f"Transcribed WhatsApp audio for {cust_name} (+{sender_phone}): {transcript}")
                             except Exception as ex_tr:
                                 logging.warning(f"Error transcribing WhatsApp voice note: {ex_tr}")
@@ -8177,18 +8218,33 @@ def whatsapp_webhook():
                         # 24h customer-initiated session window has lapsed.
 
                         # 2. Check if CS Agent is active for this tenant
-                        is_forwarding_mobile_reply = bool(
-                            settings and settings.forwarding_mobile and
-                            normalize_whatsapp_phone(settings.forwarding_mobile) == sender_phone
-                        )
                         cs_agent_active = False
                         if settings and settings.access_token and settings.phone_number_id:
                             cs_settings = CSAgentSettings.query.filter_by(tenant_id=resolved_tenant_id).first()
                             if cs_settings is None or cs_settings.is_active:
                                 cs_agent_active = True
 
+                        ai_will_run = bool(cs_agent_active and getattr(settings, 'auto_reply_enabled', True))
+                        ai_paused = False
+                        if inbox_conv is not None:
+                            try:
+                                whatsapp_inbox.maybe_auto_resume(inbox_conv)
+                                ai_paused = bool(inbox_conv.ai_paused)
+                                reason = whatsapp_inbox.inbound_attention_reason(
+                                    ai_paused=ai_paused, ai_will_run=ai_will_run,
+                                    has_customer=cust_obj is not None,
+                                    msg_type=inbox_msg.msg_type if inbox_msg is not None else 'text')
+                                if reason:
+                                    whatsapp_inbox.flag_attention(inbox_conv, reason)
+                                db.session.commit()
+                                if inbox_conv.needs_attention:
+                                    whatsapp_inbox.notify_conversation(_appmod, inbox_conv)
+                            except Exception as ex_flag:
+                                db.session.rollback()
+                                logging.error(f"WhatsApp inbox: could not flag conversation for {wamid}: {ex_flag}")
+
                         ticket = None
-                        if cs_agent_active and getattr(settings, 'auto_reply_enabled', True) and not is_forwarding_mobile_reply:
+                        if ai_will_run and not is_forwarding_mobile_reply and not ai_paused:
                             # 3a. CS AI Agent handles the message autonomously.
                             # IMPORTANT: spawn as a background greenlet so the webhook returns 200 OK
                             # immediately. WhatsApp retries the webhook if it doesn't get a 200 within
@@ -8205,38 +8261,26 @@ def whatsapp_webhook():
                                 _is_voice = bool(msg_type in ['audio', 'voice'])
                                 _settings = settings
 
-                                def _run_ai_reply_with_ctx(
-                                    flask_app=_flask_app, appmod=_appmod,
-                                    tenant_id=_tenant_id, sender=_sender,
-                                    cust=_cust, text=_text,
-                                    is_voice=_is_voice, stgs=_settings
+                                def _run_ai_reply(
+                                    appmod=_appmod, tenant_id=_tenant_id, sender=_sender,
+                                    cust=_cust, text=_text, is_voice=_is_voice, stgs=_settings
                                 ):
-                                    with flask_app.app_context():
-                                        cs_agent_tools.handle_whatsapp_cs_ai_reply(
-                                            appmod=appmod,
-                                            tenant_id=tenant_id,
-                                            sender_phone=sender,
-                                            customer=cust,
-                                            incoming_text=text,
-                                            is_voice=is_voice,
-                                            settings=stgs,
-                                            ticket=None
-                                        )
+                                    try:
+                                        result = cs_agent_tools.handle_whatsapp_cs_ai_reply(
+                                            appmod=appmod, tenant_id=tenant_id, sender_phone=sender,
+                                            customer=cust, incoming_text=text, is_voice=is_voice,
+                                            settings=stgs, ticket=None)
+                                    except Exception:
+                                        logging.exception("CS AI reply crashed")
+                                        result = None
+                                    whatsapp_inbox.after_ai_reply(appmod, tenant_id, sender, result)
 
-                                # Spawn through the bounded pool rather than a bare gevent.spawn():
-                                # this caps how many AI-reply greenlets (and their DB connections /
-                                # ElevenLabs sessions) can run concurrently. If the pool is already
-                                # at capacity, .spawn() cooperatively waits for a free slot -- it
-                                # only delays *this* webhook's 200 OK, not other in-flight requests.
-                                if AI_REPLY_GREENLET_POOL is not None:
-                                    AI_REPLY_GREENLET_POOL.spawn(_run_ai_reply_with_ctx)
-                                elif gevent is not None:
-                                    gevent.spawn(_run_ai_reply_with_ctx)
-                                else:
-                                    _run_ai_reply_with_ctx()
+                                # Bounded pool (see AI_REPLY_GREENLET_POOL); run_background pushes the
+                                # app context the greenlet needs, or runs inline under tests.
+                                whatsapp_inbox.run_background(_flask_app, _run_ai_reply, pool=AI_REPLY_GREENLET_POOL)
                             except Exception as ex_ai:
                                 logging.error(f"Error spawning CS AI reply greenlet: {ex_ai}")
-                        elif not is_forwarding_mobile_reply:
+                        elif not is_forwarding_mobile_reply and not ai_paused:
                             # 3b. CS Agent is inactive/disabled: create support ticket for human staff follow-up
                             if cust_obj:
                                 try:
@@ -8287,6 +8331,16 @@ def whatsapp_webhook():
                                         res_rep = requests.post(url_reply, json=payload_reply, headers=headers_reply, timeout=10)
                                         if res_rep.ok:
                                             logging.info(f"Sent fallback canned reply to +{sender_phone}.")
+                                            if inbox_conv is not None:
+                                                try:
+                                                    _w = ((res_rep.json() or {}).get('messages') or [{}])[0].get('id')
+                                                    whatsapp_inbox.record_outbound(
+                                                        _appmod, inbox_conv, sender='system', msg_type='text',
+                                                        text=reply_text, wa_message_id=_w)
+                                                    db.session.commit()
+                                                except Exception as ex_rec:
+                                                    db.session.rollback()
+                                                    logging.warning(f"WhatsApp inbox: could not record canned reply: {ex_rec}")
                                         else:
                                             logging.warning(f"Could not send fallback canned reply to +{sender_phone}: {res_rep.text}")
                                     except Exception as ex_rep:

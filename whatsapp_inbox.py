@@ -7,10 +7,14 @@ time. Functions here do NOT commit unless their docstring says so -- the caller
 owns the transaction. See docs/superpowers/specs/2026-09-23-whatsapp-inbox-design.md.
 """
 import logging
+import mimetypes
 import re
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError
+
+import media_convert
+import storage
 
 WINDOW = timedelta(hours=24)
 AI_AUTO_RESUME_AFTER = timedelta(hours=24)
@@ -325,3 +329,49 @@ def apply_status(appmod, tenant_id, status):
     if new in STATUS_RANK and msg.status != 'failed' and STATUS_RANK[new] > STATUS_RANK.get(msg.status, -1):
         msg.status = new
     return msg, None
+
+
+def store_inbound_media(appmod, message_id, access_token, api_version):
+    """Download an inbound message's media from Meta into storage (plus an mp3
+    playback copy for audio). Commits. Never raises into the caller."""
+    import cs_agent_tools  # lazy: cs_agent_tools imports this module lazily too
+    msg = appmod.db.session.get(appmod.WhatsAppMessage, message_id)
+    if msg is None or not msg.wa_media_id:
+        return
+    try:
+        data, mime = cs_agent_tools.download_meta_media(access_token, msg.wa_media_id, api_version=api_version)
+        if not data:
+            msg.media_status = 'failed'
+            appmod.db.session.commit()
+            return
+        mime = (mime or msg.media_mime or 'application/octet-stream').split(';')[0].strip()
+        ext = mimetypes.guess_extension(mime) or '.bin'
+        msg.media_key = storage.save_bytes(data, msg.tenant_id, f"wa-{msg.id}{ext}", mime)
+        msg.media_mime = mime
+        if msg.msg_type == 'audio':
+            try:
+                mp3 = media_convert.to_mp3(data)
+                msg.media_playback_key = storage.save_bytes(mp3, msg.tenant_id, f"wa-{msg.id}.mp3", 'audio/mpeg')
+            except media_convert.ConversionError as e:
+                logging.warning(f"whatsapp_inbox: no mp3 playback copy for message {msg.id}: {e}")
+        msg.media_status = 'stored'
+        appmod.db.session.commit()
+    except Exception:
+        appmod.db.session.rollback()
+        logging.exception(f"whatsapp_inbox: media download failed for message {message_id}")
+        msg = appmod.db.session.get(appmod.WhatsAppMessage, message_id)
+        if msg is not None:
+            msg.media_status = 'failed'
+            appmod.db.session.commit()
+
+
+def after_ai_reply(appmod, tenant_id, wa_phone, result):
+    """Placeholder until Task 7 -- flags ai_failed when the AI path returned nothing."""
+    conv = find_conversation_by_phone(appmod, tenant_id, wa_phone)
+    if conv is None:
+        return
+    if result is None:
+        flag_attention(conv, 'ai_failed')
+    appmod.db.session.commit()
+    if conv.needs_attention:
+        notify_conversation(appmod, conv)
