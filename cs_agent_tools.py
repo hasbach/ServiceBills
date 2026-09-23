@@ -926,6 +926,7 @@ def escalate_to_human(appmod, tenant_id, customer_id, reason, summary, phone=Non
         if flag_phone:
             whatsapp_inbox.flag_attention_for_phone(appmod, tenant_id, flag_phone, 'escalated')
     except Exception as ex_inbox:
+        appmod.db.session.rollback()
         logging.warning(f"Could not flag inbox conversation for escalation: {ex_inbox}")
 
     return {
@@ -2347,6 +2348,7 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
         appmod.db.session.add(out_log)
         appmod.db.session.commit()
     except Exception as ex_log:
+        appmod.db.session.rollback()  # else record_ai_reply below hits PendingRollbackError
         logging.warning(f"Could not log CS Agent WhatsApp session: {ex_log}")
 
     # 5. Mirror what was actually sent into the admin inbox (see whatsapp_inbox.py).

@@ -407,12 +407,15 @@ def after_ai_reply(appmod, tenant_id, wa_phone, result):
     - ai_failed: the AI raised / returned nothing, OR the tenant has a Gemini
       key but Gemini produced nothing and the rule-based fallback answered;
     - escalated: the (rule-based) AI decided to escalate.
-    send_failed was already flagged by record_ai_reply. Commits and pushes."""
+    send_failed was already flagged by record_ai_reply and takes precedence
+    (the customer never got the reply). Commits and pushes."""
     try:
         conv = find_conversation_by_phone(appmod, tenant_id, wa_phone)
         if conv is None:
             return
-        if result is None:
+        if result and result.get('inbox_send_failed'):
+            pass  # keep send_failed
+        elif result is None:
             flag_attention(conv, 'ai_failed')
         elif result.get('escalate'):
             flag_attention(conv, 'escalated')

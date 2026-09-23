@@ -169,6 +169,68 @@ def test_status_failure_push_runs_in_background(app, client, deferred_env):
     assert len(deferred_env["pushes"]) == 1
 
 
+# --- 4. after_ai_reply keeps send_failed; record_ai_reply voice branch -------
+
+def test_after_ai_reply_does_not_overwrite_send_failed(app, client, monkeypatch):
+    make_tenant(client, "Biz SF", "sf_admin")
+    tid = _tid(app, "sf_admin")
+    pushes = []
+    monkeypatch.setattr(appmod, "send_push_notification", lambda p, **kw: pushes.append(p) or 1)
+    with app.app_context():
+        conv = wi.upsert_conversation(appmod, tid, "96170100300")
+        wi.flag_attention(conv, "send_failed")
+        appmod.db.session.commit()
+        wi.after_ai_reply(appmod, tid, "96170100300",
+                          {"reply_text": "x", "ai_source": "rules", "gemini_configured": True,
+                           "escalate": True, "inbox_send_failed": True})
+        assert conv.attention_reason == "send_failed"
+    assert len(pushes) == 1
+
+
+@pytest.mark.parametrize("voice_result,expected_wamid", [("wamid.V1", "wamid.V1"), (True, None)])
+def test_record_ai_reply_records_voice(app, client, voice_result, expected_wamid):
+    make_tenant(client, "Biz V" + str(expected_wamid), "v_admin_" + str(bool(expected_wamid)))
+    tid = _tid(app, "v_admin_" + str(bool(expected_wamid)))
+    with app.app_context():
+        failed = wi.record_ai_reply(appmod, tid, "96170100400", reply_text="hello", text_wamid="wamid.T1",
+                                    text_ok=True, text_error=None, voice_result=voice_result)
+        assert failed is False
+        audio = appmod.WhatsAppMessage.query.filter_by(sender="ai", msg_type="audio").all()
+        assert len(audio) == 1
+        assert audio[0].transcript == "hello" and audio[0].wa_message_id == expected_wamid
+        assert appmod.WhatsAppMessage.query.filter_by(sender="ai", msg_type="text").count() == 1
+
+
+# --- 5. audit-log failure must not poison the inbox record -------------------
+
+def test_audit_log_failure_still_records_ai_inbox_message(app, client, monkeypatch):
+    hdr = make_tenant(client, "Biz Aud", "aud_admin")
+    tid = _tid(app, "aud_admin")
+    seed_customer(client, hdr, "70777999", name="Aud")
+    monkeypatch.setattr(cs_agent_tools.requests, "post",
+                        lambda *a, **kw: FakeResponse(body={"messages": [{"id": "wamid.AUD"}]}))
+    settings = SimpleNamespace(access_token="tok", phone_number_id="PN", api_version="v19.0")
+    fired = []
+
+    def _boom(mapper, connection, target):
+        if not fired:
+            fired.append(1)
+            raise RuntimeError("audit insert failed")
+
+    sa.event.listen(appmod.CSAgentMessageLog, "before_insert", _boom)
+    try:
+        with app.app_context():
+            cust = appmod.Customer.query.filter_by(tenant_id=tid).first()
+            res = cs_agent_tools.handle_whatsapp_cs_ai_reply(appmod, tid, "96170777999", cust, "رصيدي",
+                                                             settings=settings)
+            assert fired, "the audit insert should have been attempted"
+            assert res["inbox_send_failed"] is False
+            ai = appmod.WhatsAppMessage.query.filter_by(sender="ai").all()
+            assert len(ai) == 1 and ai[0].wa_message_id == "wamid.AUD"
+    finally:
+        sa.event.remove(appmod.CSAgentMessageLog, "before_insert", _boom)
+
+
 # --- 9. a full media pool must not block the webhook -------------------------
 
 def test_run_background_falls_back_to_spawn_when_pool_full(app, monkeypatch):
