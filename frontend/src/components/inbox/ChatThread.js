@@ -8,7 +8,7 @@ import {
     PauseCircle as PauseIcon
 } from '@mui/icons-material';
 import InboxMedia from './InboxMedia';
-import { REASON_META } from './inboxFormat';
+import { REASON_META, describeWindow } from './inboxFormat';
 import { formatStamp } from '../formatStamp';
 
 const BUBBLE = {
@@ -101,7 +101,7 @@ const ChatThread = ({ conversation, messages, hasMore, onLoadOlder, onBack, onRe
     useEffect(() => { bottomRef.current?.scrollIntoView({ block: 'end' }); }, [lastId]);
     const byWamid = Object.fromEntries(messages.filter(m => m.wa_message_id).map(m => [m.wa_message_id, m]));
     const cust = conversation.customer;
-    const windowOpen = !!conversation.window_open;
+    const windowOpen = describeWindow(conversation.window_expires_at).open;
     return (
         <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
             <Stack direction="row" alignItems="center" spacing={1} sx={{ p: 1.5, borderBottom: 1, borderColor: 'divider' }}>

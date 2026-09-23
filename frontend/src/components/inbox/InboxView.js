@@ -56,7 +56,7 @@ const InboxView = ({ openConversationId = null, renderComposer = null, headerExt
     }, [loadList, search]);
 
     useEffect(() => {
-        setThread(null); setReplyTo(null);
+        setThread(null); setReplyTo(null); setReactTarget(null);
         if (!selectedId) return undefined;
         loadThread(selectedId, { markRead: true });
         const i = setInterval(() => loadThread(selectedId, { markRead: true }), THREAD_POLL_MS);

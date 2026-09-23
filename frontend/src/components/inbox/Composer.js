@@ -55,17 +55,20 @@ const Composer = ({ conversation, replyTo, clearReply, reactTarget, clearReactTa
     const [voiceAvailable, setVoiceAvailable] = useState(true);
     const [, forceTick] = useState(0);
     const fileRef = useRef(null);
+    const mountedRef = useRef(true);
     const notify = (message) => setSnackbar({ open: true, message, severity: 'error' });
 
     useEffect(() => { apiService.fetchInboxSummary().then(r => setVoiceAvailable(!!r.data.voice_available)).catch(() => {}); }, [apiService]);
     useEffect(() => { const i = setInterval(() => forceTick(t => t + 1), 30000); return () => clearInterval(i); }, []);
+    useEffect(() => () => { mountedRef.current = false; }, []);
 
     const windowInfo = describeWindow(conversation.window_expires_at);
+    useEffect(() => { if (!windowInfo.open && reactTarget) clearReactTarget(); }, [windowInfo.open, reactTarget, clearReactTarget]);
     const run = async (fn) => {
         setSending(true);
         try { await fn(); await onSent(); }
         catch (e) { notify(e.response?.data?.msg || 'Send failed'); if (e.response?.data?.error === 'window_closed') await onSent(); }
-        finally { setSending(false); }
+        finally { if (mountedRef.current) setSending(false); }
     };
     const sendText = () => text.trim() && !sending && run(async () => {
         await apiService.sendInboxMessage(conversation.id, { type: 'text', text, reply_to: replyTo?.wa_message_id });
