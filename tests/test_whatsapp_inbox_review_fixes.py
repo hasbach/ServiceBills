@@ -113,3 +113,83 @@ def test_deleting_user_unlinks_sent_messages(app, client):
     assert r.status_code == 200, r.get_json()
     with app.app_context():
         assert appmod.db.session.get(appmod.WhatsAppMessage, msg_id).sent_by_user_id is None
+
+
+# --- 3. push off the webhook request path ------------------------------------
+
+def test_webpush_one_passes_timeout_and_ttl(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(appmod, "webpush", lambda **kw: seen.update(kw))
+    sub = SimpleNamespace(subscription_info=json.dumps({"endpoint": "https://x"}), user_id=1)
+    assert appmod._webpush_one(sub, {"title": "t"}) is True
+    assert seen["timeout"] == 10 and seen["ttl"] == 86400
+
+
+@pytest.fixture
+def deferred_env(app, client, monkeypatch, tmp_path):
+    """Webhook env where background tasks are captured instead of run."""
+    monkeypatch.setattr(storage, "UPLOAD_ROOT", str(tmp_path))
+    monkeypatch.setattr(storage, "_backend", storage.LocalBackend())
+    pushes, deferred = [], []
+    monkeypatch.setattr(appmod, "send_push_notification", lambda payload, **kw: pushes.append(payload) or 1)
+    monkeypatch.setattr(cs_agent_tools, "handle_whatsapp_cs_ai_reply",
+                        lambda **kw: {"reply_text": "ok", "ai_source": "gemini", "gemini_configured": True})
+    monkeypatch.setattr(appmod.requests, "post", lambda *a, **kw: FakeResponse())
+    monkeypatch.setattr(wi, "run_background", lambda flask_app, fn, pool=None: deferred.append((fn, pool)))
+    hdr, tid = setup_wa_tenant(app, client, "Biz Defer", "defer_admin", "PNID_DF")
+    return {"tid": tid, "pushes": pushes, "deferred": deferred}
+
+
+def _run_deferred(app, env):
+    with app.app_context():
+        for fn, _pool in env["deferred"]:
+            fn()
+
+
+def test_inbound_flag_push_runs_in_background(app, client, deferred_env):
+    r = signed_post(client, wa_payload("PNID_DF", messages=[
+        {"from": "96171999000", "id": "wamid.DF1", "type": "text", "text": {"body": "hello"}}]), "s3cret")
+    assert r.status_code == 200
+    assert deferred_env["pushes"] == [], "push must not run inside the webhook request"
+    assert any(pool is wi.media_pool() for _fn, pool in deferred_env["deferred"])
+    _run_deferred(app, deferred_env)
+    assert len(deferred_env["pushes"]) == 1
+
+
+def test_status_failure_push_runs_in_background(app, client, deferred_env):
+    with app.app_context():
+        conv = wi.upsert_conversation(appmod, deferred_env["tid"], "96170123456")
+        wi.record_outbound(appmod, conv, sender="admin", msg_type="text", text="hi", wa_message_id="wamid.DFO")
+        appmod.db.session.commit()
+    signed_post(client, wa_payload("PNID_DF", statuses=[
+        {"id": "wamid.DFO", "status": "failed", "errors": [{"code": 131026, "title": "Undeliverable"}]}]), "s3cret")
+    assert deferred_env["pushes"] == []
+    assert len(deferred_env["deferred"]) == 1
+    _run_deferred(app, deferred_env)
+    assert len(deferred_env["pushes"]) == 1
+
+
+# --- 9. a full media pool must not block the webhook -------------------------
+
+def test_run_background_falls_back_to_spawn_when_pool_full(app, monkeypatch):
+    import gevent
+    monkeypatch.setattr(wi, "SYNC_BACKGROUND_TASKS", False)
+    spawned = []
+    monkeypatch.setattr(gevent, "spawn", lambda fn: spawned.append(fn))
+
+    class FullPool:
+        def __init__(self):
+            self.spawned = []
+
+        def full(self):
+            return True
+
+        def spawn(self, fn):
+            self.spawned.append(fn)
+
+    pool = FullPool()
+    ran = []
+    wi.run_background(app, lambda: ran.append(1), pool=pool)
+    assert pool.spawned == [] and len(spawned) == 1
+    spawned[0]()  # the wrapped function still pushes its own app context
+    assert ran == [1]

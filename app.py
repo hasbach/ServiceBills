@@ -7387,7 +7387,12 @@ def _webpush_one(sub, payload_dict):
             subscription_info=json.loads(sub.subscription_info),
             data=json.dumps(payload_dict),
             vapid_private_key=VAPID_PRIVATE_KEY,
-            vapid_claims={"sub": f"mailto:{VAPID_CLAIM_EMAIL}"}
+            vapid_claims={"sub": f"mailto:{VAPID_CLAIM_EMAIL}"},
+            # Never hang a caller on a slow push service (pywebpush defaults to
+            # no timeout), and let the push service hold an undelivered
+            # notification for a day instead of dropping it (default ttl=0).
+            timeout=10,
+            ttl=86400,
         )
         return True
     except Exception as e:
@@ -8119,7 +8124,12 @@ def whatsapp_webhook():
                             _st_msg, _st_flagged = whatsapp_inbox.apply_status(_appmod, resolved_tenant_id, st)
                             db.session.commit()
                             if _st_flagged is not None:
-                                whatsapp_inbox.notify_conversation(_appmod, _st_flagged)
+                                # Push off the request path: reload by id in the task's own session.
+                                def _notify_status(conv_id=_st_flagged.id, appmod=_appmod):
+                                    c = appmod.db.session.get(appmod.WhatsAppConversation, conv_id)
+                                    if c is not None:
+                                        whatsapp_inbox.notify_conversation(appmod, c)
+                                whatsapp_inbox.run_background(app, _notify_status, pool=whatsapp_inbox.media_pool())
                         except Exception as ex_st:
                             db.session.rollback()
                             logging.warning(f"WhatsApp inbox: could not apply status {st.get('id')}: {ex_st}")
@@ -8273,7 +8283,13 @@ def whatsapp_webhook():
                                     whatsapp_inbox.flag_attention(inbox_conv, reason)
                                 db.session.commit()
                                 if inbox_conv.needs_attention:
-                                    whatsapp_inbox.notify_conversation(_appmod, inbox_conv)
+                                    # Push off the request path (and before the AI is spawned):
+                                    # reload by id in the task's own session.
+                                    def _notify_inbound(conv_id=inbox_conv.id, appmod=_appmod):
+                                        c = appmod.db.session.get(appmod.WhatsAppConversation, conv_id)
+                                        if c is not None:
+                                            whatsapp_inbox.notify_conversation(appmod, c)
+                                    whatsapp_inbox.run_background(app, _notify_inbound, pool=whatsapp_inbox.media_pool())
                             except Exception as ex_flag:
                                 db.session.rollback()
                                 logging.error(f"WhatsApp inbox: could not flag conversation for {wamid}: {ex_flag}")

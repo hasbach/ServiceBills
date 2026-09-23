@@ -88,7 +88,7 @@ def run_background(flask_app, fn, pool=None):
         import gevent
     except ImportError:
         gevent = None
-    if pool is not None:
+    if pool is not None and not (gevent is not None and pool.full()):
         pool.spawn(_wrapped)
     elif gevent is not None:
         gevent.spawn(_wrapped)
