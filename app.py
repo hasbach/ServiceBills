@@ -10913,6 +10913,10 @@ def agent_poll_job():
     if fingerprint:
         agent.connector_fingerprint = fingerprint
 
+    # Before choosing: a pending job older than JOB_CLAIM_TIMEOUT_SECONDS is
+    # one the cloud already gave up on, so it must expire, not run late.
+    _sweep_stale_agent_jobs(agent.tenant_id)
+
     job = (NetworkAgentJob.query
            .filter_by(tenant_id=agent.tenant_id, status='pending')
            .order_by(NetworkAgentJob.created_at)
@@ -11212,39 +11216,70 @@ JOB_RESULT_TIMEOUT_SECONDS = 120
 NETWORK_AGENT_JOB_RETENTION_DAYS = 7
 
 
-def _expire_job_if_stale(job):
-    """Lazy expiry, evaluated when a job is read. Not a scheduled task -- there
-    wasn't reliable scheduled-job infrastructure to depend on when this was
-    written (see NetworkAgentJob's docstring for why); a Cron Job could
-    replace this now, but nothing has needed it enough to be worth the change.
-
-    Residual gap, accepted rather than fixed: because this only runs when
-    something reads the job (GET /api/network-jobs/<id>), a write job nobody
-    ever polls again -- tab closed, page never reopened -- stays 'claimed'
-    forever, and its paired NetworkWriteAudit row stays 'queued' forever
-    along with it. That is different from the five stuck-'queued' routes
-    _complete_write_audit was added to close off below: those had a request
-    already in flight to hang the fix on, and this one doesn't -- there is no
-    read to attach a completion to when nobody ever reads. A scheduled sweep
-    could close this now that Cron Jobs exist; left as documented, not silent,
-    since nothing has forced the issue yet.
-    """
-    now = datetime.utcnow()
+def _mark_job_if_stale(job, now):
+    """Move one timed-out job to its terminal state, without committing.
+    True if the job changed. Shared by the per-job read path below and the
+    per-tenant sweep, so both reach the same verdict with the same message."""
     if job.status == 'pending' and job.created_at:
         if (now - job.created_at).total_seconds() > JOB_CLAIM_TIMEOUT_SECONDS:
             job.status = 'expired'
             job.error = 'The agent did not pick this up. Is it still running?'
             job.finished_at = now
             _complete_write_audit(job)
-            db.session.commit()
+            return True
     elif job.status == 'claimed' and job.claimed_at:
         if (now - job.claimed_at).total_seconds() > JOB_RESULT_TIMEOUT_SECONDS:
             job.status = 'failed'
             job.error = 'The agent claimed this check but never reported back.'
             job.finished_at = now
             _complete_write_audit(job)
-            db.session.commit()
+            return True
+    return False
+
+
+def _expire_job_if_stale(job):
+    """Lazy expiry, evaluated when a job is read. Not a scheduled task -- a
+    Cron Job could do this now, but the request paths below already cover it.
+
+    A job nobody ever reads -- the automatic unsuspend from
+    _maybe_restore_mikrotik_access, or a tab closed mid-check -- is closed by
+    _sweep_stale_agent_jobs instead, which hangs the same verdict on two
+    requests that always happen: the agent's poll and the next job creation.
+    """
+    if _mark_job_if_stale(job, datetime.utcnow()):
+        db.session.commit()
     return job
+
+
+def _sweep_stale_agent_jobs(tenant_id):
+    """Close this tenant's timed-out 'pending'/'claimed' jobs, without
+    committing -- the caller's own commit persists the sweep.
+
+    Called from agent_poll_job BEFORE it picks a job, so a pending job left
+    over from an agent outage expires instead of being performed hours after
+    the cloud stopped expecting it (the claim query has no age check of its
+    own), and a job the agent claimed and then died on is failed on its first
+    poll after restart. Also called from job creation, which still runs when
+    the agent never comes back. Either way the paired NetworkWriteAudit row
+    leaves 'queued' via _complete_write_audit.
+
+    If the agent is gone for good and nothing creates another job, stale rows
+    stay put -- but nothing will ever claim them either, so they are inert.
+    """
+    now = datetime.utcnow()
+    claim_cutoff = now - timedelta(seconds=JOB_CLAIM_TIMEOUT_SECONDS)
+    result_cutoff = now - timedelta(seconds=JOB_RESULT_TIMEOUT_SECONDS)
+    stale = NetworkAgentJob.query.filter(
+        NetworkAgentJob.tenant_id == tenant_id,
+        db.or_(
+            db.and_(NetworkAgentJob.status == 'pending',
+                    NetworkAgentJob.created_at < claim_cutoff),
+            db.and_(NetworkAgentJob.status == 'claimed',
+                    NetworkAgentJob.claimed_at < result_cutoff),
+        ),
+    ).all()
+    for job in stale:
+        _mark_job_if_stale(job, now)
 
 
 def _run_device_operation_direct(device, operation, params):
@@ -11357,6 +11392,7 @@ def _create_device_job(device, operation, params=None, commit=True):
         job.finished_at = datetime.utcnow()
         job.result = value if ok else None
         job.error = None if ok else value
+        _sweep_stale_agent_jobs(device.tenant_id)
         _prune_stale_agent_jobs(device.tenant_id)
         db.session.add(job)
         if commit:
@@ -11370,6 +11406,7 @@ def _create_device_job(device, operation, params=None, commit=True):
         last = agent.last_seen_at.strftime('%Y-%m-%d %H:%M:%S') if (agent and agent.last_seen_at) else 'never'
         return None, 'Agent offline (last seen {}). Start the agent on your network and try again.'.format(last)
 
+    _sweep_stale_agent_jobs(device.tenant_id)
     _prune_stale_agent_jobs(device.tenant_id)
     db.session.add(job)
     if commit:
@@ -11413,6 +11450,7 @@ def _create_scheduled_device_job(device, operation):
         operation=operation, params={'_scheduled': True},
         requested_by_user_id=None,
     )
+    _sweep_stale_agent_jobs(device.tenant_id)
     _prune_stale_agent_jobs(device.tenant_id)
     db.session.add(job)
     db.session.commit()
