@@ -6,7 +6,7 @@ import * as swReg from '../../serviceWorkerRegistration';
 
 const TOPIC = 'whatsapp_inbox';
 const SW_READY_TIMEOUT_MS = 3000;
-const isIos = () => /iphone|ipad|ipod/i.test(navigator.userAgent);
+const isIos = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isStandalone = () => window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone === true;
 
 const InboxNotificationsControl = () => {
@@ -18,10 +18,15 @@ const InboxNotificationsControl = () => {
     // navigator.serviceWorker.ready never resolves when no service worker is
     // registered (e.g. plain `npm start`), so race it against a short timeout
     // rather than hang the control on 'loading' forever.
-    const getRegistration = () => Promise.race([
-        navigator.serviceWorker.ready,
-        new Promise((_, reject) => setTimeout(() => reject(new Error('sw_ready_timeout')), SW_READY_TIMEOUT_MS)),
-    ]);
+    const getRegistration = () => {
+        let t;
+        return Promise.race([
+            navigator.serviceWorker.ready,
+            new Promise((_, reject) => {
+                t = setTimeout(() => reject(new Error('sw_ready_timeout')), SW_READY_TIMEOUT_MS);
+            }),
+        ]).finally(() => clearTimeout(t));
+    };
 
     const currentSub = async () => {
         const reg = await getRegistration();
