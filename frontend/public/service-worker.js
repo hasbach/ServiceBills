@@ -30,43 +30,44 @@ self.addEventListener('fetch', event => {
 });
 
 self.addEventListener('push', function(event) {
-  if (event.data) {
-    const data = event.data.json();
-    const options = {
-      body: data.body,
-      icon: '/logo192.png',
-      vibrate: [100, 50, 100],
-      data: {
-        dateOfArrival: Date.now(),
-        primaryKey: '2',
-        url: data.url || '/'
-      }
-    };
-    event.waitUntil(
-      self.registration.showNotification(data.title, options)
-    );
+  if (!event.data) return;
+  let data;
+  try { data = event.data.json(); } catch (e) { data = { title: 'servicesBills', body: event.data.text() }; }
+  const options = {
+    body: data.body,
+    icon: '/logo192.png',
+    badge: '/logo192.png',
+    vibrate: [100, 50, 100],
+    data: {
+      dateOfArrival: Date.now(),
+      url: data.url || '/',
+      conversationId: data.conversation_id || null
+    }
+  };
+  // Same tag -> the new notification replaces the old one (one per WhatsApp
+  // conversation) and renotify makes it buzz again instead of updating silently.
+  if (data.tag) {
+    options.tag = data.tag;
+    options.renotify = true;
   }
+  event.waitUntil(self.registration.showNotification(data.title || 'servicesBills', options));
 });
 
 self.addEventListener('notificationclick', function(event) {
   event.notification.close();
-  const urlToOpen = new URL(event.notification.data.url, self.location.origin).href;
+  const data = event.notification.data || {};
+  const urlToOpen = new URL(data.url || '/', self.location.origin).href;
 
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
-      let matchingClient = null;
-      for (let i = 0; i < windowClients.length; i++) {
-        const windowClient = windowClients[i];
-        if (windowClient.url === urlToOpen) {
-          matchingClient = windowClient;
-          break;
-        }
+      // Reuse any open window of this app: tell it where to go (App.js listens)
+      // instead of requiring an exact URL match like before.
+      const client = windowClients.find(c => new URL(c.url).origin === self.location.origin);
+      if (client) {
+        client.postMessage({ type: 'open-url', url: urlToOpen, conversationId: data.conversationId || null });
+        return client.focus();
       }
-      if (matchingClient) {
-        return matchingClient.focus();
-      } else {
-        return clients.openWindow(urlToOpen);
-      }
+      return clients.openWindow(urlToOpen);
     })
   );
 });
