@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, func, extract
 from werkzeug.utils import secure_filename
 import atexit
-from apscheduler.schedulers.background import BackgroundScheduler
+import click
 from flask import send_from_directory
 from sqlalchemy.exc import IntegrityError
 from dateutil.relativedelta import relativedelta # REQUIRED: pip install python-dateutil
@@ -52,7 +52,7 @@ try:
     from flask_jwt_extended import get_jwt
 except ImportError:
     from flask_jwt_extended import get_raw_jwt as get_jwt
-from functools import wraps, partial
+from functools import wraps
 import calendar
 from pywebpush import webpush, WebPusher
 import logging
@@ -179,12 +179,9 @@ def health_check():
         db_ok = False
         db_error = str(e)
 
-    # Informational only -- RUN_SCHEDULER=0 is a valid, intentional config on a
-    # scaled-out web worker (see DEPLOY.md), so scheduler-off must never fail health.
     payload = {
         'status': 'ok' if db_ok else 'unhealthy',
         'database': 'ok' if db_ok else 'error',
-        'scheduler_running': scheduler.running if 'scheduler' in globals() else None,
     }
     if db_error:
         payload['database_error'] = db_error
@@ -667,9 +664,11 @@ class NetworkAgent(db.Model):
 
 class NetworkAgentJob(db.Model):
     """One relayed device call. Created by the cloud, claimed and completed by
-    the agent, polled by the browser. Expiry is computed lazily on read -- no
-    scheduled job, deliberately: the in-process scheduler fires during
-    `flask db upgrade` on deploy."""
+    the agent, polled by the browser. Expiry is computed lazily on read, not
+    by a scheduled job -- there wasn't one to piggyback on when this was
+    written (see _expire_job_if_stale's docstring); a real Cron Job could
+    replace this now, but nothing has needed it enough to be worth the
+    change."""
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     device_id = db.Column(db.Integer, db.ForeignKey('network_device.id'), nullable=False)
@@ -2964,23 +2963,29 @@ def _prune_scheduled_job_runs():
 
 
 def _run_scheduled_job(job_name, fn):
-    """Run one interval-scheduler job body with cross-process duplicate
-    protection and a durable audit trail.
+    """Run one scheduled job body with cross-process duplicate protection and
+    a durable audit trail. This is what `flask run-scheduled-job` (below)
+    invokes -- each job runs as its own one-shot Render Cron Job container.
 
-    Root-cause context: this app's daily jobs fire immediately on every
-    process that imports app.py with RUN_SCHEDULER=1 (see the scheduler
-    registration below) -- normally exactly one process (see DEPLOY.md's
-    "Scheduler at scale" and render.yaml's dedicated scheduler worker), but
-    `flask db upgrade` also imports app.py, and Render's zero-downtime deploy
-    keeps the outgoing instance alive briefly alongside the incoming one.
-    Either of those can put two of these jobs in flight at once against the
-    same Postgres instance, which previously showed up as either a very slow
-    run (both sides serializing on the same customer/payment row locks) or,
-    worse, a boot that never produces another log line because the very
-    first autoflushed UPDATE is stuck behind the other side's transaction.
-    A Postgres advisory lock makes the second fire skip immediately instead
-    of contending for those rows. It's session-scoped, so a killed/crashed
-    process can never leave it stuck held.
+    Root-cause context: these jobs used to run on an in-process APScheduler
+    that fired immediately on import, in every process that imported app.py
+    with RUN_SCHEDULER=1 -- not just one gunicorn worker among several, but
+    also `flask db upgrade` and `flask create-superadmin` (both import this
+    module too), and Render's zero-downtime deploy keeping the outgoing
+    instance alive briefly alongside the incoming one. Any two of those
+    running the same job at once against the same Postgres instance
+    previously showed up as either a very slow run (both sides serializing
+    on the same customer/payment row locks) or, worse, a boot that never
+    produced another log line because the very first autoflushed UPDATE was
+    stuck behind the other side's transaction. Moving to one-shot Cron Job
+    invocations removes most of those overlap windows, but not all: two Cron
+    Job containers for the *same* job are independent processes that can
+    still genuinely overlap (a slow run still going when its next scheduled
+    tick fires), so the advisory lock stays as the actual correctness
+    guarantee. It's session-scoped, so a killed/crashed process (including
+    this function raising before its own cleanup runs) can never leave it
+    stuck held -- the lock is released the moment that process's DB
+    connection closes, which happens no later than process exit either way.
 
     SQLite (tests, and local dev without a Postgres DATABASE_URL) has no
     advisory locks, and a single-process SQLite setup can't have this race
@@ -3000,29 +3005,27 @@ def _run_scheduled_job(job_name, fn):
                              f"process; skipping this fire.")
                 return
 
-        run = ScheduledJobRun(job_name=job_name, status='running', started_at=datetime.utcnow())
-        db.session.add(run)
-        db.session.commit()
         try:
-            fn()
-            run.status = 'success'
-        except Exception as e:
-            db.session.rollback()
-            run = db.session.get(ScheduledJobRun, run.id)
-            run.status = 'failed'
-            run.error = str(e)[:2000]
-            logging.error(f"Scheduled job '{job_name}' failed: {e}")
-        finally:
+            run = ScheduledJobRun(job_name=job_name, status='running', started_at=datetime.utcnow())
+            db.session.add(run)
+            db.session.commit()
+            try:
+                fn()
+                run.status = 'success'
+            except Exception as e:
+                db.session.rollback()
+                run = db.session.get(ScheduledJobRun, run.id)
+                run.status = 'failed'
+                run.error = str(e)[:2000]
+                logging.error(f"Scheduled job '{job_name}' failed: {e}")
             run.finished_at = datetime.utcnow()
             db.session.commit()
+        finally:
             if is_postgres:
                 db.session.execute(db.text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
                 db.session.commit()
         _prune_scheduled_job_runs()
 
-
-# Initialize scheduler
-scheduler = BackgroundScheduler(daemon=True, executors={'default': {'type': 'threadpool', 'max_workers': 1}})
 
 def generate_missing_payments_with_context():
     with app.app_context():
@@ -3053,9 +3056,10 @@ def send_daily_whatsapp_keepalive(tenant_id):
         return
     if not (settings.forwarding_mobile and settings.access_token and settings.phone_number_id):
         return
-    # Already sent today? This host spins down and the scheduler re-fires
-    # immediately on every restart (see the interval-trigger comment below) --
-    # without this check a restart-heavy day would blast the template repeatedly.
+    # Already sent today? The Cron Job that invokes this could be manually
+    # re-triggered, or (before the Cron Job migration) the old in-process
+    # scheduler re-fired on every restart -- without this check a repeat run
+    # the same day would blast the template again.
     if (settings.last_forwarding_keepalive_sent_at
             and settings.last_forwarding_keepalive_sent_at.date() == datetime.utcnow().date()):
         return
@@ -3127,10 +3131,12 @@ def send_daily_whatsapp_keepalive_with_context():
 # deployment (see DEPLOY.md); scaling to multiple workers later would need
 # a cross-process mechanism (e.g. a Postgres advisory lock) instead of this.
 #
-# Defined here (alongside the other scheduler jobs), not next to the manual
-# route further down, because scheduler.add_job(func=...) below evaluates
-# its func argument at import time -- it must already be defined by the time
-# that line runs, not merely by the time the app finishes loading.
+# Defined here (alongside the other scheduled jobs), not next to the manual
+# route further down -- historical: this used to be a hard import-time
+# ordering requirement (scheduler.add_job(func=...) evaluated its argument
+# immediately), which no longer applies now that each job runs via a
+# `flask run-scheduled-job` CLI invocation (see _SCHEDULED_JOBS below). Left
+# in place since there's no need to move it.
 _UPSTREAM_SYNC_CONCURRENCY_LIMIT = 1
 _upstream_sync_semaphore = threading.Semaphore(_UPSTREAM_SYNC_CONCURRENCY_LIMIT)
 # A human waiting on the manual-trigger button shouldn't hang indefinitely
@@ -3203,10 +3209,10 @@ _UPSTREAM_AUTO_SYNC_MIN_INTERVAL = timedelta(hours=20)
 
 
 def auto_sync_upstream_status_for_tenant(tenant_id):
-    """Skips any customer synced within the last _UPSTREAM_AUTO_SYNC_MIN_INTERVAL
-    so repeated scheduler fires -- this host restarts often and re-fires all
-    daily jobs immediately on every restart, see the scheduler registration
-    comment below -- don't re-sync the same customer many times in one day.
+    """Skips any customer synced within the last _UPSTREAM_AUTO_SYNC_MIN_INTERVAL,
+    so a manual re-trigger landing close to this job's own daily Cron Job run
+    (or, historically, the old in-process scheduler's restart-driven re-fires)
+    doesn't re-sync the same customer many times in one day.
     Routes every real portal call through _sync_customer_upstream_status_core,
     so the Playwright concurrency limit applies here exactly as it does for
     the manual button. Never raises -- one customer's failure (portal down,
@@ -3257,10 +3263,10 @@ def auto_sync_upstream_status_with_context():
 # Whish has no auto-renew -- this is what keeps a lapsed Pro plan from
 # silently staying Pro forever, and what nudges a tenant to pay again before
 # that happens. Defined here, not near the checkout/callback routes further
-# down, for the exact same reason every other scheduler-registered function
-# in this file lives here: scheduler.add_job(func=...) below evaluates its
-# func argument at import time, so it must already be defined by the time
-# that line runs -- getting this wrong crashed production earlier today.
+# down -- historical placement from when scheduler.add_job(func=...)
+# evaluated its argument at import time; no longer a hard requirement now
+# that each job runs via a `flask run-scheduled-job` CLI invocation (see
+# _SCHEDULED_JOBS below), but left in place since there's no need to move it.
 _PRO_PLAN_REMINDER_WINDOW = timedelta(days=5)
 _PRO_PLAN_GRACE_PERIOD = timedelta(days=3)
 
@@ -3322,9 +3328,10 @@ NETWORK_FRESHNESS_OPERATIONS = ('olt_status', 'cpe_locations')
 def refresh_agent_mode_network_status_for_tenant(tenant_id):
     """Enqueue a fresh olt_status + cpe_locations job for every OLT this
     tenant owns, skipping a device+operation pair that already has a
-    pending/claimed job outstanding -- an agent offline for a while (or the
-    scheduler firing twice in quick succession on deploy, see Dockerfile)
-    must not accumulate an unbounded backlog of duplicate jobs. A no-op for
+    pending/claimed job outstanding -- an agent offline for a while (or this
+    job's own Cron Job overlapping itself, e.g. a slow run still going when
+    the next 15-minute tick fires) must not accumulate an unbounded backlog
+    of duplicate jobs. A no-op for
     a tenant not in 'agent' mode: _create_scheduled_device_job's own
     offline check would refuse anyway, but skipping the query entirely here
     avoids the wasted work for direct-mode tenants on every 15-minute tick.
@@ -3384,64 +3391,57 @@ def refresh_agent_mode_network_status_with_context():
                 logging.error(f"Scheduled network freshness refresh failed for tenant {t.id}: {e}")
 
 
-# Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
-# in-process scheduler would fire the daily jobs once per worker; run exactly one
-# process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
-# In production this is the dedicated single-instance scheduler worker service
-# in render.yaml (RUN_SCHEDULER=0 on the multi-worker web service) -- see
-# DEPLOY.md's "Scheduler at scale". Every job below is still wrapped in
-# _run_scheduled_job's Postgres advisory lock as defense-in-depth: that's what
-# actually protects against the two windows that "run exactly one process"
-# can't fully rule out on its own -- `flask db upgrade` importing this same
-# module, and the old instance of this very worker service staying alive
-# briefly during its own deploy handoff.
+# --- CLI entry point for the jobs above ----------------------------------
+# These used to run on an in-process APScheduler (BackgroundScheduler) that
+# started and fired every job immediately on import. That was fragile in a
+# multi-process deployment: every gunicorn worker -- and `flask db upgrade`,
+# and `flask create-superadmin`, since both also import this module -- got
+# its own scheduler and independently re-fired every job. On one real deploy
+# that produced a boot that hung for minutes on a Postgres row lock, and on
+# the retry the same job running four times in ~100 seconds.
 #
-# next_run_time=datetime.now() below is required, not cosmetic: APScheduler's
-# IntervalTrigger with no explicit start_date defaults it to now + the interval
-# (verified: days=1 -> first fire is ~24h after the job is added), not "now".
-# On this app's actual host (Render free tier, spins down when idle -- see
-# render.yaml) a process rarely stays up for a full 24h between restarts, so
-# every restart re-registered these jobs with a fresh "fire in 24h" clock that
-# real traffic almost never survives long enough to reach -- the daily
-# catch-up (missing payments, salary accrual, profit estimates) could go
-# effectively forever without ever actually running. Firing immediately on
-# every startup makes each wake-up do its own catch-up, which is what a
-# spin-down-prone deployment actually needs.
-# Must be datetime.now() (naive LOCAL time), not datetime.utcnow(): APScheduler
-# interprets a naive next_run_time in the scheduler's local timezone, so a
-# naive UTC value is read as "that many hours in the past" on any host whose
-# local tz isn't UTC -- verified this makes the job log a "missed" warning and
-# push its first real fire a full day out instead of firing immediately.
-if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
-    scheduler.add_job(func=partial(_run_scheduled_job, "generate_missing_payments", generate_missing_payments_with_context),
-                       trigger="interval", days=1, next_run_time=datetime.now())
-    scheduler.add_job(func=partial(_run_scheduled_job, "generate_missing_salary_charges", generate_missing_salary_charges_with_context),
-                       trigger="interval", days=1, next_run_time=datetime.now())
-    scheduler.add_job(func=partial(_run_scheduled_job, "recalculate_all_estimated_profits", recalculate_all_estimated_profits_with_context),
-                       trigger="interval", days=1, next_run_time=datetime.now())
-    scheduler.add_job(func=partial(_run_scheduled_job, "send_daily_whatsapp_keepalive", send_daily_whatsapp_keepalive_with_context),
-                       trigger="interval", days=1, next_run_time=datetime.now())
+# Each job now runs as a one-shot `flask run-scheduled-job <name>`
+# invocation, triggered by its own Render Cron Job (see render.yaml) on a
+# plain cron schedule -- no long-lived process or in-process scheduler, and
+# no need for the old "fire immediately on every restart" workaround (that
+# existed only to cover a spin-down-prone single dyno; a Cron Job just runs
+# on its schedule regardless of the web service's uptime). See DEPLOY.md's
+# "Scheduled jobs" section.
+#
+# _run_scheduled_job's Postgres advisory lock still matters here, and for a
+# different reason than before: two Cron Job containers for the *same* job
+# can now genuinely overlap (each is an independent container, not
+# serialized by APScheduler's single-threaded executor the way the old daily
+# and 15-minute jobs were), so the lock is what stops a slow run and its
+# next scheduled tick from double-processing the same rows.
+_SCHEDULED_JOBS = {
+    "generate_missing_payments": generate_missing_payments_with_context,
+    "generate_missing_salary_charges": generate_missing_salary_charges_with_context,
+    "recalculate_all_estimated_profits": recalculate_all_estimated_profits_with_context,
+    "send_daily_whatsapp_keepalive": send_daily_whatsapp_keepalive_with_context,
     # Phase 3: opt-in only (BusinessSettings.upstream_sync_automation_enabled),
     # so this fires for every active tenant same as the jobs above but is a
     # genuine no-op for any tenant that hasn't turned it on. The per-customer
     # 20h freshness check in auto_sync_upstream_status_for_tenant is what
-    # actually protects against over-syncing on a spin-down-prone host that
-    # restarts (and re-fires next_run_time=now()) more than once a day --
-    # not a change to this "fire immediately" pattern itself.
-    scheduler.add_job(func=partial(_run_scheduled_job, "auto_sync_upstream_status", auto_sync_upstream_status_with_context),
-                       trigger="interval", days=1, next_run_time=datetime.now())
-    scheduler.add_job(func=partial(_run_scheduled_job, "check_pro_plan_expirations", check_pro_plan_expirations_with_context),
-                       trigger="interval", days=1, next_run_time=datetime.now())
-    # misfire_grace_time=600: this executor is single-threaded (max_workers=1,
-    # shared with the daily jobs above), and auto_sync_upstream_status_with_context
-    # can run for an unbounded duration. APScheduler 3.x's default
-    # misfire_grace_time is 1 second, so a 15-minute tick that has to wait
-    # behind a long-running daily job would otherwise be skipped entirely
-    # (logged as a missed run), not deferred. 600s (10 min) comfortably
-    # survives sitting behind a slow daily job without stacking indefinitely.
-    scheduler.add_job(func=partial(_run_scheduled_job, "refresh_agent_mode_network_status", refresh_agent_mode_network_status_with_context),
-                       trigger="interval", minutes=15, next_run_time=datetime.now(), misfire_grace_time=600)
-    scheduler.start()
+    # actually protects against over-syncing if this cron and a manual
+    # trigger land close together, not anything about the schedule itself.
+    "auto_sync_upstream_status": auto_sync_upstream_status_with_context,
+    "check_pro_plan_expirations": check_pro_plan_expirations_with_context,
+    "refresh_agent_mode_network_status": refresh_agent_mode_network_status_with_context,
+}
+
+
+@app.cli.command("run-scheduled-job")
+@click.argument("job_name")
+def run_scheduled_job_command(job_name):
+    """Run one named job from _SCHEDULED_JOBS through _run_scheduled_job
+    (Postgres advisory lock + ScheduledJobRun audit row), then exit. This is
+    what render.yaml's Cron Job services invoke."""
+    fn = _SCHEDULED_JOBS.get(job_name)
+    if fn is None:
+        raise click.ClickException(
+            f"Unknown scheduled job {job_name!r}. Valid names: {', '.join(sorted(_SCHEDULED_JOBS))}")
+    _run_scheduled_job(job_name, fn)
  
     
 
@@ -9235,11 +9235,6 @@ def get_financial_report():
 # Graceful shutdown handler
 def signal_handler(sig, frame):
     print('\nShutting down gracefully...')
-    try:
-        if scheduler.running:
-            scheduler.shutdown(wait=False)
-    except:
-        pass
     sys.exit(0)
 
 # Register signal handlers
@@ -10815,16 +10810,18 @@ JOB_CLAIM_TIMEOUT_SECONDS = 30
 JOB_RESULT_TIMEOUT_SECONDS = 120
 
 # NetworkAgentJob has no retention and (by design, see _expire_job_if_stale's
-# docstring) no scheduled job to add one -- the in-process APScheduler only
-# fires during `flask db upgrade` on deploy, so a cron-style prune can't be
-# relied on. Every check-now, OLT refresh, and label-matcher open writes a
-# permanent row, and an olt_status result stores the OLT's full ONU list
-# (~75 ONUs, roughly 15-20 KB of JSON each) -- this applies to direct-mode
-# tenants too, which previously wrote nothing at all for a check. Production
-# is Supabase free tier, capped at 500 MB total across every tenant's data.
+# docstring) no scheduled job to add one -- there wasn't a reliable one to
+# piggyback on when this was written (see NetworkAgentJob's own docstring).
+# A real Cron Job could prune this on its own schedule now, but this reuses
+# the lazy pattern already established for expiry above instead of adding
+# one, since nothing has needed it enough to be worth the change. Every
+# check-now, OLT refresh, and label-matcher open writes a permanent row, and
+# an olt_status result stores the OLT's full ONU list (~75 ONUs, roughly
+# 15-20 KB of JSON each) -- this applies to direct-mode tenants too, which
+# previously wrote nothing at all for a check. Production is Supabase free
+# tier, capped at 500 MB total across every tenant's data.
 #
-# Rather than add a scheduler, this reuses the lazy pattern already
-# established for expiry above: prune opportunistically on the same path
+# So instead: prune opportunistically on the same path
 # that grows the table, right before the write that already commits (see
 # _create_device_job). 7 days is long enough that a tenant investigating an
 # issue from a few days back still finds the terminal job that recorded it,
@@ -10836,9 +10833,10 @@ NETWORK_AGENT_JOB_RETENTION_DAYS = 7
 
 
 def _expire_job_if_stale(job):
-    """Lazy expiry, evaluated when a job is read. Deliberately not a scheduled
-    task: the in-process APScheduler fires during `flask db upgrade` on deploy,
-    and this path must not depend on it.
+    """Lazy expiry, evaluated when a job is read. Not a scheduled task -- there
+    wasn't reliable scheduled-job infrastructure to depend on when this was
+    written (see NetworkAgentJob's docstring for why); a Cron Job could
+    replace this now, but nothing has needed it enough to be worth the change.
 
     Residual gap, accepted rather than fixed: because this only runs when
     something reads the job (GET /api/network-jobs/<id>), a write job nobody
@@ -10847,10 +10845,9 @@ def _expire_job_if_stale(job):
     along with it. That is different from the five stuck-'queued' routes
     _complete_write_audit was added to close off below: those had a request
     already in flight to hang the fix on, and this one doesn't -- there is no
-    read to attach a completion to when nobody ever reads. Adding a scheduled
-    sweep to close it would need the same infrastructure this function's own
-    docstring says isn't reliably available in production (see above); left
-    as documented, not silent.
+    read to attach a completion to when nobody ever reads. A scheduled sweep
+    could close this now that Cron Jobs exist; left as documented, not silent,
+    since nothing has forced the issue yet.
     """
     now = datetime.utcnow()
     if job.status == 'pending' and job.created_at:

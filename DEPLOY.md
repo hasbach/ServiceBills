@@ -105,32 +105,47 @@ the Dockerfile, set the env vars, override the start command to run
 
 ---
 
-## Scheduler at scale
+## Scheduled jobs
 
-APScheduler runs **in-process**, so with multiple web workers it would fire the daily
-jobs once per worker -- and since `flask db upgrade` (which runs ahead of gunicorn on
-every deploy) imports `app.py` too, `RUN_SCHEDULER=1` there fires it a third way,
-uncoordinated with either. This isn't hypothetical: this exact combination once
-produced a deploy that hung for minutes with no log output (stuck on a Postgres row
-lock held by an overlapping fire) and, on the retry, the same job running four times
-in ~100 seconds.
+These used to run on an in-process APScheduler that fired every job immediately on
+import, in **every** process that imported `app.py` with `RUN_SCHEDULER=1` -- not
+just one web worker among several (with multiple gunicorn workers and no
+`--preload`, each forked worker got its own scheduler), but also `flask db upgrade`
+and `flask create-superadmin` (both import `app.py` too, ahead of gunicorn on every
+deploy), plus Render's zero-downtime deploy keeping the outgoing instance alive
+briefly alongside the incoming one. This isn't hypothetical: this exact combination
+once produced a deploy that hung for minutes with no log output (stuck on a Postgres
+row lock held by an overlapping fire) and, on the retry, the same job running four
+times in ~100 seconds.
 
-render.yaml implements the fix already:
-- `servicesbills-web` (the multi-worker tier) has `RUN_SCHEDULER=0`.
-- `servicesbills-scheduler` is a separate, single-instance worker service running
-  `gunicorn -w 1 app:app` (no `flask db upgrade`/`create-superadmin` -- the web
-  service's own deploy already did both against the same database) with
-  `RUN_SCHEDULER=1`. It is the only process anywhere that should ever have this set.
-- Every scheduled job body also runs through `_run_scheduled_job` (app.py), which
-  takes a Postgres advisory lock before running and skips instantly if it can't get
-  it. This is defense-in-depth for the two windows service topology alone can't fully
-  close: the scheduler worker's own deploy handoff (old and new instance briefly both
-  alive), and anyone re-running `flask db upgrade` locally/manually without first
-  setting `RUN_SCHEDULER=0`.
+The fix: there is no in-process scheduler anymore. Each job is a small Flask CLI
+command --
 
-If you add further scaling (e.g. more than one instance of the web tier), the same
-rule applies: `RUN_SCHEDULER=1` belongs on exactly one always-on process, never on
-anything that runs with `WEB_CONCURRENCY>1` or that also runs migrations.
+```
+flask run-scheduled-job <name>
+```
+
+-- where `<name>` is one of the keys in `_SCHEDULED_JOBS` (app.py): `generate_missing_payments`,
+`generate_missing_salary_charges`, `recalculate_all_estimated_profits`,
+`send_daily_whatsapp_keepalive`, `auto_sync_upstream_status`,
+`check_pro_plan_expirations`, `refresh_agent_mode_network_status`.
+
+render.yaml runs each one as its own **Render Cron Job** on its own schedule (six
+daily, one every 15 minutes) -- a one-shot container that runs the command and
+exits, not a long-lived process. Nothing needs to be kept alive just to host a
+scheduler thread, and nothing fires on web-service or migration boot.
+
+`_run_scheduled_job` (app.py) still wraps every invocation in a Postgres advisory
+lock, and that still matters here: two Cron Job containers for the *same* job are
+independent processes that can genuinely overlap (a slow run still going when its
+next scheduled tick fires), so the lock is what makes the second one skip instantly
+instead of contending for the same customer/payment rows, rather than a topology
+guarantee doing that job.
+
+Every Cron Job needs the same `sync: false` secrets filled in as
+`servicesbills-web` -- see the comment above the first Cron Job entry in
+render.yaml. `JWT_SECRET_KEY` and `FERNET_KEY` in particular must be byte-identical
+to web's copy, not independently generated.
 
 ## Notes
 - HTTPS/custom domain: configure on the host; then set `APP_BASE_URL`/`CORS_ORIGINS`

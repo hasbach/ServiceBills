@@ -27,5 +27,5 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest tests/ -q
-        # No env vars needed here: tests/conftest.py sets JWT_SECRET_KEY,
-        # DATABASE_PATH=:memory:, and RUN_SCHEDULER=0 itself at import time.
+        # No env vars needed here: tests/conftest.py sets JWT_SECRET_KEY and
+        # DATABASE_PATH=:memory: itself at import time.

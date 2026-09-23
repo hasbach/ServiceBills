@@ -1,6 +1,9 @@
 # Local production-like dry-run: Postgres + the servicesBills web image.
 #   docker compose up --build
 # Then open http://localhost:8000 . Migrations run automatically on start.
+# The scheduled jobs (generate_missing_payments, etc.) don't run automatically
+# here -- run one manually to test it:
+#   docker compose exec web flask run-scheduled-job generate_missing_payments
 services:
   db:
     image: postgres:16
@@ -25,11 +28,10 @@ services:
       DATABASE_URL: postgresql+psycopg2://servicesbills:localdevpass@db:5432/servicesbills
       FLASK_APP: app.py
       DISABLE_AUTO_CREATE_ALL: "1"   # Alembic owns the schema
-      RUN_SCHEDULER: "1"             # single container -> run the scheduler here
     depends_on:
       db:
         condition: service_healthy
-    # Build the schema, then serve (1 worker so the in-process scheduler fires once).
+    # Build the schema, then serve.
     command: sh -c "flask db upgrade && gunicorn -w 1 -b 0.0.0.0:8000 --timeout 120 app:app"
     ports:
       - "8000:8000"
