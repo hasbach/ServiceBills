@@ -1,29 +1,30 @@
-# Render blueprint — web service + one Render Cron Job per scheduled job,
-# external Postgres (Supabase). Secrets marked sync:false are entered in the
-# Render dashboard (never committed). Set DATABASE_URL to your Supabase
-# SESSION-pooler URL.
+# Render blueprint — a single web service, external Postgres (Supabase).
+# Secrets marked sync:false are entered in the Render dashboard (never
+# committed). Set DATABASE_URL to your Supabase SESSION-pooler URL.
 #
-# Scheduled-job topology (see DEPLOY.md's "Scheduled jobs"): these used to
-# run on an in-process APScheduler that fired immediately on import, in
-# EVERY process that imported app.py with RUN_SCHEDULER=1 -- not just one
-# gunicorn worker among several (WEB_CONCURRENCY>1, no --preload, so each
-# forked worker got its own scheduler), but also `flask db upgrade` and
-# `flask create-superadmin` (both import app.py too, ahead of gunicorn on
-# every deploy), plus Render's zero-downtime deploy keeping the outgoing
-# instance alive briefly alongside the incoming one. On one real deploy that
-# combination produced a boot that hung for minutes with zero log output
-# (blocked on a Postgres row lock from an overlapping fire) and, on the
-# retry, the same job executing four times in ~100 seconds.
+# Scheduled jobs (generate_missing_payments, etc.) do NOT run in-process and
+# do NOT need any other Render service. They used to run on an in-process
+# APScheduler that fired immediately on import, in EVERY process that
+# imported app.py with RUN_SCHEDULER=1 -- not just one gunicorn worker among
+# several (WEB_CONCURRENCY>1, no --preload, so each forked worker got its own
+# scheduler), but also `flask db upgrade` and `flask create-superadmin` (both
+# import app.py too, ahead of gunicorn on every deploy), plus Render's
+# zero-downtime deploy keeping the outgoing instance alive briefly alongside
+# the incoming one. On one real deploy that combination produced a boot that
+# hung for minutes with zero log output (blocked on a Postgres row lock from
+# an overlapping fire) and, on the retry, the same job executing four times
+# in ~100 seconds.
 #
-# The fix: there is no scheduler anymore. Each job below is a Render Cron
-# Job that runs `flask run-scheduled-job <name>` as a one-shot container on
-# its own schedule and then exits -- nothing fires on web-service or
-# migration boot, and no long-lived process needs to be kept alive just to
-# host a scheduler thread. app.py's _run_scheduled_job still wraps every
-# invocation in a Postgres advisory lock, because two Cron Job containers
-# for the *same* job can still genuinely overlap (a slow run still going
-# when its next scheduled tick fires) -- the lock makes the second one skip
-# instantly instead of contending for the same customer/payment rows.
+# The fix: each job is triggered externally over HTTP, by GitHub Actions'
+# free `schedule:` cron (see .github/workflows/scheduled-jobs.yml), which
+# POSTs to /api/internal/scheduled-jobs/<name> (app.py) with the
+# CRON_TRIGGER_SECRET below. An earlier version of this fix used a Render
+# Cron Job per job instead -- correct, but each Cron Job service carries its
+# own $1/month minimum regardless of actual usage, which stopped being worth
+# it once it was seven of them (or a dedicated always-on worker service,
+# which is a full second paid instance). This way, nothing new needs to be
+# created or paid for on Render at all: the trigger just calls back into the
+# web service that's already running. See DEPLOY.md's "Scheduled jobs".
 services:
   - type: web
     name: servicesbills-web
@@ -43,6 +44,8 @@ services:
         value: "1"
       - key: WEB_CONCURRENCY
         value: "4"   # Min 3 needed: (1) WhatsApp/WebSocket, (2) ElevenLabs tool webhook, (3) on-premise agent poll+result
+      - key: CRON_TRIGGER_SECRET
+        generateValue: true   # copy this into the GitHub repo's Actions secrets as CRON_TRIGGER_SECRET
       - key: FERNET_KEY
         sync: false
       - key: APP_BASE_URL
@@ -104,143 +107,3 @@ services:
         sync: false
       - key: SENTRY_ENVIRONMENT
         value: production
-
-  # Every Cron Job below shares this exact env var set (the &cron_env_vars
-  # anchor, aliased with *cron_env_vars on the rest) -- they're one-shot
-  # invocations of the same image against the same database and the same
-  # encrypted credentials as servicesbills-web.
-  #
-  # IMPORTANT (manual step after the blueprint syncs): every `sync: false`
-  # var below must be filled in with the EXACT SAME value as
-  # servicesbills-web's copy. JWT_SECRET_KEY and FERNET_KEY in particular
-  # must be byte-identical to web's (not independently generated), or
-  # token/decrypt operations touching data the other service wrote will fail.
-  # That's also why JWT_SECRET_KEY is sync:false here rather than
-  # generateValue:true -- unlike a YAML alias, Render generates a fresh,
-  # different secret for every occurrence of generateValue:true, even ones
-  # that came from the same anchored block.
-  - type: cron
-    name: servicesbills-cron-missing-payments
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    plan: starter
-    schedule: "0 2 * * *"    # 02:00 UTC daily
-    dockerCommand: "flask run-scheduled-job generate_missing_payments"
-    envVars: &cron_env_vars
-      - key: DATABASE_URL
-        sync: false        # same Supabase Session-pooler URL as servicesbills-web
-      - key: JWT_SECRET_KEY
-        sync: false        # copy servicesbills-web's generated value -- do NOT let Render generate a new one here
-      - key: FLASK_APP
-        value: app.py
-      - key: DISABLE_AUTO_CREATE_ALL
-        value: "1"
-      - key: FERNET_KEY
-        sync: false        # copy servicesbills-web's value exactly
-      - key: APP_BASE_URL
-        sync: false
-      - key: CORS_ORIGINS
-        sync: false
-      - key: STORAGE_BACKEND
-        value: s3
-      - key: STORAGE_BUCKET
-        sync: false
-      - key: STORAGE_PREFIX
-        value: uploads
-      - key: AWS_REGION
-        value: auto
-      - key: S3_ENDPOINT_URL
-        sync: false
-      - key: AWS_ACCESS_KEY_ID
-        sync: false
-      - key: AWS_SECRET_ACCESS_KEY
-        sync: false
-      - key: STRIPE_SECRET_KEY
-        sync: false
-      - key: STRIPE_WEBHOOK_SECRET
-        sync: false
-      - key: STRIPE_PRICE_PRO
-        sync: false
-      - key: WHISH_CHANNEL
-        sync: false
-      - key: WHISH_SECRET
-        sync: false
-      - key: MAIL_BACKEND
-        value: sendgrid
-      - key: SENDGRID_API_KEY
-        sync: false
-      - key: SMTP_HOST
-        sync: false
-      - key: SMTP_PORT
-        value: "587"
-      - key: SMTP_USER
-        sync: false
-      - key: SMTP_PASSWORD
-        sync: false
-      - key: MAIL_FROM
-        sync: false
-      - key: VAPID_PRIVATE_KEY
-        sync: false
-      - key: VAPID_PUBLIC_KEY
-        sync: false
-      - key: SENTRY_DSN
-        sync: false
-      - key: SENTRY_ENVIRONMENT
-        value: production
-
-  - type: cron
-    name: servicesbills-cron-salary-charges
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    plan: starter
-    schedule: "10 2 * * *"    # 02:10 UTC daily -- staggered 10min behind the job above
-    dockerCommand: "flask run-scheduled-job generate_missing_salary_charges"
-    envVars: *cron_env_vars
-
-  - type: cron
-    name: servicesbills-cron-profit-estimates
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    plan: starter
-    schedule: "20 2 * * *"
-    dockerCommand: "flask run-scheduled-job recalculate_all_estimated_profits"
-    envVars: *cron_env_vars
-
-  - type: cron
-    name: servicesbills-cron-whatsapp-keepalive
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    plan: starter
-    schedule: "30 2 * * *"
-    dockerCommand: "flask run-scheduled-job send_daily_whatsapp_keepalive"
-    envVars: *cron_env_vars
-
-  - type: cron
-    name: servicesbills-cron-upstream-sync
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    plan: starter
-    schedule: "40 2 * * *"
-    dockerCommand: "flask run-scheduled-job auto_sync_upstream_status"
-    envVars: *cron_env_vars
-
-  - type: cron
-    name: servicesbills-cron-plan-expirations
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    plan: starter
-    schedule: "50 2 * * *"
-    dockerCommand: "flask run-scheduled-job check_pro_plan_expirations"
-    envVars: *cron_env_vars
-
-  # Unlike the six daily jobs above, this one keeps its original 15-minute
-  # cadence -- see NETWORK_FRESHNESS_OPERATIONS / refresh_agent_mode_network_status
-  # in app.py for why agent-mode tenants need it this frequent.
-  - type: cron
-    name: servicesbills-cron-network-freshness
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    plan: starter
-    schedule: "*/15 * * * *"
-    dockerCommand: "flask run-scheduled-job refresh_agent_mode_network_status"
-    envVars: *cron_env_vars

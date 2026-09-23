@@ -1,0 +1,51 @@
+name: Scheduled jobs
+
+# Triggers the app's scheduled jobs (see _SCHEDULED_JOBS / _run_scheduled_job
+# in app.py) over HTTP against the already-running web service, instead of
+# an in-process scheduler or a dedicated Render service -- see the big
+# comment above _SCHEDULED_JOBS in app.py and render.yaml for why. Each
+# `schedule:` entry below fires this same workflow; the "Determine job name"
+# step below maps github.event.schedule back to which job that was, since
+# GitHub doesn't do that for you.
+#
+# Requires one repo secret: CRON_TRIGGER_SECRET, matching the env var of the
+# same name on servicesbills-web (Render dashboard -> Environment). Set it
+# under Settings -> Secrets and variables -> Actions.
+on:
+  schedule:
+    - cron: "0 2 * * *"     # generate_missing_payments
+    - cron: "10 2 * * *"    # generate_missing_salary_charges
+    - cron: "20 2 * * *"    # recalculate_all_estimated_profits
+    - cron: "30 2 * * *"    # send_daily_whatsapp_keepalive
+    - cron: "40 2 * * *"    # auto_sync_upstream_status
+    - cron: "50 2 * * *"    # check_pro_plan_expirations
+    - cron: "*/15 * * * *"  # refresh_agent_mode_network_status
+  workflow_dispatch:
+    inputs:
+      job_name:
+        description: "Job name to run (one of the _SCHEDULED_JOBS keys in app.py)"
+        required: true
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine job name
+        id: job
+        run: |
+          case "${{ github.event.schedule }}" in
+            "0 2 * * *")    echo "name=generate_missing_payments" >> "$GITHUB_OUTPUT" ;;
+            "10 2 * * *")   echo "name=generate_missing_salary_charges" >> "$GITHUB_OUTPUT" ;;
+            "20 2 * * *")   echo "name=recalculate_all_estimated_profits" >> "$GITHUB_OUTPUT" ;;
+            "30 2 * * *")   echo "name=send_daily_whatsapp_keepalive" >> "$GITHUB_OUTPUT" ;;
+            "40 2 * * *")   echo "name=auto_sync_upstream_status" >> "$GITHUB_OUTPUT" ;;
+            "50 2 * * *")   echo "name=check_pro_plan_expirations" >> "$GITHUB_OUTPUT" ;;
+            "*/15 * * * *") echo "name=refresh_agent_mode_network_status" >> "$GITHUB_OUTPUT" ;;
+            *)              echo "name=${{ github.event.inputs.job_name }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Trigger the job
+        run: |
+          curl -sS -f --max-time 60 --retry 1 \
+            -X POST "https://servicebills.onrender.com/api/internal/scheduled-jobs/${{ steps.job.outputs.name }}" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_TRIGGER_SECRET }}"

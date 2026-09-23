@@ -118,34 +118,49 @@ once produced a deploy that hung for minutes with no log output (stuck on a Post
 row lock held by an overlapping fire) and, on the retry, the same job running four
 times in ~100 seconds.
 
-The fix: there is no in-process scheduler anymore. Each job is a small Flask CLI
-command --
+The fix: there is no in-process scheduler anymore, and no dedicated Render service
+either -- each job is triggered externally, over HTTP, against the same web service
+that's already running:
 
 ```
-flask run-scheduled-job <name>
+POST /api/internal/scheduled-jobs/<name>
+X-Cron-Secret: <CRON_TRIGGER_SECRET>
 ```
 
 -- where `<name>` is one of the keys in `_SCHEDULED_JOBS` (app.py): `generate_missing_payments`,
 `generate_missing_salary_charges`, `recalculate_all_estimated_profits`,
 `send_daily_whatsapp_keepalive`, `auto_sync_upstream_status`,
 `check_pro_plan_expirations`, `refresh_agent_mode_network_status`.
+`flask run-scheduled-job <name>` (a small Flask CLI command, app.py) runs the same
+thing locally/manually without the HTTP layer.
 
-render.yaml runs each one as its own **Render Cron Job** on its own schedule (six
-daily, one every 15 minutes) -- a one-shot container that runs the command and
-exits, not a long-lived process. Nothing needs to be kept alive just to host a
-scheduler thread, and nothing fires on web-service or migration boot.
+`.github/workflows/scheduled-jobs.yml` calls this route on GitHub Actions' free
+`schedule:` cron (six daily, one every 15 minutes) -- a one-shot job that makes one
+HTTP request and exits, no Render service involved at all. An earlier version of
+this fix ran each job as its own Render Cron Job instead -- correct, but each Cron
+Job service carries its own $1/month minimum regardless of actual usage, which
+stopped paying for itself once it was seven of them (and before that, a dedicated
+always-on worker service -- a full second paid instance -- was tried first). This
+way nothing new needs to be created or paid for on Render: `render.yaml` is back to
+a single web service.
+
+The route spawns the job onto a background gevent greenlet and returns immediately
+(202), rather than holding the HTTP request open for however long the job takes --
+some of these (`auto_sync_upstream_status`'s Playwright scraping especially) can run
+well past gunicorn's `--timeout 120` for a tenant with many customers. It also fails
+closed: `CRON_TRIGGER_SECRET` unset means the trigger returns 503, not silently
+allows an unauthenticated call.
 
 `_run_scheduled_job` (app.py) still wraps every invocation in a Postgres advisory
-lock, and that still matters here: two Cron Job containers for the *same* job are
-independent processes that can genuinely overlap (a slow run still going when its
-next scheduled tick fires), so the lock is what makes the second one skip instantly
-instead of contending for the same customer/payment rows, rather than a topology
-guarantee doing that job.
+lock, and that still matters here: a retried or manually-repeated GitHub Actions run
+for the *same* job can genuinely overlap a still-running previous trigger, so the
+lock is what stops that overlap from double-processing the same customer/payment
+rows, not anything about the trigger mechanism itself.
 
-Every Cron Job needs the same `sync: false` secrets filled in as
-`servicesbills-web` -- see the comment above the first Cron Job entry in
-render.yaml. `JWT_SECRET_KEY` and `FERNET_KEY` in particular must be byte-identical
-to web's copy, not independently generated.
+**Setup:** generate a value for `CRON_TRIGGER_SECRET` (Render dashboard ->
+servicesbills-web -> Environment; `render.yaml` has it as `generateValue: true`), then
+copy that same value into the GitHub repo's Settings -> Secrets and variables ->
+Actions, as a secret named `CRON_TRIGGER_SECRET`.
 
 ## Notes
 - HTTPS/custom domain: configure on the host; then set `APP_BASE_URL`/`CORS_ORIGINS`
