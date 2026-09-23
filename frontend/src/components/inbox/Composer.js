@@ -60,7 +60,8 @@ const Composer = ({ conversation, replyTo, clearReply, reactTarget, clearReactTa
 
     useEffect(() => { apiService.fetchInboxSummary().then(r => setVoiceAvailable(!!r.data.voice_available)).catch(() => {}); }, [apiService]);
     useEffect(() => { const i = setInterval(() => forceTick(t => t + 1), 30000); return () => clearInterval(i); }, []);
-    useEffect(() => () => { mountedRef.current = false; }, []);
+    // Set true on (re)mount too: StrictMode's dev double-mount runs the cleanup once.
+    useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
 
     const windowInfo = describeWindow(conversation.window_expires_at);
     useEffect(() => { if (!windowInfo.open && reactTarget) clearReactTarget(); }, [windowInfo.open, reactTarget, clearReactTarget]);
