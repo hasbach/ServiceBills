@@ -562,7 +562,10 @@ def test_query_elevenlabs_conversational_ai_success(monkeypatch):
     assert fake_ws.sent_messages[0]["type"] == "conversation_initiation_client_data"
     dyn_vars = fake_ws.sent_messages[0]["conversation_initiation_client_data_event"]["dynamic_variables"]
     assert dyn_vars["customer_name"] == "Hasan Salloum"
-    assert dyn_vars["customer_id"] == "99"
+    # customer_id is deliberately NOT sent (see the NOTE in
+    # query_elevenlabs_conversational_ai): including it made ElevenLabs
+    # auto-fire customer-status/network-diagnostic tools on every message.
+    assert "customer_id" not in dyn_vars
     # 2. pong
     pong_msgs = [m for m in fake_ws.sent_messages if m.get("type") == "pong"]
     assert len(pong_msgs) == 1
