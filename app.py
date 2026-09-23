@@ -1506,12 +1506,32 @@ class TicketLog(db.Model):
     timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     user = db.relationship('User', foreign_keys=[user_id])
 
+DEFAULT_PUSH_TOPICS = ('tickets', 'whatsapp_inbox')
+
+
 class PushSubscription(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     subscription_info = db.Column(db.Text, nullable=False) # JSON
+    # JSON list of topics this device wants (see DEFAULT_PUSH_TOPICS). NULL
+    # means "all topics" so every pre-existing subscription keeps getting
+    # ticket pushes and starts getting inbox pushes.
+    topics = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def topic_list(self):
+        try:
+            value = json.loads(self.topics) if self.topics else None
+        except ValueError:
+            value = None
+        return value if isinstance(value, list) else list(DEFAULT_PUSH_TOPICS)
+
+    def endpoint(self):
+        try:
+            return (json.loads(self.subscription_info) or {}).get('endpoint')
+        except (ValueError, AttributeError):
+            return None
 
 class ServiceOutage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -1697,6 +1717,110 @@ class CSAgentKnowledgeEntry(db.Model):
         }
 
 
+def _utc_stamp(dt):
+    return dt.strftime('%Y-%m-%d %H:%M:%S') if dt else None
+
+
+class WhatsAppConversation(db.Model):
+    """One WhatsApp chat (tenant x customer phone) for the admin inbox -- see
+    docs/superpowers/specs/2026-09-23-whatsapp-inbox-design.md."""
+    __tablename__ = 'whatsapp_conversation'
+    __table_args__ = (
+        db.UniqueConstraint('tenant_id', 'wa_phone', name='uq_whatsapp_conversation_tenant_phone'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    wa_phone = db.Column(db.String(20), nullable=False)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True)
+    contact_name = db.Column(db.String(120), nullable=True)
+    needs_attention = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    attention_reason = db.Column(db.String(30), nullable=True)
+    attention_since = db.Column(db.DateTime, nullable=True)
+    ai_paused = db.Column(db.Boolean, nullable=False, default=False)
+    ai_paused_at = db.Column(db.DateTime, nullable=True)
+    last_admin_reply_at = db.Column(db.DateTime, nullable=True)
+    last_inbound_at = db.Column(db.DateTime, nullable=True)
+    last_message_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    last_message_preview = db.Column(db.String(200), nullable=True)
+    unread_count = db.Column(db.Integer, nullable=False, default=0)
+    last_push_at = db.Column(db.DateTime, nullable=True)
+
+    customer = db.relationship('Customer', foreign_keys=[customer_id])
+
+    def to_dict(self):
+        window_expires = self.last_inbound_at + timedelta(hours=24) if self.last_inbound_at else None
+        return {
+            'id': self.id,
+            'wa_phone': self.wa_phone,
+            'contact_name': self.contact_name,
+            'customer_id': self.customer_id,
+            'customer_name': self.customer.name if self.customer else None,
+            'needs_attention': bool(self.needs_attention),
+            'attention_reason': self.attention_reason,
+            'attention_since': _utc_stamp(self.attention_since),
+            'ai_paused': bool(self.ai_paused),
+            'last_inbound_at': _utc_stamp(self.last_inbound_at),
+            'window_expires_at': _utc_stamp(window_expires),
+            'last_message_at': _utc_stamp(self.last_message_at),
+            'last_message_preview': self.last_message_preview,
+            'unread_count': self.unread_count or 0,
+        }
+
+
+class WhatsAppMessage(db.Model):
+    """One inbound or outbound WhatsApp message in an inbox conversation."""
+    __tablename__ = 'whatsapp_message'
+    __table_args__ = (
+        db.UniqueConstraint('tenant_id', 'wa_message_id', name='uq_whatsapp_message_tenant_wamid'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    conversation_id = db.Column(db.Integer, db.ForeignKey('whatsapp_conversation.id'), nullable=False, index=True)
+    direction = db.Column(db.String(3), nullable=False)          # 'in' | 'out'
+    sender = db.Column(db.String(10), nullable=False)            # 'customer' | 'ai' | 'admin' | 'system'
+    sent_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    msg_type = db.Column(db.String(20), nullable=False)
+    text = db.Column(db.Text, nullable=True)
+    transcript = db.Column(db.Text, nullable=True)
+    wa_message_id = db.Column(db.String(128), nullable=True)
+    reply_to_wa_message_id = db.Column(db.String(128), nullable=True)
+    reaction_emoji = db.Column(db.String(16), nullable=True)
+    reaction_target_wa_id = db.Column(db.String(128), nullable=True)
+    wa_media_id = db.Column(db.String(128), nullable=True)
+    media_key = db.Column(db.String(300), nullable=True)
+    media_playback_key = db.Column(db.String(300), nullable=True)
+    media_mime = db.Column(db.String(80), nullable=True)
+    media_status = db.Column(db.String(10), nullable=False, default='none')
+    status = db.Column(db.String(12), nullable=False, default='received')
+    error_code = db.Column(db.String(20), nullable=True)
+    error_message = db.Column(db.String(300), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    sent_by = db.relationship('User', foreign_keys=[sent_by_user_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'direction': self.direction,
+            'sender': self.sender,
+            'sent_by': self.sent_by.username if self.sent_by else None,
+            'msg_type': self.msg_type,
+            'text': self.text,
+            'transcript': self.transcript,
+            'wa_message_id': self.wa_message_id,
+            'reply_to_wa_message_id': self.reply_to_wa_message_id,
+            'reaction_emoji': self.reaction_emoji,
+            'reaction_target_wa_id': self.reaction_target_wa_id,
+            'media_status': self.media_status,
+            'media_mime': self.media_mime,
+            'has_playback': bool(self.media_playback_key),
+            'status': self.status,
+            'error_code': self.error_code,
+            'error_message': self.error_message,
+            'created_at': _utc_stamp(self.created_at),
+        }
+
+
 class BillingPaymentAttempt(db.Model):
     """One Whish checkout attempt for a Pro-plan payment. Whish's API has no
     subscription/order object to query later -- this table is our own record
@@ -1776,6 +1900,7 @@ TENANT_OWNED_MODELS = (
     UpstreamProvider, UpstreamProviderPayment,
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
+    WhatsAppConversation, WhatsAppMessage,
 )
 
 from sqlalchemy import event as _sa_event
@@ -2591,7 +2716,12 @@ _TENANT_DELETE_ORDER = [
     NetworkWriteAudit,
     UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
     CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment,
-    Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
+    # WhatsAppMessage holds an FK to whatsapp_conversation, and
+    # WhatsAppConversation holds an FK to customer, so both must be deleted
+    # before Customer -- message before conversation -- or a tenant delete
+    # raises ForeignKeyViolation on Postgres (SQLite doesn't enforce FKs, so
+    # the gap would be invisible there).
+    Expense, WhatsAppMessage, WhatsAppConversation, Customer, ServiceOutage, PushSubscription, BusinessSettings,
     WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
     # NetworkDevice arrived on the network-topology branch, so origin/main's
