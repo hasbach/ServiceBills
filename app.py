@@ -8116,7 +8116,13 @@ def whatsapp_webhook():
                         sender_phone = msg.get('from', '')
                         msg_type = msg.get('type', '')
                         wamid = msg.get('id')
-                        if wamid and whatsapp_inbox.is_duplicate(_appmod, resolved_tenant_id, wamid):
+                        try:
+                            _is_dup = bool(wamid) and whatsapp_inbox.is_duplicate(_appmod, resolved_tenant_id, wamid)
+                        except Exception as ex_dup:
+                            db.session.rollback()
+                            _is_dup = False
+                            logging.warning(f"WhatsApp inbox: duplicate check failed for {wamid}; treating as new: {ex_dup}")
+                        if _is_dup:
                             logging.info(f"WhatsApp webhook: duplicate delivery of {wamid}; skipping.")
                             continue
                         msg_text = ''
@@ -8185,12 +8191,25 @@ def whatsapp_webhook():
                             except Exception as ex_inbox:
                                 db.session.rollback()
                                 inbox_conv = inbox_msg = None
+                                _race_dup = False
+                                if isinstance(ex_inbox, IntegrityError) and wamid:
+                                    try:
+                                        _race_dup = whatsapp_inbox.is_duplicate(_appmod, resolved_tenant_id, wamid)
+                                    except Exception:
+                                        db.session.rollback()
+                                if _race_dup:
+                                    logging.info(f"WhatsApp webhook: duplicate delivery (race) of {wamid}; skipping.")
+                                    continue
                                 logging.error(f"WhatsApp inbox: could not persist inbound {wamid}: {ex_inbox}")
-                        if inbox_msg is not None and inbox_msg.wa_media_id and settings.access_token:
-                            whatsapp_inbox.run_background(app, functools.partial(
-                                whatsapp_inbox.store_inbound_media, _appmod, inbox_msg.id,
-                                settings.access_token, settings.api_version or 'v19.0'),
-                                pool=whatsapp_inbox.media_pool())
+                        try:
+                            if inbox_msg is not None and inbox_msg.wa_media_id and settings.access_token:
+                                whatsapp_inbox.run_background(app, functools.partial(
+                                    whatsapp_inbox.store_inbound_media, _appmod, inbox_msg.id,
+                                    settings.access_token, settings.api_version or 'v19.0'),
+                                    pool=whatsapp_inbox.media_pool())
+                        except Exception as ex_media:
+                            db.session.rollback()
+                            logging.warning(f"WhatsApp inbox: could not schedule media download for {wamid}: {ex_media}")
 
                         # If voice note or audio, transcribe with ElevenLabs STT
                         if msg_type in ['audio', 'voice'] and media_payload and settings and settings.access_token:
@@ -8203,8 +8222,12 @@ def whatsapp_webhook():
                                     if transcript:
                                         msg_text = f"[رسالة صوتية]: {transcript}"
                                         if inbox_msg is not None:
-                                            inbox_msg.transcript = transcript
-                                            db.session.commit()
+                                            try:
+                                                inbox_msg.transcript = transcript
+                                                db.session.commit()
+                                            except Exception as ex_tx:
+                                                db.session.rollback()
+                                                logging.warning(f"WhatsApp inbox: could not save transcript for {wamid}: {ex_tx}")
                                         logging.info(f"Transcribed WhatsApp audio for {cust_name} (+{sender_phone}): {transcript}")
                             except Exception as ex_tr:
                                 logging.warning(f"Error transcribing WhatsApp voice note: {ex_tr}")
@@ -8256,16 +8279,23 @@ def whatsapp_webhook():
                                 _appmod = sys.modules[__name__]
                                 _tenant_id = resolved_tenant_id
                                 _sender = sender_phone
-                                _cust = cust_obj
+                                # Primitives only: the greenlet runs in its own app context
+                                # (own session) after this request's session is removed, so
+                                # ORM objects from here would be expired + detached there.
+                                _customer_id = cust_obj.id if cust_obj else None
                                 _text = msg_text
                                 _is_voice = bool(msg_type in ['audio', 'voice'])
-                                _settings = settings
+                                _settings_id = settings.id
 
                                 def _run_ai_reply(
                                     appmod=_appmod, tenant_id=_tenant_id, sender=_sender,
-                                    cust=_cust, text=_text, is_voice=_is_voice, stgs=_settings
+                                    customer_id=_customer_id, text=_text, is_voice=_is_voice,
+                                    settings_id=_settings_id
                                 ):
                                     try:
+                                        stgs = appmod.db.session.get(appmod.WhatsAppSettings, settings_id)
+                                        cust = (appmod.db.session.get(appmod.Customer, customer_id)
+                                                if customer_id is not None else None)
                                         result = cs_agent_tools.handle_whatsapp_cs_ai_reply(
                                             appmod=appmod, tenant_id=tenant_id, sender_phone=sender,
                                             customer=cust, incoming_text=text, is_voice=is_voice,

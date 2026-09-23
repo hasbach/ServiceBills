@@ -139,3 +139,71 @@ def test_status_callbacks_update_outbound(app, client, env):
     with app.app_context():
         assert _conv(app, env["tid"]).attention_reason == "send_failed"
     assert len(env["pushes"]) == 1
+
+
+def test_ai_background_task_reloads_settings_and_customer_in_its_own_session(app, client, env, monkeypatch):
+    """Production runs the AI in a greenlet with a fresh app context (so a fresh
+    session) after the request's session is gone. ORM objects captured from the
+    request are expired by its commits and detached by its teardown, so the AI
+    task must re-load them by id. SYNC_BACKGROUND_TASKS hides this, so schedule
+    the task ourselves and run it only after the request session is removed."""
+    seed_customer(client, env["hdr"], "70123456", name="Rami")
+    monkeypatch.setattr(wi, "SYNC_BACKGROUND_TASKS", False)
+    scheduled = []
+    monkeypatch.setattr(wi, "run_background", lambda flask_app, fn, pool=None: scheduled.append(fn))
+    seen = []
+
+    def fake_ai(**kw):
+        s, c = kw["settings"], kw["customer"]
+        seen.append((s.access_token, s.phone_number_id, c.name if c is not None else None))
+        return {"reply_text": "ok", "ai_source": "gemini", "gemini_configured": True}
+
+    monkeypatch.setattr(cs_agent_tools, "handle_whatsapp_cs_ai_reply", fake_ai)
+    r = _send(client, {"from": "96170123456", "id": "wamid.BG1", "type": "text", "text": {"body": "hello"}})
+    assert r.status_code == 200 and len(scheduled) == 1
+    # In tests the request reuses the fixture's app context, so its session is
+    # this one; removing it is what request teardown does in production.
+    appmod.db.session.remove()
+    with app.app_context():
+        scheduled[0]()
+    assert seen == [("tok", "PNID_WH", "Rami")]
+    with app.app_context():
+        assert _conv(app, env["tid"]).attention_reason != "ai_failed"
+
+
+def test_concurrent_duplicate_delivery_skips_ai(app, client, env, monkeypatch):
+    """Two simultaneous deliveries of one wamid both pass is_duplicate; the loser
+    hits the unique constraint on persist and must be skipped, not re-run the AI."""
+    seed_customer(client, env["hdr"], "70123456")
+    with app.app_context():
+        conv = wi.upsert_conversation(appmod, env["tid"], "96170123456")
+        wi.record_inbound(appmod, env["tid"], conv, wi.parse_inbound(
+            {"from": "96170123456", "id": "wamid.RACE", "type": "text", "text": {"body": "hello"}}))
+        appmod.db.session.commit()
+    real_is_duplicate = wi.is_duplicate
+    calls = []
+
+    def racy_is_duplicate(*a, **kw):
+        calls.append(1)
+        return False if len(calls) == 1 else real_is_duplicate(*a, **kw)
+
+    monkeypatch.setattr(wi, "is_duplicate", racy_is_duplicate)
+    r = _send(client, {"from": "96170123456", "id": "wamid.RACE", "type": "text", "text": {"body": "hello"}})
+    assert r.status_code == 200
+    assert env["ai_calls"] == []
+    with app.app_context():
+        assert appmod.WhatsAppMessage.query.filter_by(wa_message_id="wamid.RACE").count() == 1
+
+
+def test_is_duplicate_failure_does_not_abort_message(app, client, env, monkeypatch):
+    seed_customer(client, env["hdr"], "70123456")
+
+    def boom(*a, **kw):
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(wi, "is_duplicate", boom)
+    r = _send(client, {"from": "96170123456", "id": "wamid.ID1", "type": "text", "text": {"body": "hello"}})
+    assert r.status_code == 200
+    with app.app_context():
+        assert appmod.WhatsAppMessage.query.filter_by(wa_message_id="wamid.ID1").count() == 1
+    assert len(env["ai_calls"]) == 1
