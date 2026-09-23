@@ -12,6 +12,10 @@ RUN npm run build
 FROM python:3.13-slim
 WORKDIR /app
 
+# ffmpeg converts admin-recorded voice notes to WhatsApp's OGG/Opus and makes
+# mp3 playback copies of inbound voice notes (see media_convert.py).
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install --with-deps chromium
