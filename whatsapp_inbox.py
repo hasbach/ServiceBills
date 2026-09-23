@@ -427,16 +427,21 @@ def after_ai_reply(appmod, tenant_id, wa_phone, result):
 
 
 class SendError(Exception):
-    def __init__(self, code, message, http_status=502):
+    def __init__(self, code, message, http_status=502, meta_code=None):
         super().__init__(message)
         self.code = str(code)
         self.message = message
         self.http_status = http_status
+        # Raw error code from Meta's Graph API, when this SendError wraps one.
+        # Kept separate from .code so subclasses (e.g. WindowClosed) can carry
+        # a stable public .code while still recording the real Meta code.
+        self.meta_code = str(meta_code) if meta_code is not None else None
 
 
 class WindowClosed(SendError):
-    def __init__(self, message="The 24-hour WhatsApp window has closed -- send an approved template instead."):
-        super().__init__('window_closed', message, 409)
+    def __init__(self, message="The 24-hour WhatsApp window has closed -- send an approved template instead.",
+                meta_code=None):
+        super().__init__('window_closed', message, 409, meta_code=meta_code)
 
 
 def _graph_base(settings):
@@ -451,32 +456,53 @@ def _json(res):
 
 
 def _post_message(settings, payload):
-    res = requests.post(f"{_graph_base(settings)}/messages",
-                        json={'messaging_product': 'whatsapp', **payload},
-                        headers={'Authorization': f'Bearer {settings.access_token}',
-                                 'Content-Type': 'application/json'}, timeout=15)
+    try:
+        res = requests.post(f"{_graph_base(settings)}/messages",
+                            json={'messaging_product': 'whatsapp', **payload},
+                            headers={'Authorization': f'Bearer {settings.access_token}',
+                                     'Content-Type': 'application/json'}, timeout=15)
+    except requests.RequestException as e:
+        logging.warning("whatsapp_inbox: network error posting message: %s", e)
+        raise SendError('network_error', 'Could not reach WhatsApp. Please try again.', 502)
     body = _json(res)
     if not res.ok:
         err = body.get('error') or {}
         code = str(err.get('code') or res.status_code)
         if code == '131047':
-            wc = WindowClosed()
-            wc.code = code
-            raise wc
-        raise SendError(code, err.get('message') or res.text[:300])
+            raise WindowClosed(meta_code=code)
+        raise SendError(code, err.get('message') or res.text[:300], meta_code=code)
     return ((body.get('messages') or [{}])[0]).get('id')
 
 
 def _upload_media(settings, data, filename, mime):
-    res = requests.post(f"{_graph_base(settings)}/media",
-                        headers={'Authorization': f'Bearer {settings.access_token}'},
-                        files={'file': (filename, io.BytesIO(data), mime)},
-                        data={'messaging_product': 'whatsapp', 'type': mime}, timeout=30)
+    try:
+        res = requests.post(f"{_graph_base(settings)}/media",
+                            headers={'Authorization': f'Bearer {settings.access_token}'},
+                            files={'file': (filename, io.BytesIO(data), mime)},
+                            data={'messaging_product': 'whatsapp', 'type': mime}, timeout=30)
+    except requests.RequestException as e:
+        logging.warning("whatsapp_inbox: network error uploading media: %s", e)
+        raise SendError('network_error', 'Could not reach WhatsApp. Please try again.', 502)
     body = _json(res)
     if not res.ok or not body.get('id'):
         err = body.get('error') or {}
-        raise SendError(str(err.get('code') or res.status_code), err.get('message') or 'Media upload to WhatsApp failed')
+        code = str(err.get('code') or res.status_code)
+        raise SendError(code, err.get('message') or 'Media upload to WhatsApp failed', meta_code=code)
     return body['id']
+
+
+def _record_send_failure(appmod, conv, user_id, rec, err):
+    """Record a failed outbound admin message and commit, then the caller re-raises `err`.
+
+    Used both for a failed media upload (Task 8 finding #2: an upload failure
+    must still leave an auditable failed row) and for a failed message post.
+    error_code prefers the raw Meta error code (`meta_code`) over the public
+    `.code`, so a WindowClosed still records '131047' while the exception the
+    caller sees keeps `.code == 'window_closed'` for the route contract.
+    """
+    record_outbound(appmod, conv, sender='admin', sent_by_user_id=user_id, status='failed',
+                    error_code=err.meta_code or err.code, error_message=err.message, **rec)
+    appmod.db.session.commit()
 
 
 def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None, target=None, emoji=None,
@@ -512,9 +538,13 @@ def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None,
         try:
             ogg = media_convert.to_ogg_opus(file_bytes)
         except media_convert.ConversionError as e:
-            logging.warning(f"whatsapp_inbox: voice conversion failed: {e}")
+            logging.warning("whatsapp_inbox: voice conversion failed: %s", e)
             raise SendError('bad_audio', 'Could not convert the recording.', 400)
-        media_id = _upload_media(settings, ogg, 'voice.ogg', 'audio/ogg')
+        try:
+            media_id = _upload_media(settings, ogg, 'voice.ogg', 'audio/ogg')
+        except SendError as e:
+            _record_send_failure(appmod, conv, user_id, rec, e)
+            raise
         playback_key = None
         try:
             playback_key = storage.save_bytes(media_convert.to_mp3(ogg), conv.tenant_id, 'voice.mp3', 'audio/mpeg')
@@ -532,7 +562,11 @@ def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None,
             webp = media_convert.to_sticker_webp(file_bytes)
         except media_convert.ConversionError as e:
             raise SendError('bad_image', str(e), 400)
-        media_id = _upload_media(settings, webp, 'sticker.webp', 'image/webp')
+        try:
+            media_id = _upload_media(settings, webp, 'sticker.webp', 'image/webp')
+        except SendError as e:
+            _record_send_failure(appmod, conv, user_id, rec, e)
+            raise
         payload = {'to': to, 'type': 'sticker', 'sticker': {'id': media_id}}
         rec.update(media_key=storage.save_bytes(webp, conv.tenant_id, 'sticker.webp', 'image/webp'), media_mime='image/webp')
     elif kind == 'template':
@@ -551,9 +585,7 @@ def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None,
     try:
         wamid = _post_message(settings, payload)
     except SendError as e:
-        record_outbound(appmod, conv, sender='admin', sent_by_user_id=user_id, status='failed',
-                        error_code=e.code, error_message=e.message, **rec)
-        appmod.db.session.commit()
+        _record_send_failure(appmod, conv, user_id, rec, e)
         raise
     msg = record_outbound(appmod, conv, sender='admin', sent_by_user_id=user_id, wa_message_id=wamid,
                           status='sent', **rec)

@@ -109,11 +109,36 @@ def test_meta_131047_maps_to_window_closed_and_records_failed_row(app, conv_env,
     monkeypatch.setattr(wi.requests, "post", lambda url, **kw: FakeResponse(
         ok=False, status_code=400, body={"error": {"code": 131047, "message": "Re-engagement message"}}))
     with app.app_context():
-        with pytest.raises(wi.WindowClosed):
+        with pytest.raises(wi.WindowClosed) as e:
             wi.send_admin_message(appmod, _conv(conv_env), conv_env["uid"], "text", text="hi")
+        assert e.value.code == "window_closed" and e.value.http_status == 409
         failed = appmod.WhatsAppMessage.query.filter_by(sender="admin").first()
         assert failed.status == "failed" and failed.error_code == "131047"
         assert _conv(conv_env).ai_paused is False
+
+
+def test_network_error_on_text_send_is_recorded_and_returns_502(app, conv_env, monkeypatch):
+    def raise_conn_error(url, **kw):
+        raise wi.requests.ConnectionError("boom")
+    monkeypatch.setattr(wi.requests, "post", raise_conn_error)
+    with app.app_context():
+        with pytest.raises(wi.SendError) as e:
+            wi.send_admin_message(appmod, _conv(conv_env), conv_env["uid"], "text", text="hi")
+        assert e.value.code == "network_error" and e.value.http_status == 502
+        failed = appmod.WhatsAppMessage.query.filter_by(sender="admin").first()
+        assert failed.status == "failed" and failed.error_code == "network_error"
+
+
+def test_sticker_upload_meta_error_is_recorded_as_failed_row(app, conv_env, monkeypatch):
+    buf = io.BytesIO(); Image.new("RGBA", (300, 200), (0, 0, 255, 255)).save(buf, "PNG")
+    monkeypatch.setattr(wi.requests, "post", lambda url, **kw: FakeResponse(
+        ok=False, status_code=400, body={"error": {"code": 190, "message": "Invalid token"}}))
+    with app.app_context():
+        with pytest.raises(wi.SendError) as e:
+            wi.send_admin_message(appmod, _conv(conv_env), conv_env["uid"], "sticker", file_bytes=buf.getvalue())
+        assert e.value.code == "190" and e.value.meta_code == "190"
+        failed = appmod.WhatsAppMessage.query.filter_by(sender="admin").first()
+        assert failed.status == "failed" and failed.msg_type == "sticker" and failed.error_code == "190"
 
 
 def test_empty_text_and_unknown_kind_rejected(app, conv_env):
