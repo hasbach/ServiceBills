@@ -13,6 +13,7 @@ from tenancy import tenant_query
 
 PAGE_SIZE = 30
 THREAD_PAGE = 50
+MULTIPART_OVERHEAD = 1024 * 1024  # form fields + multipart framing on top of the file
 
 
 def register_inbox_routes(app, appmod):
@@ -117,10 +118,9 @@ def register_inbox_routes(app, appmod):
     @app.route('/api/whatsapp/inbox/conversations/<int:conv_id>/pause', methods=['POST'])
     @inbox_admin
     def inbox_pause(conv_id):
-        from datetime import datetime
         conv = _conv_or_404(conv_id)
         conv.ai_paused = True
-        conv.ai_paused_at = datetime.utcnow()
+        conv.ai_paused_at = wi._now()
         conv.last_admin_reply_at = conv.ai_paused_at  # auto-resume clock starts now
         db.session.commit()
         return jsonify({'conversation': _conv_payload(conv)})
@@ -131,6 +131,9 @@ def register_inbox_routes(app, appmod):
         conv = _conv_or_404(conv_id)
         user = appmod.User.query.filter_by(username=get_jwt_identity()).first()
         if request.files:
+            # Overall cap checked before anything is read into memory.
+            if (request.content_length or 0) > media_convert.VOICE_MAX_BYTES + MULTIPART_OVERHEAD:
+                return jsonify({'error': 'too_large', 'msg': 'Upload is too large.'}), 413
             kind = request.form.get('type')
             upload = request.files.get('file')
             kwargs = {'file_bytes': upload.read() if upload else None}
@@ -140,7 +143,8 @@ def register_inbox_routes(app, appmod):
             kwargs = {'text': data.get('text'), 'reply_to': data.get('reply_to'),
                       'target': data.get('target'), 'emoji': data.get('emoji'),
                       'template_name': data.get('template_name'), 'body_params': data.get('body_params'),
-                      'header_param': data.get('header_param')}
+                      'header_param': data.get('header_param'),
+                      'template_language': data.get('language')}
         try:
             msg = wi.send_admin_message(appmod, conv, user.id if user else None, kind, **kwargs)
         except wi.SendError as e:
@@ -162,4 +166,7 @@ def register_inbox_routes(app, appmod):
         mime = 'audio/mpeg' if use_playback else (msg.media_mime or 'application/octet-stream')
         resp = Response(data, mimetype=mime)
         resp.headers['Cache-Control'] = 'private, max-age=300'
+        resp.headers['X-Content-Type-Options'] = 'nosniff'
+        if not mime.startswith(('image/', 'audio/', 'video/')):
+            resp.headers['Content-Disposition'] = 'attachment'
         return resp

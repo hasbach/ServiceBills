@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import pytest
 
 import app as appmod
+import media_convert
 import storage
 import whatsapp_inbox as wi
 from tests.conftest import auth_headers
@@ -102,3 +103,52 @@ def test_tenant_isolation_and_roles(client, two_tenants):
     collector = auth_headers(client, "rb_collector", role="collector")
     assert client.get("/api/whatsapp/inbox/summary", headers=collector).status_code == 403
     assert client.get("/api/whatsapp/inbox/summary").status_code == 401
+
+
+def test_send_template_passes_language_through(client, two_tenants, monkeypatch):
+    seen = {}
+
+    def fake_send(appmod_, conv, user_id, kind, **kw):
+        seen.update(kw, kind=kind)
+        raise wi.SendError("stop", "stop", 400)
+
+    monkeypatch.setattr(wi, "send_admin_message", fake_send)
+    client.post(f"/api/whatsapp/inbox/conversations/{two_tenants['a1']}/send", headers=two_tenants["a"],
+                json={"type": "template", "template_name": "follow_up", "language": "ar"})
+    assert seen["kind"] == "template" and seen["template_language"] == "ar"
+
+
+def test_pause_uses_inbox_clock(client, two_tenants, monkeypatch, app):
+    fixed = datetime(2026, 9, 23, 10, 0, 0)
+    monkeypatch.setattr(wi, "_now", lambda: fixed)
+    client.post(f"/api/whatsapp/inbox/conversations/{two_tenants['a1']}/pause", headers=two_tenants["a"])
+    with app.app_context():
+        conv = appmod.db.session.get(appmod.WhatsAppConversation, two_tenants["a1"])
+        assert conv.ai_paused_at == fixed and conv.last_admin_reply_at == fixed
+
+
+def test_oversized_upload_rejected_before_read(client, two_tenants, monkeypatch):
+    monkeypatch.setattr(media_convert, "VOICE_MAX_BYTES", 10)
+    big = io.BytesIO(b"x" * (1024 * 1024 + 100))
+    r = client.post(f"/api/whatsapp/inbox/conversations/{two_tenants['a1']}/send", headers=two_tenants["a"],
+                    data={"type": "voice", "file": (big, "v.webm")}, content_type="multipart/form-data")
+    assert r.status_code == 413 and r.get_json()["error"] == "too_large"
+
+
+def test_media_headers_nosniff_and_attachment_for_non_media(client, two_tenants, app):
+    r = client.get(f"/api/whatsapp/inbox/media/{two_tenants['img']}", headers=two_tenants["a"])
+    assert r.headers.get("X-Content-Type-Options") == "nosniff"
+    assert "Content-Disposition" not in r.headers
+    with app.app_context():
+        msg = appmod.db.session.get(appmod.WhatsAppMessage, two_tenants["img"])
+        conv = appmod.db.session.get(appmod.WhatsAppConversation, msg.conversation_id)
+        doc = wi.record_inbound(appmod, msg.tenant_id, conv, wi.parse_inbound(
+            {"id": "wamid.DOC", "type": "document", "document": {"id": "D"}}))
+        doc.media_key = storage.save_bytes(b"<html>x</html>", msg.tenant_id, "x.html", "text/html")
+        doc.media_mime = "text/html"; doc.media_status = "stored"
+        appmod.db.session.commit()
+        doc_id = doc.id
+    r = client.get(f"/api/whatsapp/inbox/media/{doc_id}", headers=two_tenants["a"])
+    assert r.status_code == 200
+    assert r.headers.get("X-Content-Type-Options") == "nosniff"
+    assert (r.headers.get("Content-Disposition") or "").startswith("attachment")

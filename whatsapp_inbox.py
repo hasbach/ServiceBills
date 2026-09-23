@@ -509,7 +509,8 @@ def _record_send_failure(appmod, conv, user_id, rec, err):
 
 
 def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None, target=None, emoji=None,
-                       file_bytes=None, template_name=None, body_params=None, header_param=None):
+                       file_bytes=None, template_name=None, body_params=None, header_param=None,
+                       template_language=None):
     settings = appmod.WhatsAppSettings.query.filter_by(tenant_id=conv.tenant_id).first()
     if not settings or not settings.access_token or not settings.phone_number_id:
         raise SendError('not_configured', 'WhatsApp Cloud API is not configured for this business.', 400)
@@ -578,8 +579,12 @@ def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None,
         params = [str(p) for p in (body_params or []) if str(p).strip()]
         tpl = appmod.build_meta_template_payload(
             settings=settings, template_name=template_name,
-            default_language=settings.template_language or 'en',
+            default_language=template_language or settings.template_language or 'en',
             user_body_params=params, user_header_params=header_param or None)
+        if template_language:
+            # The stored definition's language would otherwise win -- the admin
+            # picked a specific (name, language) pair.
+            tpl['language'] = {'code': template_language}
         payload = {'to': to, 'type': 'template', 'template': tpl}
         rec.update(text=f"[Template: {template_name}]" + (" " + " | ".join(params) if params else ""))
     else:

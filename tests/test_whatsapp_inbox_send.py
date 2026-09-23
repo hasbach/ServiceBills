@@ -148,3 +148,18 @@ def test_empty_text_and_unknown_kind_rejected(app, conv_env):
         assert e.value.http_status == 400
         with pytest.raises(wi.SendError):
             wi.send_admin_message(appmod, _conv(conv_env), conv_env["uid"], "gif")
+
+
+def test_template_explicit_language_overrides_definition(app, conv_env, monkeypatch):
+    seen = {}
+
+    def fake_build(**kw):
+        seen.update(kw)
+        return {"name": kw["template_name"], "language": {"code": "en"}}  # definition's language
+
+    monkeypatch.setattr(appmod, "build_meta_template_payload", fake_build)
+    with app.app_context():
+        wi.send_admin_message(appmod, _conv(conv_env), conv_env["uid"], "template",
+                              template_name="follow_up", template_language="ar")
+        assert seen["default_language"] == "ar"
+        assert conv_env["calls"][0]["json"]["template"]["language"] == {"code": "ar"}
