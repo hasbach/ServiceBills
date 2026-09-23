@@ -303,6 +303,30 @@ const rawApiService = {
     deleteWhatsAppTemplate: (id) => api.delete(`/whatsapp/templates/${id}`),
     uploadWhatsAppTemplateSample: (formData) => api.post('/whatsapp/templates/upload-sample', formData,
         { headers: { 'Content-Type': 'multipart/form-data' } }),
+
+    // WhatsApp Inbox (see docs/superpowers/specs/2026-09-23-whatsapp-inbox-design.md)
+    fetchInboxSummary: () => api.get('/whatsapp/inbox/summary'),
+    fetchInboxConversations: (params) => api.get('/whatsapp/inbox/conversations', { params }),
+    fetchInboxMessages: (id, before) => api.get(`/whatsapp/inbox/conversations/${id}/messages`, { params: before ? { before } : {} }),
+    markInboxRead: (id) => api.post(`/whatsapp/inbox/conversations/${id}/read`),
+    resolveInboxConversation: (id) => api.post(`/whatsapp/inbox/conversations/${id}/resolve`),
+    pauseInboxConversation: (id) => api.post(`/whatsapp/inbox/conversations/${id}/pause`),
+    sendInboxMessage: (id, payload) => api.post(`/whatsapp/inbox/conversations/${id}/send`, payload),
+    sendInboxFile: (id, type, file) => {
+        const fd = new FormData();
+        fd.append('type', type);
+        fd.append('file', file);
+        return api.post(`/whatsapp/inbox/conversations/${id}/send`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+    },
+    fetchInboxMedia: (messageId, variant = 'original') => api.get(`/whatsapp/inbox/media/${messageId}`, { params: { variant }, responseType: 'blob' }),
+
+    // Web push (per-device)
+    fetchVapidPublicKey: () => api.get('/vapid-public-key'),
+    pushSubscribe: (subscription) => api.post('/push-subscribe', { subscription }),
+    fetchPushTopics: (endpoint) => api.get('/push-subscription/topics', { params: { endpoint } }),
+    setPushTopics: (endpoint, topics) => api.put('/push-subscription/topics', { endpoint, topics }),
+    unsubscribePush: (endpoint) => api.post('/push-unsubscribe', { endpoint }),
+    sendTestPush: (endpoint) => api.post('/push-test', { endpoint }),
 };
 
 export const apiService = Object.fromEntries(
