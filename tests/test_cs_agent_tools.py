@@ -1088,3 +1088,124 @@ def test_whatsapp_reply_falls_back_to_rule_based_without_gemini_key(app, client)
 
         mock_gemini.assert_not_called()
 
+
+
+# ---------------------------------------------------------------------------
+# Handoff honesty guard in handle_whatsapp_cs_ai_reply
+# ---------------------------------------------------------------------------
+
+def _handoff_guard_env(app, client, monkeypatch, tenant_name, reply_text, escalate=False):
+    """Tenant + customer + a stubbed Gemini brain that returns `reply_text`,
+    with every outgoing Meta call captured instead of sent."""
+    import cs_agent_tools
+    from unittest.mock import MagicMock
+
+    sent = []
+
+    class _Ok:
+        ok = True
+        status_code = 200
+        text = '{}'
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(cs_agent_tools.requests, "post", lambda url, *a, **kw: sent.append(kw.get("json", {})) or _Ok())
+    monkeypatch.setattr(
+        cs_agent_tools, "query_gemini_agent",
+        lambda *a, **kw: {"intent": "gemini_agent", "reply_text": reply_text,
+                          "ticket_tag": "محادثة ذكاء اصطناعي", "escalate": escalate}
+    )
+
+    auth_headers(client, tenant_name, "pw123")
+    tenant = appmod.Tenant.query.filter_by(name=tenant_name).first()
+    cust_id, _ = _setup_customer(app, tenant.id, "Mohammad Test", "71555666", balance=-50.0)
+    appmod.db.session.add(appmod.CSAgentSettings(tenant_id=tenant.id, gemini_api_key="fake-gemini-key"))
+    appmod.db.session.commit()
+
+    settings = MagicMock()
+    settings.access_token = "mock_token"
+    settings.phone_number_id = "mock_phone_id"
+    settings.elevenlabs_agent_id = None
+    settings.api_version = "v19.0"
+    return tenant, appmod.db.session.get(appmod.Customer, cust_id), settings, sent
+
+
+def _ai_tickets(tenant_id):
+    return appmod.SupportTicket.query.filter(
+        appmod.SupportTicket.tenant_id == tenant_id,
+        appmod.SupportTicket.title.like("[مساعد الذكاء الاصطناعي]%"),
+    ).all()
+
+
+def test_unbacked_handoff_claim_triggers_real_escalation(app, client, monkeypatch):
+    """Reproduces production session 13 (2026-09-20): Gemini told the customer
+    "حولت ملفك للقسم المالي" but never called escalate_to_human, so no ticket
+    existed and nobody followed up. The claim must now be made true: a ticket
+    is opened, the customer is given its number, and the result says so."""
+    import cs_agent_tools
+    claim = "اعتذر منك كتير، حولت ملفك للقسم المالي ليتحققوا من الوصل ويعدلوا الرصيد."
+    with app.app_context():
+        tenant, cust, settings, sent = _handoff_guard_env(app, client, monkeypatch, "admin_test_handoff_claim", claim)
+
+        res = cs_agent_tools.handle_whatsapp_cs_ai_reply(
+            appmod, tenant.id, "96171555666", cust, "أنا دافع 25 بس، ليش 50؟", settings=settings
+        )
+
+        tickets = _ai_tickets(tenant.id)
+        assert len(tickets) == 1
+        assert tickets[0].customer_id == cust.id
+        assert tickets[0].priority == "high"
+        assert res["escalate"] is True
+        assert res["ticket_id"] == tickets[0].id
+        body = [p for p in sent if p.get("type") == "text"][0]["text"]["body"]
+        assert claim in body
+        assert str(tickets[0].id) in body
+
+
+def test_ordinary_reply_does_not_open_a_ticket(app, client, monkeypatch):
+    import cs_agent_tools
+    with app.app_context():
+        tenant, cust, settings, _ = _handoff_guard_env(
+            app, client, monkeypatch, "admin_test_handoff_plain", "أهلاً! رصيدك 50 دولار."
+        )
+        res = cs_agent_tools.handle_whatsapp_cs_ai_reply(
+            appmod, tenant.id, "96171555666", cust, "قديش رصيدي؟", settings=settings
+        )
+        assert _ai_tickets(tenant.id) == []
+        assert res["escalate"] is False
+
+
+def test_repeated_handoff_claims_reuse_the_open_ticket(app, client, monkeypatch):
+    """Session 13 repeated the claim three turns in a row ("حولت…", "سجّلت
+    طلب…", "عم يتابعوه…"). One open AI ticket per customer is enough -- later
+    claims must point at it instead of opening a new one each turn."""
+    import cs_agent_tools
+    with app.app_context():
+        tenant, cust, settings, sent = _handoff_guard_env(
+            app, client, monkeypatch, "admin_test_handoff_dedupe", "حولت ملفك للقسم المالي."
+        )
+        cs_agent_tools.handle_whatsapp_cs_ai_reply(appmod, tenant.id, "96171555666", cust, "ليش 50؟", settings=settings)
+
+        monkeypatch.setattr(
+            cs_agent_tools, "query_gemini_agent",
+            lambda *a, **kw: {"intent": "gemini_agent", "reply_text": "ما تعتل هم، عم يتابعوه الماليّة.",
+                              "ticket_tag": "محادثة ذكاء اصطناعي", "escalate": False}
+        )
+        res = cs_agent_tools.handle_whatsapp_cs_ai_reply(appmod, tenant.id, "96171555666", cust, "ماشي، سلام", settings=settings)
+
+        tickets = _ai_tickets(tenant.id)
+        assert len(tickets) == 1
+        assert res["escalate"] is True
+        assert res["ticket_id"] == tickets[0].id
+
+
+def test_real_escalation_is_not_duplicated_by_the_guard(app, client, monkeypatch):
+    """When the model genuinely called escalate_to_human (escalate=True), the
+    guard must leave it alone -- no second ticket."""
+    import cs_agent_tools
+    with app.app_context():
+        tenant, cust, settings, _ = _handoff_guard_env(
+            app, client, monkeypatch, "admin_test_handoff_real", "حولت طلبك لفريق الدعم.", escalate=True
+        )
+        cs_agent_tools.handle_whatsapp_cs_ai_reply(appmod, tenant.id, "96171555666", cust, "بدي موظف", settings=settings)
+        assert _ai_tickets(tenant.id) == []
