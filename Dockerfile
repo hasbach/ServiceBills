@@ -26,19 +26,15 @@ EXPOSE 8000
 # FERNET_KEY, CORS_ORIGINS, and for prod uploads: STORAGE_BACKEND=s3,
 # STORAGE_BUCKET, S3_ENDPOINT_URL (Cloudflare R2), AWS_* creds.
 ENV FLASK_APP=app.py
-# Single-runner scheduler by default: with a single worker and no separate
-# scheduler service, this one process runs it. This default only applies when
-# nothing overrides it (e.g. a bare `docker run`) -- render.yaml explicitly
-# sets RUN_SCHEDULER=0 on the multi-worker web service and 1 on the dedicated
-# servicesbills-scheduler worker (see render.yaml and DEPLOY.md's "Scheduler
-# at scale"). Do not run this image with WEB_CONCURRENCY>1 AND
-# RUN_SCHEDULER=1 at the same time: with no --preload, every forked gunicorn
-# worker imports this module and starts its own scheduler, independently
-# firing every daily job.
-ENV RUN_SCHEDULER=1
 # Startup: apply DB migrations, then serve. Binds Render's $PORT (falls back 8000)
-# and uses WEB_CONCURRENCY workers (Render sets this; falls back 1). This runs
-# regardless of any platform command override, so the schema is always built.
+# and uses WEB_CONCURRENCY workers (Render sets this; falls back 1).
 # Startup: migrate; create the super-admin if SA_USERNAME/SA_PASSWORD are set
 # (self-guarded + idempotent — no-op if unset or already exists); then serve.
+#
+# render.yaml's Cron Job services (the scheduled jobs -- see DEPLOY.md's
+# "Scheduled jobs") override this CMD entirely with a one-shot
+# `flask run-scheduled-job <name>`, deliberately skipping the migrate/
+# create-superadmin steps below: the web service's own deploy already runs
+# both against the same DATABASE_URL, so a cron container doing it again on
+# every 15-minute tick would be redundant work, not a safety net.
 CMD ["sh", "-c", "flask db upgrade && (flask create-superadmin || true) && exec gunicorn -w ${WEB_CONCURRENCY:-1} -k gevent -b 0.0.0.0:${PORT:-8000} --timeout 120 app:app"]
