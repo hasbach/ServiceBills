@@ -814,7 +814,7 @@ def escalate_to_human(appmod, tenant_id, customer_id, reason, summary, phone=Non
 
     customer_name = customer.name if customer else "عميل"
     customer_phone = customer.phone if customer else (str(phone or '').strip())
-    ticket_title = f"[مساعد الذكاء الاصطناعي] طلب متابعة: {reason or 'استفسار من عميل'}"
+    ticket_title = f"{AI_ESCALATION_TITLE_PREFIX} طلب متابعة: {reason or 'استفسار من عميل'}"
     ticket_desc = (
         f"تم تحويل المحادثة من المساعد الآلي.\n\n"
         f"العميل: {customer_name} (معرف: {customer.id if customer else (customer_id or 'غير محدد')})\n"
@@ -927,6 +927,107 @@ def escalate_to_human(appmod, tenant_id, customer_id, reason, summary, phone=Non
         "forwarded_to": fwd_phone if alert_sent else None,
         "message_ar": "ولا يهمك، حولت طلبك لفريق الدعم الفني وفتحتلك تذكرة متابعة برقم " + str(ticket.id) + ". رح يتواصلوا معك بأقرب وقت ممكن."
     }
+
+
+# Title prefix escalate_to_human() gives every ticket it opens -- used to find
+# an AI escalation that is already open for a customer.
+AI_ESCALATION_TITLE_PREFIX = "[مساعد الذكاء الاصطناعي]"
+AI_ESCALATION_REUSE_WINDOW = timedelta(hours=24)
+
+# Phrases in which the assistant tells the customer it has ALREADY handed the
+# case to a person (or that a person will follow up). Offers ("فيني حولك")
+# and instructions to the customer ("تواصل مع الدعم") deliberately don't match.
+_HANDOFF_CLAIM_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
+    r"حول(ت|نا)",                                             # حولت / حولتلك / حولنا
+    r"(تم|جار[يٍ]?)\s+(ال)?تحويل",                             # تم تحويل / جاري تحويل
+    r"سجل(ت|نا)\S*\s+(ال)?(طلب|تذكر|شكو)",                     # سجلت طلب / سجلتلك تذكرة
+    r"فتح(ت|نا)\S*\s+(ال)?(تذكر|طلب)",                         # فتحتلك تذكرة
+    r"رفع(ت|نا)\S*\s+(ال)?(طلب|شكو)",                          # رفعت طلب
+    r"(بلغت|بلغنا|خبرت)\S*\s+(ال)?(فريق|قسم|موظف|فني|مالي|دعم)",
+    r"(رح|راح|عم|سوف|سي)\s*ي(تواصل|تابع|تصل)",                 # رح يتواصلوا / عم يتابعوه
+    r"\b(escalated|forwarded|transferred|passed)\b.{0,40}\b(team|support|agent|department|staff)",
+    r"\b(opened|created|logged|raised)\s+(a|an)\s+(ticket|request|case)",
+    r"\bwill\s+(contact|call|reach|get back to|follow up with)\s+you",
+    r"\b(transf[ée]r[ée]|escalad[ée])",
+    r"vous\s+(contacter|rappeler)a",
+)]
+
+_ARABIC_DIACRITICS = re.compile(r"[ً-ْـ]")  # tashkeel + tatweel
+
+
+def _claims_handoff(text):
+    """True if `text` tells the customer their case has been handed to a
+    human. The assistant must never say this unless escalate_to_human ran --
+    see _enforce_handoff_claim."""
+    norm = _ARABIC_DIACRITICS.sub("", text or "")
+    return any(p.search(norm) for p in _HANDOFF_CLAIM_PATTERNS)
+
+
+def _find_open_ai_escalation(appmod, tenant_id, customer, sender_phone):
+    """The newest still-open AI escalation ticket for this customer (or, if
+    they are unidentified, for this phone) from the last 24h, or None."""
+    q = appmod.SupportTicket.query.filter(
+        appmod.SupportTicket.tenant_id == tenant_id,
+        appmod.SupportTicket.status.in_(('open', 'in_progress')),
+        appmod.SupportTicket.title.like(f"{AI_ESCALATION_TITLE_PREFIX}%"),
+        appmod.SupportTicket.created_at >= datetime.utcnow() - AI_ESCALATION_REUSE_WINDOW,
+    )
+    if customer and getattr(customer, 'id', None):
+        q = q.filter(appmod.SupportTicket.customer_id == customer.id)
+    else:
+        digits = re.sub(r'\D', '', str(sender_phone or ''))
+        if len(digits) < 8:
+            return None
+        q = q.filter(appmod.SupportTicket.description.like(f"%{digits[-8:]}%"))
+    return q.order_by(appmod.SupportTicket.id.desc()).first()
+
+
+def _enforce_handoff_claim(appmod, tenant_id, customer, sender_phone, incoming_text, ai_result):
+    """Makes sure a reply never tells the customer "I've passed you to the
+    team" unless a human really has been notified.
+
+    Production session 13 (2026-09-20): Gemini told a customer three times
+    that it had transferred their billing dispute to finance, but never
+    called escalate_to_human -- no ticket, no alert, nobody followed up.
+    If the reply claims a handoff and none ran this turn, escalate now (or
+    reuse the customer's already-open AI ticket) and give the customer the
+    ticket number, so the claim is true by the time it is sent.
+    Mutates and returns ai_result."""
+    reply_text = ai_result.get("reply_text") or ""
+    if ai_result.get("escalate") or not _claims_handoff(reply_text):
+        return ai_result
+
+    try:
+        existing = _find_open_ai_escalation(appmod, tenant_id, customer, sender_phone)
+        if existing:
+            ticket_id = existing.id
+        else:
+            logging.warning(
+                f"CS AI reply to +{sender_phone} claimed a handoff without escalating -- escalating now."
+            )
+            esc = escalate_to_human(
+                appmod, tenant_id, getattr(customer, 'id', None),
+                "المساعد الآلي أبلغ الزبون بتحويل طلبه",
+                f"رسالة الزبون: {incoming_text}\nرد المساعد: {reply_text}",
+                phone=sender_phone
+            )
+            ticket_id = esc.get("ticket_id")
+    except Exception as ex:
+        logging.error(f"Could not back the handoff claimed to +{sender_phone} with an escalation: {ex}")
+        try:
+            appmod.db.session.rollback()
+        except Exception:
+            pass
+        return ai_result
+
+    ai_result["escalate"] = True
+    ai_result["ticket_id"] = ticket_id
+    if ticket_id and str(ticket_id) not in reply_text:
+        is_arabic = re.search(r"[؀-ۿ]", reply_text) is not None
+        ai_result["reply_text"] = reply_text + (
+            f"\n\nرقم تذكرة المتابعة: {ticket_id}" if is_arabic else f"\n\nFollow-up ticket #{ticket_id}"
+        )
+    return ai_result
 
 
 # ---------------------------------------------------------------------------
@@ -1486,6 +1587,13 @@ def _build_gemini_system_instruction(appmod, tenant_id, customer, user_msg_clean
         "ما عندو إنترنت أو في مشكلة بالخط أو الاتصال، استخدمي lookup_customer (إذا لسا ما بتعرفي "
         "الزبون) ثم network_diagnostic فوراً، وردي بنتيجة الفحص الفعلية -- مش بوعد إنك رح تفحصي."
     )
+    parts.append(
+        "ممنوع تقولي للزبون إنك حولتي طلبه أو سجلتي طلب أو فتحتي تذكرة أو إنو حدا من الفريق "
+        "(الدعم الفني، القسم المالي، الصيانة) رح يتواصل معه أو عم يتابع الموضوع، إلا إذا فعلاً "
+        "استخدمتي الأداة escalate_to_human بهذا الدور. إذا المشكلة بدها موظف (خلاف على الرصيد أو "
+        "دفعة، عطل ما قدرتي تحليه، أو الزبون طلب يحكي مع حدا) استخدمي escalate_to_human، وعطي "
+        "الزبون رقم التذكرة يلي رجعتلك ياه الأداة."
+    )
 
     # Prompt-injection guard: the customer's message arrives wrapped in
     # CUSTOMER_MESSAGE_DELIMITER_START/_END (see query_gemini_agent). Treat it
@@ -1540,6 +1648,10 @@ def query_gemini_agent(appmod, tenant_id, api_key, incoming_text, sender_phone, 
     # arbitrary id the model is talked into inventing. See
     # _customer_id_mismatch_error.
     known_customer_ids = set()
+    # escalate_to_human's result, if Gemini really called it this turn --
+    # kept across the model fallback, like the roundtrip budget, because the
+    # ticket it opened is real either way.
+    escalation = None
 
     try:
         # _build_gemini_system_instruction() queries CSAgentKnowledgeEntry
@@ -1597,6 +1709,8 @@ def query_gemini_agent(appmod, tenant_id, api_key, incoming_text, sender_phone, 
                         appmod, tenant_id, sender_phone, fc.name, dict(fc.args or {}),
                         customer=customer, is_admin=is_admin, known_customer_ids=known_customer_ids
                     )
+                    if fc.name == 'escalate_to_human' and isinstance(result, dict) and result.get('escalated'):
+                        escalation = result
                     response_parts.append(types.Part.from_function_response(name=fc.name, response=result))
                 # 'tool' is not a valid Content role for the Gemini API (only
                 # 'user'/'model' are, per google.genai.types.Content and
@@ -1609,12 +1723,15 @@ def query_gemini_agent(appmod, tenant_id, api_key, incoming_text, sender_phone, 
             final_text = (response.text or '').strip()
             if final_text:
                 logging.info(f"Gemini ({candidate_model}) reply: {final_text[:80]}")
-                return {
+                result = {
                     "intent": "gemini_agent",
                     "reply_text": final_text,
                     "ticket_tag": "محادثة ذكاء اصطناعي",
-                    "escalate": False
+                    "escalate": escalation is not None
                 }
+                if escalation is not None:
+                    result["ticket_id"] = escalation.get("ticket_id")
+                return result
             return None  # exhausted tool loop with no final text -- fall back to rule-based
         except errors.APIError as e:
             if e.code in GEMINI_RETRYABLE_ERROR_CODES and attempt < len(candidate_models) - 1:
@@ -2197,9 +2314,12 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
             appmod, tenant_id, customer, incoming_text, is_voice=is_voice, is_new_session=is_new_session
         )
 
-    reply_text = ai_result.get("reply_text")
-    if not reply_text:
+    if not ai_result.get("reply_text"):
         return None
+    # Before anything is sent: a reply that says "I've passed you to the team"
+    # must have a real escalation behind it.
+    ai_result = _enforce_handoff_claim(appmod, tenant_id, customer, sender_phone, incoming_text, ai_result)
+    reply_text = ai_result["reply_text"]
 
     api_version = getattr(settings, 'api_version', None) or 'v19.0'
     url_reply = f'https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages'

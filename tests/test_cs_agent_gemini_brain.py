@@ -643,3 +643,72 @@ def test_query_gemini_agent_returns_none_and_rolls_back_when_system_instruction_
     assert result is None
     MockClient.assert_not_called()  # never even reached the Gemini call
     mock_rollback.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Handoff honesty: a reply may only claim a transfer if escalation really ran
+# ---------------------------------------------------------------------------
+
+@patch("cs_agent_tools.search_knowledge_entries", return_value=[])
+@patch("cs_agent_tools.escalate_to_human")
+def test_query_gemini_agent_reports_escalation_when_tool_was_called(mock_escalate, mock_search):
+    """query_gemini_agent always returned escalate=False, even when Gemini
+    really did call escalate_to_human -- so the caller couldn't tell a real
+    handoff from a claimed one. It must now report escalate=True plus the
+    ticket id when the tool actually ran this turn."""
+    mock_escalate.return_value = {"success": True, "escalated": True, "ticket_id": 77}
+
+    fake_call = MagicMock()
+    fake_call.name = "escalate_to_human"
+    fake_call.args = {"reason": "خلاف على الرصيد", "summary": "الزبون بيقول دفع 25"}
+    first = MagicMock()
+    first.function_calls = [fake_call]
+    first.candidates = [MagicMock(content="model-turn")]
+    second = _text_only_response("حولت طلبك للقسم المالي، رقم التذكرة 77.")
+
+    with patch("google.genai.Client") as MockClient:
+        MockClient.return_value.models.generate_content.side_effect = [first, second]
+        result = cs_agent_tools.query_gemini_agent(
+            appmod, tenant_id=1, api_key="fake-key",
+            incoming_text="أنا دافع 25 بس", sender_phone="70123456"
+        )
+
+    assert result["escalate"] is True
+    assert result["ticket_id"] == 77
+
+
+def test_build_gemini_system_instruction_forbids_unbacked_handoff_claims(app, client):
+    headers = auth_headers(client, "admin_test_handoff_rule", "pw123")
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="admin_test_handoff_rule").first()
+        with patch("cs_agent_tools.search_knowledge_entries", return_value=[]):
+            text = cs_agent_tools._build_gemini_system_instruction(appmod, tenant.id, None, "مرحبا", False)
+    assert "escalate_to_human" in text
+
+
+@pytest.mark.parametrize("reply", [
+    # Verbatim claims from the 2026-09-20 production conversation (session 13):
+    "اعتذر منك كتير يا استاذ محمد، حولت ملفك للقسم المالي والمتابعة ليتحققوا من الوصل",
+    "أنا سجّلت طلب بالقسم المالي ليتأكدوا من دفعتك",
+    "ما تعتل هم الموضوع عم يتابعوه الماليّة",
+    # Other common phrasings:
+    "فتحتلك تذكرة متابعة",
+    "رح يتواصل معك أحد موظفينا بأقرب وقت",
+    "جاري تحويل الطلب لفريق الصيانة",
+    "I've escalated this to our support team.",
+    "Someone from our team will contact you shortly.",
+])
+def test_claims_handoff_detects_transfer_claims(reply):
+    assert cs_agent_tools._claims_handoff(reply) is True
+
+
+@pytest.mark.parametrize("reply", [
+    "أهلاً يا استاذ محمد. تشيكت الخط والحساب عندك، والاشتراك مفعل",
+    "فيك تتأكد إذا الراوتر شغال؟ وإذا بدك ببعتلك رابط دفع سريع",
+    "إذا بدك فيني حولك لموظف، بس قلي",
+    "تواصل مع الدعم الفني إذا الإنترنت مش شغال.",
+    "Your balance is $25, due on the 1st.",
+    "",
+])
+def test_claims_handoff_ignores_ordinary_replies(reply):
+    assert cs_agent_tools._claims_handoff(reply) is False
