@@ -6,11 +6,13 @@ exactly like cs_agent_tools.py, so this module never imports app.py at import
 time. Functions here do NOT commit unless their docstring says so -- the caller
 owns the transaction. See docs/superpowers/specs/2026-09-23-whatsapp-inbox-design.md.
 """
+import io
 import logging
 import mimetypes
 import re
 from datetime import datetime, timedelta, timezone
 
+import requests
 from sqlalchemy.exc import IntegrityError
 
 import media_convert
@@ -422,3 +424,144 @@ def after_ai_reply(appmod, tenant_id, wa_phone, result):
     except Exception:
         appmod.db.session.rollback()
         logging.exception("whatsapp_inbox: after_ai_reply failed")
+
+
+class SendError(Exception):
+    def __init__(self, code, message, http_status=502):
+        super().__init__(message)
+        self.code = str(code)
+        self.message = message
+        self.http_status = http_status
+
+
+class WindowClosed(SendError):
+    def __init__(self, message="The 24-hour WhatsApp window has closed -- send an approved template instead."):
+        super().__init__('window_closed', message, 409)
+
+
+def _graph_base(settings):
+    return f"https://graph.facebook.com/{settings.api_version or 'v19.0'}/{settings.phone_number_id}"
+
+
+def _json(res):
+    try:
+        return res.json() or {}
+    except ValueError:
+        return {}
+
+
+def _post_message(settings, payload):
+    res = requests.post(f"{_graph_base(settings)}/messages",
+                        json={'messaging_product': 'whatsapp', **payload},
+                        headers={'Authorization': f'Bearer {settings.access_token}',
+                                 'Content-Type': 'application/json'}, timeout=15)
+    body = _json(res)
+    if not res.ok:
+        err = body.get('error') or {}
+        code = str(err.get('code') or res.status_code)
+        if code == '131047':
+            wc = WindowClosed()
+            wc.code = code
+            raise wc
+        raise SendError(code, err.get('message') or res.text[:300])
+    return ((body.get('messages') or [{}])[0]).get('id')
+
+
+def _upload_media(settings, data, filename, mime):
+    res = requests.post(f"{_graph_base(settings)}/media",
+                        headers={'Authorization': f'Bearer {settings.access_token}'},
+                        files={'file': (filename, io.BytesIO(data), mime)},
+                        data={'messaging_product': 'whatsapp', 'type': mime}, timeout=30)
+    body = _json(res)
+    if not res.ok or not body.get('id'):
+        err = body.get('error') or {}
+        raise SendError(str(err.get('code') or res.status_code), err.get('message') or 'Media upload to WhatsApp failed')
+    return body['id']
+
+
+def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None, target=None, emoji=None,
+                       file_bytes=None, template_name=None, body_params=None, header_param=None):
+    settings = appmod.WhatsAppSettings.query.filter_by(tenant_id=conv.tenant_id).first()
+    if not settings or not settings.access_token or not settings.phone_number_id:
+        raise SendError('not_configured', 'WhatsApp Cloud API is not configured for this business.', 400)
+    if kind != 'template' and not window_open(conv):
+        raise WindowClosed()
+
+    to = conv.wa_phone
+    rec = {'msg_type': kind, 'text': None}
+    if kind == 'text':
+        text = (text or '').strip()
+        if not text:
+            raise SendError('empty', 'Message is empty.', 400)
+        payload = {'to': to, 'type': 'text', 'text': {'body': text[:4096]}}
+        if reply_to:
+            payload['context'] = {'message_id': reply_to}
+        rec.update(text=text[:4096], reply_to_wa_message_id=reply_to)
+    elif kind == 'reaction':
+        if not target:
+            raise SendError('missing_target', 'Pick a message to react to.', 400)
+        payload = {'to': to, 'type': 'reaction', 'reaction': {'message_id': target, 'emoji': emoji or ''}}
+        rec.update(reaction_emoji=emoji or '', reaction_target_wa_id=target)
+    elif kind == 'voice':
+        if not file_bytes:
+            raise SendError('empty', 'No recording received.', 400)
+        if len(file_bytes) > media_convert.VOICE_MAX_BYTES:
+            raise SendError('too_large', 'Voice notes are limited to 16 MB.', 413)
+        if not media_convert.ffmpeg_available():
+            raise SendError('voice_unavailable', 'Voice notes are unavailable: ffmpeg is not installed on the server.', 503)
+        try:
+            ogg = media_convert.to_ogg_opus(file_bytes)
+        except media_convert.ConversionError as e:
+            logging.warning(f"whatsapp_inbox: voice conversion failed: {e}")
+            raise SendError('bad_audio', 'Could not convert the recording.', 400)
+        media_id = _upload_media(settings, ogg, 'voice.ogg', 'audio/ogg')
+        playback_key = None
+        try:
+            playback_key = storage.save_bytes(media_convert.to_mp3(ogg), conv.tenant_id, 'voice.mp3', 'audio/mpeg')
+        except media_convert.ConversionError:
+            pass
+        payload = {'to': to, 'type': 'audio', 'audio': {'id': media_id}}
+        rec.update(msg_type='audio', media_key=storage.save_bytes(ogg, conv.tenant_id, 'voice.ogg', 'audio/ogg'),
+                   media_playback_key=playback_key, media_mime='audio/ogg')
+    elif kind == 'sticker':
+        if not file_bytes:
+            raise SendError('empty', 'No sticker file received.', 400)
+        if len(file_bytes) > media_convert.STICKER_SOURCE_MAX_BYTES:
+            raise SendError('too_large', 'Sticker source images are limited to 5 MB.', 413)
+        try:
+            webp = media_convert.to_sticker_webp(file_bytes)
+        except media_convert.ConversionError as e:
+            raise SendError('bad_image', str(e), 400)
+        media_id = _upload_media(settings, webp, 'sticker.webp', 'image/webp')
+        payload = {'to': to, 'type': 'sticker', 'sticker': {'id': media_id}}
+        rec.update(media_key=storage.save_bytes(webp, conv.tenant_id, 'sticker.webp', 'image/webp'), media_mime='image/webp')
+    elif kind == 'template':
+        if not template_name:
+            raise SendError('missing_template', 'Pick a template.', 400)
+        params = [str(p) for p in (body_params or []) if str(p).strip()]
+        tpl = appmod.build_meta_template_payload(
+            settings=settings, template_name=template_name,
+            default_language=settings.template_language or 'en',
+            user_body_params=params, user_header_params=header_param or None)
+        payload = {'to': to, 'type': 'template', 'template': tpl}
+        rec.update(text=f"[Template: {template_name}]" + (" " + " | ".join(params) if params else ""))
+    else:
+        raise SendError('bad_kind', f'Unsupported message type: {kind}', 400)
+
+    try:
+        wamid = _post_message(settings, payload)
+    except SendError as e:
+        record_outbound(appmod, conv, sender='admin', sent_by_user_id=user_id, status='failed',
+                        error_code=e.code, error_message=e.message, **rec)
+        appmod.db.session.commit()
+        raise
+    msg = record_outbound(appmod, conv, sender='admin', sent_by_user_id=user_id, wa_message_id=wamid,
+                          status='sent', **rec)
+    now = _now()
+    conv.last_admin_reply_at = now
+    conv.ai_paused = True
+    conv.ai_paused_at = now
+    conv.unread_count = 0
+    clear_attention(conv)
+    appmod.db.session.commit()
+    return msg
