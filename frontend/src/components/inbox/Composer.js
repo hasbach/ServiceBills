@@ -20,12 +20,12 @@ const TemplateSender = ({ conversationId, onSent, notify }) => {
             .then(r => setTemplates((r.data.templates || []).filter(t => (t.status || '').toUpperCase() === 'APPROVED')))
             .catch(() => {});
     }, [apiService]);
-    const selected = templates.find(t => t.name === name);
+    const selected = templates.find(t => `${t.name}|${t.language}` === name);
     const count = templateParamCount(selected);
     useEffect(() => setParams(Array(count).fill('')), [name, count]);
     const send = async () => {
         try {
-            await apiService.sendInboxMessage(conversationId, { type: 'template', template_name: name, body_params: params });
+            await apiService.sendInboxMessage(conversationId, { type: 'template', template_name: selected.name, body_params: params });
             setName(''); onSent();
         } catch (e) { notify(e.response?.data?.msg || 'Template send failed'); }
     };
@@ -34,7 +34,7 @@ const TemplateSender = ({ conversationId, onSent, notify }) => {
             <FormControl size="small" fullWidth>
                 <InputLabel>Approved template</InputLabel>
                 <Select label="Approved template" value={name} onChange={e => setName(e.target.value)}>
-                    {templates.map(t => <MenuItem key={`${t.name}-${t.language}`} value={t.name}>{t.name} ({t.language})</MenuItem>)}
+                    {templates.map(t => <MenuItem key={`${t.name}-${t.language}`} value={`${t.name}|${t.language}`}>{t.name} ({t.language})</MenuItem>)}
                 </Select>
             </FormControl>
             {params.map((p, i) => (
@@ -59,7 +59,6 @@ const Composer = ({ conversation, replyTo, clearReply, reactTarget, clearReactTa
 
     useEffect(() => { apiService.fetchInboxSummary().then(r => setVoiceAvailable(!!r.data.voice_available)).catch(() => {}); }, [apiService]);
     useEffect(() => { const i = setInterval(() => forceTick(t => t + 1), 30000); return () => clearInterval(i); }, []);
-    useEffect(() => { setText(''); }, [conversation.id]);
 
     const windowInfo = describeWindow(conversation.window_expires_at);
     const run = async (fn) => {
@@ -75,9 +74,9 @@ const Composer = ({ conversation, replyTo, clearReply, reactTarget, clearReactTa
     const sendReaction = (emoji) => {
         const target = reactTarget?.message;
         clearReactTarget(); setFullReactPicker(false);
-        if (target) run(() => apiService.sendInboxMessage(conversation.id, { type: 'reaction', target: target.wa_message_id, emoji }));
+        if (target && !sending) run(() => apiService.sendInboxMessage(conversation.id, { type: 'reaction', target: target.wa_message_id, emoji }));
     };
-    const sendSticker = (file) => file && run(() => apiService.sendInboxFile(conversation.id, 'sticker', file));
+    const sendSticker = (file) => file && !sending && run(() => apiService.sendInboxFile(conversation.id, 'sticker', file));
     const sendVoice = (file) => run(() => apiService.sendInboxFile(conversation.id, 'voice', file));
 
     const reactionPopover = (
@@ -96,7 +95,6 @@ const Composer = ({ conversation, replyTo, clearReply, reactTarget, clearReactTa
 
     if (!windowInfo.open) return (
         <Box sx={{ p: 2, borderTop: 1, borderColor: 'divider' }}>
-            {reactionPopover}
             <Typography variant="body2" color="warning.main" sx={{ mb: 1 }}>{windowInfo.label}</Typography>
             <TemplateSender conversationId={conversation.id} onSent={onSent} notify={notify} />
         </Box>

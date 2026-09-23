@@ -16,15 +16,24 @@ const VoiceRecorder = ({ disabled, onSend, onError }) => {
     const recRef = useRef(null);
     const timerRef = useRef(null);
     const streamRef = useRef(null);
+    const previewUrlRef = useRef(null);
 
     const stop = () => { clearInterval(timerRef.current); recRef.current?.state === 'recording' && recRef.current.stop(); };
 
+    useEffect(() => { previewUrlRef.current = previewUrl; }, [previewUrl]);
+
     useEffect(() => () => {
         clearInterval(timerRef.current);
-        if (recRef.current?.state === 'recording') recRef.current.stop();
+        const rec = recRef.current;
+        if (rec) {
+            rec.ondataavailable = null;
+            rec.onstop = null;
+            if (rec.state === 'recording') rec.stop();
+        }
         streamRef.current?.getTracks().forEach(t => t.stop());
+        streamRef.current = null;
+        if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
     }, []);
-    useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, [previewUrl]);
     useEffect(() => { if (state === 'recording' && seconds >= MAX_SECONDS) stop(); }, [seconds, state]);
 
     const start = async () => {

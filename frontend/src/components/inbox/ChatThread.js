@@ -26,12 +26,19 @@ const StatusTick = ({ m }) => {
     return <SentIcon sx={{ fontSize: 14, color: 'text.secondary' }} />;
 };
 
-const Bubble = ({ m, byWamid, onReply, onReact }) => {
+const FAILED_MEDIA_LABEL = { voice: '🎤 Voice note (not sent)', sticker: 'Sticker (not sent)' };
+
+const Bubble = ({ m, byWamid, onReply, onReact, windowOpen }) => {
     const [showTranscript, setShowTranscript] = React.useState(false);
     const style = BUBBLE[m.sender] || BUBBLE.customer;
     const quoted = m.reply_to_wa_message_id ? byWamid[m.reply_to_wa_message_id] : null;
     const isSticker = m.msg_type === 'sticker';
-    const canInteract = m.direction === 'in' && m.wa_message_id;
+    const canInteract = m.direction === 'in' && m.wa_message_id && windowOpen;
+    const canReply = canInteract;
+    const canReact = canInteract;
+    const failedEmptyLabel = m.status === 'failed' && m.media_status === 'none' && !m.text
+        ? FAILED_MEDIA_LABEL[m.msg_type]
+        : null;
     return (
         <Box sx={{ display: 'flex', justifyContent: style.align, mb: 1, '&:hover .bubble-actions': { opacity: 1 } }}>
             <Box sx={{ maxWidth: '75%' }}>
@@ -47,6 +54,9 @@ const Bubble = ({ m, byWamid, onReply, onReact }) => {
                         </Box>
                     )}
                     {m.media_status !== 'none' && <InboxMedia message={m} />}
+                    {failedEmptyLabel && (
+                        <Typography variant="body2" color="text.secondary" fontStyle="italic">{failedEmptyLabel}</Typography>
+                    )}
                     {m.text && m.msg_type !== 'sticker' && (
                         <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                             {m.msg_type === 'location'
@@ -69,10 +79,14 @@ const Bubble = ({ m, byWamid, onReply, onReact }) => {
                 </Paper>
                 <Stack direction="row" spacing={0.5} justifyContent={style.align}>
                     {m.reactions?.map(r => <Chip key={r.side} size="small" label={r.emoji} sx={{ mt: -1, height: 22 }} />)}
-                    {canInteract && (
+                    {(canReply || canReact) && (
                         <Box className="bubble-actions" sx={{ opacity: { xs: 1, md: 0 }, transition: 'opacity .15s' }}>
-                            <IconButton size="small" onClick={() => onReply(m)}><ReplyIcon sx={{ fontSize: 16 }} /></IconButton>
-                            <IconButton size="small" onClick={(e) => onReact(m, e.currentTarget)}><ReactIcon sx={{ fontSize: 16 }} /></IconButton>
+                            {canReply && (
+                                <IconButton size="small" aria-label="Reply" onClick={() => onReply(m)}><ReplyIcon sx={{ fontSize: 16 }} /></IconButton>
+                            )}
+                            {canReact && (
+                                <IconButton size="small" aria-label="React" onClick={(e) => onReact(m, e.currentTarget)}><ReactIcon sx={{ fontSize: 16 }} /></IconButton>
+                            )}
                         </Box>
                     )}
                 </Stack>
@@ -87,6 +101,7 @@ const ChatThread = ({ conversation, messages, hasMore, onLoadOlder, onBack, onRe
     useEffect(() => { bottomRef.current?.scrollIntoView({ block: 'end' }); }, [lastId]);
     const byWamid = Object.fromEntries(messages.filter(m => m.wa_message_id).map(m => [m.wa_message_id, m]));
     const cust = conversation.customer;
+    const windowOpen = !!conversation.window_open;
     return (
         <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
             <Stack direction="row" alignItems="center" spacing={1} sx={{ p: 1.5, borderBottom: 1, borderColor: 'divider' }}>
@@ -107,7 +122,7 @@ const ChatThread = ({ conversation, messages, hasMore, onLoadOlder, onBack, onRe
             </Stack>
             <Box sx={{ flex: 1, overflowY: 'auto', p: 2, bgcolor: '#efeae2' }}>
                 {hasMore && <Box sx={{ textAlign: 'center', mb: 1 }}><Button size="small" onClick={onLoadOlder}>Load older</Button></Box>}
-                {messages.map(m => <Bubble key={m.id} m={m} byWamid={byWamid} onReply={onReply} onReact={onReact} />)}
+                {messages.map(m => <Bubble key={m.id} m={m} byWamid={byWamid} onReply={onReply} onReact={onReact} windowOpen={windowOpen} />)}
                 <div ref={bottomRef} />
             </Box>
             {conversation.ai_paused && (

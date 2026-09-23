@@ -234,7 +234,7 @@ const MessagingView = ({ openConversationId = null }) => {
 
                 {activeTab === 0 ? (
                     <InboxView openConversationId={openConversationId}
-                        renderComposer={(props) => <Composer {...props} />} />
+                        renderComposer={(props) => <Composer key={props.conversation.id} {...props} />} />
                 ) : (
                 <Box sx={{ p: 4 }}>
                     {activeTab === 1 ? (
