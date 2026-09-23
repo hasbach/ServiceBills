@@ -3,7 +3,7 @@ import { Box, Paper, Typography, useMediaQuery, useTheme, Stack } from '@mui/mat
 import { useAppContext } from '../../context/AppContext';
 import ConversationList from './ConversationList';
 import ChatThread from './ChatThread';
-import { attachReactions } from './inboxFormat';
+import { attachReactions, mergeThreadPage } from './inboxFormat';
 
 const LIST_POLL_MS = 20000;
 const THREAD_POLL_MS = 5000;
@@ -39,7 +39,11 @@ const InboxView = ({ openConversationId = null, renderComposer = null, headerExt
             const res = await apiService.fetchInboxMessages(id);
             if (selectedRef.current !== id) return;
             if (!res.data || typeof res.data !== 'object' || !Array.isArray(res.data.messages)) return;
-            setThread(res.data);
+            // Same conversation: keep any older pages loaded via "Load older".
+            setThread(t => {
+                if (!t || String(t.conversation?.id) !== String(id)) return res.data;
+                return { ...res.data, ...mergeThreadPage(t.messages, t.has_more, res.data) };
+            });
             if (markRead && res.data.conversation?.unread_count > 0) {
                 await apiService.markInboxRead(id);
                 loadList();

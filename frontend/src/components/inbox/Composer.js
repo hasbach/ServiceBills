@@ -25,7 +25,7 @@ const TemplateSender = ({ conversationId, onSent, notify }) => {
     useEffect(() => setParams(Array(count).fill('')), [name, count]);
     const send = async () => {
         try {
-            await apiService.sendInboxMessage(conversationId, { type: 'template', template_name: selected.name, body_params: params });
+            await apiService.sendInboxMessage(conversationId, { type: 'template', template_name: selected.name, language: selected.language, body_params: params });
             setName(''); onSent();
         } catch (e) { notify(e.response?.data?.msg || 'Template send failed'); }
     };

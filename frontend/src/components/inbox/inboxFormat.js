@@ -43,3 +43,16 @@ export function templateParamCount(template) {
     if (!body?.text) return 0;
     return new Set(body.text.match(/\{\{\d+\}\}/g) || []).size;
 }
+
+/** Merge a freshly polled newest page into what's already shown, so older
+ *  pages fetched via "Load older" survive the poll. Previously loaded messages
+ *  older than the page's first id are kept in front of it; when any are kept,
+ *  has_more comes from the older state (it describes what lies beyond them). */
+export function mergeThreadPage(prevMessages, prevHasMore, page) {
+    const fresh = Array.isArray(page?.messages) ? page.messages : [];
+    const firstId = fresh[0]?.id;
+    const prev = Array.isArray(prevMessages) ? prevMessages : [];
+    const older = firstId == null ? prev : prev.filter(m => m.id < firstId);
+    if (older.length === 0) return { messages: fresh, has_more: !!page?.has_more };
+    return { messages: [...older, ...fresh], has_more: !!prevHasMore };
+}

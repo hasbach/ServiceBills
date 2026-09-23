@@ -13,6 +13,8 @@ const VoiceRecorder = ({ disabled, onSend, onError }) => {
     const [seconds, setSeconds] = useState(0);
     const [blob, setBlob] = useState(null);
     const [previewUrl, setPreviewUrl] = useState(null);
+    const [sendingVoice, setSendingVoice] = useState(false);
+    const mountedRef = useRef(true);
     const recRef = useRef(null);
     const timerRef = useRef(null);
     const streamRef = useRef(null);
@@ -21,6 +23,7 @@ const VoiceRecorder = ({ disabled, onSend, onError }) => {
     const stop = () => { clearInterval(timerRef.current); recRef.current?.state === 'recording' && recRef.current.stop(); };
 
     useEffect(() => { previewUrlRef.current = previewUrl; }, [previewUrl]);
+    useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
 
     useEffect(() => () => {
         clearInterval(timerRef.current);
@@ -59,9 +62,14 @@ const VoiceRecorder = ({ disabled, onSend, onError }) => {
     };
     const discard = () => { if (previewUrl) URL.revokeObjectURL(previewUrl); setBlob(null); setPreviewUrl(null); setState('idle'); };
     const send = async () => {
+        if (sendingVoice || !blob) return;
         const ext = (blob.type.includes('mp4') ? 'm4a' : blob.type.includes('ogg') ? 'ogg' : 'webm');
-        await onSend(new File([blob], `voice.${ext}`, { type: blob.type }));
-        discard();
+        setSendingVoice(true);
+        try {
+            await onSend(new File([blob], `voice.${ext}`, { type: blob.type }));
+        } finally {
+            if (mountedRef.current) { setSendingVoice(false); discard(); }
+        }
     };
 
     if (state === 'recording') return (
@@ -73,8 +81,8 @@ const VoiceRecorder = ({ disabled, onSend, onError }) => {
     if (state === 'review') return (
         <Stack direction="row" alignItems="center" spacing={1}>
             <audio controls src={previewUrl} style={{ height: 36, maxWidth: 220 }} />
-            <IconButton onClick={discard}><DeleteIcon /></IconButton>
-            <IconButton color="primary" onClick={send}><SendIcon /></IconButton>
+            <IconButton onClick={discard} disabled={sendingVoice}><DeleteIcon /></IconButton>
+            <IconButton color="primary" onClick={send} disabled={sendingVoice}><SendIcon /></IconButton>
         </Stack>
     );
     return (

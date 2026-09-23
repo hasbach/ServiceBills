@@ -1,4 +1,4 @@
-import { describeWindow, attachReactions, REASON_META, templateParamCount } from './inboxFormat';
+import { describeWindow, attachReactions, REASON_META, templateParamCount, mergeThreadPage } from './inboxFormat';
 
 const NOW = Date.parse('2026-09-23T12:00:00Z');
 
@@ -39,4 +39,23 @@ test('templateParamCount counts distinct BODY placeholders', () => {
     expect(templateParamCount({ components: [{ type: 'BODY', text: 'Hi {{1}}, your balance is {{2}} ({{1}})' }] })).toBe(2);
     expect(templateParamCount({ components: [{ type: 'HEADER', text: 'x' }] })).toBe(0);
     expect(templateParamCount({})).toBe(0);
+});
+
+test('mergeThreadPage keeps older loaded messages ahead of the newest page', () => {
+    const prev = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+    const page = { messages: [{ id: 3, status: 'read' }, { id: 4 }, { id: 5 }], has_more: true };
+    expect(mergeThreadPage(prev, false, page)).toEqual({
+        messages: [{ id: 1 }, { id: 2 }, { id: 3, status: 'read' }, { id: 4 }, { id: 5 }],
+        has_more: false,
+    });
+});
+
+test('mergeThreadPage with nothing older loaded takes the page as-is', () => {
+    const page = { messages: [{ id: 3 }, { id: 4 }], has_more: true };
+    expect(mergeThreadPage([{ id: 3 }], false, page)).toEqual({ messages: [{ id: 3 }, { id: 4 }], has_more: true });
+    expect(mergeThreadPage(null, undefined, page)).toEqual({ messages: [{ id: 3 }, { id: 4 }], has_more: true });
+});
+
+test('mergeThreadPage with an empty page keeps previous messages', () => {
+    expect(mergeThreadPage([{ id: 1 }], true, { messages: [], has_more: false })).toEqual({ messages: [{ id: 1 }], has_more: true });
 });
