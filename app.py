@@ -8302,6 +8302,7 @@ def whatsapp_webhook():
                                             settings=stgs, ticket=None)
                                     except Exception:
                                         logging.exception("CS AI reply crashed")
+                                        appmod.db.session.rollback()
                                         result = None
                                     whatsapp_inbox.after_ai_reply(appmod, tenant_id, sender, result)
 

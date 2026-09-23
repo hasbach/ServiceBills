@@ -207,3 +207,33 @@ def test_is_duplicate_failure_does_not_abort_message(app, client, env, monkeypat
     with app.app_context():
         assert appmod.WhatsAppMessage.query.filter_by(wa_message_id="wamid.ID1").count() == 1
     assert len(env["ai_calls"]) == 1
+
+
+def test_ai_crash_mid_flush_rolls_back_before_after_ai_reply(app, client, env, monkeypatch):
+    """If handle_whatsapp_cs_ai_reply blows up after leaving a bad pending write
+    on the session (e.g. crashes mid-flush), the webhook closure's except branch
+    must roll back before calling after_ai_reply -- otherwise the session is left
+    in SQLAlchemy's PendingRollback state and the very query that flags
+    ai_failed raises instead of running, silently losing the flag."""
+    seed_customer(client, env["hdr"], "70123456", name="Rami")
+    monkeypatch.setattr(wi, "SYNC_BACKGROUND_TASKS", False)
+    scheduled = []
+    monkeypatch.setattr(wi, "run_background", lambda flask_app, fn, pool=None: scheduled.append(fn))
+
+    def fake_ai_crashes_mid_flush(**kw):
+        # Simulate a real failed-flush state: an invalid row (missing NOT NULL
+        # columns) is added and flushed, raising IntegrityError. That leaves
+        # the session unusable until it is rolled back.
+        conv = wi.find_conversation_by_phone(appmod, kw["tenant_id"], kw["sender_phone"])
+        bad = appmod.WhatsAppMessage(tenant_id=kw["tenant_id"], conversation_id=conv.id)
+        appmod.db.session.add(bad)
+        appmod.db.session.flush()  # raises IntegrityError (direction/sender/msg_type NOT NULL)
+
+    monkeypatch.setattr(cs_agent_tools, "handle_whatsapp_cs_ai_reply", fake_ai_crashes_mid_flush)
+    r = _send(client, {"from": "96170123456", "id": "wamid.CRASH1", "type": "text", "text": {"body": "hello"}})
+    assert r.status_code == 200 and len(scheduled) == 1
+    appmod.db.session.remove()
+    with app.app_context():
+        scheduled[0]()  # must not raise PendingRollbackError
+    with app.app_context():
+        assert _conv(app, env["tid"]).attention_reason == "ai_failed"

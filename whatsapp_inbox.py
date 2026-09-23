@@ -365,13 +365,60 @@ def store_inbound_media(appmod, message_id, access_token, api_version):
             appmod.db.session.commit()
 
 
-def after_ai_reply(appmod, tenant_id, wa_phone, result):
-    """Placeholder until Task 7 -- flags ai_failed when the AI path returned nothing."""
-    conv = find_conversation_by_phone(appmod, tenant_id, wa_phone)
+def flag_attention_for_phone(appmod, tenant_id, phone, reason):
+    """Flag an EXISTING conversation for this phone (never creates one -- an
+    escalation from the phone channel must not invent a WhatsApp chat).
+    Commits and pushes. Returns the conversation or None."""
+    conv = find_conversation_by_phone(appmod, tenant_id, phone)
     if conv is None:
-        return
-    if result is None:
-        flag_attention(conv, 'ai_failed')
+        return None
+    flag_attention(conv, reason)
     appmod.db.session.commit()
-    if conv.needs_attention:
-        notify_conversation(appmod, conv)
+    notify_conversation(appmod, conv)
+    return conv
+
+
+def record_ai_reply(appmod, tenant_id, wa_phone, *, reply_text, text_wamid, text_ok, text_error, voice_result):
+    """Record what the AI actually sent. Returns True when the text send failed
+    (the conversation is then flagged send_failed). Commits; never raises."""
+    try:
+        conv = upsert_conversation(appmod, tenant_id, wa_phone)
+        record_outbound(appmod, conv, sender='ai', msg_type='text', text=reply_text,
+                        wa_message_id=text_wamid if text_ok else None,
+                        status='sent' if text_ok else 'failed',
+                        error_code=(text_error or {}).get('code'), error_message=(text_error or {}).get('message'))
+        if voice_result:
+            record_outbound(appmod, conv, sender='ai', msg_type='audio', transcript=reply_text,
+                            wa_message_id=voice_result if isinstance(voice_result, str) else None)
+        if not text_ok:
+            flag_attention(conv, 'send_failed')
+        appmod.db.session.commit()
+        return not text_ok
+    except Exception:
+        appmod.db.session.rollback()
+        logging.exception("whatsapp_inbox: could not record AI reply")
+        return not text_ok
+
+
+def after_ai_reply(appmod, tenant_id, wa_phone, result):
+    """Called after every AI attempt on an inbound message. Flags:
+    - ai_failed: the AI raised / returned nothing, OR the tenant has a Gemini
+      key but Gemini produced nothing and the rule-based fallback answered;
+    - escalated: the (rule-based) AI decided to escalate.
+    send_failed was already flagged by record_ai_reply. Commits and pushes."""
+    try:
+        conv = find_conversation_by_phone(appmod, tenant_id, wa_phone)
+        if conv is None:
+            return
+        if result is None:
+            flag_attention(conv, 'ai_failed')
+        elif result.get('escalate'):
+            flag_attention(conv, 'escalated')
+        elif result.get('gemini_configured') and result.get('ai_source') == 'rules':
+            flag_attention(conv, 'ai_failed')
+        appmod.db.session.commit()
+        if conv.needs_attention:
+            notify_conversation(appmod, conv)
+    except Exception:
+        appmod.db.session.rollback()
+        logging.exception("whatsapp_inbox: after_ai_reply failed")

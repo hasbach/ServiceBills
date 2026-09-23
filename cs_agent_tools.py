@@ -919,6 +919,15 @@ def escalate_to_human(appmod, tenant_id, customer_id, reason, summary, phone=Non
     except Exception as ex_fwd:
         logging.error(f"Error preparing escalation template alert to forwarding_mobile: {ex_fwd}")
 
+    # Surface this in the admin WhatsApp inbox, if a WhatsApp chat exists for them.
+    try:
+        import whatsapp_inbox
+        flag_phone = phone or (customer.phone if customer else None)
+        if flag_phone:
+            whatsapp_inbox.flag_attention_for_phone(appmod, tenant_id, flag_phone, 'escalated')
+    except Exception as ex_inbox:
+        logging.warning(f"Could not flag inbox conversation for escalation: {ex_inbox}")
+
     return {
         "success": True,
         "ticket_id": ticket.id,
@@ -1204,7 +1213,11 @@ def send_whatsapp_voice(access_token, phone_number_id, recipient_phone, audio_by
         res_msg = requests.post(msg_url, headers=headers_msg, json=payload, timeout=15)
         if not res_msg.ok:
             logging.warning(f"Failed to send WhatsApp audio message: {res_msg.status_code} {res_msg.text}")
-        return res_msg.ok
+            return False
+        try:
+            return ((res_msg.json() or {}).get('messages') or [{}])[0].get('id') or True
+        except ValueError:
+            return True
     except Exception as e:
         logging.error(f"Error sending WhatsApp voice note: {e}")
         return False
@@ -2192,10 +2205,15 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
             logging.warning(f"Gemini agent call failed, will fallback: {ex_gemini}")
 
     # Fallback to local rule-based AI processor if ElevenLabs ConvAI did not return a response
+    ai_source = 'gemini' if (ai_result and ai_result.get("reply_text")) else 'rules'
     if not ai_result or not ai_result.get("reply_text"):
         ai_result = process_customer_message_ai(
             appmod, tenant_id, customer, incoming_text, is_voice=is_voice, is_new_session=is_new_session
         )
+
+    ai_result = dict(ai_result or {})
+    ai_result['ai_source'] = ai_source
+    ai_result['gemini_configured'] = bool(gemini_key)
 
     reply_text = ai_result.get("reply_text")
     if not reply_text:
@@ -2209,6 +2227,7 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     }
 
     # 1. Send WhatsApp Text message
+    text_ok, text_wamid, text_error = False, None, None
     try:
         payload_reply = {
             'messaging_product': 'whatsapp',
@@ -2217,19 +2236,29 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
             'text': {'body': reply_text}
         }
         res_rep = requests.post(url_reply, json=payload_reply, headers=headers_reply, timeout=10)
+        try:
+            body = res_rep.json() or {}
+        except ValueError:
+            body = {}
         if res_rep.ok:
+            text_ok = True
+            text_wamid = (body.get('messages') or [{}])[0].get('id')
             logging.info(f"Sent CS AI reply text to +{sender_phone} (intent: {ai_result.get('intent')}).")
         else:
+            err = body.get('error') or {}
+            text_error = {'code': err.get('code') or res_rep.status_code, 'message': err.get('message') or res_rep.text}
             logging.warning(f"Could not send CS AI reply text to +{sender_phone}: {res_rep.text}")
     except Exception as e:
+        text_error = {'code': 'exception', 'message': str(e)}
         logging.error(f"Error sending WhatsApp text reply: {e}")
 
     # 2. If customer sent voice note, try to respond with voice note too (if ElevenLabs TTS available)
+    voice_result = None
     if is_voice:
         try:
             tts_audio = synthesize_speech_elevenlabs(reply_text, agent_id=target_agent_id)
             if tts_audio:
-                sent_voice = send_whatsapp_voice(
+                sent_voice = voice_result = send_whatsapp_voice(
                     settings.access_token,
                     settings.phone_number_id,
                     sender_phone,
@@ -2319,6 +2348,12 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
         appmod.db.session.commit()
     except Exception as ex_log:
         logging.warning(f"Could not log CS Agent WhatsApp session: {ex_log}")
+
+    # 5. Mirror what was actually sent into the admin inbox (see whatsapp_inbox.py).
+    import whatsapp_inbox  # lazy: whatsapp_inbox imports this module lazily too
+    ai_result['inbox_send_failed'] = whatsapp_inbox.record_ai_reply(
+        appmod, tenant_id, sender_phone, reply_text=reply_text, text_wamid=text_wamid,
+        text_ok=text_ok, text_error=text_error, voice_result=voice_result)
 
     return ai_result
 
