@@ -2524,6 +2524,9 @@ _SUSPEND_EXEMPT_PREFIXES = (
     "/api/billing", "/api/login", "/api/logout", "/api/stripe/webhook",
     "/api/verify-email", "/api/forgot-password", "/api/reset-password",
     "/api/tenant/", "/api/plans", "/api/admin/",
+    # Its own secret-header auth, not a tenant JWT -- there is no tenant to
+    # suspend-check against a cron trigger.
+    "/api/internal/",
 )
 
 
@@ -2964,8 +2967,8 @@ def _prune_scheduled_job_runs():
 
 def _run_scheduled_job(job_name, fn):
     """Run one scheduled job body with cross-process duplicate protection and
-    a durable audit trail. This is what `flask run-scheduled-job` (below)
-    invokes -- each job runs as its own one-shot Render Cron Job container.
+    a durable audit trail. This is what `flask run-scheduled-job` and the
+    /api/internal/scheduled-jobs/<name> HTTP route (both below) invoke.
 
     Root-cause context: these jobs used to run on an in-process APScheduler
     that fired immediately on import, in every process that imported app.py
@@ -2977,12 +2980,13 @@ def _run_scheduled_job(job_name, fn):
     previously showed up as either a very slow run (both sides serializing
     on the same customer/payment row locks) or, worse, a boot that never
     produced another log line because the very first autoflushed UPDATE was
-    stuck behind the other side's transaction. Moving to one-shot Cron Job
-    invocations removes most of those overlap windows, but not all: two Cron
-    Job containers for the *same* job are independent processes that can
-    still genuinely overlap (a slow run still going when its next scheduled
-    tick fires), so the advisory lock stays as the actual correctness
-    guarantee. It's session-scoped, so a killed/crashed process (including
+    stuck behind the other side's transaction. Moving to one-shot, externally
+    triggered invocations (see the HTTP route below) removes most of those
+    overlap windows, but not all: a retried or manually-repeated trigger for
+    the *same* job is an independent process that can still genuinely
+    overlap a still-running previous one, so the advisory lock stays as the
+    actual correctness guarantee. It's session-scoped, so a killed/crashed
+    process (including
     this function raising before its own cleanup runs) can never leave it
     stuck held -- the lock is released the moment that process's DB
     connection closes, which happens no later than process exit either way.
@@ -3391,7 +3395,7 @@ def refresh_agent_mode_network_status_with_context():
                 logging.error(f"Scheduled network freshness refresh failed for tenant {t.id}: {e}")
 
 
-# --- CLI entry point for the jobs above ----------------------------------
+# --- Trigger mechanism for the jobs above --------------------------------
 # These used to run on an in-process APScheduler (BackgroundScheduler) that
 # started and fired every job immediately on import. That was fragile in a
 # multi-process deployment: every gunicorn worker -- and `flask db upgrade`,
@@ -3400,20 +3404,22 @@ def refresh_agent_mode_network_status_with_context():
 # that produced a boot that hung for minutes on a Postgres row lock, and on
 # the retry the same job running four times in ~100 seconds.
 #
-# Each job now runs as a one-shot `flask run-scheduled-job <name>`
-# invocation, triggered by its own Render Cron Job (see render.yaml) on a
-# plain cron schedule -- no long-lived process or in-process scheduler, and
-# no need for the old "fire immediately on every restart" workaround (that
-# existed only to cover a spin-down-prone single dyno; a Cron Job just runs
-# on its schedule regardless of the web service's uptime). See DEPLOY.md's
-# "Scheduled jobs" section.
+# There is no in-process scheduler or dedicated Render service for this
+# anymore. Each job is triggered externally, by GitHub Actions' free
+# `schedule:` cron (see .github/workflows/scheduled-jobs.yml), which POSTs to
+# /api/internal/scheduled-jobs/<name> below on the already-running web
+# service -- no standing Render Cron Job instances to pay for or create by
+# hand (an earlier version of this fix used Render Cron Jobs directly, but
+# each one carries its own $1/month minimum regardless of actual usage,
+# which stopped being worth it once it was seven of them). `flask
+# run-scheduled-job <name>` (below) runs the same thing locally/manually.
+# See DEPLOY.md's "Scheduled jobs" section.
 #
-# _run_scheduled_job's Postgres advisory lock still matters here, and for a
-# different reason than before: two Cron Job containers for the *same* job
-# can now genuinely overlap (each is an independent container, not
-# serialized by APScheduler's single-threaded executor the way the old daily
-# and 15-minute jobs were), so the lock is what stops a slow run and its
-# next scheduled tick from double-processing the same rows.
+# _run_scheduled_job's Postgres advisory lock still matters here: a retried
+# or manually-repeated GitHub Actions run for the *same* job can still
+# genuinely overlap a still-running previous trigger, so the lock is what
+# stops that overlap from double-processing the same customer/payment rows,
+# not anything about the trigger mechanism itself.
 _SCHEDULED_JOBS = {
     "generate_missing_payments": generate_missing_payments_with_context,
     "generate_missing_salary_charges": generate_missing_salary_charges_with_context,
@@ -3435,13 +3441,57 @@ _SCHEDULED_JOBS = {
 @click.argument("job_name")
 def run_scheduled_job_command(job_name):
     """Run one named job from _SCHEDULED_JOBS through _run_scheduled_job
-    (Postgres advisory lock + ScheduledJobRun audit row), then exit. This is
-    what render.yaml's Cron Job services invoke."""
+    (Postgres advisory lock + ScheduledJobRun audit row), then exit. For
+    local/manual use -- production is triggered over HTTP, see the route
+    below."""
     fn = _SCHEDULED_JOBS.get(job_name)
     if fn is None:
         raise click.ClickException(
             f"Unknown scheduled job {job_name!r}. Valid names: {', '.join(sorted(_SCHEDULED_JOBS))}")
     _run_scheduled_job(job_name, fn)
+
+
+# Bounded like AI_REPLY_GREENLET_POOL above, for the same reason: this fires
+# the job in a background greenlet and returns immediately, rather than
+# holding the request open for however long the job takes (generate_missing
+# _payments, and especially auto_sync_upstream_status's Playwright scraping,
+# can run well past gunicorn's --timeout 120 for a tenant with many
+# customers). A small cap here is just defense-in-depth against something
+# hammering this endpoint spawning unbounded concurrent job runs -- the
+# advisory lock already makes a second trigger for the *same* job name a
+# no-op, so this only matters for many *different* job names firing at once.
+SCHEDULED_JOB_TRIGGER_POOL = _GeventPool(3) if gevent is not None else None
+
+
+@app.route('/api/internal/scheduled-jobs/<job_name>', methods=['POST'])
+def trigger_scheduled_job(job_name):
+    """External trigger for one scheduled job, called by GitHub Actions'
+    cron workflow (.github/workflows/scheduled-jobs.yml) -- see the big
+    comment above _SCHEDULED_JOBS for why this replaced Render Cron Jobs.
+    Gated by a shared secret (not a tenant/user JWT: nobody is logged in when
+    a cron trigger fires), compared with hmac.compare_digest to avoid a
+    timing side-channel. CRON_TRIGGER_SECRET unset means this deploy hasn't
+    configured the trigger -- fail closed (503), not open.
+    """
+    secret = os.environ.get('CRON_TRIGGER_SECRET')
+    if not secret:
+        return jsonify({'error': 'Scheduled job trigger not configured'}), 503
+    provided = request.headers.get('X-Cron-Secret', '')
+    if not hmac.compare_digest(provided, secret):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    fn = _SCHEDULED_JOBS.get(job_name)
+    if fn is None:
+        return jsonify({'error': f"Unknown scheduled job {job_name!r}"}), 404
+
+    if SCHEDULED_JOB_TRIGGER_POOL is not None:
+        SCHEDULED_JOB_TRIGGER_POOL.spawn(_run_scheduled_job, job_name, fn)
+    else:
+        # No gevent (e.g. a sync-worker local run) -- nothing to spawn onto,
+        # so run inline. Only reachable outside the gevent gunicorn worker
+        # this app otherwise always runs under.
+        _run_scheduled_job(job_name, fn)
+    return jsonify({'status': 'accepted', 'job_name': job_name}), 202
  
     
 
