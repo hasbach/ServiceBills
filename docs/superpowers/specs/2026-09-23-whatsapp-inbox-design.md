@@ -116,7 +116,7 @@ One row per message, inbound or outbound.
 
 | Reason | Set when |
 |---|---|
-| `ai_failed` | the AI path raised, or returned no reply (Gemini and the rule-based fallback both empty) |
+| `ai_failed` | the AI path raised or returned no reply, **or** the tenant has a Gemini key but Gemini produced nothing and the rule-based fallback answered instead (the fallback always produces some text) |
 | `escalated` | `escalate_to_human` ran for this phone (tool call, keyword, or HTTP endpoint) |
 | `awaiting_admin` | a new inbound message arrived while `ai_paused` |
 | `unknown_sender` | the phone matched no `Customer` |
@@ -234,7 +234,7 @@ comes from the summary endpoint.
 | `POST /api/whatsapp/inbox/conversations/<id>/resolve` | clear attention, set `ai_paused=false` |
 | `POST /api/whatsapp/inbox/conversations/<id>/pause` | manually pause the AI without replying |
 | `POST /api/whatsapp/inbox/conversations/<id>/send` | JSON for text/reaction/template; multipart for voice/sticker (`type` field) |
-| `GET /api/whatsapp/inbox/media/<message_id>?variant=original\|playback` | auth-checked; S3 → 302 to a short-lived presigned URL, local → stream the file |
+| `GET /api/whatsapp/inbox/media/<message_id>?variant=original\|playback` | auth-checked; streams the bytes from either backend (the browser fetches with the JWT as a blob, so no redirect is used; a redirect to R2 would need bucket CORS) |
 
 Media is never linked publicly. Every access goes through the tenant check on
 the message row.
@@ -364,8 +364,8 @@ daily-use tab; the Messaging nav item also shows a badge. New components go in
 
 - All inbox routes require JWT + admin role and use `tenant_query`, so one
   tenant can never read another's conversations or media.
-- The media endpoint checks the message's tenant before redirecting. Presigned
-  URLs expire in 5 minutes.
+- The media endpoint checks the message's tenant before streaming. Responses
+  are `Cache-Control: private, max-age=300`.
 - Upload limits:
   - voice ≤ 16 MB;
   - sticker source ≤ 5 MB;
