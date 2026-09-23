@@ -52,7 +52,7 @@ try:
     from flask_jwt_extended import get_jwt
 except ImportError:
     from flask_jwt_extended import get_raw_jwt as get_jwt
-from functools import wraps
+from functools import wraps, partial
 import calendar
 from pywebpush import webpush, WebPusher
 import logging
@@ -2932,6 +2932,95 @@ def recalculate_estimated_profit(tenant_id):
         print(f"Error recalculating estimated profit: {str(e)}")
 
 
+class ScheduledJobRun(db.Model):
+    """Audit trail for the daily/interval scheduler jobs below -- when did
+    'generate_missing_payments' etc last actually run, did it succeed, and
+    (via _run_scheduled_job's advisory lock) was a concurrent fire skipped.
+
+    Not tenant-scoped: these jobs iterate every tenant themselves, so a run
+    is a single global event, same as ScheduledJobRun's sibling reference
+    tables (Currency) rather than the per-tenant models above."""
+    id = db.Column(db.Integer, primary_key=True)
+    job_name = db.Column(db.String(50), nullable=False, index=True)
+    status = db.Column(db.String(15), nullable=False, default='running')  # running/success/failed
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    finished_at = db.Column(db.DateTime, nullable=True)
+    error = db.Column(db.Text, nullable=True)
+
+
+# How long ScheduledJobRun rows are kept. These jobs run at worst every 15
+# minutes, so unbounded retention would grow this table forever against the
+# 500 MB production storage cap (see NETWORK_AGENT_JOB_RETENTION_DAYS for the
+# same concern elsewhere) -- 30 days is far more than enough to diagnose a
+# recent bad deploy while keeping row count trivial.
+SCHEDULED_JOB_RUN_RETENTION_DAYS = 30
+
+
+def _prune_scheduled_job_runs():
+    cutoff = datetime.utcnow() - timedelta(days=SCHEDULED_JOB_RUN_RETENTION_DAYS)
+    ScheduledJobRun.query.filter(ScheduledJobRun.finished_at.isnot(None),
+                                  ScheduledJobRun.finished_at < cutoff).delete()
+    db.session.commit()
+
+
+def _run_scheduled_job(job_name, fn):
+    """Run one interval-scheduler job body with cross-process duplicate
+    protection and a durable audit trail.
+
+    Root-cause context: this app's daily jobs fire immediately on every
+    process that imports app.py with RUN_SCHEDULER=1 (see the scheduler
+    registration below) -- normally exactly one process (see DEPLOY.md's
+    "Scheduler at scale" and render.yaml's dedicated scheduler worker), but
+    `flask db upgrade` also imports app.py, and Render's zero-downtime deploy
+    keeps the outgoing instance alive briefly alongside the incoming one.
+    Either of those can put two of these jobs in flight at once against the
+    same Postgres instance, which previously showed up as either a very slow
+    run (both sides serializing on the same customer/payment row locks) or,
+    worse, a boot that never produces another log line because the very
+    first autoflushed UPDATE is stuck behind the other side's transaction.
+    A Postgres advisory lock makes the second fire skip immediately instead
+    of contending for those rows. It's session-scoped, so a killed/crashed
+    process can never leave it stuck held.
+
+    SQLite (tests, and local dev without a Postgres DATABASE_URL) has no
+    advisory locks, and a single-process SQLite setup can't have this race
+    anyway, so this is a plain call to `fn()` there.
+    """
+    with app.app_context():
+        is_postgres = db.engine.dialect.name == 'postgresql'
+        lock_key = None
+        if is_postgres:
+            import zlib
+            lock_key = zlib.crc32(job_name.encode()) & 0x7fffffff
+            got_lock = db.session.execute(
+                db.text("SELECT pg_try_advisory_lock(:key)"), {"key": lock_key}
+            ).scalar()
+            if not got_lock:
+                logging.info(f"Scheduled job '{job_name}' is already running in another "
+                             f"process; skipping this fire.")
+                return
+
+        run = ScheduledJobRun(job_name=job_name, status='running', started_at=datetime.utcnow())
+        db.session.add(run)
+        db.session.commit()
+        try:
+            fn()
+            run.status = 'success'
+        except Exception as e:
+            db.session.rollback()
+            run = db.session.get(ScheduledJobRun, run.id)
+            run.status = 'failed'
+            run.error = str(e)[:2000]
+            logging.error(f"Scheduled job '{job_name}' failed: {e}")
+        finally:
+            run.finished_at = datetime.utcnow()
+            db.session.commit()
+            if is_postgres:
+                db.session.execute(db.text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
+                db.session.commit()
+        _prune_scheduled_job_runs()
+
+
 # Initialize scheduler
 scheduler = BackgroundScheduler(daemon=True, executors={'default': {'type': 'threadpool', 'max_workers': 1}})
 
@@ -3298,6 +3387,14 @@ def refresh_agent_mode_network_status_with_context():
 # Start the scheduler in ONE runner only. Under multiple gunicorn workers, an
 # in-process scheduler would fire the daily jobs once per worker; run exactly one
 # process/container with RUN_SCHEDULER=1. Defaults on for single-process dev.
+# In production this is the dedicated single-instance scheduler worker service
+# in render.yaml (RUN_SCHEDULER=0 on the multi-worker web service) -- see
+# DEPLOY.md's "Scheduler at scale". Every job below is still wrapped in
+# _run_scheduled_job's Postgres advisory lock as defense-in-depth: that's what
+# actually protects against the two windows that "run exactly one process"
+# can't fully rule out on its own -- `flask db upgrade` importing this same
+# module, and the old instance of this very worker service staying alive
+# briefly during its own deploy handoff.
 #
 # next_run_time=datetime.now() below is required, not cosmetic: APScheduler's
 # IntervalTrigger with no explicit start_date defaults it to now + the interval
@@ -3316,10 +3413,14 @@ def refresh_agent_mode_network_status_with_context():
 # local tz isn't UTC -- verified this makes the job log a "missed" warning and
 # push its first real fire a full day out instead of firing immediately.
 if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
-    scheduler.add_job(func=generate_missing_payments_with_context, trigger="interval", days=1, next_run_time=datetime.now())
-    scheduler.add_job(func=generate_missing_salary_charges_with_context, trigger="interval", days=1, next_run_time=datetime.now())
-    scheduler.add_job(func=recalculate_all_estimated_profits_with_context, trigger="interval", days=1, next_run_time=datetime.now())
-    scheduler.add_job(func=send_daily_whatsapp_keepalive_with_context, trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=partial(_run_scheduled_job, "generate_missing_payments", generate_missing_payments_with_context),
+                       trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=partial(_run_scheduled_job, "generate_missing_salary_charges", generate_missing_salary_charges_with_context),
+                       trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=partial(_run_scheduled_job, "recalculate_all_estimated_profits", recalculate_all_estimated_profits_with_context),
+                       trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=partial(_run_scheduled_job, "send_daily_whatsapp_keepalive", send_daily_whatsapp_keepalive_with_context),
+                       trigger="interval", days=1, next_run_time=datetime.now())
     # Phase 3: opt-in only (BusinessSettings.upstream_sync_automation_enabled),
     # so this fires for every active tenant same as the jobs above but is a
     # genuine no-op for any tenant that hasn't turned it on. The per-customer
@@ -3327,8 +3428,10 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     # actually protects against over-syncing on a spin-down-prone host that
     # restarts (and re-fires next_run_time=now()) more than once a day --
     # not a change to this "fire immediately" pattern itself.
-    scheduler.add_job(func=auto_sync_upstream_status_with_context, trigger="interval", days=1, next_run_time=datetime.now())
-    scheduler.add_job(func=check_pro_plan_expirations_with_context, trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=partial(_run_scheduled_job, "auto_sync_upstream_status", auto_sync_upstream_status_with_context),
+                       trigger="interval", days=1, next_run_time=datetime.now())
+    scheduler.add_job(func=partial(_run_scheduled_job, "check_pro_plan_expirations", check_pro_plan_expirations_with_context),
+                       trigger="interval", days=1, next_run_time=datetime.now())
     # misfire_grace_time=600: this executor is single-threaded (max_workers=1,
     # shared with the daily jobs above), and auto_sync_upstream_status_with_context
     # can run for an unbounded duration. APScheduler 3.x's default
@@ -3336,8 +3439,8 @@ if os.environ.get("RUN_SCHEDULER", "1") == "1" and not scheduler.running:
     # behind a long-running daily job would otherwise be skipped entirely
     # (logged as a missed run), not deferred. 600s (10 min) comfortably
     # survives sitting behind a slow daily job without stacking indefinitely.
-    scheduler.add_job(func=refresh_agent_mode_network_status_with_context, trigger="interval", minutes=15,
-                       next_run_time=datetime.now(), misfire_grace_time=600)
+    scheduler.add_job(func=partial(_run_scheduled_job, "refresh_agent_mode_network_status", refresh_agent_mode_network_status_with_context),
+                       trigger="interval", minutes=15, next_run_time=datetime.now(), misfire_grace_time=600)
     scheduler.start()
  
     

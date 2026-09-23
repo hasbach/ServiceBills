@@ -1,7 +1,28 @@
-# Render blueprint — free web service, external Postgres (Supabase).
-# Secrets marked sync:false are entered in the Render dashboard (never committed).
-# Free web spins down when idle; the in-process scheduler (RUN_SCHEDULER=1, -w 1)
-# only runs while awake. Set DATABASE_URL to your Supabase SESSION-pooler URL.
+# Render blueprint — web service + a dedicated scheduler worker, external
+# Postgres (Supabase). Secrets marked sync:false are entered in the Render
+# dashboard (never committed). Set DATABASE_URL to your Supabase
+# SESSION-pooler URL.
+#
+# Scheduler topology (see DEPLOY.md's "Scheduler at scale"): the web service
+# runs WEB_CONCURRENCY>1 gunicorn workers, so it must never also run the
+# in-process APScheduler -- with no --preload, each forked worker would
+# import app.py and start its own scheduler, independently firing every daily
+# job on its own clock. `flask db upgrade` (which runs ahead of gunicorn on
+# every deploy) imports app.py too, so RUN_SCHEDULER=1 there means a THIRD
+# uncoordinated fire before the web service even starts. Concretely, this
+# combination once produced a boot that hung for minutes with zero log
+# output (blocked on a Postgres row lock held by an overlapping fire) and,
+# on the retry, the same job executing four times in ~100 seconds. See the
+# scheduled-job-startup-race investigation for the full writeup.
+#
+# The fix: RUN_SCHEDULER=0 on the web service, and a single dedicated
+# `servicesbills-scheduler` worker (below) that is the only process anywhere
+# with RUN_SCHEDULER=1. Its own deploy handoff can still briefly overlap old
+# and new instances, and a stray `flask db upgrade` invocation with
+# RUN_SCHEDULER left on would too -- app.py's _run_scheduled_job wraps every
+# job in a Postgres advisory lock as defense-in-depth against exactly that
+# residual window, so a second concurrent fire skips instantly instead of
+# contending for the same customer/payment rows.
 services:
   - type: web
     name: servicesbills-web
@@ -22,7 +43,7 @@ services:
       - key: WEB_CONCURRENCY
         value: "4"   # Min 3 needed: (1) WhatsApp/WebSocket, (2) ElevenLabs tool webhook, (3) on-premise agent poll+result
       - key: RUN_SCHEDULER
-        value: "1"
+        value: "0"   # multi-worker web service must never also run the scheduler -- see servicesbills-scheduler below
       - key: FERNET_KEY
         sync: false
       - key: APP_BASE_URL
@@ -80,6 +101,90 @@ services:
       # Error tracking (Phase 2). Sign up for a Sentry account (free tier is enough
       # at current scale) and paste the project DSN here. Leave unset and error
       # tracking simply stays off -- it's not required for the app to run.
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENVIRONMENT
+        value: production
+
+  # The single dedicated runner for the in-process APScheduler (see the big
+  # comment at the top of this file). Same image as the web service, but its
+  # dockerCommand skips `flask db upgrade`/`flask create-superadmin` (the web
+  # service's deploy already does both against the same DATABASE_URL) and
+  # runs a single-worker gunicorn whose only job is to stay alive and host
+  # the scheduler thread -- it serves no traffic and needs no health check.
+  #
+  # IMPORTANT (manual step after the blueprint syncs): every `sync: false`
+  # var below must be filled in with the EXACT SAME value as the
+  # servicesbills-web service's copy -- these two services share one
+  # database and one set of encrypted credentials. JWT_SECRET_KEY and
+  # FERNET_KEY in particular must be byte-identical to web's (not
+  # independently generated), or token/decrypt operations touching data the
+  # other service wrote will fail.
+  - type: worker
+    name: servicesbills-scheduler
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    dockerCommand: "exec gunicorn -w 1 app:app"
+    envVars:
+      - key: DATABASE_URL
+        sync: false        # same Supabase Session-pooler URL as servicesbills-web
+      - key: JWT_SECRET_KEY
+        sync: false        # copy servicesbills-web's generated value -- do NOT let Render generate a new one here
+      - key: FLASK_APP
+        value: app.py
+      - key: DISABLE_AUTO_CREATE_ALL
+        value: "1"
+      - key: RUN_SCHEDULER
+        value: "1"   # the only process anywhere that should have this set to 1
+      - key: FERNET_KEY
+        sync: false        # copy servicesbills-web's value exactly
+      - key: APP_BASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: STORAGE_BACKEND
+        value: s3
+      - key: STORAGE_BUCKET
+        sync: false
+      - key: STORAGE_PREFIX
+        value: uploads
+      - key: AWS_REGION
+        value: auto
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_PRO
+        sync: false
+      - key: WHISH_CHANNEL
+        sync: false
+      - key: WHISH_SECRET
+        sync: false
+      - key: MAIL_BACKEND
+        value: sendgrid
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
       - key: SENTRY_DSN
         sync: false
       - key: SENTRY_ENVIRONMENT

@@ -26,9 +26,15 @@ EXPOSE 8000
 # FERNET_KEY, CORS_ORIGINS, and for prod uploads: STORAGE_BACKEND=s3,
 # STORAGE_BUCKET, S3_ENDPOINT_URL (Cloudflare R2), AWS_* creds.
 ENV FLASK_APP=app.py
-# Single-runner scheduler by default: with WEB_CONCURRENCY=1 (Render free) the one
-# worker runs the scheduler. If you scale to multiple workers, set RUN_SCHEDULER=0
-# here and run the scheduler in a separate 1-instance service.
+# Single-runner scheduler by default: with a single worker and no separate
+# scheduler service, this one process runs it. This default only applies when
+# nothing overrides it (e.g. a bare `docker run`) -- render.yaml explicitly
+# sets RUN_SCHEDULER=0 on the multi-worker web service and 1 on the dedicated
+# servicesbills-scheduler worker (see render.yaml and DEPLOY.md's "Scheduler
+# at scale"). Do not run this image with WEB_CONCURRENCY>1 AND
+# RUN_SCHEDULER=1 at the same time: with no --preload, every forked gunicorn
+# worker imports this module and starts its own scheduler, independently
+# firing every daily job.
 ENV RUN_SCHEDULER=1
 # Startup: apply DB migrations, then serve. Binds Render's $PORT (falls back 8000)
 # and uses WEB_CONCURRENCY workers (Render sets this; falls back 1). This runs

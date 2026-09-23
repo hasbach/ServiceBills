@@ -108,11 +108,29 @@ the Dockerfile, set the env vars, override the start command to run
 ## Scheduler at scale
 
 APScheduler runs **in-process**, so with multiple web workers it would fire the daily
-jobs once per worker. The starter blueprint uses **one** web worker with
-`RUN_SCHEDULER=1` (fires once). To scale the web tier:
-- Set the web service `RUN_SCHEDULER=0` and raise `-w`.
-- Add a **1-instance worker** service from the same image with `RUN_SCHEDULER=1`
-  (command `gunicorn -w 1 app:app` — it just needs to stay alive).
+jobs once per worker -- and since `flask db upgrade` (which runs ahead of gunicorn on
+every deploy) imports `app.py` too, `RUN_SCHEDULER=1` there fires it a third way,
+uncoordinated with either. This isn't hypothetical: this exact combination once
+produced a deploy that hung for minutes with no log output (stuck on a Postgres row
+lock held by an overlapping fire) and, on the retry, the same job running four times
+in ~100 seconds.
+
+render.yaml implements the fix already:
+- `servicesbills-web` (the multi-worker tier) has `RUN_SCHEDULER=0`.
+- `servicesbills-scheduler` is a separate, single-instance worker service running
+  `gunicorn -w 1 app:app` (no `flask db upgrade`/`create-superadmin` -- the web
+  service's own deploy already did both against the same database) with
+  `RUN_SCHEDULER=1`. It is the only process anywhere that should ever have this set.
+- Every scheduled job body also runs through `_run_scheduled_job` (app.py), which
+  takes a Postgres advisory lock before running and skips instantly if it can't get
+  it. This is defense-in-depth for the two windows service topology alone can't fully
+  close: the scheduler worker's own deploy handoff (old and new instance briefly both
+  alive), and anyone re-running `flask db upgrade` locally/manually without first
+  setting `RUN_SCHEDULER=0`.
+
+If you add further scaling (e.g. more than one instance of the web tier), the same
+rule applies: `RUN_SCHEDULER=1` belongs on exactly one always-on process, never on
+anything that runs with `WEB_CONCURRENCY>1` or that also runs migrations.
 
 ## Notes
 - HTTPS/custom domain: configure on the host; then set `APP_BASE_URL`/`CORS_ORIGINS`
