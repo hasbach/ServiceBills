@@ -3,7 +3,7 @@ import {
     Button, AppBar, Toolbar, Typography, Box, CircularProgress,
     Snackbar, Alert, IconButton, Drawer, List, ListItem, ListItemButton,
     ListItemIcon, ListItemText, Divider, alpha, useTheme, useMediaQuery, Chip,
-    ThemeProvider, CssBaseline, Fab, Zoom, useScrollTrigger
+    ThemeProvider, CssBaseline, Fab, Zoom, useScrollTrigger, Badge
 } from '@mui/material';
 import { BrowserRouter, useLocation } from 'react-router-dom';
 import theme from './theme';
@@ -153,6 +153,37 @@ const MainApp = ({
     const [currentView, setCurrentView] = useState(getDefaultView());
     const [drawerOpen, setDrawerOpen] = useState(false);
 
+    const [inboxOpenId, setInboxOpenId] = useState(() => {
+        const v = new URLSearchParams(window.location.search).get('inbox');
+        return v ? Number(v) : null;
+    });
+    const [inboxAttention, setInboxAttention] = useState(0);
+
+    useEffect(() => {
+        if (!hasRole('admin')) return undefined;
+        let cancelled = false;
+        const poll = () => apiService.fetchInboxSummary()
+            .then(r => { if (!cancelled) setInboxAttention(r.data.needs_attention || 0); })
+            .catch(() => {});
+        poll();
+        const i = setInterval(poll, 20000);
+        return () => { cancelled = true; clearInterval(i); };
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+    useEffect(() => {
+        if (!('serviceWorker' in navigator)) return undefined;
+        const onMessage = (event) => {
+            if (event.data?.type !== 'open-url') return;
+            const url = new URL(event.data.url, window.location.origin);
+            const view = url.searchParams.get('view');
+            if (view) setCurrentView(view);
+            if (event.data.conversationId) setInboxOpenId(Number(event.data.conversationId));
+            window.history.replaceState(null, '', url.pathname + url.search);
+        };
+        navigator.serviceWorker.addEventListener('message', onMessage);
+        return () => navigator.serviceWorker.removeEventListener('message', onMessage);
+    }, []);
+
     const navigate = (key) => {
         setCurrentView(key);
         setDrawerOpen(false);
@@ -185,7 +216,9 @@ const MainApp = ({
                         minWidth: 'auto',
                     }}
                 >
-                    {item.label}
+                    {item.key === 'messaging' && inboxAttention > 0
+                        ? <Badge color="error" badgeContent={inboxAttention} sx={{ '& .MuiBadge-badge': { right: -10 } }}>{item.label}</Badge>
+                        : item.label}
                 </Button>
             ))}
             <Button onClick={logout} startIcon={<LogoutIcon sx={{ fontSize: '1rem' }} />} size="small"
@@ -252,7 +285,7 @@ const MainApp = ({
                                                     {React.cloneElement(item.icon, { fontSize: 'small' })}
                                                 </ListItemIcon>
                                                 <ListItemText
-                                                    primary={item.label}
+                                                    primary={item.key === 'messaging' && inboxAttention > 0 ? `${item.label} (${inboxAttention})` : item.label}
                                                     primaryTypographyProps={{ fontSize: '0.88rem', fontWeight: active ? 700 : 500, color: active ? 'white' : 'rgba(255,255,255,0.75)' }}
                                                 />
                                                 {active && <ChevronRightIcon sx={{ fontSize: 18, color: 'rgba(255,255,255,0.7)' }} />}
@@ -297,7 +330,7 @@ const MainApp = ({
             case 'service': return <ServiceManagementView />;
             case 'enhanced-reports': return <EnhancedReportsView />;
             case 'subscription-plans': return <SubscriptionPlansView subscriptionPlans={subscriptionPlans} refetchSubscriptionPlans={refetchSubscriptionPlans} setSnackbar={setSnackbar} />;
-            case 'messaging': return hasRole('admin') ? <MessagingView /> : <Typography>Access Denied</Typography>;
+            case 'messaging': return hasRole('admin') ? <MessagingView openConversationId={inboxOpenId} /> : <Typography>Access Denied</Typography>;
             case 'settings': return hasRole('admin') ? <SettingsView businessSettings={businessSettings} setBusinessSettings={setBusinessSettings} setSnackbar={setSnackbar} /> : <Typography>Access Denied</Typography>;
             case 'cs-agent-voice': return hasRole('admin') ? <CSAgentVoiceTest /> : <Typography>Access Denied</Typography>;
             case 'billing': return hasRole('admin') ? <BillingView /> : <Typography>Access Denied</Typography>;

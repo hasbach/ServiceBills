@@ -11,12 +11,16 @@ import {
     Close as CloseIcon, ContentCopy as ContentCopyIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext';
+import InboxView from './inbox/InboxView';
+import Composer from './inbox/Composer';
+import InboxNotificationsControl from './inbox/InboxNotificationsControl';
 
-const MessagingView = () => {
+const MessagingView = ({ openConversationId = null }) => {
     const { apiService, setSnackbar } = useAppContext();
     const [loading, setLoading] = useState(false);
     const [activeTab, setActiveTab] = useState(0);
-    
+    useEffect(() => { if (openConversationId) setActiveTab(0); }, [openConversationId]);
+
     // Existing customer bulk messaging states
     const [audience, setAudience] = useState('all');
     const [eventType, setEventType] = useState('outage');
@@ -119,7 +123,7 @@ const MessagingView = () => {
         try {
             let payload = {};
 
-            if (activeTab === 0) {
+            if (activeTab === 1) {
                 const variables = {};
                 if (eventType === 'outage' || eventType === 'feature' || eventType === 'offer') {
                     variables.message = message;
@@ -169,8 +173,8 @@ const MessagingView = () => {
             if (response.data && response.data.report) {
                 setReportDialog({ open: true, data: response.data.report });
             }
-            
-            if (activeTab === 0) {
+
+            if (activeTab === 1) {
                 setMessage(eventType === 'outage' ? 'an outage occured from the isp , will be repaired soon' : '');
                 setLocation('');
                 setEstimatedTime('');
@@ -224,12 +228,18 @@ const MessagingView = () => {
                     onChange={(e, val) => setActiveTab(val)}
                     sx={{ borderBottom: 1, borderColor: 'divider', px: 3, pt: 1, bgcolor: 'rgba(0,0,0,0.01)' }}
                 >
+                    <Tab label="Inbox" sx={{ fontWeight: 700, fontSize: '0.95rem' }} />
                     <Tab label="Customer Notifications" sx={{ fontWeight: 700, fontSize: '0.95rem' }} />
                     <Tab label="Marketing Campaign (Custom / Non-Customers)" icon={<WhatsAppIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={{ fontWeight: 700, fontSize: '0.95rem' }} />
                 </Tabs>
 
+                {activeTab === 0 ? (
+                    <InboxView openConversationId={openConversationId}
+                        headerExtra={<InboxNotificationsControl />}
+                        renderComposer={(props) => <Composer key={props.conversation.id} {...props} />} />
+                ) : (
                 <Box sx={{ p: 4 }}>
-                    {activeTab === 0 ? (
+                    {activeTab === 1 ? (
                         <>
                             <Alert severity="info" sx={{ mb: 3, borderRadius: '12px' }}>
                                 Send automated notification alerts directly to your existing subscribers registered in servicesBills.
@@ -445,10 +455,11 @@ const MessagingView = () => {
                             disabled={loading}
                             sx={{ borderRadius: '12px', px: 5, py: 1.5, fontWeight: 700 }}
                         >
-                            {loading ? 'Sending...' : activeTab === 0 ? 'Send Customer Notification' : `Send Marketing Campaign (${validPhoneCount} Recipients)`}
+                            {loading ? 'Sending...' : activeTab === 1 ? 'Send Customer Notification' : `Send Marketing Campaign (${validPhoneCount} Recipients)`}
                         </Button>
                     </Box>
                 </Box>
+                )}
             </Paper>
 
             {/* Delivery Report Modal Dialog */}

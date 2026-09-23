@@ -46,6 +46,8 @@ import signal
 import sys
 import json
 import cs_agent_tools
+import functools
+import whatsapp_inbox
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager, verify_jwt_in_request
 try:
@@ -75,6 +77,8 @@ if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
                     VAPID_PUBLIC_KEY = line.split('=', 1)[1].strip()
     except Exception as e:
         print("Warning: Could not load VAPID keys.", e)
+
+VAPID_CLAIM_EMAIL = os.environ.get('VAPID_CLAIM_EMAIL', 'admin@example.com')
 
 # static_url_path is a parked prefix (NOT '/') so Flask's built-in static handler
 # doesn't shadow client-side routes like /login. The serve() catch-all below serves
@@ -1505,12 +1509,32 @@ class TicketLog(db.Model):
     timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     user = db.relationship('User', foreign_keys=[user_id])
 
+DEFAULT_PUSH_TOPICS = ('tickets', 'whatsapp_inbox')
+
+
 class PushSubscription(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     subscription_info = db.Column(db.Text, nullable=False) # JSON
+    # JSON list of topics this device wants (see DEFAULT_PUSH_TOPICS). NULL
+    # means "all topics" so every pre-existing subscription keeps getting
+    # ticket pushes and starts getting inbox pushes.
+    topics = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def topic_list(self):
+        try:
+            value = json.loads(self.topics) if self.topics else None
+        except ValueError:
+            value = None
+        return value if isinstance(value, list) else list(DEFAULT_PUSH_TOPICS)
+
+    def endpoint(self):
+        try:
+            return (json.loads(self.subscription_info) or {}).get('endpoint')
+        except (ValueError, AttributeError):
+            return None
 
 class ServiceOutage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -1696,6 +1720,112 @@ class CSAgentKnowledgeEntry(db.Model):
         }
 
 
+def _utc_stamp(dt):
+    return dt.strftime('%Y-%m-%d %H:%M:%S') if dt else None
+
+
+class WhatsAppConversation(db.Model):
+    """One WhatsApp chat (tenant x customer phone) for the admin inbox -- see
+    docs/superpowers/specs/2026-09-23-whatsapp-inbox-design.md."""
+    __tablename__ = 'whatsapp_conversation'
+    __table_args__ = (
+        db.UniqueConstraint('tenant_id', 'wa_phone', name='uq_whatsapp_conversation_tenant_phone'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    wa_phone = db.Column(db.String(20), nullable=False)
+    # SET NULL: deleting a customer must unlink, not block on, their chat.
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id', ondelete='SET NULL'), nullable=True)
+    contact_name = db.Column(db.String(120), nullable=True)
+    needs_attention = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    attention_reason = db.Column(db.String(30), nullable=True)
+    attention_since = db.Column(db.DateTime, nullable=True)
+    ai_paused = db.Column(db.Boolean, nullable=False, default=False)
+    ai_paused_at = db.Column(db.DateTime, nullable=True)
+    last_admin_reply_at = db.Column(db.DateTime, nullable=True)
+    last_inbound_at = db.Column(db.DateTime, nullable=True)
+    last_message_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    last_message_preview = db.Column(db.String(200), nullable=True)
+    unread_count = db.Column(db.Integer, nullable=False, default=0)
+    last_push_at = db.Column(db.DateTime, nullable=True)
+
+    customer = db.relationship('Customer', foreign_keys=[customer_id])
+
+    def to_dict(self):
+        window_expires = self.last_inbound_at + timedelta(hours=24) if self.last_inbound_at else None
+        return {
+            'id': self.id,
+            'wa_phone': self.wa_phone,
+            'contact_name': self.contact_name,
+            'customer_id': self.customer_id,
+            'customer_name': self.customer.name if self.customer else None,
+            'needs_attention': bool(self.needs_attention),
+            'attention_reason': self.attention_reason,
+            'attention_since': _utc_stamp(self.attention_since),
+            'ai_paused': bool(self.ai_paused),
+            'last_inbound_at': _utc_stamp(self.last_inbound_at),
+            'window_expires_at': _utc_stamp(window_expires),
+            'last_message_at': _utc_stamp(self.last_message_at),
+            'last_message_preview': self.last_message_preview,
+            'unread_count': self.unread_count or 0,
+        }
+
+
+class WhatsAppMessage(db.Model):
+    """One inbound or outbound WhatsApp message in an inbox conversation."""
+    __tablename__ = 'whatsapp_message'
+    __table_args__ = (
+        db.UniqueConstraint('tenant_id', 'wa_message_id', name='uq_whatsapp_message_tenant_wamid'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    conversation_id = db.Column(db.Integer, db.ForeignKey('whatsapp_conversation.id'), nullable=False, index=True)
+    direction = db.Column(db.String(3), nullable=False)          # 'in' | 'out'
+    sender = db.Column(db.String(10), nullable=False)            # 'customer' | 'ai' | 'admin' | 'system'
+    # SET NULL: deleting a staff account keeps the messages they sent.
+    sent_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
+    msg_type = db.Column(db.String(20), nullable=False)
+    text = db.Column(db.Text, nullable=True)
+    transcript = db.Column(db.Text, nullable=True)
+    wa_message_id = db.Column(db.String(128), nullable=True)
+    reply_to_wa_message_id = db.Column(db.String(128), nullable=True)
+    reaction_emoji = db.Column(db.String(16), nullable=True)
+    reaction_target_wa_id = db.Column(db.String(128), nullable=True)
+    wa_media_id = db.Column(db.String(128), nullable=True)
+    media_key = db.Column(db.String(300), nullable=True)
+    media_playback_key = db.Column(db.String(300), nullable=True)
+    media_mime = db.Column(db.String(80), nullable=True)
+    media_status = db.Column(db.String(10), nullable=False, default='none')
+    status = db.Column(db.String(12), nullable=False, default='received')
+    error_code = db.Column(db.String(20), nullable=True)
+    error_message = db.Column(db.String(300), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    sent_by = db.relationship('User', foreign_keys=[sent_by_user_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'direction': self.direction,
+            'sender': self.sender,
+            'sent_by': self.sent_by.username if self.sent_by else None,
+            'msg_type': self.msg_type,
+            'text': self.text,
+            'transcript': self.transcript,
+            'wa_message_id': self.wa_message_id,
+            'reply_to_wa_message_id': self.reply_to_wa_message_id,
+            'reaction_emoji': self.reaction_emoji,
+            'reaction_target_wa_id': self.reaction_target_wa_id,
+            'media_status': self.media_status,
+            'media_mime': self.media_mime,
+            'has_playback': bool(self.media_playback_key),
+            'status': self.status,
+            'error_code': self.error_code,
+            'error_message': self.error_message,
+            'created_at': _utc_stamp(self.created_at),
+        }
+
+
 class BillingPaymentAttempt(db.Model):
     """One Whish checkout attempt for a Pro-plan payment. Whish's API has no
     subscription/order object to query later -- this table is our own record
@@ -1775,6 +1905,7 @@ TENANT_OWNED_MODELS = (
     UpstreamProvider, UpstreamProviderPayment,
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
+    WhatsAppConversation, WhatsAppMessage,
 )
 
 from sqlalchemy import event as _sa_event
@@ -2593,7 +2724,12 @@ _TENANT_DELETE_ORDER = [
     NetworkWriteAudit,
     UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
     CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment,
-    Expense, Customer, ServiceOutage, PushSubscription, BusinessSettings,
+    # WhatsAppMessage holds an FK to whatsapp_conversation, and
+    # WhatsAppConversation holds an FK to customer, so both must be deleted
+    # before Customer -- message before conversation -- or a tenant delete
+    # raises ForeignKeyViolation on Postgres (SQLite doesn't enforce FKs, so
+    # the gap would be invisible there).
+    Expense, WhatsAppMessage, WhatsAppConversation, Customer, ServiceOutage, PushSubscription, BusinessSettings,
     WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
     # NetworkDevice arrived on the network-topology branch, so origin/main's
@@ -2701,7 +2837,11 @@ def delete_user(user_id):
     current_username = get_jwt_identity()
     if user.username == current_username:
         return jsonify({"msg": "Cannot delete your own account"}), 400
-            
+
+    # Keep inbox messages this admin sent; just drop the author link (the FK
+    # is ondelete='SET NULL' too -- this also covers SQLite in tests).
+    WhatsAppMessage.query.filter_by(sent_by_user_id=user.id).update(
+        {'sent_by_user_id': None}, synchronize_session=False)
     db.session.delete(user)
     db.session.commit()
     return jsonify({"msg": "User deleted successfully"}), 200
@@ -4179,6 +4319,12 @@ def update_customer(customer_id):
 def _delete_customer_core(customer):
     """Delete one customer (cascade handles related records). Caller commits
     and triggers recalculate_estimated_profit."""
+    # The inbox conversation outlives the customer: unlink it explicitly (the
+    # FK's ondelete='SET NULL' covers Postgres; this also covers SQLite, which
+    # doesn't enforce FKs by default, and keeps the ORM from ever issuing a
+    # DELETE that the constraint would reject).
+    WhatsAppConversation.query.filter_by(customer_id=customer.id).update(
+        {'customer_id': None}, synchronize_session=False)
     db.session.delete(customer)
 
 
@@ -7387,51 +7533,138 @@ def update_service_status(customer_id):
     db.session.commit()
     return jsonify({'message': 'Service status updated successfully'})
 
-def send_push_notification(payload_dict):
+def _webpush_one(sub, payload_dict):
+    """Send one push; prune the subscription when the push service says it's gone."""
+    try:
+        webpush(
+            subscription_info=json.loads(sub.subscription_info),
+            data=json.dumps(payload_dict),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims={"sub": f"mailto:{VAPID_CLAIM_EMAIL}"},
+            # Never hang a caller on a slow push service (pywebpush defaults to
+            # no timeout), and let the push service hold an undelivered
+            # notification for a day instead of dropping it (default ttl=0).
+            timeout=10,
+            ttl=86400,
+        )
+        return True
+    except Exception as e:
+        print(f"Failed to send push to user {sub.user_id}:", e)
+        if "410" in str(e) or "404" in str(e):
+            db.session.delete(sub)
+            db.session.commit()
+        return False
+
+
+def _user_has_any_role(user, roles):
+    wanted = {r.lower() for r in roles}
+    return bool(wanted & {r.strip().lower() for r in (user.role or '').split(',')})
+
+
+def send_push_notification(payload_dict, tenant_id=None, roles=None, topic=None):
+    """Push to a tenant's subscriptions. tenant_id defaults to the request's
+    JWT tenant (so the webhook/scheduler, which have no JWT, pass it
+    explicitly); roles limits to users holding any of them; topic limits to
+    subscriptions that opted into it. Returns how many pushes went out."""
     if not VAPID_PRIVATE_KEY:
         print("Push notification failed: VAPID keys not configured.")
-        return
-        
-    subs = tenant_query(PushSubscription).all()
-    for sub in subs:
-        try:
-            sub_info = json.loads(sub.subscription_info)
-            webpush(
-                subscription_info=sub_info,
-                data=json.dumps(payload_dict),
-                vapid_private_key=VAPID_PRIVATE_KEY,
-                vapid_claims={"sub": "mailto:admin@example.com"}
-            )
-        except Exception as e:
-            print(f"Failed to send push to user {sub.user_id}:", e)
-            # Optionally remove invalid subscriptions
-            if "410 Gone" in str(e) or "404 Not Found" in str(e):
-                db.session.delete(sub)
-                db.session.commit()
+        return 0
+    tid = tenant_id if tenant_id is not None else current_tenant_id()
+    q = PushSubscription.query.filter_by(tenant_id=tid)
+    if roles:
+        user_ids = [u.id for u in User.query.filter_by(tenant_id=tid).all() if _user_has_any_role(u, roles)]
+        if not user_ids:
+            return 0
+        q = q.filter(PushSubscription.user_id.in_(user_ids))
+    sent = 0
+    for sub in q.all():
+        if topic and topic not in sub.topic_list():
+            continue
+        if _webpush_one(sub, payload_dict):
+            sent += 1
+    return sent
+
+
+def _current_user():
+    return User.query.filter_by(username=get_jwt_identity()).first()
+
+
+def _my_subscription(user, endpoint):
+    if not endpoint:
+        return None
+    for sub in tenant_query(PushSubscription).filter_by(user_id=user.id).all():
+        if sub.endpoint() == endpoint:
+            return sub
+    return None
+
 
 @app.route('/api/vapid-public-key', methods=['GET'])
 def get_vapid_public_key():
     return jsonify({"public_key": VAPID_PUBLIC_KEY})
 
+
 @app.route('/api/push-subscribe', methods=['POST'])
 @jwt_required()
 def push_subscribe():
-    data = request.json
-    current_username = get_jwt_identity()
-    user = User.query.filter_by(username=current_username).first()
+    data = request.json or {}
+    user = _current_user()
     if not user:
         return jsonify({"msg": "User not found"}), 404
-        
-    sub_info_str = json.dumps(data.get('subscription'))
-    
-    # Check if this exact subscription already exists for this user
-    existing = tenant_query(PushSubscription).filter_by(user_id=user.id, subscription_info=sub_info_str).first()
-    if not existing:
-        new_sub = PushSubscription(user_id=user.id, subscription_info=sub_info_str)
-        db.session.add(new_sub)
-        db.session.commit()
-        
+    subscription = data.get('subscription') or {}
+    existing = _my_subscription(user, subscription.get('endpoint'))
+    if existing:
+        existing.subscription_info = json.dumps(subscription)  # keys may rotate
+    else:
+        db.session.add(PushSubscription(user_id=user.id, subscription_info=json.dumps(subscription)))
+    db.session.commit()
     return jsonify({"msg": "Subscribed successfully"}), 200
+
+
+@app.route('/api/push-unsubscribe', methods=['POST'])
+@jwt_required()
+def push_unsubscribe():
+    user = _current_user()
+    sub = _my_subscription(user, (request.json or {}).get('endpoint')) if user else None
+    if sub:
+        db.session.delete(sub)
+        db.session.commit()
+    return jsonify({"msg": "Unsubscribed"}), 200
+
+
+@app.route('/api/push-subscription/topics', methods=['GET', 'PUT'])
+@jwt_required()
+def push_subscription_topics():
+    user = _current_user()
+    if not user:
+        return jsonify({"msg": "User not found"}), 404
+    if request.method == 'GET':
+        sub = _my_subscription(user, request.args.get('endpoint'))
+        return jsonify({"subscribed": bool(sub), "topics": sub.topic_list() if sub else []})
+    data = request.json or {}
+    topics = data.get('topics')
+    if not isinstance(topics, list) or any(t not in DEFAULT_PUSH_TOPICS for t in topics):
+        return jsonify({"msg": f"topics must be a list drawn from {list(DEFAULT_PUSH_TOPICS)}"}), 400
+    sub = _my_subscription(user, data.get('endpoint'))
+    if not sub:
+        return jsonify({"msg": "This device is not subscribed"}), 404
+    sub.topics = json.dumps(topics)
+    db.session.commit()
+    return jsonify({"subscribed": True, "topics": sub.topic_list()})
+
+
+@app.route('/api/push-test', methods=['POST'])
+@jwt_required()
+def push_test():
+    user = _current_user()
+    sub = _my_subscription(user, (request.json or {}).get('endpoint')) if user else None
+    if not sub:
+        return jsonify({"msg": "This device is not subscribed"}), 404
+    if not VAPID_PRIVATE_KEY:
+        return jsonify({"msg": "Push is not configured on the server"}), 503
+    ok = _webpush_one(sub, {"title": "Test notification", "body": "Notifications are working on this device.",
+                            "tag": "push-test", "url": "/?view=messaging"})
+    return (jsonify({"msg": "Sent"}), 200) if ok else (jsonify({"msg": "Push service rejected the message"}), 502)
+
 
 @app.route('/api/support-tickets', methods=['POST'])
 @jwt_required()
@@ -7470,7 +7703,7 @@ def create_support_ticket():
             "body": f"{data['title']} (Priority: {data['priority']})",
             "url": "/?view=service"
         }
-        send_push_notification(payload)
+        send_push_notification(payload, topic='tickets')
     except Exception as e:
         print("Push notification error:", e)
 
@@ -8032,18 +8265,41 @@ def whatsapp_webhook():
                     # Delivery/read/failure receipts for messages WE sent (e.g. the forwarded
                     # alert to forwarding_mobile). Meta reports these separately from inbound
                     # "messages" -- log them so a silent delivery failure is diagnosable.
+                    _appmod = sys.modules[__name__]
                     for st in val.get('statuses', []):
                         st_status = st.get('status')
                         st_recipient = st.get('recipient_id')
                         if st_status == 'failed':
-                            errors = st.get('errors', [])
-                            logging.warning(f"WhatsApp message to {st_recipient} FAILED: {errors}")
+                            logging.warning(f"WhatsApp message to {st_recipient} FAILED: {st.get('errors', [])}")
                         else:
                             logging.info(f"WhatsApp message status update: to={st_recipient} status={st_status}")
+                        try:
+                            _st_msg, _st_flagged = whatsapp_inbox.apply_status(_appmod, resolved_tenant_id, st)
+                            db.session.commit()
+                            if _st_flagged is not None:
+                                # Push off the request path: reload by id in the task's own session.
+                                def _notify_status(conv_id=_st_flagged.id, appmod=_appmod):
+                                    c = appmod.db.session.get(appmod.WhatsAppConversation, conv_id)
+                                    if c is not None:
+                                        whatsapp_inbox.notify_conversation(appmod, c)
+                                whatsapp_inbox.run_background(app, _notify_status, pool=whatsapp_inbox.media_pool())
+                        except Exception as ex_st:
+                            db.session.rollback()
+                            logging.warning(f"WhatsApp inbox: could not apply status {st.get('id')}: {ex_st}")
 
                     for msg in messages:
                         sender_phone = msg.get('from', '')
                         msg_type = msg.get('type', '')
+                        wamid = msg.get('id')
+                        try:
+                            _is_dup = bool(wamid) and whatsapp_inbox.is_duplicate(_appmod, resolved_tenant_id, wamid)
+                        except Exception as ex_dup:
+                            db.session.rollback()
+                            _is_dup = False
+                            logging.warning(f"WhatsApp inbox: duplicate check failed for {wamid}; treating as new: {ex_dup}")
+                        if _is_dup:
+                            logging.info(f"WhatsApp webhook: duplicate delivery of {wamid}; skipping.")
+                            continue
                         msg_text = ''
                         media_payload = None
                         
@@ -8093,6 +8349,43 @@ def whatsapp_webhook():
                         if cust_obj:
                             cust_name = cust_obj.name or cust_name
 
+                        is_forwarding_mobile_reply = bool(
+                            settings and settings.forwarding_mobile and
+                            normalize_whatsapp_phone(settings.forwarding_mobile) == sender_phone
+                        )
+
+                        # --- Admin inbox persistence (before the AI, so nothing is lost) ---
+                        inbox_conv = inbox_msg = None
+                        if not is_forwarding_mobile_reply:
+                            try:
+                                _profile = contacts[0].get('profile', {}).get('name') if contacts else None
+                                inbox_conv = whatsapp_inbox.upsert_conversation(_appmod, resolved_tenant_id, sender_phone, _profile)
+                                inbox_msg = whatsapp_inbox.record_inbound(
+                                    _appmod, resolved_tenant_id, inbox_conv, whatsapp_inbox.parse_inbound(msg))
+                                db.session.commit()
+                            except Exception as ex_inbox:
+                                db.session.rollback()
+                                inbox_conv = inbox_msg = None
+                                _race_dup = False
+                                if isinstance(ex_inbox, IntegrityError) and wamid:
+                                    try:
+                                        _race_dup = whatsapp_inbox.is_duplicate(_appmod, resolved_tenant_id, wamid)
+                                    except Exception:
+                                        db.session.rollback()
+                                if _race_dup:
+                                    logging.info(f"WhatsApp webhook: duplicate delivery (race) of {wamid}; skipping.")
+                                    continue
+                                logging.error(f"WhatsApp inbox: could not persist inbound {wamid}: {ex_inbox}")
+                        try:
+                            if inbox_msg is not None and inbox_msg.wa_media_id and settings.access_token:
+                                whatsapp_inbox.run_background(app, functools.partial(
+                                    whatsapp_inbox.store_inbound_media, _appmod, inbox_msg.id,
+                                    settings.access_token, settings.api_version or 'v19.0'),
+                                    pool=whatsapp_inbox.media_pool())
+                        except Exception as ex_media:
+                            db.session.rollback()
+                            logging.warning(f"WhatsApp inbox: could not schedule media download for {wamid}: {ex_media}")
+
                         # If voice note or audio, transcribe with ElevenLabs STT
                         if msg_type in ['audio', 'voice'] and media_payload and settings and settings.access_token:
                             try:
@@ -8103,6 +8396,13 @@ def whatsapp_webhook():
                                     )
                                     if transcript:
                                         msg_text = f"[رسالة صوتية]: {transcript}"
+                                        if inbox_msg is not None:
+                                            try:
+                                                inbox_msg.transcript = transcript
+                                                db.session.commit()
+                                            except Exception as ex_tx:
+                                                db.session.rollback()
+                                                logging.warning(f"WhatsApp inbox: could not save transcript for {wamid}: {ex_tx}")
                                         logging.info(f"Transcribed WhatsApp audio for {cust_name} (+{sender_phone}): {transcript}")
                             except Exception as ex_tr:
                                 logging.warning(f"Error transcribing WhatsApp voice note: {ex_tr}")
@@ -8116,18 +8416,39 @@ def whatsapp_webhook():
                         # 24h customer-initiated session window has lapsed.
 
                         # 2. Check if CS Agent is active for this tenant
-                        is_forwarding_mobile_reply = bool(
-                            settings and settings.forwarding_mobile and
-                            normalize_whatsapp_phone(settings.forwarding_mobile) == sender_phone
-                        )
                         cs_agent_active = False
                         if settings and settings.access_token and settings.phone_number_id:
                             cs_settings = CSAgentSettings.query.filter_by(tenant_id=resolved_tenant_id).first()
                             if cs_settings is None or cs_settings.is_active:
                                 cs_agent_active = True
 
+                        ai_will_run = bool(cs_agent_active and getattr(settings, 'auto_reply_enabled', True))
+                        ai_paused = False
+                        if inbox_conv is not None:
+                            try:
+                                whatsapp_inbox.maybe_auto_resume(inbox_conv)
+                                ai_paused = bool(inbox_conv.ai_paused)
+                                reason = whatsapp_inbox.inbound_attention_reason(
+                                    ai_paused=ai_paused, ai_will_run=ai_will_run,
+                                    has_customer=cust_obj is not None,
+                                    msg_type=inbox_msg.msg_type if inbox_msg is not None else 'text')
+                                if reason:
+                                    whatsapp_inbox.flag_attention(inbox_conv, reason)
+                                db.session.commit()
+                                if inbox_conv.needs_attention:
+                                    # Push off the request path (and before the AI is spawned):
+                                    # reload by id in the task's own session.
+                                    def _notify_inbound(conv_id=inbox_conv.id, appmod=_appmod):
+                                        c = appmod.db.session.get(appmod.WhatsAppConversation, conv_id)
+                                        if c is not None:
+                                            whatsapp_inbox.notify_conversation(appmod, c)
+                                    whatsapp_inbox.run_background(app, _notify_inbound, pool=whatsapp_inbox.media_pool())
+                            except Exception as ex_flag:
+                                db.session.rollback()
+                                logging.error(f"WhatsApp inbox: could not flag conversation for {wamid}: {ex_flag}")
+
                         ticket = None
-                        if cs_agent_active and getattr(settings, 'auto_reply_enabled', True) and not is_forwarding_mobile_reply:
+                        if ai_will_run and not is_forwarding_mobile_reply and not ai_paused:
                             # 3a. CS AI Agent handles the message autonomously.
                             # IMPORTANT: spawn as a background greenlet so the webhook returns 200 OK
                             # immediately. WhatsApp retries the webhook if it doesn't get a 200 within
@@ -8139,43 +8460,39 @@ def whatsapp_webhook():
                                 _appmod = sys.modules[__name__]
                                 _tenant_id = resolved_tenant_id
                                 _sender = sender_phone
-                                _cust = cust_obj
+                                # Primitives only: the greenlet runs in its own app context
+                                # (own session) after this request's session is removed, so
+                                # ORM objects from here would be expired + detached there.
+                                _customer_id = cust_obj.id if cust_obj else None
                                 _text = msg_text
                                 _is_voice = bool(msg_type in ['audio', 'voice'])
-                                _settings = settings
+                                _settings_id = settings.id
 
-                                def _run_ai_reply_with_ctx(
-                                    flask_app=_flask_app, appmod=_appmod,
-                                    tenant_id=_tenant_id, sender=_sender,
-                                    cust=_cust, text=_text,
-                                    is_voice=_is_voice, stgs=_settings
+                                def _run_ai_reply(
+                                    appmod=_appmod, tenant_id=_tenant_id, sender=_sender,
+                                    customer_id=_customer_id, text=_text, is_voice=_is_voice,
+                                    settings_id=_settings_id
                                 ):
-                                    with flask_app.app_context():
-                                        cs_agent_tools.handle_whatsapp_cs_ai_reply(
-                                            appmod=appmod,
-                                            tenant_id=tenant_id,
-                                            sender_phone=sender,
-                                            customer=cust,
-                                            incoming_text=text,
-                                            is_voice=is_voice,
-                                            settings=stgs,
-                                            ticket=None
-                                        )
+                                    try:
+                                        stgs = appmod.db.session.get(appmod.WhatsAppSettings, settings_id)
+                                        cust = (appmod.db.session.get(appmod.Customer, customer_id)
+                                                if customer_id is not None else None)
+                                        result = cs_agent_tools.handle_whatsapp_cs_ai_reply(
+                                            appmod=appmod, tenant_id=tenant_id, sender_phone=sender,
+                                            customer=cust, incoming_text=text, is_voice=is_voice,
+                                            settings=stgs, ticket=None)
+                                    except Exception:
+                                        logging.exception("CS AI reply crashed")
+                                        appmod.db.session.rollback()
+                                        result = None
+                                    whatsapp_inbox.after_ai_reply(appmod, tenant_id, sender, result)
 
-                                # Spawn through the bounded pool rather than a bare gevent.spawn():
-                                # this caps how many AI-reply greenlets (and their DB connections /
-                                # ElevenLabs sessions) can run concurrently. If the pool is already
-                                # at capacity, .spawn() cooperatively waits for a free slot -- it
-                                # only delays *this* webhook's 200 OK, not other in-flight requests.
-                                if AI_REPLY_GREENLET_POOL is not None:
-                                    AI_REPLY_GREENLET_POOL.spawn(_run_ai_reply_with_ctx)
-                                elif gevent is not None:
-                                    gevent.spawn(_run_ai_reply_with_ctx)
-                                else:
-                                    _run_ai_reply_with_ctx()
+                                # Bounded pool (see AI_REPLY_GREENLET_POOL); run_background pushes the
+                                # app context the greenlet needs, or runs inline under tests.
+                                whatsapp_inbox.run_background(_flask_app, _run_ai_reply, pool=AI_REPLY_GREENLET_POOL)
                             except Exception as ex_ai:
                                 logging.error(f"Error spawning CS AI reply greenlet: {ex_ai}")
-                        elif not is_forwarding_mobile_reply:
+                        elif not is_forwarding_mobile_reply and not ai_paused:
                             # 3b. CS Agent is inactive/disabled: create support ticket for human staff follow-up
                             if cust_obj:
                                 try:
@@ -8226,6 +8543,16 @@ def whatsapp_webhook():
                                         res_rep = requests.post(url_reply, json=payload_reply, headers=headers_reply, timeout=10)
                                         if res_rep.ok:
                                             logging.info(f"Sent fallback canned reply to +{sender_phone}.")
+                                            if inbox_conv is not None:
+                                                try:
+                                                    _w = ((res_rep.json() or {}).get('messages') or [{}])[0].get('id')
+                                                    whatsapp_inbox.record_outbound(
+                                                        _appmod, inbox_conv, sender='system', msg_type='text',
+                                                        text=reply_text, wa_message_id=_w)
+                                                    db.session.commit()
+                                                except Exception as ex_rec:
+                                                    db.session.rollback()
+                                                    logging.warning(f"WhatsApp inbox: could not record canned reply: {ex_rec}")
                                         else:
                                             logging.warning(f"Could not send fallback canned reply to +{sender_phone}: {res_rep.text}")
                                     except Exception as ex_rep:
@@ -8236,6 +8563,9 @@ def whatsapp_webhook():
             traceback.print_exc()
 
         return jsonify({'status': 'ok'}), 200
+
+import whatsapp_inbox_routes
+whatsapp_inbox_routes.register_inbox_routes(app, sys.modules[__name__])
 
 @app.route('/api/reports/revenue', methods=['GET'])
 @jwt_required()

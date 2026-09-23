@@ -26,3 +26,4 @@ websocket-client
 gevent
 psycogreen
 google-genai
+Pillow
