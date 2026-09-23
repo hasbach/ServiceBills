@@ -13,6 +13,7 @@ import {
 import { useAppContext } from '../context/AppContext';
 import InboxView from './inbox/InboxView';
 import Composer from './inbox/Composer';
+import InboxNotificationsControl from './inbox/InboxNotificationsControl';
 
 const MessagingView = ({ openConversationId = null }) => {
     const { apiService, setSnackbar } = useAppContext();
@@ -234,6 +235,7 @@ const MessagingView = ({ openConversationId = null }) => {
 
                 {activeTab === 0 ? (
                     <InboxView openConversationId={openConversationId}
+                        headerExtra={<InboxNotificationsControl />}
                         renderComposer={(props) => <Composer key={props.conversation.id} {...props} />} />
                 ) : (
                 <Box sx={{ p: 4 }}>
