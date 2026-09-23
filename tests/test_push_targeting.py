@@ -80,6 +80,26 @@ def test_notify_conversation_throttles(app, client, monkeypatch):
     assert kw == {"tenant_id": tid, "roles": ["admin"], "topic": "whatsapp_inbox"}
 
 
+def test_notify_conversation_never_raises_on_db_error(app, client, monkeypatch):
+    make_tenant(client, "Biz DBError", "db_error_admin")
+    with app.app_context():
+        tid = appmod.User.query.filter_by(username="db_error_admin").first().tenant_id
+        conv = wi.upsert_conversation(appmod, tid, "96170999999", "TestContact")
+        wi.flag_attention(conv, "ai_failed")
+        conv.last_message_preview = "test message"
+        appmod.db.session.commit()
+
+        # Monkeypatch commit to raise RuntimeError
+        def patched_commit():
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(appmod.db.session, "commit", patched_commit)
+
+        # notify_conversation should return False without raising
+        result = wi.notify_conversation(appmod, conv)
+        assert result is False
+
+
 def test_topics_routes_and_unsubscribe(app, client, monkeypatch):
     hdr = make_tenant(client, "Biz Top", "top_admin")
     sub = {"endpoint": "https://e/dev1", "keys": {"p256dh": "x", "auth": "y"}}

@@ -287,19 +287,21 @@ def notify_conversation(appmod, conv, body=None, now=None):
     now = now or _now()
     if conv.last_push_at and now - conv.last_push_at < PUSH_THROTTLE:
         return False
-    conv.last_push_at = now
-    appmod.db.session.commit()
-    title = (conv.customer.name if conv.customer_id and conv.customer else None) or conv.contact_name or f"+{conv.wa_phone}"
-    if body is None:
-        label = REASON_LABELS.get(conv.attention_reason, 'New WhatsApp message')
-        preview = conv.last_message_preview or ''
-        body = f"{label}: {preview}" if preview else label
-    payload = {'title': title, 'body': body[:180], 'tag': f"wa-conv-{conv.id}",
-               'url': f"/?view=messaging&inbox={conv.id}", 'conversation_id': conv.id}
     try:
+        conv.last_push_at = now
+        appmod.db.session.commit()
+        title = (conv.customer.name if conv.customer_id and conv.customer else None) or conv.contact_name or f"+{conv.wa_phone}"
+        if body is None:
+            label = REASON_LABELS.get(conv.attention_reason, 'New WhatsApp message')
+            preview = conv.last_message_preview or ''
+            body = f"{label}: {preview}" if preview else label
+        payload = {'title': title, 'body': body[:180], 'tag': f"wa-conv-{conv.id}",
+                   'url': f"/?view=messaging&inbox={conv.id}", 'conversation_id': conv.id}
         appmod.send_push_notification(payload, tenant_id=conv.tenant_id, roles=['admin'], topic='whatsapp_inbox')
     except Exception:
+        appmod.db.session.rollback()
         logging.exception("whatsapp_inbox push failed")
+        return False
     return True
 
 
