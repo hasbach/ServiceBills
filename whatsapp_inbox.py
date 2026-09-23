@@ -380,9 +380,23 @@ def flag_attention_for_phone(appmod, tenant_id, phone, reason):
     return conv
 
 
-def record_ai_reply(appmod, tenant_id, wa_phone, *, reply_text, text_wamid, text_ok, text_error, voice_result):
+def _store_ai_voice(tenant_id, voice_audio):
+    """Save the AI's TTS voice reply (mp3) so admins can play it. Best effort:
+    a storage failure returns None and the row is still recorded without audio."""
+    if not voice_audio:
+        return None
+    try:
+        return storage.save_bytes(voice_audio, tenant_id, 'ai-voice.mp3', 'audio/mpeg')
+    except Exception:
+        logging.exception("whatsapp_inbox: could not store AI voice reply audio")
+        return None
+
+
+def record_ai_reply(appmod, tenant_id, wa_phone, *, reply_text, text_wamid, text_ok, text_error, voice_result,
+                    voice_audio=None):
     """Record what the AI actually sent. Returns True when the text send failed
-    (the conversation is then flagged send_failed). Commits; never raises."""
+    (the conversation is then flagged send_failed). voice_audio is the TTS mp3
+    that was sent as the voice reply, stored for playback. Commits; never raises."""
     try:
         conv = upsert_conversation(appmod, tenant_id, wa_phone)
         record_outbound(appmod, conv, sender='ai', msg_type='text', text=reply_text,
@@ -390,8 +404,10 @@ def record_ai_reply(appmod, tenant_id, wa_phone, *, reply_text, text_wamid, text
                         status='sent' if text_ok else 'failed',
                         error_code=(text_error or {}).get('code'), error_message=(text_error or {}).get('message'))
         if voice_result:
+            media_key = _store_ai_voice(tenant_id, voice_audio)
             record_outbound(appmod, conv, sender='ai', msg_type='audio', transcript=reply_text,
-                            wa_message_id=voice_result if isinstance(voice_result, str) else None)
+                            wa_message_id=voice_result if isinstance(voice_result, str) else None,
+                            media_key=media_key, media_mime='audio/mpeg' if media_key else None)
         if not text_ok:
             flag_attention(conv, 'send_failed')
         appmod.db.session.commit()

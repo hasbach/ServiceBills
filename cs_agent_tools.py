@@ -2375,6 +2375,7 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
 
     # 2. If customer sent voice note, try to respond with voice note too (if ElevenLabs TTS available)
     voice_result = None
+    tts_audio = None
     if is_voice:
         try:
             tts_audio = synthesize_speech_elevenlabs(reply_text, agent_id=target_agent_id)
@@ -2475,7 +2476,8 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     import whatsapp_inbox  # lazy: whatsapp_inbox imports this module lazily too
     ai_result['inbox_send_failed'] = whatsapp_inbox.record_ai_reply(
         appmod, tenant_id, sender_phone, reply_text=reply_text, text_wamid=text_wamid,
-        text_ok=text_ok, text_error=text_error, voice_result=voice_result)
+        text_ok=text_ok, text_error=text_error, voice_result=voice_result,
+        voice_audio=tts_audio if voice_result else None)
 
     return ai_result
 
