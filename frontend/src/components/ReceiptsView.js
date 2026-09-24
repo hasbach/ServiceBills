@@ -286,7 +286,7 @@ const ReceiptsView = () => {
                             <span>العنوان: ${escapeHtml(data.customer_address)}</span>
                             <span>الهاتف: ${escapeHtml(data.customer_phone)}</span>
                             <span>تاريخ الإيصال: ${escapeHtml(data.payment_date)}</span>
-                            <span>الدفعة الشهرية: ${escapeHtml(data.subscription_plan_details.price)}$ - الخدمة: ${escapeHtml(data.subscription_plan_details.name)}</span>
+                            <span>الدفعة الشهرية: ${escapeHtml((data.subscription_plan_details?.price ?? 0))}$ - الخدمة: ${escapeHtml((data.subscription_plan_details?.name ?? ''))}</span>
                             <span>عن شهر: ${arabicMonthYear}</span>
                             <span>الرصيد الحالي: ${currentBalance}$ - الرصيد السابق: ${previousBalance}$</span>
                         </div>
@@ -296,7 +296,7 @@ const ReceiptsView = () => {
                             <span>الإسم: ${escapeHtml(data.customer_name)}</span>
                             <span>العنوان: ${escapeHtml(data.customer_address)}</span>
                             <span>الهاتف: ${escapeHtml(data.customer_phone)}</span>
-                            <span>الدفعة الشهرية: ${escapeHtml(data.subscription_plan_details.price)}$</span>
+                            <span>الدفعة الشهرية: ${escapeHtml((data.subscription_plan_details?.price ?? 0))}$</span>
                             <span>عن شهر: ${arabicMonthYear}</span>
                             <span>الرصيد الحالي: ${currentBalance}$</span>
                             <span>الرصيد السابق: ${previousBalance}$</span>

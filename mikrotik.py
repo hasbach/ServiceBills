@@ -43,7 +43,7 @@ def _connect(server):
         host=server.host,
         username=server.username,
         password=server.password,
-        port=server.api_port,
+        port=server.api_port or (8729 if server.use_tls else 8728),
         timeout=8,
     )
     if server.use_tls:

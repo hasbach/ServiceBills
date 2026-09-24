@@ -1483,7 +1483,7 @@ class ServiceStatus(db.Model):
 class SupportTicket(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
-    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True)
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(50), nullable=False)  # open, in_progress, resolved, closed
@@ -2166,6 +2166,7 @@ def apply_customer_balance_to_unpaid_payments(customer):
 
             # Mark original payment as paid
             # (This is the established logic from mark_payment_as_paid)
+            payment.amount = amount_paid_from_balance
             payment.paid = True
             payment.paid_at = datetime.utcnow()
             
@@ -2863,6 +2864,7 @@ def login():
 
 
 @app.route('/uploads/<path:filename>')
+@jwt_required()
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)        
         
@@ -4890,7 +4892,10 @@ def delete_payment(payment_id):
         # Reverse the balance effect of this payment
         if payment.paid:
             # If the payment was paid, removing it means reducing the customer's balance
-            customer.balance -= payment.amount
+            if getattr(payment, 'is_refund', False):
+                customer.balance += payment.amount
+            else:
+                customer.balance -= payment.amount
         else:
             # If the payment was unpaid, removing it means increasing the customer's balance (less owed)
             customer.balance += payment.amount
@@ -5211,6 +5216,7 @@ def mark_payment_as_paid(payment_id):
                     remaining_amount = payment.amount - partial_amount_received
 
                     # Mark original as paid (keeping original amount)
+                    payment.amount = partial_amount_received
                     payment.paid = True
                     payment.paid_at = datetime.utcnow()
                     payment.received_by_id = current_user.id
@@ -5511,7 +5517,10 @@ def bulk_delete_payments():
                 failed.append({'id': payment.id, 'error': 'Customer not found for this payment'})
                 continue
             if payment.paid:
-                customer.balance -= payment.amount
+                if getattr(payment, 'is_refund', False):
+                    customer.balance += payment.amount
+                else:
+                    customer.balance -= payment.amount
             else:
                 customer.balance += payment.amount
             _detach_payment_dependents(payment)
@@ -6204,7 +6213,7 @@ def save_whatsapp_settings():
             return jsonify({"msg": "WhatsApp API mode requires an upgraded plan."}), 402
         settings = tenant_query(WhatsAppSettings).first()
         if not settings:
-            settings = WhatsAppSettings()
+            settings = new_for_tenant(WhatsAppSettings)
             db.session.add(settings)
         fields = ['mode','enabled','phone_number_id','business_account_id','app_id',
                   'app_secret','access_token','api_version','template_payment_paid',
@@ -9207,6 +9216,7 @@ def generate_receipts_for_month():
     return jsonify({'message': f'{generated_count} new receipts generated for {month}/{year}.'}), 200
 
 @app.route('/api/receipts/log_print', methods=['POST'])
+@jwt_required()
 def log_receipt_print():
     data = request.json
     receipt_ids = data.get('receipt_ids', [])
@@ -9957,7 +9967,7 @@ def topup_upstream_provider(provider_id):
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
-        provider.balance -= amount
+        provider.balance += amount
         db.session.add(UpstreamProviderPayment(
             upstream_provider_id=provider.id,
             amount=amount,
@@ -10920,6 +10930,7 @@ def agent_poll_job():
     job = (NetworkAgentJob.query
            .filter_by(tenant_id=agent.tenant_id, status='pending')
            .order_by(NetworkAgentJob.created_at)
+           .with_for_update(skip_locked=True)
            .first())
     if not job:
         db.session.commit()  # still persist the heartbeat
@@ -13191,7 +13202,7 @@ def cs_tool_escalate():
 @app.route('/api/cs-agent/recent-tickets', methods=['GET'])
 def cs_get_recent_tickets():
     appmod = sys.modules[__name__]
-    tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
+    tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
 

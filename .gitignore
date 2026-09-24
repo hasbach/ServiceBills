@@ -69,3 +69,4 @@ frontend/build.zip
 
 # Subagent-driven-development scratch (progress ledger, task briefs, reports)
 .superpowers/
+graphify-out/

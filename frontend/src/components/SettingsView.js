@@ -212,7 +212,7 @@ $tomlPath = "$installDir\\agent.toml"
 if (-not (Test-Path $tomlPath)) {
     Write-Host "Creating agent.toml configuration..."
     $tomlContent = @"
-cloud_url = "${API_BASE_URL}"
+cloud_url = "${API_BASE_URL || window.location.origin}"
 token = "${token}"
 poll_seconds = 2
 

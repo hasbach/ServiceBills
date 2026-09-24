@@ -49,6 +49,7 @@ export default function CSAgentVoiceTest() {
     const audioQueueRef = useRef([]);
     const isPlayingRef = useRef(false);
     const transcriptEndRef = useRef(null);
+    const isMutedRef = useRef(false);
 
     // Fetch initial config from backend
     useEffect(() => {
@@ -70,6 +71,15 @@ export default function CSAgentVoiceTest() {
             .catch(() => {
                 // Ignore config fetch error in dev
             });
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            if (wsRef.current) {
+                try { wsRef.current.close(); } catch(e) {}
+            }
+            cleanupAudio();
+        };
     }, []);
 
     // Auto-scroll transcript
@@ -235,7 +245,7 @@ export default function CSAgentVoiceTest() {
                     const level = Math.min(100, Math.round(rms * 450));
                     setAudioLevel(level);
 
-                    if (isMuted) return;
+                    if (isMutedRef.current) return;
 
                     // Ensure strictly 16,000 Hz PCM for ElevenLabs
                     const samples16k = downsampleTo16k(inputData, audioCtx.sampleRate);
@@ -652,7 +662,10 @@ export default function CSAgentVoiceTest() {
                                     <Stack direction="row" spacing={2} alignItems="center">
                                         <IconButton
                                             color={isMuted ? 'error' : 'primary'}
-                                            onClick={() => setIsMuted(!isMuted)}
+                                            onClick={() => {
+                                                isMutedRef.current = !isMuted;
+                                                setIsMuted(isMutedRef.current);
+                                            }}
                                             sx={{
                                                 bgcolor: isMuted ? 'error.light' : 'action.hover',
                                                 p: 2

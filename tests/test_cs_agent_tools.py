@@ -386,7 +386,7 @@ def test_elevenlabs_agent_config_sync(app, monkeypatch):
 
     # Reset cache
     cs_agent_tools._CACHED_AGENT_CONFIG = {}
-    cs_agent_tools._CACHED_AGENT_CONFIG_TIME = 0
+    cs_agent_tools._CACHED_AGENT_CONFIG_TIME = {}
 
     mock_resp = MagicMock()
     mock_resp.ok = True

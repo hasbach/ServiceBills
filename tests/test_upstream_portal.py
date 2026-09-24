@@ -88,21 +88,38 @@ class FakeRowLocator:
         # anywhere in the row's full text, not just the username cell.
         return " ".join(self._cell_texts)
 
+    def wait_for(self, timeout=None):
+        pass
+
 
 class FakeRowsLocator:
     """Models `page.locator(selector, has_text=...)` over multiple <tr>s."""
 
-    def __init__(self, rows, has_text=None):
+    def __init__(self, rows, has_text=None, filtered_wait_times_out=False):
         if has_text is not None:
             self._rows = [r for r in rows if has_text in r.inner_text()]
         else:
             self._rows = list(rows)
+        self._filtered_wait_times_out = filtered_wait_times_out
 
     def count(self):
         return len(self._rows)
 
     def nth(self, i):
         return self._rows[i]
+
+    @property
+    def first(self):
+        if self._filtered_wait_times_out:
+            return FakeFirstLocator()
+        return self._rows[0] if self._rows else FakeFirstLocator()
+
+
+class FakeFirstLocator:
+    """Stub for .first.wait_for() when no rows match."""
+    def wait_for(self, timeout=None):
+        from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
+        raise PlaywrightTimeoutError("timed out waiting for first row")
 
 
 class FakePage:
@@ -142,7 +159,8 @@ class FakePage:
             raise PlaywrightTimeoutError("timed out waiting for filtered row")
 
     def locator(self, selector, has_text=None):
-        return FakeRowsLocator(self._rows, has_text=has_text)
+        return FakeRowsLocator(self._rows, has_text=has_text,
+                               filtered_wait_times_out=self._filtered_wait_times_out and has_text is not None)
 
 
 class FakeBrowser:

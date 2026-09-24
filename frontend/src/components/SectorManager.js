@@ -66,7 +66,7 @@ const SectorManager = () => {
             return;
         }
         try {
-            await apiService.updateExpenseSector(sectorId, { name: editingName });
+            await apiService.updateSector(sectorId, { name: editingName });
             setSnackbar({ open: true, message: 'Sector updated successfully!', severity: 'success' });
             handleCancelEdit();
             fetchSectors();

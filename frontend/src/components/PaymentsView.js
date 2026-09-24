@@ -394,7 +394,7 @@ const PaymentCardItem = React.memo(({
                                 Print Receipt
                             </Button>
                         )}
-                        {isAdminOrFinance && waSettings.enabled && waSettings.mode === 'deeplink' && payment.paid && (() => {
+                        {isAdminOrFinance && waSettings.enabled && waSettings.mode === 'deeplink' && (payment.paid || payment.collected) && (() => {
                             const link = buildWhatsAppLink(payment);
                             return link ? (
                                 <Button size="small" variant="outlined" startIcon={<WhatsAppIcon />}
@@ -520,13 +520,14 @@ const PaymentsView = () => {
         }
     };
 
-    // Build wa.me deep-link for a paid payment
+    // Build wa.me deep-link for a paid or collected payment
     const buildWhatsAppLink = (payment) => {
         const phone = (payment.customer_phone || '').replace(/\D/g, '');
         if (!phone) return null;
-        const msg = (waSettings.deeplink_msg_payment || '')
+        const amount = payment.paid ? payment.amount : (payment.collected_amount || payment.amount);
+        const msg = (waSettings.deeplink_msg_payment || 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!')
             .replace('{customer_name}', payment.customer_name || '')
-            .replace('{amount}', parseFloat(payment.amount || 0).toFixed(2));
+            .replace('{amount}', parseFloat(amount || 0).toFixed(2));
         return `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
     };
 
@@ -790,24 +791,42 @@ const PaymentsView = () => {
             if (filters.customer_id) {
                 fetchCustomerBalance(filters.customer_id);
             }
-            if (action === 'collect') {
-                return;
-            }
-
-            const paidPayment    = payments.find(p => p.id === paymentId) || {};
+            const paidPayment    = payments.find(p => p.id === paymentId) || targetPayment || {};
             const paidCustomer   = customers.find(c => c.id === paidPayment.customer_id) || {};
-            const paidCustomerPhone = paidCustomer.phone || '';
-            const paidCustomerName  = paidPayment.customer_name || '';
+            const paidCustomerPhone = paidPayment.customer_phone || paidCustomer.phone || '';
+            const paidCustomerName  = paidPayment.customer_name || paidCustomer.name || '';
 
             // ── Auto-open WhatsApp deep link (deep-link mode) ──────────────────
             if (waSettings.enabled && waSettings.mode === 'deeplink') {
                 const phone = paidCustomerPhone.replace(/\D/g, '');
                 if (phone) {
-                    const amountPaid = parseFloat(response.data.amount_received_in_this_transaction || 0).toFixed(2);
+                    const amountPaid = parseFloat(
+                        response.data?.amount_received_in_this_transaction ??
+                        (action === 'collect' ? amountReceived : paidPayment.amount) ??
+                        amountReceived ?? 0
+                    ).toFixed(2);
                     const msg = (waSettings.deeplink_msg_payment || 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!')
                         .replace('{customer_name}', paidCustomerName)
                         .replace('{amount}', amountPaid);
-                    window.open(`https://wa.me/${phone}?text=${encodeURIComponent(msg)}`, '_blank', 'noopener,noreferrer');
+                    const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+
+                    try {
+                        window.open(waUrl, '_blank', 'noopener,noreferrer');
+                    } catch (e) {
+                        console.warn('Popup blocked, use snackbar link:', e);
+                    }
+
+                    setSnackbar({
+                        open: true,
+                        message: `${response.data.message || 'Payment recorded!'} — WhatsApp link ready`,
+                        severity: 'success',
+                        action: (
+                            <Button color="inherit" size="small" onClick={() => window.open(waUrl, '_blank', 'noopener,noreferrer')} sx={{ fontWeight: 700, textDecoration: 'underline' }}>
+                                Open WhatsApp
+                            </Button>
+                        )
+                    });
+                    return;
                 }
             }
             // ──────────────────────────────────────────────────────────────────
@@ -1613,7 +1632,7 @@ const handlePrint = () => {
                                                         </IconButton>
                                                     </Tooltip>
                                                 )}
-                                                {(userRoles.includes('admin') || userRoles.includes('finance')) && waSettings.enabled && waSettings.mode === 'deeplink' && payment.paid && (() => {
+                                                {(userRoles.includes('admin') || userRoles.includes('finance')) && waSettings.enabled && waSettings.mode === 'deeplink' && (payment.paid || payment.collected) && (() => {
                                                     const waLink = buildWhatsAppLink(payment);
                                                     return waLink ? (
                                                         <Tooltip title="Send via WhatsApp">

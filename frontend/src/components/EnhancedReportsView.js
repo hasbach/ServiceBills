@@ -70,16 +70,9 @@ const EnhancedReportsView = () => {
     try {
       if (reportType === 'daily-cash') {
         const { startIso, endIso } = localDayRange(cashDate);
-        const token = localStorage.getItem('token');
-        const response = await fetch(`/api/reports/daily-cash?start_date=${startIso}&end_date=${endIso}`, {
-          headers: { 'Authorization': `Bearer ${token}` }
-        });
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data?.error || data?.message || `Failed to load report (HTTP ${response.status})`);
-        }
+        const response = await apiService.api.get('/reports/daily-cash', { params: { start_date: startIso, end_date: endIso } });
         setExpandedCashGroups({});
-        setReportData(data);
+        setReportData(response.data);
         return;
       }
 
@@ -90,18 +83,11 @@ const EnhancedReportsView = () => {
       }
 
       // Fallback for other reports
-      const token = localStorage.getItem('token');
-      const response = await fetch(`/api/reports/${reportType}?start_date=${startDate.toISOString()}&end_date=${endDate.toISOString()}`, {
-         headers: { 'Authorization': `Bearer ${token}` }
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.error || data?.message || `Failed to load report (HTTP ${response.status})`);
-      }
-      setReportData(data);
+      const response = await apiService.api.get(`/reports/${reportType}`, { params: { start_date: startDate.toISOString(), end_date: endDate.toISOString() } });
+      setReportData(response.data);
     } catch (error) {
       console.error('Error fetching report data:', error);
-      setReportError(error.message || 'Failed to load report data.');
+      setReportError(error.message || error.response?.data?.error || error.response?.data?.message || 'Failed to load report data.');
     }
   };
 

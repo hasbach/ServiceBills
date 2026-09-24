@@ -449,27 +449,37 @@ def run_once(session, config):
     payload = {"ok": ok, "result": result, "error": error}
     if status is not None:
         payload["status"] = status
-    post_response = session.post(
-        "{}/api/agent/jobs/{}/result".format(config["cloud_url"], job_id),
-        json=payload,
-        timeout=HTTP_TIMEOUT_SECONDS, headers=_headers(config),
-    )
-    if post_response.status_code >= 400:
-        # The cloud returns 4xx when it rejects a result outright -- a
-        # malformed shape (400, see agent_post_result/_validate_agent_result)
-        # or a job that's no longer claimed (409) -- specifically so a broken
-        # agent build or a race surfaces in its own logs instead of failing
-        # silently. Logging the connector's own ok/error unconditionally, as
-        # before, defeated that: a rejected POST looked identical in this log
-        # to a clean success. The body is the cloud's own short JSON error
-        # message, not attacker-controlled, but it's still truncated here --
-        # there's no reason to let an oversized response bloat the log.
-        body = getattr(post_response, "text", "") or ""
-        logger.warning("Cloud rejected result for job %s: HTTP %s %s",
-                       job_id, post_response.status_code, body[:200])
-    else:
-        logger.info("Job %s (%s) -> %s", job_id, job.get("operation"),
-                    "ok" if ok else "error: {}".format(error))
+    for attempt in range(3):
+        try:
+            post_response = session.post(
+                "{}/api/agent/jobs/{}/result".format(config["cloud_url"], job_id),
+                json=payload,
+                timeout=HTTP_TIMEOUT_SECONDS, headers=_headers(config),
+            )
+            if post_response.status_code >= 400:
+                # The cloud returns 4xx when it rejects a result outright -- a
+                # malformed shape (400, see agent_post_result/_validate_agent_result)
+                # or a job that's no longer claimed (409) -- specifically so a broken
+                # agent build or a race surfaces in its own logs instead of failing
+                # silently. Logging the connector's own ok/error unconditionally, as
+                # before, defeated that: a rejected POST looked identical in this log
+                # to a clean success. The body is the cloud's own short JSON error
+                # message, not attacker-controlled, but it's still truncated here --
+                # there's no reason to let an oversized response bloat the log.
+                body = getattr(post_response, "text", "") or ""
+                logger.warning("Cloud rejected result for job %s: HTTP %s %s",
+                               job_id, post_response.status_code, body[:200])
+            else:
+                logger.info("Job %s (%s) -> %s", job_id, job.get("operation"),
+                            "ok" if ok else "error: {}".format(error))
+            break
+        except requests.RequestException:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                logger.error("Failed to POST result after 3 attempts for job %s", job_id)
+                raise
+
     return True
 
 

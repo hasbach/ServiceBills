@@ -227,7 +227,7 @@ def _find_subscriber_row(page, username, username_col_index):
     # server-side-search UI (see upstream_portal.py's _find_subscriber_row
     # history) and must not be repeated.
     try:
-        page.wait_for_selector(f'{SUBSCRIBER_TABLE_SELECTOR} tbody tr:has-text("{username}")', timeout=_TIMEOUT_MS)
+        page.locator(f"{SUBSCRIBER_TABLE_SELECTOR} tbody tr", has_text=username).first.wait_for(timeout=_TIMEOUT_MS)
     except PlaywrightTimeoutError:
         raise SubscriberNotFound(username)
     # `has_text` is a coarse pre-filter across the whole row's visible
@@ -299,6 +299,9 @@ def get_subscriber_status(provider, username):
     of 'auth_failed', 'not_found', 'timeout', 'scrape_failed'. Never
     raises.
     """
+    if not provider.portal_url or not provider.portal_username or not provider.portal_password:
+        return False, "auth_failed"
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -333,6 +336,9 @@ def get_subscriber_status(provider, username):
         return False, "timeout"
     except PlaywrightError as e:
         logger.warning("Krypton portal scrape failed for provider %s: %s", provider.id, e)
+        return False, "scrape_failed"
+    except Exception as e:
+        logger.exception("Unexpected error in Krypton portal for provider %s", provider.id)
         return False, "scrape_failed"
 
     return True, {"status": status, "expiry": expiry}

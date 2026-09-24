@@ -240,6 +240,7 @@ const rawApiService = {
     emailWhishPaymentLink: (customerId, paymentId, email, payUrl) => api.post(`/customers/${customerId}/payments/${paymentId}/whish-link/email`, { email, pay_url: payUrl }),
     sendWhatsappReminder: (customerId, templateType = 'payment_reminder') => api.post(`/customers/${customerId}/send-whatsapp-reminder`, { template_type: templateType }),
     fetchReceipt: (paymentId) => api.get(`/receipt/${paymentId}`),
+    fetchUnpaidReceipt: (customerId) => api.get('/customers/' + customerId + '/unpaid_receipt'),
     addCustomerPayment: (paymentData) => api.post(`/payments`, paymentData),
     renewSubscription: (customerId) => api.post(`/customers/${customerId}/renew_subscription`),
     fetchCustomerBalance: (customerId) => api.get(`/customers/${customerId}/balance`),
@@ -343,14 +344,21 @@ export const AppContext = createContext();
 
 export const AppContextProvider = ({ children }) => {
     const [token, setToken] = useState(localStorage.getItem('token'));
-    const [user, setUser] = useState(JSON.parse(localStorage.getItem('user')));
+    const [user, setUser] = useState(() => {
+        try {
+            const u = localStorage.getItem('user');
+            return u && u !== 'undefined' ? JSON.parse(u) : null;
+        } catch {
+            return null;
+        }
+    });
     const [isAuthenticated, setIsAuthenticated] = useState(!!token);
     const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'info' });
 
     useEffect(() => {
         if (token) {
             localStorage.setItem('token', token);
-            localStorage.setItem('user', JSON.stringify(user));
+            localStorage.setItem('user', JSON.stringify(user ?? null));
             setIsAuthenticated(true);
         } else {
             localStorage.removeItem('token');

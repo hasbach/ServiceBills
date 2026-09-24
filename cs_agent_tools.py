@@ -183,11 +183,6 @@ def resolve_tenant_id(appmod):
         except (ValueError, TypeError):
             pass
 
-    # Fallback to first active tenant (e.g. DeltaNet)
-    default_tenant = appmod.Tenant.query.filter_by(status='active').order_by(appmod.Tenant.id).first()
-    if default_tenant:
-        return default_tenant.id, False
-
     return None, False
 
 
@@ -805,12 +800,10 @@ def escalate_to_human(appmod, tenant_id, customer_id, reason, summary, phone=Non
         customer = appmod.Customer.query.filter_by(tenant_id=tenant_id, id=customer_id).first()
     if not customer and phone:
         candidates = normalize_lebanese_phone(phone)
-        for cand in candidates:
+        if candidates:
             customer = appmod.Customer.query.filter_by(tenant_id=tenant_id).filter(
-                (appmod.Customer.phone == cand) | (appmod.Customer.phone.like(f"%{cand}%"))
+                appmod.Customer.phone.in_(candidates)
             ).first()
-            if customer:
-                break
 
     customer_name = customer.name if customer else "عميل"
     customer_phone = customer.phone if customer else (str(phone or '').strip())
@@ -826,9 +819,7 @@ def escalate_to_human(appmod, tenant_id, customer_id, reason, summary, phone=Non
 
     ticket = appmod.SupportTicket(
         tenant_id=tenant_id,
-        customer_id=customer.id if customer else (
-            appmod.Customer.query.filter_by(tenant_id=tenant_id).first().id if appmod.Customer.query.filter_by(tenant_id=tenant_id).first() else 1
-        ),
+        customer_id=customer.id if customer else None,
         title=ticket_title,
         description=ticket_desc,
         status='open',
@@ -1117,7 +1108,7 @@ def clean_speech_tags(text):
 
 
 _CACHED_AGENT_CONFIG = {}
-_CACHED_AGENT_CONFIG_TIME = 0
+_CACHED_AGENT_CONFIG_TIME = {}
 
 def get_elevenlabs_agent_config(api_key=None, agent_id=None):
     """Fetches the agent configuration directly from ElevenLabs Conversational AI API.
@@ -1127,8 +1118,6 @@ def get_elevenlabs_agent_config(api_key=None, agent_id=None):
     global _CACHED_AGENT_CONFIG, _CACHED_AGENT_CONFIG_TIME
     import time
     now = time.time()
-    if _CACHED_AGENT_CONFIG and (now - _CACHED_AGENT_CONFIG_TIME < 300):
-        return _CACHED_AGENT_CONFIG
 
     target_agent_id = agent_id
     if not target_agent_id:
@@ -1145,7 +1134,11 @@ def get_elevenlabs_agent_config(api_key=None, agent_id=None):
             key = os.environ.get('ELEVENLABS_API_KEY')
 
     if not target_agent_id or not key:
-        return _CACHED_AGENT_CONFIG or {}
+        return {}
+
+    cache_key = (target_agent_id, key)
+    if cache_key in _CACHED_AGENT_CONFIG and (now - _CACHED_AGENT_CONFIG_TIME.get(cache_key, 0) < 300):
+        return _CACHED_AGENT_CONFIG[cache_key]
 
     try:
         url = f"https://api.elevenlabs.io/v1/convai/agents/{target_agent_id}"
@@ -1161,24 +1154,24 @@ def get_elevenlabs_agent_config(api_key=None, agent_id=None):
             first_msg = (agent_cfg.get("first_message") or "").strip()
             name = (data.get("name") or "يارا").strip()
 
-            _CACHED_AGENT_CONFIG = {
+            _CACHED_AGENT_CONFIG[cache_key] = {
                 "agent_id": target_agent_id,
                 "name": name,
                 "voice_id": voice_id,
                 "model_id": model_id,
                 "first_message": first_msg
             }
-            _CACHED_AGENT_CONFIG_TIME = now
+            _CACHED_AGENT_CONFIG_TIME[cache_key] = now
             logging.info(
                 f"Synced ElevenLabs agent '{name}' ({target_agent_id}): voice_id={voice_id}, model={model_id}, first_message='{first_msg}'"
             )
-            return _CACHED_AGENT_CONFIG
+            return _CACHED_AGENT_CONFIG[cache_key]
         else:
             logging.warning(f"Could not fetch ElevenLabs agent config ({res.status_code}): {res.text}")
     except Exception as e:
         logging.warning(f"Error fetching ElevenLabs agent config: {e}")
 
-    return _CACHED_AGENT_CONFIG or {}
+    return _CACHED_AGENT_CONFIG.get(cache_key, {})
 
 
 def get_effective_elevenlabs_voice_id(api_key=None, agent_id=None):
@@ -1951,7 +1944,7 @@ def query_elevenlabs_conversational_ai(agent_id, incoming_text, sender_phone, cu
     return None
 
 
-def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_voice=False, is_new_session=True):
+def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_voice=False, is_new_session=True, sender_phone=None):
     """Processes incoming customer WhatsApp message or voice note transcript,
     analyzing the intent and generating a friendly, accurate Lebanese Arabic reply.
     """
@@ -2183,7 +2176,7 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
             appmod, tenant_id, cust_id,
             reason="طلب التحدث مع موظف عبر واتساب",
             summary=clean_text,
-            phone=getattr(customer, 'phone', None)
+            phone=sender_phone or getattr(customer, 'phone', None)
         )
         ticket_id = esc_res.get("ticket_id", "")
         reply_text = (
@@ -2326,7 +2319,7 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     ai_source = 'gemini' if (ai_result and ai_result.get("reply_text")) else 'rules'
     if not ai_result or not ai_result.get("reply_text"):
         ai_result = process_customer_message_ai(
-            appmod, tenant_id, customer, incoming_text, is_voice=is_voice, is_new_session=is_new_session
+            appmod, tenant_id, customer, incoming_text, is_voice=is_voice, is_new_session=is_new_session, sender_phone=sender_phone
         )
 
     ai_result = dict(ai_result or {})
@@ -2348,6 +2341,12 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     }
 
     # 1. Send WhatsApp Text message
+    # Re-check: admin may have replied while we were thinking
+    conv = appmod.WhatsAppConversation.query.filter_by(tenant_id=tenant_id, wa_phone=sender_phone).first()
+    if conv and conv.ai_paused:
+        logging.info('AI reply suppressed: admin replied during processing')
+        return None
+
     text_ok, text_wamid, text_error = False, None, None
     try:
         payload_reply = {

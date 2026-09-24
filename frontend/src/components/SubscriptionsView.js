@@ -248,6 +248,13 @@ const SubscriptionsView = ({
     const [loadingPayments, setLoadingPayments] = useState(false);
     const [waReminderDialog, setWaReminderDialog] = useState({ open: false, customer: null });
     const [waReminderType, setWaReminderType] = useState('payment_reminder');
+    const [waSettings, setWaSettings] = useState({ enabled: false, mode: 'deeplink', deeplink_msg_renewal: 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!' });
+
+    useEffect(() => {
+        apiService.fetchWhatsAppSettings().then(res => {
+            if (res.data?.settings) setWaSettings(res.data.settings);
+        }).catch(() => {});
+    }, [apiService]);
 
     const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
     const [editDialogOpen, setEditDialogOpen] = useState(false);
@@ -511,15 +518,48 @@ const SubscriptionsView = ({
     const handleSubscriptionAction = useCallback(async (action, customerId, confirmMessage) => {
         if (window.confirm(confirmMessage)) {
             try {
-                await action(customerId);
-                setSnackbar({ open: true, message: 'Action completed successfully!', severity: 'success' });
+                const response = await action(customerId);
                 refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery);
+
+                const customer = (customers || []).find(c => c.id === customerId);
+                const isRenewal = action === apiService.renewSubscription;
+
+                if (isRenewal && waSettings.enabled && waSettings.mode === 'deeplink') {
+                    const phone = (customer?.phone || '').replace(/\D/g, '');
+                    const newExpiry = response?.data?.new_expiry_date || '';
+                    if (phone) {
+                        const msg = (waSettings.deeplink_msg_renewal || 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!')
+                            .replace('{customer_name}', customer?.name || '')
+                            .replace('{expiry_date}', newExpiry);
+                        const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+
+                        try {
+                            window.open(waUrl, '_blank', 'noopener,noreferrer');
+                        } catch (e) {
+                            console.warn('Popup blocked, use snackbar link:', e);
+                        }
+
+                        setSnackbar({
+                            open: true,
+                            message: `Subscription renewed successfully! — WhatsApp link ready`,
+                            severity: 'success',
+                            action: (
+                                <Button color="inherit" size="small" onClick={() => window.open(waUrl, '_blank', 'noopener,noreferrer')} sx={{ fontWeight: 700, textDecoration: 'underline' }}>
+                                    Open WhatsApp
+                                </Button>
+                            )
+                        });
+                        return;
+                    }
+                }
+
+                setSnackbar({ open: true, message: response?.data?.message || 'Action completed successfully!', severity: 'success' });
             } catch (error) {
                 console.error(`Error with subscription action:`, error);
                 setSnackbar({ open: true, message: `Failed to complete action. ${error.response?.data?.message || error.message}`, severity: 'error' });
             }
         }
-    }, [apiService, setSnackbar, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery]);
+    }, [apiService, setSnackbar, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery, customers, waSettings]);
     const handleToggleWA = useCallback(async (customer) => {
         try {
             await apiService.updateCustomer(customer.id, {
@@ -543,16 +583,45 @@ const SubscriptionsView = ({
 
     const handleConfirmWAReminder = useCallback(async (templateType) => {
         if (!waReminderDialog.customer) return;
-        const custId = waReminderDialog.customer.id;
+        const cust = waReminderDialog.customer;
+        const custId = cust.id;
         setWaReminderDialog({ open: false, customer: null });
         try {
+            if (waSettings.enabled && waSettings.mode === 'deeplink') {
+                const phone = (cust.phone || '').replace(/\D/g, '');
+                if (phone) {
+                    let msg = '';
+                    if (templateType === 'current_balance') {
+                        msg = `Dear ${cust.name}, your current balance is $${parseFloat(cust.balance || 0).toFixed(2)}. Expiry date: ${cust.subscription_expiry_date || 'N/A'}. Thank you!`;
+                    } else {
+                        msg = `Dear ${cust.name}, this is a friendly reminder that your subscription payment is due. Balance: $${parseFloat(cust.balance || 0).toFixed(2)}. Thank you!`;
+                    }
+                    const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+                    try {
+                        window.open(waUrl, '_blank', 'noopener,noreferrer');
+                    } catch (e) {
+                        console.warn('Popup blocked, use snackbar link:', e);
+                    }
+                    setSnackbar({
+                        open: true,
+                        message: `WhatsApp reminder link ready`,
+                        severity: 'success',
+                        action: (
+                            <Button color="inherit" size="small" onClick={() => window.open(waUrl, '_blank', 'noopener,noreferrer')} sx={{ fontWeight: 700, textDecoration: 'underline' }}>
+                                Open WhatsApp
+                            </Button>
+                        )
+                    });
+                    return;
+                }
+            }
             await apiService.sendWhatsappReminder(custId, templateType);
             setSnackbar({ open: true, message: `WhatsApp ${templateType.replace('_', ' ')} triggered!`, severity: 'success' });
         } catch (error) {
             console.error('Error sending WA reminder:', error);
             setSnackbar({ open: true, message: 'Failed to send WhatsApp reminder', severity: 'error' });
         }
-    }, [waReminderDialog.customer, apiService, setSnackbar]);
+    }, [waReminderDialog.customer, apiService, setSnackbar, waSettings]);
 
     // --- NEW: Bulk Action Handlers ---
     const handleExportCSV = async () => {
