@@ -96,6 +96,7 @@ const Section = ({ icon, title, subtitle, color, action, children }) => {
 const tomlString = (value) => String(value ?? '')
     .replace(/\\/g, '\\\\')
     .replace(/"/g, '\\"')
+    // eslint-disable-next-line no-control-regex -- stripping control chars is the point
     .replace(/[\u0000-\u001f\u007f]/g, '');
 
 // agent.toml [[device]] blocks, pre-filled from the Network Devices page.
