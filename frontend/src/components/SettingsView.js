@@ -731,6 +731,15 @@ Read-Host -Prompt "Press Enter to exit"
                                                     sx={{ ml: 1.5, borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
                                                     Download Update Script
                                                 </Button>
+                                                <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }}>
+                                                    To run it on the agent box, open PowerShell in the folder it downloaded to and run:
+                                                </Typography>
+                                                <Box component="code" sx={{ display: 'block', mt: 0.5, p: 1, borderRadius: '8px', bgcolor: 'action.hover', fontSize: '0.85rem', wordBreak: 'break-all' }}>
+                                                    powershell -ExecutionPolicy Bypass -File .\Install-ServiceBillsAgent.ps1
+                                                </Box>
+                                                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                                                    Your existing <code>agent.toml</code> (token and devices) is left untouched.
+                                                </Typography>
                                                 <Alert severity="info" sx={{ mt: 2, borderRadius: '12px' }}>
                                                     Regenerating invalidates the current token immediately — the running agent will
                                                     stop authenticating until <code>agent.toml</code> is updated with the new one.
