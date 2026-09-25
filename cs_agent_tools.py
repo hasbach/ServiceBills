@@ -1063,12 +1063,13 @@ def download_meta_media(access_token, media_id, api_version='v19.0'):
 
 
 def transcribe_voice_elevenlabs(audio_bytes, api_key=None, mime_type='audio/ogg'):
-    """Transcribes audio using ElevenLabs Speech-to-Text (Scribe) API."""
+    """Transcribes audio using ElevenLabs Speech-to-Text (Scribe) API.
+    Requires tenant's own ElevenLabs API key."""
     if not audio_bytes:
         return None
-    key = api_key or current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
+    key = (api_key or '').strip()
     if not key:
-        logging.warning("transcribe_voice_elevenlabs: No ELEVENLABS_API_KEY available.")
+        logging.warning("transcribe_voice_elevenlabs: No ElevenLabs API key provided for tenant.")
         return None
 
     try:
@@ -1114,24 +1115,14 @@ def get_elevenlabs_agent_config(api_key=None, agent_id=None):
     """Fetches the agent configuration directly from ElevenLabs Conversational AI API.
     Extracts the agent's name, voice_id, model_id, and first_message.
     Caches results for 300 seconds to minimize latency and avoid API rate limits.
+    Requires both agent_id and api_key configured per-tenant.
     """
     global _CACHED_AGENT_CONFIG, _CACHED_AGENT_CONFIG_TIME
     import time
     now = time.time()
 
-    target_agent_id = agent_id
-    if not target_agent_id:
-        try:
-            target_agent_id = current_app.config.get('ELEVENLABS_AGENT_ID') or os.environ.get('ELEVENLABS_AGENT_ID')
-        except Exception:
-            target_agent_id = os.environ.get('ELEVENLABS_AGENT_ID')
-
-    key = api_key
-    if not key:
-        try:
-            key = current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
-        except Exception:
-            key = os.environ.get('ELEVENLABS_API_KEY')
+    target_agent_id = (agent_id or '').strip()
+    key = (api_key or '').strip()
 
     if not target_agent_id or not key:
         return {}
@@ -1175,64 +1166,48 @@ def get_elevenlabs_agent_config(api_key=None, agent_id=None):
 
 
 def get_effective_elevenlabs_voice_id(api_key=None, agent_id=None):
-    """Finds the effective ElevenLabs voice ID.
+    """Finds the effective ElevenLabs voice ID for the tenant's agent.
     Priority:
     1. Voice configured on the ElevenLabs agent itself (via ConvAI agent config)
-    2. Explicit ELEVENLABS_VOICE_ID from config / environment variable
-    3. User's account voices via /v1/voices
-    Note: Never hardcodes a voice ID and never defaults to a male voice.
+    2. User's account voices via /v1/voices
+    Note: Requires tenant's own ElevenLabs credentials.
     """
-    key = api_key
-    if not key:
-        try:
-            key = current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
-        except Exception:
-            key = os.environ.get('ELEVENLABS_API_KEY')
+    key = (api_key or '').strip()
+    target_agent_id = (agent_id or '').strip()
+    if not key or not target_agent_id:
+        return None
 
     # 1. Fetch the default voice assigned in the ElevenLabs agent's configuration
-    agent_cfg = get_elevenlabs_agent_config(api_key=key, agent_id=agent_id)
+    agent_cfg = get_elevenlabs_agent_config(api_key=key, agent_id=target_agent_id)
     if agent_cfg.get("voice_id"):
         return agent_cfg["voice_id"]
 
-    # 2. Check if explicitly set in config/env (without hardcoded defaults)
+    # 2. Query /v1/voices to find an authorized voice on the account
     try:
-        configured = (current_app.config.get('ELEVENLABS_VOICE_ID') or os.environ.get('ELEVENLABS_VOICE_ID') or "").strip()
-    except Exception:
-        configured = (os.environ.get('ELEVENLABS_VOICE_ID') or "").strip()
-
-    if configured:
-        return configured
-
-    # 3. Query /v1/voices to find an authorized voice on the account
-    if key:
-        try:
-            res = requests.get("https://api.elevenlabs.io/v1/voices", headers={"xi-api-key": key}, timeout=5)
-            if res.ok:
-                voices = res.json().get("voices", [])
-                if voices:
-                    return voices[0]["voice_id"]
-        except Exception as e:
-            logging.warning(f"Could not query /v1/voices: {e}")
+        res = requests.get("https://api.elevenlabs.io/v1/voices", headers={"xi-api-key": key}, timeout=5)
+        if res.ok:
+            voices = res.json().get("voices", [])
+            if voices:
+                return voices[0]["voice_id"]
+    except Exception as e:
+        logging.warning(f"Could not query /v1/voices: {e}")
 
     return None
 
 
 def synthesize_speech_elevenlabs(text, voice_id=None, api_key=None, agent_id=None):
-    """Synthesizes text to speech using ElevenLabs TTS API with the agent's configured voice."""
+    """Synthesizes text to speech using ElevenLabs TTS API with the agent's configured voice.
+    Both api_key and agent_id are required per tenant."""
     if not text:
         return None
-    key = api_key
-    if not key:
-        try:
-            key = current_app.config.get('ELEVENLABS_API_KEY') or os.environ.get('ELEVENLABS_API_KEY')
-        except Exception:
-            key = os.environ.get('ELEVENLABS_API_KEY')
-    if not key:
-        logging.warning("synthesize_speech_elevenlabs: No ELEVENLABS_API_KEY available.")
+    key = (api_key or '').strip()
+    target_agent_id = (agent_id or '').strip()
+    if not key or not target_agent_id:
+        logging.warning("synthesize_speech_elevenlabs: Both ElevenLabs API key and Agent ID are required.")
         return None
 
-    agent_cfg = get_elevenlabs_agent_config(api_key=key, agent_id=agent_id)
-    target_voice_id = voice_id or agent_cfg.get("voice_id") or get_effective_elevenlabs_voice_id(key, agent_id=agent_id)
+    agent_cfg = get_elevenlabs_agent_config(api_key=key, agent_id=target_agent_id)
+    target_voice_id = voice_id or agent_cfg.get("voice_id") or get_effective_elevenlabs_voice_id(api_key=key, agent_id=target_agent_id)
     if not target_voice_id:
         logging.warning("synthesize_speech_elevenlabs: No voice ID available from ElevenLabs agent configuration.")
         return None
@@ -1318,12 +1293,12 @@ def send_whatsapp_voice(access_token, phone_number_id, recipient_phone, audio_by
         return False
 
 
-def handle_whatsapp_audio_transcription(access_token, media_id, api_version='v19.0'):
-    """Helper called in webhook to download audio and transcribe it into Arabic text."""
+def handle_whatsapp_audio_transcription(access_token, media_id, api_version='v19.0', api_key=None):
+    """Helper called in webhook to download audio and transcribe it into Arabic text using tenant's ElevenLabs key."""
     audio_bytes, mime = download_meta_media(access_token, media_id, api_version=api_version)
     if not audio_bytes:
         return None
-    return transcribe_voice_elevenlabs(audio_bytes, mime_type=mime)
+    return transcribe_voice_elevenlabs(audio_bytes, api_key=api_key, mime_type=mime)
 
 
 # gemini-flash-latest is Google's own self-updating alias -- always hot-swapped
@@ -1976,7 +1951,16 @@ def process_customer_message_ai(appmod, tenant_id, customer, incoming_text, is_v
         "الو", "ألو", "alo", "hello", "hi", "hey"
     ]
     if any(kw in norm for kw in greeting_keywords) and len(norm) < 40:
-        agent_cfg = get_elevenlabs_agent_config()
+        agent_cfg = {}
+        try:
+            cs_stgs = appmod.CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
+            if cs_stgs and cs_stgs.elevenlabs_agent_id and cs_stgs.elevenlabs_api_key:
+                agent_cfg = get_elevenlabs_agent_config(
+                    api_key=cs_stgs.elevenlabs_api_key,
+                    agent_id=cs_stgs.elevenlabs_agent_id
+                )
+        except Exception:
+            pass
         first_msg = clean_speech_tags(agent_cfg.get("first_message"))
         name_str = f" {customer.name}" if customer else ""
         if is_new_session:
@@ -2264,9 +2248,9 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
     except Exception as e_sess:
         logging.warning(f"Error checking active session: {e_sess}")
 
-    # Resolve target ElevenLabs agent ID (still used for TTS voice selection)
-    # and admin permissions, and this tenant's own Gemini key (the brain).
+    # Resolve target ElevenLabs agent ID and API key (per-tenant only)
     target_agent_id = getattr(settings, 'elevenlabs_agent_id', None)
+    tenant_elevenlabs_key = None
     is_admin = False
     cs_settings = None
 
@@ -2275,18 +2259,14 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
         if cs_settings:
             if cs_settings.elevenlabs_agent_id:
                 target_agent_id = cs_settings.elevenlabs_agent_id
+            if cs_settings.elevenlabs_api_key:
+                tenant_elevenlabs_key = cs_settings.elevenlabs_api_key
             if cs_settings.admin_mobile_number:
                 admin_phone_clean = re.sub(r'\D', '', str(cs_settings.admin_mobile_number))
                 if phone_digits and admin_phone_clean and (phone_digits == admin_phone_clean or phone_digits.endswith(admin_phone_clean) or admin_phone_clean.endswith(phone_digits)):
                     is_admin = True
     except Exception:
         pass
-
-    if not target_agent_id:
-        try:
-            target_agent_id = current_app.config.get('ELEVENLABS_AGENT_ID') or os.environ.get('ELEVENLABS_AGENT_ID')
-        except Exception:
-            target_agent_id = os.environ.get('ELEVENLABS_AGENT_ID')
 
     # Fetch recent conversation history from active session if available
     recent_history = []
@@ -2372,12 +2352,14 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
         text_error = {'code': 'exception', 'message': str(e)}
         logging.error(f"Error sending WhatsApp text reply: {e}")
 
-    # 2. If customer sent voice note, try to respond with voice note too (if ElevenLabs TTS available)
+    # 2. If customer sent voice note, try to respond with voice note too (if ElevenLabs TTS available for tenant)
     voice_result = None
     tts_audio = None
     if is_voice:
         try:
-            tts_audio = synthesize_speech_elevenlabs(reply_text, agent_id=target_agent_id)
+            tts_audio = synthesize_speech_elevenlabs(
+                reply_text, voice_id=None, api_key=tenant_elevenlabs_key, agent_id=target_agent_id
+            )
             if tts_audio:
                 sent_voice = voice_result = send_whatsapp_voice(
                     settings.access_token,
@@ -2391,7 +2373,7 @@ def handle_whatsapp_cs_ai_reply(appmod, tenant_id, sender_phone, customer, incom
                 else:
                     logging.warning(f"send_whatsapp_voice returned False for +{sender_phone}")
             else:
-                logging.warning(f"synthesize_speech_elevenlabs returned None for +{sender_phone} (check ELEVENLABS_API_KEY).")
+                logging.info(f"synthesize_speech_elevenlabs returned None for +{sender_phone} (credentials missing or TTS disabled).")
         except Exception as e_voice:
             logging.warning(f"Could not send voice reply to +{sender_phone}: {e_voice}")
 

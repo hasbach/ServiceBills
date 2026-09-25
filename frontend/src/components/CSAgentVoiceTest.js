@@ -21,6 +21,10 @@ export default function CSAgentVoiceTest() {
     const [adminMobile, setAdminMobile] = useState('');
     const [isEditingAgentId, setIsEditingAgentId] = useState(false);
     const [isEditingAdminMobile, setIsEditingAdminMobile] = useState(false);
+    const [elevenlabsApiKey, setElevenlabsApiKey] = useState('');
+    const [elevenlabsKeyMask, setElevenlabsKeyMask] = useState('');
+    const [hasElevenlabsKey, setHasElevenlabsKey] = useState(false);
+    const [isEditingElevenlabsKey, setIsEditingElevenlabsKey] = useState(false);
     const [geminiApiKey, setGeminiApiKey] = useState('');
     const [geminiKeyMask, setGeminiKeyMask] = useState('');
     const [hasGeminiKey, setHasGeminiKey] = useState(false);
@@ -61,6 +65,8 @@ export default function CSAgentVoiceTest() {
                 if (res.data) {
                     if (res.data.elevenlabs_agent_id) setAgentId(res.data.elevenlabs_agent_id);
                     if (res.data.admin_mobile_number) setAdminMobile(res.data.admin_mobile_number);
+                    setHasElevenlabsKey(!!res.data.has_elevenlabs_key);
+                    setElevenlabsKeyMask(res.data.elevenlabs_api_key || '');
                     // The server now sends a masked form (e.g. "AIza...xxxx"), never
                     // the real key -- leave the editable field blank and just show
                     // the mask as a hint that a key is already on file.
@@ -101,6 +107,10 @@ export default function CSAgentVoiceTest() {
             setErrorMessage('يجب إدخال ElevenLabs Agent ID لحفظ الإعدادات.');
             return;
         }
+        if (!hasElevenlabsKey && !elevenlabsApiKey.trim()) {
+            setErrorMessage('يجب إدخال مفتاح ElevenLabs API Key الخاص بحسابك.');
+            return;
+        }
         setSavingConfig(true);
         setSaveSuccess('');
         setErrorMessage('');
@@ -110,6 +120,9 @@ export default function CSAgentVoiceTest() {
                 elevenlabs_agent_id: agentId.trim(),
                 admin_mobile_number: adminMobile.trim(),
             };
+            if (elevenlabsApiKey.trim()) {
+                payload.elevenlabs_api_key = elevenlabsApiKey.trim();
+            }
             // Only send gemini_api_key if the user actually typed a new one --
             // the field holds the masked value (or is blank), never the real
             // key, so resubmitting it unconditionally would overwrite the
@@ -122,14 +135,18 @@ export default function CSAgentVoiceTest() {
             });
 
             if (res.data && res.data.settings) {
+                setHasElevenlabsKey(!!res.data.settings.elevenlabs_api_key);
+                setElevenlabsKeyMask(res.data.settings.elevenlabs_api_key || '');
                 setHasGeminiKey(!!res.data.settings.gemini_api_key);
                 setGeminiKeyMask(res.data.settings.gemini_api_key || '');
             }
             setGeminiApiKey('');
+            setElevenlabsApiKey('');
 
             setSaveSuccess('تم حفظ إعدادات الـ Agent بنجاح!');
             setIsEditingAgentId(false);
             setIsEditingAdminMobile(false);
+            setIsEditingElevenlabsKey(false);
             setIsEditingGeminiKey(false);
         } catch (err) {
             setErrorMessage(err.response?.data?.error || 'حدث خطأ أثناء الحفظ.');
@@ -510,6 +527,12 @@ export default function CSAgentVoiceTest() {
                 <Grid item xs={12} md={7}>
                     <Card elevation={1} sx={{ borderRadius: '16px', height: '100%', display: 'flex', flexDirection: 'column' }}>
                         <CardContent sx={{ p: 3, flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
+                            {(!agentId.trim() || !hasElevenlabsKey) && (
+                                <Alert severity="warning" sx={{ mb: 2.5 }}>
+                                    تنبيه: يجب على كل مستأجر توفير الـ Agent ID ومفتاح الـ ElevenLabs API Key الخاصين به لتفعيل واختبار المساعد الصوتي.
+                                </Alert>
+                            )}
+
                             {/* Agent ID & Status Header */}
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2, flexWrap: 'wrap' }}>
                                 <TextField
@@ -545,6 +568,51 @@ export default function CSAgentVoiceTest() {
                                 >
                                     حفظ للمستأجر
                                 </Button>
+                            </Box>
+
+                            {/* ElevenLabs API Key */}
+                            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, mb: 2 }}>
+                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
+                                    <TextField
+                                        size="small"
+                                        label="ElevenLabs API Key"
+                                        value={elevenlabsApiKey}
+                                        onChange={(e) => setElevenlabsApiKey(e.target.value)}
+                                        placeholder={hasElevenlabsKey ? 'اتركه فارغاً للإبقاء على المفتاح الحالي' : 'xi-api-key...'}
+                                        disabled={!isEditingElevenlabsKey || (status !== 'idle' && status !== 'error')}
+                                        helperText={
+                                            <span>
+                                                مفتاح ElevenLabs الخاص بحسابك لتوليد الصوت وتحويل الرسائل الصوتية.{' '}
+                                                <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener noreferrer">
+                                                    إدارة المفاتيح من هنا
+                                                </a>
+                                            </span>
+                                        }
+                                        sx={{ minWidth: 260, flexGrow: 1 }}
+                                        InputProps={{
+                                            endAdornment: (
+                                                <InputAdornment position="end">
+                                                    <IconButton
+                                                        onClick={() => setIsEditingElevenlabsKey(true)}
+                                                        disabled={status !== 'idle' && status !== 'error'}
+                                                        edge="end"
+                                                    >
+                                                        <EditIcon fontSize="small" />
+                                                    </IconButton>
+                                                </InputAdornment>
+                                            )
+                                        }}
+                                    />
+                                    {hasElevenlabsKey && !elevenlabsApiKey.trim() && (
+                                        <Chip
+                                            icon={<CheckCircleIcon />}
+                                            color="success"
+                                            variant="filled"
+                                            label={`مفتاح ElevenLabs محفوظ: ${elevenlabsKeyMask || '(مخفي)'}`}
+                                            sx={{ fontWeight: 700 }}
+                                        />
+                                    )}
+                                </Box>
                             </Box>
 
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 4, flexWrap: 'wrap' }}>

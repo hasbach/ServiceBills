@@ -1608,6 +1608,7 @@ class CSAgentSettings(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, unique=True, index=True)
     elevenlabs_agent_id = db.Column(db.String(100), nullable=True)
+    elevenlabs_api_key = db.Column(EncryptedString, nullable=True)   # tenant's own key; encrypted at rest
     admin_mobile_number = db.Column(db.String(50), nullable=True)
     gemini_api_key = db.Column(EncryptedString, nullable=True)   # tenant's own free-tier key; encrypted at rest
     gemini_model = db.Column(db.String(50), nullable=True)       # optional override; None -> default Flash/Flash-Lite chain
@@ -1620,6 +1621,7 @@ class CSAgentSettings(db.Model):
             'id': self.id,
             'tenant_id': self.tenant_id,
             'elevenlabs_agent_id': self.elevenlabs_agent_id or '',
+            'elevenlabs_api_key': _mask_secret_key(self.elevenlabs_api_key),
             'admin_mobile_number': self.admin_mobile_number or '',
             # Never the raw key -- see _mask_secret_key. has_gemini_key (added
             # by the /api/cs-agent/config endpoint) is what callers should use
@@ -8400,8 +8402,11 @@ def whatsapp_webhook():
                             try:
                                 audio_id = media_payload.get('audio', {}).get('id')
                                 if audio_id:
+                                    cs_stgs = CSAgentSettings.query.filter_by(tenant_id=resolved_tenant_id).first()
+                                    tenant_el_key = cs_stgs.elevenlabs_api_key if cs_stgs else None
                                     transcript = cs_agent_tools.handle_whatsapp_audio_transcription(
-                                        settings.access_token, audio_id, api_version=settings.api_version or 'v19.0'
+                                        settings.access_token, audio_id, api_version=settings.api_version or 'v19.0',
+                                        api_key=tenant_el_key
                                     )
                                     if transcript:
                                         msg_text = f"[رسالة صوتية]: {transcript}"
@@ -13028,6 +13033,8 @@ def cs_agent_config():
 
             if 'elevenlabs_agent_id' in data:
                 settings.elevenlabs_agent_id = (data.get('elevenlabs_agent_id') or '').strip()
+            if 'elevenlabs_api_key' in data:
+                settings.elevenlabs_api_key = (data.get('elevenlabs_api_key') or '').strip()
             if 'admin_mobile_number' in data:
                 settings.admin_mobile_number = (data.get('admin_mobile_number') or '').strip()
             if 'gemini_api_key' in data:
@@ -13044,27 +13051,30 @@ def cs_agent_config():
     admin_mobile_number = ''
     gemini_api_key_raw = ''
     gemini_model = ''
+    elevenlabs_api_key_raw = ''
     try:
         settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
         if settings:
             agent_id = settings.elevenlabs_agent_id or ''
+            elevenlabs_api_key_raw = settings.elevenlabs_api_key or ''
             admin_mobile_number = settings.admin_mobile_number or ''
             gemini_api_key_raw = settings.gemini_api_key or ''
             gemini_model = settings.gemini_model or ''
     except Exception:
         db.session.rollback()
 
-    if not agent_id:
-        agent_id = app.config.get('ELEVENLABS_AGENT_ID', '')
+    # DO NOT FALL BACK TO GLOBAL ELEVENLABS_AGENT_ID! Each tenant must have their own unique agent_id.
 
     return jsonify({
         'status': 'ok',
         'elevenlabs_agent_id': agent_id,
+        'elevenlabs_api_key': _mask_secret_key(elevenlabs_api_key_raw),
         'admin_mobile_number': admin_mobile_number,
-        # Masked -- never the raw key. Use has_gemini_key to know one is set.
+        # Masked -- never the raw key. Use has_gemini_key / has_elevenlabs_key to know one is set.
         'gemini_api_key': _mask_secret_key(gemini_api_key_raw),
         'gemini_model': gemini_model,
         'has_gemini_key': bool(gemini_api_key_raw),
+        'has_elevenlabs_key': bool(elevenlabs_api_key_raw),
         'has_agent_id': bool(agent_id),
         'ws_url': f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={agent_id}" if agent_id else None
     }), 200

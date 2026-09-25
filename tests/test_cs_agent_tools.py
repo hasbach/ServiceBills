@@ -69,29 +69,38 @@ def test_cs_agent_config(app, client):
     # 2. Authenticated tenant saves custom agent ID
     headers = auth_headers(client, "admin_agent_config", "pw123")
 
-    # Without tenant settings yet, falls back to env var
+    # Without tenant settings yet, does NOT fall back to global config/env var (strictly per-tenant)
     res = client.get("/api/cs-agent/config", headers=headers)
     assert res.status_code == 200
     data = res.get_json()
     assert data["status"] == "ok"
-    assert data["elevenlabs_agent_id"] == "agent_test_123"
-    assert "agent_test_123" in data["ws_url"]
+    assert data["elevenlabs_agent_id"] == ""
+    assert data["has_agent_id"] is False
+    assert data["has_elevenlabs_key"] is False
+    assert data["ws_url"] is None
 
     save_res = client.post(
         "/api/cs-agent/config",
-        json={"elevenlabs_agent_id": "tenant_custom_agent_999"},
+        json={
+            "elevenlabs_agent_id": "tenant_custom_agent_999",
+            "elevenlabs_api_key": "el_key_1234567890abcdef"
+        },
         headers=headers
     )
     assert save_res.status_code == 200
     save_data = save_res.get_json()
     assert save_data["status"] == "ok"
     assert save_data["settings"]["elevenlabs_agent_id"] == "tenant_custom_agent_999"
+    assert "..." in save_data["settings"]["elevenlabs_api_key"]
 
-    # 3. GET now returns tenant-specific ID instead of env fallback
+    # 3. GET now returns tenant-specific ID and masked key
     get_res = client.get("/api/cs-agent/config", headers=headers)
     assert get_res.status_code == 200
     get_data = get_res.get_json()
     assert get_data["elevenlabs_agent_id"] == "tenant_custom_agent_999"
+    assert get_data["has_agent_id"] is True
+    assert get_data["has_elevenlabs_key"] is True
+    assert "..." in get_data["elevenlabs_api_key"]
     assert "tenant_custom_agent_999" in get_data["ws_url"]
 
 
