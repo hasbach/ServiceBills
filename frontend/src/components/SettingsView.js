@@ -262,12 +262,26 @@ cloud_url = "${API_BASE_URL || window.location.origin}"
 token = "${token || ''}"
 poll_seconds = 2
 
-# Add your devices below
+# Add one [[device]] block per device, then remove the # in front of its lines.
+# The agent will NOT start until at least one device is filled in.
+# id must match the device's id on the Network Devices page in ServiceBills,
+# and host must match exactly.
+
 # [[device]]
-# id = 1
-# host = "192.168.1.1"
+# id       = 1
+# host     = "192.168.8.1"
+# type     = "mikrotik_ccr"
+# api_port = 8728
+# use_tls  = false
 # username = "admin"
-# password = "password"
+# password = "ROUTEROS-PASSWORD"
+
+# [[device]]
+# id       = 2
+# host     = "192.168.8.100"
+# type     = "vsol_olt"
+# api_port = 161
+# password = "SNMP-COMMUNITY"
 "@
     Set-Content -Path $tomlPath -Value $tomlContent
     # Administrators need write access -- the next step is editing this file.
