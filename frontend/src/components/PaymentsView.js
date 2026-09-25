@@ -423,7 +423,12 @@ const PaymentCardItem = React.memo(({
 
 const PaymentsView = () => {
     const { user, apiService, setSnackbar } = useAppContext();
-    const userRoles = user?.role ? user.role.split(',').map(r => r.trim().toLowerCase()) : [];
+    const parsedRoles = user?.role ? user.role.split(',').map(r => r.trim().toLowerCase()) : [];
+    // On this page an office 'cashier' has exactly a collector's rights
+    // (collect, never confirm receipt -- see mark_payment_as_paid), so fold
+    // it in rather than repeating 'cashier' next to every collector check.
+    const userRoles = parsedRoles.includes('cashier') && !parsedRoles.includes('collector')
+        ? [...parsedRoles, 'collector'] : parsedRoles;
 
     const theme = useTheme();
     const [payments, setPayments] = useState([]);
@@ -549,7 +554,7 @@ const PaymentsView = () => {
     useEffect(() => {
         apiService.fetchUsers().then(res => {
             const users = res.data || [];
-            setCollectors(users.filter(u => u.role && u.role.includes('collector')));
+            setCollectors(users.filter(u => u.role && (u.role.includes('collector') || u.role.includes('cashier'))));
         }).catch(err => console.error("Error fetching users", err));
     }, [apiService]);
 

@@ -100,6 +100,7 @@ const UserManagement = () => {
             case 'admin': return theme.palette.error.main;
             case 'finance': return theme.palette.success.main;
             case 'employee': return theme.palette.info.main;
+            case 'cashier': return theme.palette.warning.main;
             default: return theme.palette.text.secondary;
         }
     };
@@ -233,6 +234,10 @@ const UserManagement = () => {
                                 <MenuItem value="collector">
                                     <Checkbox checked={formData.role.indexOf('collector') > -1} />
                                     <ListItemText primary="Collector (Collect Payments)" />
+                                </MenuItem>
+                                <MenuItem value="cashier">
+                                    <Checkbox checked={formData.role.indexOf('cashier') > -1} />
+                                    <ListItemText primary="Office Cashier (Collect Payments, Renew/Edit/Cancel Subscriptions)" />
                                 </MenuItem>
                             </Select>
                         </FormControl>

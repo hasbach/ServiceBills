@@ -12,7 +12,7 @@ import NetworkMapView from './NetworkMapView';
 // comma-separated `user.role` field -- not a second source of truth, just the
 // existing field parsed the same way NetworkTreeView already parses it, then
 // collapsed to the one token NetworkMapView's prop contract expects.
-const ROLE_PRIORITY = ['admin', 'finance', 'employee', 'collector'];
+const ROLE_PRIORITY = ['admin', 'finance', 'cashier', 'employee', 'collector'];
 
 function primaryRole(rawRole) {
     const roles = (rawRole || '').split(',').map((r) => r.trim().toLowerCase()).filter(Boolean);

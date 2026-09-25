@@ -44,6 +44,7 @@ import {
     Person as PersonIcon,
     Phone as PhoneIcon,
     LocationOn as LocationOnIcon,
+    Cloud as CloudIcon,
     Visibility as VisibilityIcon,
     VisibilityOff as VisibilityOffIcon,
     Delete as DeleteIcon,
@@ -224,6 +225,13 @@ const SubscriptionsView = ({
     // restricted roles.
     const userRoles = user?.role ? user.role.split(',').map(r => r.trim().toLowerCase()) : [];
     const canManageSubscriptions = userRoles.includes('admin') || userRoles.includes('finance');
+    // 'cashier' (office front desk) sits between the two: sees balances and
+    // can edit/renew/cancel/activate one customer at a time and *collect* a
+    // payment, but can't confirm it as received, delete, bulk-act, export,
+    // or touch money/network fields -- mirrored on the backend by
+    // subscription_desk_required() and CASHIER_EDITABLE_CUSTOMER_FIELDS.
+    const isCashierOnly = !canManageSubscriptions && userRoles.includes('cashier');
+    const canServeAtDesk = canManageSubscriptions || isCashierOnly;
     const [showAddCustomerForm, setShowAddCustomerForm] = useState(false);
     const [newCustomer, setNewCustomer] = useState({
         name: '',
@@ -501,6 +509,50 @@ const SubscriptionsView = ({
             setSnackbar({ open: true, message: 'Failed to mark payment as paid. ' + (error.response?.data?.error || error.message), severity: 'error' });
         }
     }, [apiService, setSnackbar, expandedCustomerId, fetchCustomerPayments, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery]);
+
+    // Cashier counterpart of handleMarkPaid: records the cash as collected
+    // (action 'collect'); finance/admin confirm receipt later on Payments.
+    const handleCollectPayment = useCallback(async (paymentId, currentAmount) => {
+        const input = prompt(`Enter amount collected for Payment ID ${paymentId} (Outstanding: ${currentAmount.toFixed(2)}):`, currentAmount.toFixed(2));
+        if (input === null) return;
+        const amountCollected = parseFloat(input);
+        if (isNaN(amountCollected) || amountCollected <= 0) {
+            setSnackbar({ open: true, message: 'Please enter a valid positive amount.', severity: 'warning' });
+            return;
+        }
+        try {
+            const response = await apiService.markPaymentAsPaid(paymentId, {
+                action: 'collect',
+                partial_payment: amountCollected < currentAmount,
+                partial_amount: amountCollected
+            });
+            setSnackbar({ open: true, message: response.data.message, severity: 'success' });
+            if (paymentsModalCustomer) {
+                fetchCustomerPayments(paymentsModalCustomer.id, paymentsModalCustomer);
+            } else if (expandedCustomerId) {
+                // fetchCustomerPayments toggles the grid expansion closed when
+                // called for the already-expanded id -- reload directly instead.
+                const res = await apiService.fetchPayments(expandedCustomerId);
+                setPayments(res.data?.payments || res.payments || []);
+            }
+        } catch (error) {
+            console.error("Error collecting payment:", error);
+            setSnackbar({ open: true, message: 'Failed to collect payment. ' + (error.response?.data?.message || error.message), severity: 'error' });
+        }
+    }, [apiService, setSnackbar, expandedCustomerId, paymentsModalCustomer, fetchCustomerPayments]);
+
+    const renderPaymentAction = (p) => {
+        if (p.paid) return null;
+        if (canManageSubscriptions) {
+            return <Button size="small" variant="contained" color="success" onClick={() => handleMarkPaid(p.id, p.amount)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Mark Paid</Button>;
+        }
+        if (isCashierOnly) {
+            return p.collected
+                ? <Chip label="Collected – awaiting finance" size="small" color="warning" variant="outlined" />
+                : <Button size="small" variant="contained" color="primary" onClick={() => handleCollectPayment(p.id, p.amount)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Collect</Button>;
+        }
+        return null;
+    };
 
     const handleDeleteCustomer = useCallback(async (customerId) => {
         if (window.confirm('Are you sure you want to delete this customer? This action cannot be undone.')) {
@@ -891,7 +943,13 @@ const SubscriptionsView = ({
         if (!editingCustomer) return;
 
         try {
-            const payload = {
+            const payload = isCashierOnly ? {
+                name: editingCustomer.name,
+                phone: editingCustomer.phone,
+                address: editingCustomer.address,
+                sector: editingCustomer.sector,
+                subscription_plan_id: editingCustomer.subscription_plan_id,
+            } : {
                 name: editingCustomer.name,
                 phone: editingCustomer.phone,
                 address: editingCustomer.address,
@@ -914,7 +972,7 @@ const SubscriptionsView = ({
             // so omitting an untouched field is both cheaper and strictly
             // correct, while an intentional clear still sends "".
             const currentOnuMac = editingCustomer.onu_mac_address || '';
-            if (currentOnuMac !== editingOnuMacSnapshotRef.current) {
+            if (!isCashierOnly && currentOnuMac !== editingOnuMacSnapshotRef.current) {
                 payload.onu_mac_address = currentOnuMac;
             }
 
@@ -922,7 +980,7 @@ const SubscriptionsView = ({
             // only send cpe_mac_address when the user actually changed it in
             // this dialog session.
             const currentCpeMac = editingCustomer.cpe_mac_address || '';
-            if (currentCpeMac !== editingCpeMacSnapshotRef.current) {
+            if (!isCashierOnly && currentCpeMac !== editingCpeMacSnapshotRef.current) {
                 payload.cpe_mac_address = currentCpeMac;
             }
 
@@ -946,7 +1004,7 @@ const SubscriptionsView = ({
                 severity: 'error'
             });
         }
-    }, [editingCustomer, apiService, setSnackbar, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery]);
+    }, [editingCustomer, isCashierOnly, apiService, setSnackbar, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery]);
 
     const handleAddCustomer = useCallback(async () => {
         if (!newCustomer.name || !newCustomer.phone || !newCustomer.address || !newCustomer.subscription_plan_id) {
@@ -1250,6 +1308,9 @@ const SubscriptionsView = ({
                                                                 </>
                                                             )}
                                                         </Box>
+                                                        {customer.upstream_provider_name && (
+                                                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 0.5 }}><CloudIcon sx={{ fontSize: 14, color: 'text.secondary' }} /><Typography variant="body2" color="text.secondary">{customer.upstream_provider_name}</Typography></Box>
+                                                        )}
                                                     </Box>
                                                 </Box>
                                                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, alignItems: 'flex-end' }}>
@@ -1262,7 +1323,7 @@ const SubscriptionsView = ({
                                                         />
                                                     )}
                                                     <Chip label={customer.is_subscription_active ? 'Active' : 'Canceled'} size="small" sx={{ backgroundColor: alpha(getStatusColor(customer.is_subscription_active), 0.1), color: getStatusColor(customer.is_subscription_active), fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(getStatusColor(customer.is_subscription_active), 0.2)}` }} />
-                                                    {canManageSubscriptions && (
+                                                    {canServeAtDesk && (
                                                         <Chip label={`Balance: $${customer.balance.toFixed(2)}`} size="small" sx={{ backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1), color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.2)}` }} />
                                                     )}
                                                     {renderUpstreamStatusChip(customer)}
@@ -1275,7 +1336,7 @@ const SubscriptionsView = ({
                                                 <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Start Date</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{new Date(customer.subscription_start_date).toLocaleDateString()}</Typography></Box></Grid>
                                                 <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Expiry Date</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{new Date(customer.subscription_expiry_date).toLocaleDateString()}</Typography></Box></Grid>
                                             </Grid>
-                                            {canManageSubscriptions && (
+                                            {canServeAtDesk && (
                                                 <>
                                                     <Divider sx={{ my: 2, opacity: 0.6 }} />
                                                     <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
@@ -1288,7 +1349,9 @@ const SubscriptionsView = ({
                                                         ) : (
                                                             <Button size="small" variant="outlined" color="success" startIcon={<PlayArrowIcon />} onClick={() => handleSubscriptionAction(apiService.activateSubscription, customer.id, "Activate subscription?")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Activate</Button>
                                                         )}
-                                                        <Button size="small" variant="outlined" color="error" startIcon={<DeleteIcon />} onClick={() => handleDeleteCustomer(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Delete</Button>
+                                                        {canManageSubscriptions && (
+                                                            <Button size="small" variant="outlined" color="error" startIcon={<DeleteIcon />} onClick={() => handleDeleteCustomer(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Delete</Button>
+                                                        )}
                                                     </Box>
                                                 </>
                                             )}
@@ -1305,7 +1368,7 @@ const SubscriptionsView = ({
                                                                             <TableCell>{new Date(p.date).toLocaleDateString()}</TableCell>
                                                                             <TableCell sx={{ fontWeight: 600 }}>${p.amount.toFixed(2)}</TableCell>
                                                                             <TableCell><Chip label={p.paid ? 'Paid' : 'Unpaid'} size="small" color={p.paid ? 'success' : 'error'} variant="outlined" /></TableCell>
-                                                                            <TableCell>{!p.paid && <Button size="small" variant="contained" color="success" onClick={() => handleMarkPaid(p.id, p.amount)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Mark Paid</Button>}</TableCell>
+                                                                            <TableCell>{renderPaymentAction(p)}</TableCell>
                                                                         </TableRow>
                                                                     )) : <TableRow><TableCell colSpan={4} sx={{ textAlign: 'center', py: 3 }}><Typography variant="body2" color="text.secondary">No payments found</Typography></TableCell></TableRow>}
                                                                 </TableBody>
@@ -1353,9 +1416,9 @@ const SubscriptionsView = ({
                                     <TableCell sx={{ fontWeight: 700 }}>Plan</TableCell>
                                     <TableCell sx={{ fontWeight: 700 }}>Status</TableCell>
                                     {canManageSubscriptions && <TableCell sx={{ fontWeight: 700 }}>WA Alerts</TableCell>}
-                                    {canManageSubscriptions && <TableCell sx={{ fontWeight: 700 }}>Balance</TableCell>}
+                                    {canServeAtDesk && <TableCell sx={{ fontWeight: 700 }}>Balance</TableCell>}
                                     <TableCell sx={{ fontWeight: 700 }}>Expiry Date</TableCell>
-                                    {canManageSubscriptions && <TableCell sx={{ fontWeight: 700 }}>Actions</TableCell>}
+                                    {canServeAtDesk && <TableCell sx={{ fontWeight: 700 }}>Actions</TableCell>}
                                 </TableRow>
                             </TableHead>
                             <TableBody>
@@ -1392,6 +1455,7 @@ const SubscriptionsView = ({
                                                     <Box>
                                                         <Typography variant="body1" sx={{ fontWeight: 600 }}>{customer.name}</Typography>
                                                         <Typography variant="body2" color="text.secondary">{customer.address}</Typography>
+                                                        {customer.upstream_provider_name && <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>Upstream: {customer.upstream_provider_name}</Typography>}
                                                         {customer.sector && <Typography variant="caption" color="text.secondary">Sector: {customer.sector}</Typography>}
                                                     </Box>
                                                 </Box>
@@ -1420,7 +1484,7 @@ const SubscriptionsView = ({
                                                     <Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />
                                                 </TableCell>
                                             )}
-                                            {canManageSubscriptions && (
+                                            {canServeAtDesk && (
                                                 <TableCell>
                                                     <Chip
                                                         label={`$${customer.balance.toFixed(2)}`}
@@ -1434,7 +1498,7 @@ const SubscriptionsView = ({
                                                 </TableCell>
                                             )}
                                             <TableCell>{new Date(customer.subscription_expiry_date).toLocaleDateString()}</TableCell>
-                                            {canManageSubscriptions && (
+                                            {canServeAtDesk && (
                                                 <TableCell onClick={(e) => e.stopPropagation()} sx={{ whiteSpace: 'nowrap' }}>
                                                     {/* Stop propagation so clicking buttons doesn't select the row */}
                                                     <Tooltip title="Payments History">
@@ -1470,11 +1534,13 @@ const SubscriptionsView = ({
                                                             </IconButton>
                                                         </Tooltip>
                                                     )}
-                                                    <Tooltip title="Delete">
-                                                        <IconButton size="small" color="error" onClick={() => handleDeleteCustomer(customer.id)}>
-                                                            <DeleteIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
+                                                    {canManageSubscriptions && (
+                                                        <Tooltip title="Delete">
+                                                            <IconButton size="small" color="error" onClick={() => handleDeleteCustomer(customer.id)}>
+                                                                <DeleteIcon fontSize="small" />
+                                                            </IconButton>
+                                                        </Tooltip>
+                                                    )}
                                                 </TableCell>
                                             )}
                                         </TableRow>
@@ -1504,17 +1570,20 @@ const SubscriptionsView = ({
                                 {sectors && sectors.map(s => <MenuItem key={s.id} value={s.name}>{s.name}</MenuItem>)}
                             </TextField>
                         </Grid>
-                        <Grid item xs={12} md={6}>
-                            <TextField fullWidth select label="Reseller (Optional)" value={editingCustomer?.reseller_id || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, reseller_id: e.target.value })}>
-                                <MenuItem value="">None</MenuItem>
-                                {resellers && resellers.map(r => <MenuItem key={r.id} value={r.id}>{r.name}</MenuItem>)}
-                            </TextField>
-                        </Grid>
+                        {!isCashierOnly && (
+                            <Grid item xs={12} md={6}>
+                                <TextField fullWidth select label="Reseller (Optional)" value={editingCustomer?.reseller_id || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, reseller_id: e.target.value })}>
+                                    <MenuItem value="">None</MenuItem>
+                                    {resellers && resellers.map(r => <MenuItem key={r.id} value={r.id}>{r.name}</MenuItem>)}
+                                </TextField>
+                            </Grid>
+                        )}
                         <Grid item xs={12} md={6}>
                             <TextField fullWidth select label="Subscription Plan" value={editingCustomer?.subscription_plan_id || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, subscription_plan_id: e.target.value })}>
                                 {subscriptionPlans.map(plan => (<MenuItem key={plan.id} value={plan.id}>{plan.name} - ${plan.price}</MenuItem>))}
                             </TextField>
                         </Grid>
+                        {!isCashierOnly && (<>
                         {businessSettings?.network_mode === 'upstream_bridge' && (
                             <>
                                 <Grid item xs={12} md={6}>
@@ -1646,6 +1715,7 @@ const SubscriptionsView = ({
                                 </Box>
                             </Grid>
                         )}
+                        </>)}
                     </Grid>
                 </DialogContent>
                 <DialogActions>
@@ -1678,7 +1748,7 @@ const SubscriptionsView = ({
                                             <TableCell>{new Date(p.date).toLocaleDateString()}</TableCell>
                                             <TableCell sx={{ fontWeight: 600 }}>${p.amount.toFixed(2)}</TableCell>
                                             <TableCell><Chip label={p.paid ? 'Paid' : 'Unpaid'} size="small" color={p.paid ? 'success' : 'error'} variant="outlined" /></TableCell>
-                                            <TableCell>{!p.paid && <Button size="small" variant="contained" color="success" onClick={() => handleMarkPaid(p.id, p.amount)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Mark Paid</Button>}</TableCell>
+                                            <TableCell>{renderPaymentAction(p)}</TableCell>
                                         </TableRow>
                                     )) : (
                                         <TableRow><TableCell colSpan={4} sx={{ textAlign: 'center', py: 4 }}><Typography variant="body2" color="text.secondary">No payment history found for this customer.</Typography></TableCell></TableRow>

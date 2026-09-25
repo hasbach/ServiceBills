@@ -2061,7 +2061,37 @@ def admin_or_finance_required():
     return wrapper
 
 
-NETWORK_VIEW_ROLES = ('admin', 'finance', 'employee', 'collector')
+def subscription_desk_required():
+    """Admin/finance plus the office 'cashier' role: the front-desk employee
+    who serves walk-in customers. Gates the single-customer subscription
+    actions they handle at the counter (edit, renew, cancel, activate).
+
+    Deliberately narrower than admin_or_finance_required(): delete and the
+    bulk_* variants stay there, and update_customer() further restricts a
+    cashier to CASHIER_EDITABLE_CUSTOMER_FIELDS so the edit form can't be
+    used to rewrite balance/discount/reseller (money) or network links.
+    A cashier can *collect* a payment but never confirm it as received --
+    that check lives in mark_payment_as_paid()."""
+    def wrapper(fn):
+        @wraps(fn)
+        def decorator(*args, **kwargs):
+            verify_jwt_in_request()
+            if any(r in ('admin', 'finance', 'cashier') for r in _jwt_roles()):
+                return fn(*args, **kwargs)
+            return jsonify(msg="Not authorized to manage subscriptions"), 403
+        return decorator
+    return wrapper
+
+
+# Fields a cashier (without admin/finance) may send to update_customer().
+CASHIER_EDITABLE_CUSTOMER_FIELDS = frozenset({
+    'name', 'phone', 'address', 'sector', 'subscription_plan_id',
+    'subscription_start_date', 'is_subscription_active',
+    'whatsapp_notifications_enabled',
+})
+
+
+NETWORK_VIEW_ROLES = ('admin', 'finance', 'employee', 'collector', 'cashier')
 
 
 def network_view_required():
@@ -3769,6 +3799,12 @@ def get_customers():
 
         pagination = query.paginate(page=page, per_page=per_page, error_out=False)
         
+        # Resolve this page's upstream names in one query rather than lazy-
+        # loading the Customer.upstream_provider backref once per card.
+        upstream_ids = {c.upstream_provider_id for c in pagination.items if c.upstream_provider_id}
+        upstream_names = {p.id: p.name for p in tenant_query(UpstreamProvider).filter(
+            UpstreamProvider.id.in_(upstream_ids)).all()} if upstream_ids else {}
+
         customers_with_plans = []
         for c in pagination.items:
             customer_dict = {
@@ -3785,6 +3821,7 @@ def get_customers():
                 'cost_override': float(c.cost_override) if c.cost_override is not None else None,
                 'reseller_id': c.reseller_id,
                 'upstream_provider_id': c.upstream_provider_id,
+                'upstream_provider_name': upstream_names.get(c.upstream_provider_id),
                 'upstream_username': c.upstream_username,
                 'upstream_actual_expiry': c.upstream_actual_expiry.strftime('%Y-%m-%d') if c.upstream_actual_expiry else None,
                 'upstream_last_status': c.upstream_last_status,
@@ -4063,7 +4100,7 @@ def add_customer():
 
 @app.route('/api/customers/<int:customer_id>', methods=['PUT'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def update_customer(customer_id):
     try:
         customer = tenant_query(Customer).filter_by(id=customer_id).first()
@@ -4071,6 +4108,11 @@ def update_customer(customer_id):
             return jsonify({'message': 'Customer not found!'}), 404
 
         data = request.json
+        roles = _jwt_roles()
+        if 'admin' not in roles and 'finance' not in roles:
+            forbidden = sorted(set(data or {}) - CASHIER_EDITABLE_CUSTOMER_FIELDS)
+            if forbidden:
+                return jsonify({'error': 'Your role cannot change: ' + ', '.join(forbidden)}), 403
         # Bound up front (not just inside the 'cpe_mac_address' branch below)
         # so the IntegrityError handler can reference it without an
         # UnboundLocalError when the request never touched this field.
@@ -4557,7 +4599,7 @@ def generate_future_payments():
         
 @app.route('/api/subscription_plans', methods=['GET'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def get_subscription_plans():
     subscription_plans = tenant_query(SubscriptionPlan).all()
     return jsonify([plan.to_dict() for plan in subscription_plans]) # Use to_dict() for consistency
@@ -5124,7 +5166,7 @@ def mark_payment_as_paid(payment_id):
         action = data.get('action', 'pay') # 'collect' or 'pay'
         roles = [r.strip().lower() for r in current_user.role.split(',')]
         is_admin_or_finance = 'admin' in roles or 'finance' in roles
-        is_collector = 'collector' in roles or is_admin_or_finance
+        is_collector = 'collector' in roles or 'cashier' in roles or is_admin_or_finance
 
         if action == 'collect':
             if not is_collector:
@@ -5538,7 +5580,7 @@ def bulk_delete_payments():
 
 @app.route('/api/customers/<int:customer_id>/activate_subscription', methods=['PUT'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def activate_subscription(customer_id):
     customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
@@ -5635,7 +5677,7 @@ def _cancel_subscription_core(customer):
 
 @app.route('/api/customers/<int:customer_id>/cancel_subscription', methods=['PUT'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def cancel_subscription(customer_id):
     customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
@@ -8757,7 +8799,7 @@ def _renew_subscription_core(customer):
 
 @app.route('/api/customers/<int:customer_id>/renew_subscription', methods=['POST'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def renew_subscription(customer_id):
     try:
         customer = tenant_query(Customer).filter_by(id=customer_id).first()

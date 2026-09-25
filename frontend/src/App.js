@@ -72,7 +72,7 @@ const NAV_ITEMS = [
     // balance/actions) -- enforced inside SubscriptionsView.js, not by this
     // nav entry. A combined role like "employee,collector" stays read-only
     // too, since that check only grants the full view for admin/finance.
-    { key: 'subscriptions',      label: 'Subscriptions',      icon: <PeopleIcon />,          group: 'main',      allowedRoles: ['admin', 'finance', 'employee', 'collector'] },
+    { key: 'subscriptions',      label: 'Subscriptions',      icon: <PeopleIcon />,          group: 'main',      allowedRoles: ['admin', 'finance', 'cashier', 'employee', 'collector'] },
     { key: 'resellers',          label: 'Resellers',          icon: <ResellerIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
     { key: 'suppliers',          label: 'Suppliers',          icon: <ShoppingCartIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
     // Concept A/B (see docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
@@ -83,14 +83,14 @@ const NAV_ITEMS = [
     // ONU a customer sits behind and whether it's down. The write action on
     // the page (Match Labels) is hidden from them in NetworkTreeView.js and
     // refused by admin_or_finance_required() on the endpoints behind it.
-    { key: 'network-tree',       label: 'Network Tree',       icon: <NetworkTreeIcon />,      group: 'main',    allowedRoles: ['admin', 'finance', 'employee', 'collector'] },
+    { key: 'network-tree',       label: 'Network Tree',       icon: <NetworkTreeIcon />,      group: 'main',    allowedRoles: ['admin', 'finance', 'cashier', 'employee', 'collector'] },
     // Same roles as network-tree above: the map's read endpoints are also
     // network_view_required() (admin/finance/employee/collector), and writes
     // are admin_or_finance_required() -- enforced inside NetworkMapView.js
     // (canEdit) and the backend itself, not by this nav entry.
-    { key: 'network-map',        label: 'Network Map',        icon: <NetworkMapIcon />,       group: 'main',    allowedRoles: ['admin', 'finance', 'employee', 'collector'] },
+    { key: 'network-map',        label: 'Network Map',        icon: <NetworkMapIcon />,       group: 'main',    allowedRoles: ['admin', 'finance', 'cashier', 'employee', 'collector'] },
     { key: 'employees',          label: 'Payroll',            icon: <PayrollIcon />,             group: 'main',      allowedRoles: ['admin'] },
-    { key: 'payments',           label: 'Payments',           icon: <PaymentIcon />,         group: 'main',      allowedRoles: ['admin', 'finance', 'collector'] },
+    { key: 'payments',           label: 'Payments',           icon: <PaymentIcon />,         group: 'main',      allowedRoles: ['admin', 'finance', 'cashier', 'collector'] },
     { key: 'receipts',           label: 'Receipts',           icon: <ReceiptIcon />,         group: 'main',      allowedRoles: ['admin', 'finance'] },
     { key: 'expenses',           label: 'Expenses',           icon: <ExpenseIcon />,         group: 'main',      allowedRoles: ['admin'] },
     { key: 'reports',            label: 'Reports',            icon: <ReportIcon />,          group: 'analytics', allowedRoles: ['admin'] },
@@ -147,6 +147,7 @@ const MainApp = ({
 
         if (hasRole('admin') || hasRole('finance')) return 'dashboard';
         if (hasRole('employee') || hasRole('technician')) return 'service';
+        if (hasRole('cashier')) return 'subscriptions';
         if (hasRole('collector')) return 'payments';
         return 'dashboard';
     };
@@ -453,7 +454,9 @@ const AppContent = () => {
     }, [businessSettings]);
 
     const userRoles = (user?.role || '').split(',').map(r => r.trim().toLowerCase());
-    const canManagePlans = userRoles.includes('admin') || userRoles.includes('finance');
+    // Cashier needs the plan list to change a customer's plan in the edit
+    // dialog (GET /api/subscription_plans is subscription_desk_required()).
+    const canManagePlans = userRoles.includes('admin') || userRoles.includes('finance') || userRoles.includes('cashier');
 
     const refetchSubscriptionPlans = useCallback(async () => {
         if (!canManagePlans) return;

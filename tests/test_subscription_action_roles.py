@@ -67,3 +67,93 @@ def test_admin_role_unaffected_by_the_new_guard(client):
     customer_id = _setup_customer(client, admin_hdr)
 
     assert client.put(f"/api/customers/{customer_id}/cancel_subscription", headers=admin_hdr).status_code == 200
+
+
+# --- 'cashier': the office front-desk role ---------------------------------
+# Serves walk-in customers: collects payments, edits/renews/cancels/activates
+# a single subscription. Below finance: cannot confirm a payment as received,
+# delete customers, run bulk actions, or touch money/network fields on edit.
+
+def _first_unpaid_payment_id(client, admin_hdr, customer_id):
+    payments = client.get(f"/api/payments?customer_id={customer_id}", headers=admin_hdr).get_json()["payments"]
+    return next(p["id"] for p in payments if not p["paid"])
+
+
+def test_cashier_can_edit_renew_cancel_and_activate(client):
+    admin_hdr = make_tenant(client, "Biz E", "e_admin")
+    cashier_hdr = _create_user(client, admin_hdr, "e_cashier", "cashier")
+    customer_id = _setup_customer(client, admin_hdr)
+
+    assert client.get("/api/subscription_plans", headers=cashier_hdr).status_code == 200
+    r = client.put(f"/api/customers/{customer_id}", headers=cashier_hdr,
+                   json={"name": "New Name", "phone": "2", "address": "b"})
+    assert r.status_code == 200, r.get_json()
+    assert client.post(f"/api/customers/{customer_id}/renew_subscription", headers=cashier_hdr).status_code == 200
+    assert client.put(f"/api/customers/{customer_id}/cancel_subscription", headers=cashier_hdr).status_code == 200
+    assert client.put(f"/api/customers/{customer_id}/activate_subscription", headers=cashier_hdr).status_code == 200
+
+
+def test_cashier_cannot_edit_money_or_network_fields(client):
+    admin_hdr = make_tenant(client, "Biz F", "f_admin")
+    cashier_hdr = _create_user(client, admin_hdr, "f_cashier", "cashier")
+    customer_id = _setup_customer(client, admin_hdr)
+
+    for field, value in [("balance", 100), ("discount", 5), ("cost_override", 1),
+                         ("reseller_id", ""), ("upstream_username", "x"), ("onu_mac_address", "")]:
+        r = client.put(f"/api/customers/{customer_id}", headers=cashier_hdr, json={"name": "C", field: value})
+        assert r.status_code == 403, field
+
+    customer = appmod.Customer.query.get(customer_id)
+    assert float(customer.balance) != 100
+
+
+def test_cashier_cannot_delete_or_run_bulk_actions(client):
+    admin_hdr = make_tenant(client, "Biz G", "g_admin")
+    cashier_hdr = _create_user(client, admin_hdr, "g_cashier", "cashier")
+    customer_id = _setup_customer(client, admin_hdr)
+
+    assert client.delete(f"/api/customers/{customer_id}", headers=cashier_hdr).status_code == 403
+    assert client.post("/api/customers/bulk_renew_subscription", headers=cashier_hdr,
+                       json={"customer_ids": [customer_id]}).status_code == 403
+    assert client.post("/api/customers/bulk_cancel_subscription", headers=cashier_hdr,
+                       json={"customer_ids": [customer_id]}).status_code == 403
+    assert client.post("/api/customers/bulk_delete", headers=cashier_hdr,
+                       json={"customer_ids": [customer_id]}).status_code == 403
+
+
+def test_cashier_can_collect_but_not_confirm_payment(client):
+    admin_hdr = make_tenant(client, "Biz H", "h_admin")
+    cashier_hdr = _create_user(client, admin_hdr, "h_cashier", "cashier")
+    customer_id = _setup_customer(client, admin_hdr)
+    payment_id = _first_unpaid_payment_id(client, admin_hdr, customer_id)
+
+    r = client.put(f"/api/payments/{payment_id}/mark_paid", headers=cashier_hdr, json={"action": "pay"})
+    assert r.status_code == 403
+    r = client.put(f"/api/payments/{payment_id}/mark_paid", headers=cashier_hdr, json={"action": "collect"})
+    assert r.status_code == 200, r.get_json()
+    payment = appmod.Payment.query.get(payment_id)
+    assert payment.collected is True and payment.paid is False
+
+    assert client.put(f"/api/payments/{payment_id}/mark_gratis", headers=cashier_hdr, json={}).status_code == 403
+
+
+def test_employee_still_cannot_edit_customer(client):
+    admin_hdr = make_tenant(client, "Biz I", "i_admin")
+    employee_hdr = _create_user(client, admin_hdr, "i_employee", "employee")
+    customer_id = _setup_customer(client, admin_hdr)
+
+    assert client.put(f"/api/customers/{customer_id}", headers=employee_hdr, json={"name": "X"}).status_code == 403
+
+
+def test_customer_list_includes_upstream_provider_name(client):
+    admin_hdr = make_tenant(client, "Biz J", "j_admin")
+    customer_id = _setup_customer(client, admin_hdr)
+    customer = appmod.Customer.query.get(customer_id)
+    provider = appmod.UpstreamProvider(tenant_id=customer.tenant_id, name="Terra")
+    appmod.db.session.add(provider)
+    appmod.db.session.flush()
+    customer.upstream_provider_id = provider.id
+    appmod.db.session.commit()
+
+    rows = client.get("/api/customers", headers=admin_hdr).get_json()["customers"]
+    assert rows[0]["upstream_provider_name"] == "Terra"
