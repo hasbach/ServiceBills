@@ -5,7 +5,7 @@ import {
     Alert, Collapse, InputAdornment, IconButton, MenuItem,
     ToggleButton, ToggleButtonGroup, Tab, Tabs,
     Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
-    Autocomplete, Stack, Chip,
+    Autocomplete, Stack, Chip, Tooltip,
 } from '@mui/material';
 import {
     Business as BusinessIcon,
@@ -25,6 +25,7 @@ import {
     ContentCopy as ContentCopyIcon,
     Autorenew as AutorenewIcon,
     Download as DownloadIcon,
+    HelpOutline as HelpOutlineIcon,
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import ExpenseCategoryManager from './ExpenseCategoryManager.js';
@@ -90,6 +91,37 @@ const Section = ({ icon, title, subtitle, color, action, children }) => {
 };
 
 // ── Main Component ────────────────────────────────────────────────────────────
+// Hover help next to "On-prem Agent". The installer writes agent.toml with
+// every device commented out (the cloud never holds device passwords in agent
+// mode), so the owner has to fill it in by hand -- this is the only place in
+// the app that tells them what goes there.
+const AGENT_SETUP_HELP = (
+    <Box sx={{ '& code': { fontFamily: 'monospace', bgcolor: 'rgba(255,255,255,0.15)', px: 0.5, borderRadius: '4px' } }}>
+        <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 0.5 }}>Setting up the agent</Typography>
+        <Box component="ol" sx={{ m: 0, pl: 2.5, '& li': { mb: 0.75 } }}>
+            <li>Click <strong>Add local agent</strong> (or <strong>Regenerate Token</strong>). An installer script downloads with your token built in.</li>
+            <li>On an always-on PC on the same network as your devices, with Python 3.11+ installed, run it from the Downloads folder:<br />
+                <code>powershell -ExecutionPolicy Bypass -File .\Install-ServiceBillsAgent.ps1</code></li>
+            <li>Open Notepad <strong>as administrator</strong> and open <code>C:\ProgramData\ServiceBillsAgent\agent.toml</code>. Add one block per device and remove the <code>#</code> in front of its lines:
+                <Box component="pre" sx={{ m: '6px 0 0', p: 1, borderRadius: '6px', bgcolor: 'rgba(0,0,0,0.3)', fontSize: '0.72rem', whiteSpace: 'pre', overflowX: 'auto' }}>
+{`[[device]]
+id       = 1
+host     = "192.168.8.1"
+type     = "mikrotik_ccr"   # or "vsol_olt"
+api_port = 8728             # 161 for an OLT
+username = "admin"
+password = "device password"`}
+                </Box>
+            </li>
+            <li><code>id</code> and <code>host</code> must match the device exactly as listed on the <strong>Network Devices</strong> page. The agent refuses any other host. For an OLT, <code>password</code> is the SNMP community and <code>username</code> is left out.</li>
+            <li>Run the script again to start the agent. It keeps your <code>agent.toml</code>. The chip above turns <strong>Online</strong> within a few seconds.</li>
+        </Box>
+        <Typography variant="caption" component="div" sx={{ mt: 0.5, opacity: 0.85 }}>
+            Device passwords stay on that PC only and are never sent to ServiceBills. To update the agent later, use <strong>Download Update Script</strong>.
+        </Typography>
+    </Box>
+);
+
 const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) => {
     const { apiService } = useAppContext();
     const theme = useTheme();
@@ -708,7 +740,17 @@ Read-Host -Prompt "Press Enter to exit"
                             <Grid item xs={12}>
                                 <Collapse in={bizForm.network_access_mode === 'agent'}>
                                     <Paper variant="outlined" sx={{ p: 2.5, borderRadius: '12px' }}>
-                                        <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5 }}>On-prem Agent</Typography>
+                                        <Stack direction="row" alignItems="center" spacing={0.5} sx={{ mb: 1.5 }}>
+                                            <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>On-prem Agent</Typography>
+                                            {/* enterTouchDelay=0 so a tap opens it on phones, where there's no hover. */}
+                                            <Tooltip arrow placement="bottom-start" enterTouchDelay={0} leaveTouchDelay={15000}
+                                                componentsProps={{ tooltip: { sx: { maxWidth: 440, p: 1.5, fontSize: '0.8rem' } } }}
+                                                title={AGENT_SETUP_HELP}>
+                                                <IconButton size="small" aria-label="How to set up the on-prem agent">
+                                                    <HelpOutlineIcon fontSize="small" />
+                                                </IconButton>
+                                            </Tooltip>
+                                        </Stack>
                                         {agentsFetching ? (
                                             <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}><CircularProgress size={24} /></Box>
                                         ) : agent ? (
