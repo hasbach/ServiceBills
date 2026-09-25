@@ -184,9 +184,14 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     // gate rather than firing straight off the button.
     const [agentRegenerateConfirmOpen, setAgentRegenerateConfirmOpen] = useState(false);
 
+    // token is optional: the token is only ever revealed once (right after
+    // create/regenerate), so the "update" download from the agent card has
+    // none. That's fine for an existing box -- the script preserves an
+    // existing agent.toml and only refreshes the code files + task.
     const downloadInstallerScript = (token) => {
-        if (!token) return;
-        const script = `# ServiceBills On-Premise Agent Automated Installer
+        const script = `# ServiceBills On-Premise Agent Automated Installer / Updater
+# Safe to re-run: it stops the running agent, refreshes the code files,
+# keeps your existing agent.toml, and starts the agent again.
 # Self-elevate to Administrator if not already elevated
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsPrincipal]::WindowsBuiltInRole::Administrator)
 if (-not $isAdmin) {
@@ -203,22 +208,50 @@ Write-Host "==========================================================" -Foregro
 Write-Host "ServiceBills On-Premise Agent Auto-Installer" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
-Write-Host "1. Creating directories..."
+# Windows PowerShell 5.1 can default to TLS 1.0, which GitHub refuses.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+Write-Host "1. Stopping any running agent so its files can be replaced..."
+if (Get-ScheduledTask -TaskName "ServiceBillsAgent" -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName "ServiceBillsAgent" -ErrorAction SilentlyContinue
+}
+# Also catch an agent started by hand or by an older task -- Python keeps the
+# old modules in memory, so new files do nothing until the process restarts.
+Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*servicebills_agent.py*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 1
+
+Write-Host "2. Creating directories..."
 New-Item -ItemType Directory -Force -Path $installDir -ErrorAction SilentlyContinue | Out-Null
 New-Item -ItemType Directory -Force -Path $binDir -ErrorAction SilentlyContinue | Out-Null
 New-Item -ItemType Directory -Force -Path "$binDir\\agent" -ErrorAction SilentlyContinue | Out-Null
 
-Write-Host "2. Downloading agent files..."
-Invoke-WebRequest -Uri "$repoUrl/agent/servicebills_agent.py" -OutFile "$binDir\\agent\\servicebills_agent.py"
-Invoke-WebRequest -Uri "$repoUrl/mikrotik.py" -OutFile "$binDir\\mikrotik.py"
-Invoke-WebRequest -Uri "$repoUrl/vsol_olt.py" -OutFile "$binDir\\vsol_olt.py"
+Write-Host "3. Downloading agent files..."
+try {
+    Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -Uri "$repoUrl/agent/servicebills_agent.py" -OutFile "$binDir\\agent\\servicebills_agent.py"
+    Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -Uri "$repoUrl/agent/requirements-agent.txt" -OutFile "$binDir\\agent\\requirements-agent.txt"
+    Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -Uri "$repoUrl/mikrotik.py" -OutFile "$binDir\\mikrotik.py"
+    Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -Uri "$repoUrl/vsol_olt.py" -OutFile "$binDir\\vsol_olt.py"
+} catch {
+    Write-Host "Download failed: $_" -ForegroundColor Red
+    Write-Host "Nothing was restarted. Check this PC's internet access and run the script again." -ForegroundColor Red
+    Read-Host -Prompt "Press Enter to exit"
+    Exit 1
+}
 
 $tomlPath = "$installDir\\agent.toml"
-if (-not (Test-Path $tomlPath)) {
-    Write-Host "3. Creating agent.toml configuration..."
+$hasToken = ${token ? '$true' : '$false'}
+if (Test-Path $tomlPath) {
+    Write-Host "4. Existing agent.toml found at $tomlPath (preserved)."
+} elseif (-not $hasToken) {
+    Write-Warning "4. No agent.toml exists on this PC and this script carries no token."
+    Write-Warning "   In ServiceBills Settings, click Regenerate Token -- that downloads an installer with the token built in."
+} else {
+    Write-Host "4. Creating agent.toml configuration..."
     $tomlContent = @"
 cloud_url = "${API_BASE_URL || window.location.origin}"
-token = "${token}"
+token = "${token || ''}"
 poll_seconds = 2
 
 # Add your devices below
@@ -229,13 +262,14 @@ poll_seconds = 2
 # password = "password"
 "@
     Set-Content -Path $tomlPath -Value $tomlContent
-    icacls $tomlPath /inheritance:r /grant:r SYSTEM:R Administrators:R | Out-Null
-} else {
-    Write-Host "3. Existing agent.toml found at $tomlPath (preserved)."
+    # Administrators need write access -- the next step is editing this file.
+    icacls $tomlPath /inheritance:r /grant:r SYSTEM:R Administrators:F | Out-Null
 }
 
-Write-Host "4. Locating Python installation..."
+Write-Host "5. Locating Python installation..."
 $pythonPath = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
+# The WindowsApps python.exe is a Microsoft Store stub SYSTEM can't run.
+if ($pythonPath -like '*\\WindowsApps\\*') { $pythonPath = $null }
 if (-not $pythonPath) {
     $candidates = @(
         "C:\\Program Files\\Python313\\python.exe",
@@ -257,10 +291,11 @@ if (-not $pythonPath) {
     Write-Warning "Python was not found on PATH or standard folders. Please install Python 3.11+."
 } else {
     Write-Host "Found Python: $pythonPath" -ForegroundColor Green
-    Write-Host "5. Installing agent dependencies (requests, librouteros, pysnmp)..."
-    & $pythonPath -m pip install requests librouteros pysnmp --quiet
+    Write-Host "6. Installing agent dependencies..."
+    # From requirements-agent.txt, not bare names: vsol_olt.py needs pysnmp 7.x.
+    & $pythonPath -m pip install -r "$binDir\\agent\\requirements-agent.txt" --quiet
 
-    Write-Host "6. Configuring Windows Scheduled Task (ServiceBillsAgent)..."
+    Write-Host "7. Configuring Windows Scheduled Task (ServiceBillsAgent)..."
     try {
         $action = New-ScheduledTaskAction -Execute $pythonPath -Argument "C:\\ServiceBills\\agent\\servicebills_agent.py" -WorkingDirectory "C:\\ServiceBills"
         $trigger = New-ScheduledTaskTrigger -AtStartup
@@ -278,7 +313,7 @@ if (-not $pythonPath) {
 
         Register-ScheduledTask -TaskName "ServiceBillsAgent" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
         
-        Write-Host "7. Starting ServiceBillsAgent scheduled task..."
+        Write-Host "8. Starting ServiceBillsAgent scheduled task..."
         Start-ScheduledTask -TaskName "ServiceBillsAgent"
         Start-Sleep -Seconds 2
         $task = Get-ScheduledTask -TaskName "ServiceBillsAgent" -ErrorAction SilentlyContinue
@@ -676,8 +711,8 @@ Read-Host -Prompt "Press Enter to exit"
                                                         <strong>Out of date on the agent box: {describeStaleConnectors(agent.stale_connectors)}.</strong>{' '}
                                                         The version above only covers <code>servicebills_agent.py</code>, so the agent
                                                         can look current while running an old connector — checks may return nothing
-                                                        instead of failing. Copy {agent.stale_connectors?.length > 1 ? 'those files' : 'that file'} across
-                                                        again and restart the agent.
+                                                        instead of failing. Click <strong>Download Update Script</strong> below and run it
+                                                        on the agent box — it replaces the files and restarts the agent, keeping your agent.toml.
                                                     </Alert>
                                                 ) : (
                                                     <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
@@ -689,6 +724,12 @@ Read-Host -Prompt "Press Enter to exit"
                                                 <Button variant="outlined" color="warning" onClick={() => setAgentRegenerateConfirmOpen(true)} disabled={agentActionLoading}
                                                     sx={{ borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
                                                     {agentActionLoading ? 'Regenerating…' : 'Regenerate Token'}
+                                                </Button>
+                                                {/* No token here -- it's only revealed once. The script keeps the
+                                                    box's existing agent.toml, so it works as an in-place updater. */}
+                                                <Button variant="outlined" startIcon={<DownloadIcon />} onClick={() => downloadInstallerScript(null)}
+                                                    sx={{ ml: 1.5, borderRadius: '10px', textTransform: 'none', fontWeight: 600 }}>
+                                                    Download Update Script
                                                 </Button>
                                                 <Alert severity="info" sx={{ mt: 2, borderRadius: '12px' }}>
                                                     Regenerating invalidates the current token immediately — the running agent will
@@ -1207,7 +1248,8 @@ Read-Host -Prompt "Press Enter to exit"
                 <DialogContent>
                     <Alert severity="success" sx={{ mb: 2, borderRadius: '12px' }}>
                         An automated installer script (<strong>Install-ServiceBillsAgent.ps1</strong>) has been downloaded.
-                        Run it with PowerShell (as Administrator) on the server/PC that can reach your local devices.
+                        Run it on the server/PC that can reach your local devices: right-click it → <strong>Run with PowerShell</strong>.
+                        If Windows blocks it, run <code>powershell -ExecutionPolicy Bypass -File .\Install-ServiceBillsAgent.ps1</code> from the Downloads folder.
                     </Alert>
                     <Typography variant="body2" sx={{ mb: 1.5 }}>
                         The script automatically sets up directories, downloads agent files, installs Python dependencies, registers a <strong>Windows Scheduled Task</strong> (running as SYSTEM at boot, never ending, and auto-restarting on failure), and starts the agent immediately.
