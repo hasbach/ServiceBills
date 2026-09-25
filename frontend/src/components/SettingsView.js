@@ -192,11 +192,19 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
         const script = `# ServiceBills On-Premise Agent Automated Installer / Updater
 # Safe to re-run: it stops the running agent, refreshes the code files,
 # keeps your existing agent.toml, and starts the agent again.
+param([switch]$Elevated)
+
 # Self-elevate to Administrator if not already elevated
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsPrincipal]::WindowsBuiltInRole::Administrator)
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
+    if ($Elevated) {
+        # Already relaunched once and still not admin -- stop, never loop.
+        Write-Host "Could not get Administrator rights. Right-click PowerShell -> Run as administrator, then run this script again." -ForegroundColor Red
+        Read-Host -Prompt "Press Enter to exit"
+        Exit 1
+    }
     Write-Host "Elevating permissions to Administrator..." -ForegroundColor Yellow
-    Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"')
+    Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Elevated')
     Exit
 }
 
