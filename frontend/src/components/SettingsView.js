@@ -91,6 +91,70 @@ const Section = ({ icon, title, subtitle, color, action, children }) => {
 };
 
 // ── Main Component ────────────────────────────────────────────────────────────
+// Escape a value for a TOML basic string ("..."). Device fields come from
+// the tenant's own form input, so a quote or backslash must not break the file.
+const tomlString = (value) => String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/[\u0000-\u001f\u007f]/g, '');
+
+// agent.toml [[device]] blocks, pre-filled from the Network Devices page.
+// Written live (not commented out) so the agent starts right away; until the
+// owner types the passwords, those devices just read as auth failures in the
+// app, which points straight at what's missing. With no devices registered,
+// fall back to a commented example, since the agent needs at least one.
+const buildAgentDeviceBlocks = (devices) => {
+    const usable = (devices || []).filter((d) => d && d.id != null && d.host
+        && (d.device_type === 'mikrotik_ccr' || d.device_type === 'vsol_olt'));
+    if (usable.length === 0) {
+        return `# No devices are registered yet. Add them on the Network Devices page,
+# then add one block per device here and remove the # in front of its lines.
+# The agent will NOT start until at least one device is filled in.
+# id and host must match the Network Devices page exactly.
+
+# [[device]]
+# id       = 1
+# host     = "192.168.8.1"
+# type     = "mikrotik_ccr"
+# api_port = 8728
+# use_tls  = false
+# username = "admin"
+# password = "ROUTEROS-PASSWORD"
+
+# [[device]]
+# id       = 2
+# host     = "192.168.8.100"
+# type     = "vsol_olt"
+# api_port = 161
+# password = "SNMP-COMMUNITY"`;
+    }
+    const header = `# Pre-filled from your Network Devices page. Type each device's password
+# between the quotes below. Do not change id or host -- they must match
+# ServiceBills exactly. Passwords stay on this PC and are never uploaded.`;
+    const blocks = usable.map((d) => {
+        const isOlt = d.device_type === 'vsol_olt';
+        const name = String(d.name || '').replace(/[\r\n]+/g, ' ');
+        const lines = [
+            `# ${name}`,
+            '[[device]]',
+            `id       = ${Number(d.id)}`,
+            `host     = "${tomlString(d.host)}"`,
+            `type     = "${d.device_type}"`,
+            `api_port = ${Number(d.api_port) || (isOlt ? 161 : (d.use_tls ? 8729 : 8728))}`,
+        ];
+        if (isOlt) {
+            lines.push('password = ""          # <-- type the SNMP community here');
+        } else {
+            lines.push(`use_tls  = ${d.use_tls ? 'true' : 'false'}`);
+            lines.push(`username = "${tomlString(d.username || 'admin')}"`);
+            lines.push('password = ""          # <-- type the RouterOS password here');
+            if (d.service_name) lines.push(`service_name = "${tomlString(d.service_name)}"`);
+        }
+        return lines.join('\n');
+    });
+    return [header, ...blocks].join('\n\n');
+};
+
 // Hover help next to "On-prem Agent". The installer writes agent.toml with
 // every device commented out (the cloud never holds device passwords in agent
 // mode), so the owner has to fill it in by hand -- this is the only place in
@@ -99,10 +163,10 @@ const AGENT_SETUP_HELP = (
     <Box sx={{ '& code': { fontFamily: 'monospace', bgcolor: 'rgba(255,255,255,0.15)', px: 0.5, borderRadius: '4px' } }}>
         <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 0.5 }}>Setting up the agent</Typography>
         <Box component="ol" sx={{ m: 0, pl: 2.5, '& li': { mb: 0.75 } }}>
-            <li>Click <strong>Add local agent</strong> (or <strong>Regenerate Token</strong>). An installer script downloads with your token built in.</li>
+            <li>Add your devices on the <strong>Network Devices</strong> page first. Then click <strong>Add local agent</strong> (or <strong>Regenerate Token</strong>). An installer script downloads with your token and devices built in.</li>
             <li>On an always-on PC on the same network as your devices, with Python 3.11+ installed, run it from the Downloads folder:<br />
                 <code>powershell -ExecutionPolicy Bypass -File .\Install-ServiceBillsAgent.ps1</code></li>
-            <li>Open Notepad <strong>as administrator</strong> and open <code>C:\ProgramData\ServiceBillsAgent\agent.toml</code>. Add one block per device and remove the <code>#</code> in front of its lines:
+            <li>Open Notepad <strong>as administrator</strong> and open <code>C:\ProgramData\ServiceBillsAgent\agent.toml</code>. Devices already on the <strong>Network Devices</strong> page are pre-filled, so just type each <code>password</code>. Any other device needs a block like this:
                 <Box component="pre" sx={{ m: '6px 0 0', p: 1, borderRadius: '6px', bgcolor: 'rgba(0,0,0,0.3)', fontSize: '0.72rem', whiteSpace: 'pre', overflowX: 'auto' }}>
 {`[[device]]
 id       = 1
@@ -220,7 +284,22 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     // create/regenerate), so the "update" download from the agent card has
     // none. That's fine for an existing box -- the script preserves an
     // existing agent.toml and only refreshes the code files + task.
-    const downloadInstallerScript = (token) => {
+    const downloadInstallerScript = async (token) => {
+        // Pre-fill agent.toml from the Network Devices page so id/host/type/
+        // port can't be mistyped -- the agent refuses any host that doesn't
+        // match exactly. Passwords are never in the cloud in agent mode, so
+        // those stay blank for the owner to type. Only needed when this
+        // script can create agent.toml at all, i.e. when it carries a token.
+        let devices = [];
+        if (token) {
+            try {
+                const res = await apiService.fetchNetworkDevices();
+                devices = Array.isArray(res.data) ? res.data : [];
+            } catch {
+                devices = [];  // fall back to the commented example below
+            }
+        }
+        const deviceBlocks = buildAgentDeviceBlocks(devices);
         const script = `# ServiceBills On-Premise Agent Automated Installer / Updater
 # Safe to re-run: it stops the running agent, refreshes the code files,
 # keeps your existing agent.toml, and starts the agent again.
@@ -289,33 +368,18 @@ if (Test-Path $tomlPath) {
     Write-Warning "   In ServiceBills Settings, click Regenerate Token -- that downloads an installer with the token built in."
 } else {
     Write-Host "4. Creating agent.toml configuration..."
-    $tomlContent = @"
-cloud_url = "${API_BASE_URL || window.location.origin}"
-token = "${token || ''}"
+    # Single-quoted here-string: no PowerShell expansion, so a device name
+    # containing $ or a backtick lands in the file verbatim.
+    $tomlContent = @'
+cloud_url = "${tomlString(API_BASE_URL || window.location.origin)}"
+token = "${tomlString(token || '')}"
 poll_seconds = 2
 
-# Add one [[device]] block per device, then remove the # in front of its lines.
-# The agent will NOT start until at least one device is filled in.
-# id must match the device's id on the Network Devices page in ServiceBills,
-# and host must match exactly.
-
-# [[device]]
-# id       = 1
-# host     = "192.168.8.1"
-# type     = "mikrotik_ccr"
-# api_port = 8728
-# use_tls  = false
-# username = "admin"
-# password = "ROUTEROS-PASSWORD"
-
-# [[device]]
-# id       = 2
-# host     = "192.168.8.100"
-# type     = "vsol_olt"
-# api_port = 161
-# password = "SNMP-COMMUNITY"
-"@
-    Set-Content -Path $tomlPath -Value $tomlContent
+${deviceBlocks}
+'@
+    # UTF-8 without BOM: Python's tomllib rejects a BOM, and PowerShell 5.1's
+    # Set-Content would write ANSI and mangle non-English device names.
+    [IO.File]::WriteAllText($tomlPath, $tomlContent)
     # Administrators need write access -- the next step is editing this file.
     icacls $tomlPath /inheritance:r /grant:r SYSTEM:R Administrators:F | Out-Null
 }
@@ -386,7 +450,9 @@ Write-Host "==========================================================" -Foregro
 Write-Host "Please edit $tomlPath in Notepad to add your devices if you have not already."
 Read-Host -Prompt "Press Enter to exit"
 `;
-        const blob = new Blob([script], { type: 'text/plain' });
+        // Leading BOM so Windows PowerShell 5.1 reads the .ps1 as UTF-8, not
+        // ANSI -- otherwise Arabic device names in it arrive garbled.
+        const blob = new Blob(['﻿', script], { type: 'text/plain' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
