@@ -24,6 +24,7 @@ import {
     Payments as PaymentsIcon,
     ContentCopy as ContentCopyIcon,
     Autorenew as AutorenewIcon,
+    Download as DownloadIcon,
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import ExpenseCategoryManager from './ExpenseCategoryManager.js';
@@ -183,34 +184,38 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     // gate rather than firing straight off the button.
     const [agentRegenerateConfirmOpen, setAgentRegenerateConfirmOpen] = useState(false);
 
-    const handleCreateAgent = async () => {
-        setAgentActionLoading(true);
-        try {
-            const res = await apiService.createNetworkAgent({ name: 'Network Agent' });
-            setAgents([res.data.agent]);
-            const token = res.data.token;
-            setRevealedToken(token);
-            
-            // Auto-generate and download the installer script
-            const script = `
-# ServiceBills On-Premise Agent Installer
+    const downloadInstallerScript = (token) => {
+        if (!token) return;
+        const script = `# ServiceBills On-Premise Agent Automated Installer
+# Self-elevate to Administrator if not already elevated
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsPrincipal]::WindowsBuiltInRole::Administrator)
+if (-not $isAdmin) {
+    Write-Host "Elevating permissions to Administrator..." -ForegroundColor Yellow
+    Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"')
+    Exit
+}
+
 $installDir = "C:\\ProgramData\\ServiceBillsAgent"
 $binDir = "C:\\ServiceBills"
 $repoUrl = "https://raw.githubusercontent.com/hasbach/ServiceBills/main"
 
-Write-Host "Creating directories..."
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "ServiceBills On-Premise Agent Auto-Installer" -ForegroundColor Cyan
+Write-Host "==========================================================" -ForegroundColor Cyan
+
+Write-Host "1. Creating directories..."
 New-Item -ItemType Directory -Force -Path $installDir -ErrorAction SilentlyContinue | Out-Null
 New-Item -ItemType Directory -Force -Path $binDir -ErrorAction SilentlyContinue | Out-Null
 New-Item -ItemType Directory -Force -Path "$binDir\\agent" -ErrorAction SilentlyContinue | Out-Null
 
-Write-Host "Downloading agent files..."
+Write-Host "2. Downloading agent files..."
 Invoke-WebRequest -Uri "$repoUrl/agent/servicebills_agent.py" -OutFile "$binDir\\agent\\servicebills_agent.py"
 Invoke-WebRequest -Uri "$repoUrl/mikrotik.py" -OutFile "$binDir\\mikrotik.py"
 Invoke-WebRequest -Uri "$repoUrl/vsol_olt.py" -OutFile "$binDir\\vsol_olt.py"
 
 $tomlPath = "$installDir\\agent.toml"
 if (-not (Test-Path $tomlPath)) {
-    Write-Host "Creating agent.toml configuration..."
+    Write-Host "3. Creating agent.toml configuration..."
     $tomlContent = @"
 cloud_url = "${API_BASE_URL || window.location.origin}"
 token = "${token}"
@@ -224,25 +229,93 @@ poll_seconds = 2
 # password = "password"
 "@
     Set-Content -Path $tomlPath -Value $tomlContent
+    icacls $tomlPath /inheritance:r /grant:r SYSTEM:R Administrators:R | Out-Null
+} else {
+    Write-Host "3. Existing agent.toml found at $tomlPath (preserved)."
 }
 
-Write-Host "=========================================================="
-Write-Host "Agent files installed successfully to $binDir"
-Write-Host "Configuration file created at $tomlPath"
-Write-Host "Please open $tomlPath in notepad to edit your devices."
-Write-Host "=========================================================="
+Write-Host "4. Locating Python installation..."
+$pythonPath = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
+if (-not $pythonPath) {
+    $candidates = @(
+        "C:\\Program Files\\Python313\\python.exe",
+        "C:\\Program Files\\Python312\\python.exe",
+        "C:\\Program Files\\Python311\\python.exe",
+        "$env:LOCALAPPDATA\\Programs\\Python\\Python313\\python.exe",
+        "$env:LOCALAPPDATA\\Programs\\Python\\Python312\\python.exe",
+        "$env:LOCALAPPDATA\\Programs\\Python\\Python311\\python.exe"
+    )
+    foreach ($cand in $candidates) {
+        if (Test-Path $cand) {
+            $pythonPath = $cand
+            break
+        }
+    }
+}
+
+if (-not $pythonPath) {
+    Write-Warning "Python was not found on PATH or standard folders. Please install Python 3.11+."
+} else {
+    Write-Host "Found Python: $pythonPath" -ForegroundColor Green
+    Write-Host "5. Installing agent dependencies (requests, librouteros, pysnmp)..."
+    & $pythonPath -m pip install requests librouteros pysnmp --quiet
+
+    Write-Host "6. Configuring Windows Scheduled Task (ServiceBillsAgent)..."
+    try {
+        $action = New-ScheduledTaskAction -Execute $pythonPath -Argument "C:\\ServiceBills\\agent\\servicebills_agent.py" -WorkingDirectory "C:\\ServiceBills"
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        
+        $settingsParams = @{
+            AllowStartIfOnBatteries = $true
+            DontStopIfGoingOnBatteries = $true
+            StartWhenAvailable = $true
+            ExecutionTimeLimit = [TimeSpan]::Zero
+            RestartInterval = (New-TimeSpan -Minutes 1)
+            RestartCount = 999
+        }
+        $settings = New-ScheduledTaskSettingsSet @settingsParams
+
+        Register-ScheduledTask -TaskName "ServiceBillsAgent" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        
+        Write-Host "7. Starting ServiceBillsAgent scheduled task..."
+        Start-ScheduledTask -TaskName "ServiceBillsAgent"
+        Start-Sleep -Seconds 2
+        $task = Get-ScheduledTask -TaskName "ServiceBillsAgent" -ErrorAction SilentlyContinue
+        Write-Host "Scheduled Task Status: $($task.State)" -ForegroundColor Green
+    } catch {
+        Write-Warning "Could not register scheduled task automatically: $_"
+    }
+}
+
+Write-Host "==========================================================" -ForegroundColor Green
+Write-Host "ServiceBills Agent installed and configured!" -ForegroundColor Green
+Write-Host "Installation directory: $binDir"
+Write-Host "Configuration file:    $tomlPath"
+Write-Host "Log file:              $installDir\\agent.log"
+Write-Host "==========================================================" -ForegroundColor Green
+Write-Host "Please edit $tomlPath in Notepad to add your devices if you have not already."
 Read-Host -Prompt "Press Enter to exit"
 `;
-            const blob = new Blob([script], { type: 'text/plain' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'Install-ServiceBillsAgent.ps1';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
+        const blob = new Blob([script], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'Install-ServiceBillsAgent.ps1';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    };
 
+    const handleCreateAgent = async () => {
+        setAgentActionLoading(true);
+        try {
+            const res = await apiService.createNetworkAgent({ name: 'Network Agent' });
+            setAgents([res.data.agent]);
+            const token = res.data.token;
+            setRevealedToken(token);
+            downloadInstallerScript(token);
             setTokenDialogOpen(true);
         } catch (err) {
             const detail = err?.response?.data?.error || 'Failed to create agent';
@@ -258,7 +331,9 @@ Read-Host -Prompt "Press Enter to exit"
         try {
             const res = await apiService.regenerateNetworkAgentToken(agent.id);
             setAgents([res.data.agent]);
-            setRevealedToken(res.data.token);
+            const token = res.data.token;
+            setRevealedToken(token);
+            downloadInstallerScript(token);
             setTokenDialogOpen(true);
         } catch (err) {
             const detail = err?.response?.data?.error || 'Failed to regenerate token';
@@ -1131,11 +1206,11 @@ Read-Host -Prompt "Press Enter to exit"
                 <DialogTitle>Agent Installation Required</DialogTitle>
                 <DialogContent>
                     <Alert severity="success" sx={{ mb: 2, borderRadius: '12px' }}>
-                        An installer script (<strong>Install-ServiceBillsAgent.ps1</strong>) has been downloaded to your computer.
-                        Please run this script on the server that can reach your local devices.
+                        An automated installer script (<strong>Install-ServiceBillsAgent.ps1</strong>) has been downloaded.
+                        Run it with PowerShell (as Administrator) on the server/PC that can reach your local devices.
                     </Alert>
-                    <Typography variant="body2" sx={{ mb: 2 }}>
-                        The script will automatically download the required files and place them in their specific places (<code>C:\ServiceBills</code>).
+                    <Typography variant="body2" sx={{ mb: 1.5 }}>
+                        The script automatically sets up directories, downloads agent files, installs Python dependencies, registers a <strong>Windows Scheduled Task</strong> (running as SYSTEM at boot, never ending, and auto-restarting on failure), and starts the agent immediately.
                     </Typography>
                     <Typography variant="body2" sx={{ mb: 2 }}>
                         After it finishes, please open <strong>C:\ProgramData\ServiceBillsAgent\agent.toml</strong> in Notepad to add your device IP addresses and passwords.
@@ -1153,6 +1228,9 @@ Read-Host -Prompt "Press Enter to exit"
                     />
                 </DialogContent>
                 <DialogActions>
+                    <Button startIcon={<DownloadIcon />} onClick={() => downloadInstallerScript(revealedToken)}>
+                        Download Script Again
+                    </Button>
                     <Button startIcon={<ContentCopyIcon />} onClick={handleCopyToken}>
                         {tokenCopied ? 'Copied!' : 'Copy Token'}
                     </Button>
