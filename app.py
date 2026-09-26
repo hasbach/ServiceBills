@@ -2063,15 +2063,16 @@ def admin_or_finance_required():
 
 def subscription_desk_required():
     """Admin/finance plus the office 'cashier' role: the front-desk employee
-    who serves walk-in customers. Gates the single-customer subscription
-    actions they handle at the counter (edit, renew, cancel, activate).
+    who serves walk-in customers. Gates what they handle at the counter:
+    add/edit customers, renew/cancel/activate (single and bulk), add a
+    charge, generate future payments.
 
-    Deliberately narrower than admin_or_finance_required(): delete and the
-    bulk_* variants stay there, and update_customer() further restricts a
-    cashier to CASHIER_EDITABLE_CUSTOMER_FIELDS so the edit form can't be
-    used to rewrite balance/discount/reseller (money) or network links.
-    A cashier can *collect* a payment but never confirm it as received --
-    that check lives in mark_payment_as_paid()."""
+    Still narrower than admin_or_finance_required(): deleting customers or
+    payments stays there. The one hard line for a cashier is that they can
+    *collect* money but never record it as received -- enforced in
+    mark_payment_as_paid() (no 'pay'), add_payment() (no pre_payment) and
+    update_customer() (no 'balance'), since each of those credits the
+    customer's balance the same way confirming a payment does."""
     def wrapper(fn):
         @wraps(fn)
         def decorator(*args, **kwargs):
@@ -2083,12 +2084,10 @@ def subscription_desk_required():
     return wrapper
 
 
-# Fields a cashier (without admin/finance) may send to update_customer().
-CASHIER_EDITABLE_CUSTOMER_FIELDS = frozenset({
-    'name', 'phone', 'address', 'sector', 'subscription_plan_id',
-    'subscription_start_date', 'is_subscription_active',
-    'whatsapp_notifications_enabled',
-})
+def _is_cashier_only():
+    """True for a cashier who doesn't also hold admin/finance."""
+    roles = _jwt_roles()
+    return 'cashier' in roles and 'admin' not in roles and 'finance' not in roles
 
 
 NETWORK_VIEW_ROLES = ('admin', 'finance', 'employee', 'collector', 'cashier')
@@ -3901,7 +3900,7 @@ def _cpe_mac_conflict_message(mac, customer_id=None):
 
 @app.route('/api/customers', methods=['POST'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def add_customer():
     try:
         # Plan-gating: enforce the tenant's customer limit (None = unlimited).
@@ -4108,11 +4107,8 @@ def update_customer(customer_id):
             return jsonify({'message': 'Customer not found!'}), 404
 
         data = request.json
-        roles = _jwt_roles()
-        if 'admin' not in roles and 'finance' not in roles:
-            forbidden = sorted(set(data or {}) - CASHIER_EDITABLE_CUSTOMER_FIELDS)
-            if forbidden:
-                return jsonify({'error': 'Your role cannot change: ' + ', '.join(forbidden)}), 403
+        if _is_cashier_only() and 'balance' in (data or {}):
+            return jsonify({'error': 'Your role cannot change the account balance.'}), 403
         # Bound up front (not just inside the 'cpe_mac_address' branch below)
         # so the IntegrityError handler can reference it without an
         # UnboundLocalError when the request never touched this field.
@@ -4436,7 +4432,7 @@ def bulk_delete_customers():
 
 @app.route('/api/payments/generate_future', methods=['POST'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def generate_future_payments():
     try:
         data = request.json
@@ -4725,7 +4721,7 @@ def _parse_positive_amount(raw, field_name='amount'):
 
 @app.route('/api/payments', methods=['POST'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def add_payment():
     data = request.json
 
@@ -4753,6 +4749,9 @@ def add_payment():
         is_pre_payment = data.get('pre_payment', False)
         # A pre-payment is paid, a non-pre-payment (manual charge) is unpaid
         is_paid = is_pre_payment
+        if is_paid and _is_cashier_only():
+            return jsonify({'error': 'Your role cannot record a payment as received; '
+                                     'add the charge, then collect it.'}), 403
 
         # Multi-currency: lock the FX rate at creation time (see
         # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
@@ -5706,7 +5705,7 @@ def cancel_subscription(customer_id):
 
 @app.route('/api/customers/bulk_cancel_subscription', methods=['POST'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def bulk_cancel_subscriptions():
     """Cancel a batch of customer subscriptions in a single request instead of
     one HTTP round trip per row. Recomputes estimated profit once for the
@@ -8819,7 +8818,7 @@ def renew_subscription(customer_id):
 
 @app.route('/api/customers/bulk_renew_subscription', methods=['POST'])
 @jwt_required()
-@admin_or_finance_required()
+@subscription_desk_required()
 def bulk_renew_subscriptions():
     """Renew a batch of customer subscriptions in a single request instead of
     one HTTP round trip per row."""
@@ -9713,6 +9712,24 @@ def get_reseller_history(reseller_id):
     payments = tenant_query(ResellerPayment).filter_by(reseller_id=reseller_id).order_by(ResellerPayment.date.desc()).all()
     result = [p.to_dict() for p in payments]
     return jsonify(result), 200
+
+@app.route('/api/customer-form-options', methods=['GET'])
+@jwt_required()
+@subscription_desk_required()
+def get_customer_form_options():
+    """Id/name pickers for the Subscriptions add/edit customer forms. Open to
+    the cashier role; the full /api/resellers, /api/upstream-providers and
+    /api/network-devices lists stay admin/finance because they also carry
+    balances and portal/device details."""
+    return jsonify({
+        'resellers': [{'id': r.id, 'name': r.name}
+                      for r in tenant_query(Reseller).order_by(Reseller.name).all()],
+        'upstream_providers': [{'id': p.id, 'name': p.name}
+                               for p in tenant_query(UpstreamProvider).order_by(UpstreamProvider.name).all()],
+        'network_devices': [{'id': d.id, 'name': d.name, 'device_type': d.device_type}
+                            for d in tenant_query(NetworkDevice).order_by(NetworkDevice.name).all()],
+    }), 200
+
 
 @app.route('/api/resellers', methods=['GET'])
 @jwt_required()

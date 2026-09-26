@@ -139,18 +139,20 @@ const EnhancedTableToolbar = ({ numSelected, onRenew, onCancel, onDelete, disabl
                             Cancel
                         </Button>
                     </Tooltip>
-                    <Tooltip title="Delete Selected">
-                        <Button
-                            variant="outlined"
-                            color="error"
-                            startIcon={disabled ? <CircularProgress size={16} /> : <DeleteIcon />}
-                            onClick={onDelete}
-                            size="small"
-                            disabled={disabled}
-                        >
-                            Delete
-                        </Button>
-                    </Tooltip>
+                    {onDelete && (
+                        <Tooltip title="Delete Selected">
+                            <Button
+                                variant="outlined"
+                                color="error"
+                                startIcon={disabled ? <CircularProgress size={16} /> : <DeleteIcon />}
+                                onClick={onDelete}
+                                size="small"
+                                disabled={disabled}
+                            >
+                                Delete
+                            </Button>
+                        </Tooltip>
+                    )}
                 </Box>
             )}
         </Toolbar>
@@ -225,11 +227,11 @@ const SubscriptionsView = ({
     // restricted roles.
     const userRoles = user?.role ? user.role.split(',').map(r => r.trim().toLowerCase()) : [];
     const canManageSubscriptions = userRoles.includes('admin') || userRoles.includes('finance');
-    // 'cashier' (office front desk) sits between the two: sees balances and
-    // can edit/renew/cancel/activate one customer at a time and *collect* a
-    // payment, but can't confirm it as received, delete, bulk-act, export,
-    // or touch money/network fields -- mirrored on the backend by
-    // subscription_desk_required() and CASHIER_EDITABLE_CUSTOMER_FIELDS.
+    // 'cashier' (office front desk) sits between the two: adds and fully
+    // edits customers, renews/cancels/activates (single and bulk), and
+    // *collects* payments -- but can't record money as received (confirm a
+    // payment or edit the balance), delete, or export. Mirrored on the
+    // backend by subscription_desk_required() and _is_cashier_only().
     const isCashierOnly = !canManageSubscriptions && userRoles.includes('cashier');
     const canServeAtDesk = canManageSubscriptions || isCashierOnly;
     const [showAddCustomerForm, setShowAddCustomerForm] = useState(false);
@@ -321,10 +323,14 @@ const SubscriptionsView = ({
     const activeNetworkStatusCustomerIdRef = React.useRef(null);
 
     useEffect(() => {
-        apiService.fetchResellers().then(res => setResellers(res.data)).catch(err => console.error("Failed to load resellers", err));
         apiService.fetchSectors().then(res => setSectors(res.data)).catch(err => console.error("Failed to load sectors", err));
-        apiService.fetchUpstreamProviders().then(res => setUpstreamProviders(res.data)).catch(err => console.error("Failed to load upstream providers", err));
-        apiService.fetchNetworkDevices().then(res => setNetworkDevices((res.data || []).filter(d => d.device_type !== 'vsol_olt'))).catch(err => console.error("Failed to load network devices", err));
+        // Id/name pickers only -- this endpoint is open to the cashier role,
+        // unlike the full /resellers, /upstream-providers, /network-devices.
+        apiService.fetchCustomerFormOptions().then(res => {
+            setResellers(res.data.resellers || []);
+            setUpstreamProviders(res.data.upstream_providers || []);
+            setNetworkDevices((res.data.network_devices || []).filter(d => d.device_type !== 'vsol_olt'));
+        }).catch(err => console.error("Failed to load customer form options", err));
     }, []);
     const [selected, setSelected] = useState([]); // Array of customer IDs
     const [bulkActionLoading, setBulkActionLoading] = useState(false);
@@ -943,13 +949,7 @@ const SubscriptionsView = ({
         if (!editingCustomer) return;
 
         try {
-            const payload = isCashierOnly ? {
-                name: editingCustomer.name,
-                phone: editingCustomer.phone,
-                address: editingCustomer.address,
-                sector: editingCustomer.sector,
-                subscription_plan_id: editingCustomer.subscription_plan_id,
-            } : {
+            const payload = {
                 name: editingCustomer.name,
                 phone: editingCustomer.phone,
                 address: editingCustomer.address,
@@ -964,6 +964,7 @@ const SubscriptionsView = ({
                 network_device_id: editingCustomer.network_device_id || "",
                 pppoe_username: editingCustomer.pppoe_username || "",
             };
+            if (isCashierOnly) delete payload.balance;
 
             // Only include onu_mac_address when the user actually changed it
             // in this dialog session. editingCustomer can be a stale snapshot
@@ -972,7 +973,7 @@ const SubscriptionsView = ({
             // so omitting an untouched field is both cheaper and strictly
             // correct, while an intentional clear still sends "".
             const currentOnuMac = editingCustomer.onu_mac_address || '';
-            if (!isCashierOnly && currentOnuMac !== editingOnuMacSnapshotRef.current) {
+            if (currentOnuMac !== editingOnuMacSnapshotRef.current) {
                 payload.onu_mac_address = currentOnuMac;
             }
 
@@ -980,7 +981,7 @@ const SubscriptionsView = ({
             // only send cpe_mac_address when the user actually changed it in
             // this dialog session.
             const currentCpeMac = editingCustomer.cpe_mac_address || '';
-            if (!isCashierOnly && currentCpeMac !== editingCpeMacSnapshotRef.current) {
+            if (currentCpeMac !== editingCpeMacSnapshotRef.current) {
                 payload.cpe_mac_address = currentCpeMac;
             }
 
@@ -1079,7 +1080,7 @@ const SubscriptionsView = ({
                 <Typography variant="body2" sx={{ color: 'text.disabled', mb: 3 }}>
                     {searchQuery || statusFilter !== 'all' ? "Try adjusting your filters or search query." : "Start by adding your first customer."}
                 </Typography>
-                {canManageSubscriptions && (
+                {canServeAtDesk && (
                     <Button variant="contained" startIcon={<AddIcon />} onClick={() => setShowAddCustomerForm(true)} sx={{ borderRadius: '12px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5 }}>
                         Add Customer
                     </Button>
@@ -1125,11 +1126,11 @@ const SubscriptionsView = ({
                             <Typography variant="h4" sx={{ fontWeight: 700, mb: 1 }}>Subscriptions Management</Typography>
                             <Typography variant="body1" sx={{ opacity: 0.9 }}>Manage customer subscriptions and track payments</Typography>
                         </Box>
-                        {canManageSubscriptions && (
+                        {canServeAtDesk && (
                             <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, gap: 2 }}>
-                                <Button variant="contained" startIcon={<DownloadIcon />} onClick={handleExportCSV} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
+                                {canManageSubscriptions && <Button variant="contained" startIcon={<DownloadIcon />} onClick={handleExportCSV} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
                                     Export CSV
-                                </Button>
+                                </Button>}
                                 <Button variant="contained" startIcon={<AddIcon />} onClick={() => setShowAddCustomerForm(!showAddCustomerForm)} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
                                     {showAddCustomerForm ? 'Hide Form' : 'Add Customer'}
                                 </Button>
@@ -1314,7 +1315,7 @@ const SubscriptionsView = ({
                                                     </Box>
                                                 </Box>
                                                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, alignItems: 'flex-end' }}>
-                                                    {canManageSubscriptions && (
+                                                    {canServeAtDesk && (
                                                         <FormControlLabel
                                                             control={<Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />}
                                                             label={<Typography variant="caption" sx={{ fontWeight: 600 }}>WA Alerts</Typography>}
@@ -1387,12 +1388,12 @@ const SubscriptionsView = ({
             ) : (
                 // --- LIST VIEW (New) ---
                 <Paper sx={{ width: '100%', mb: 2, borderRadius: '16px', overflow: 'hidden' }}>
-                    {canManageSubscriptions && (
+                    {canServeAtDesk && (
                         <EnhancedTableToolbar
                             numSelected={selected.length}
                             onRenew={handleBulkRenew}
                             onCancel={handleBulkCancel}
-                            onDelete={handleBulkDelete}
+                            onDelete={canManageSubscriptions ? handleBulkDelete : undefined}
                             disabled={bulkActionLoading}
                         />
                     )}
@@ -1400,7 +1401,7 @@ const SubscriptionsView = ({
                         <Table sx={{ minWidth: 750 }} aria-labelledby="tableTitle">
                             <TableHead sx={{ backgroundColor: alpha(theme.palette.primary.main, 0.05) }}>
                                 <TableRow>
-                                    {canManageSubscriptions && (
+                                    {canServeAtDesk && (
                                         <TableCell padding="checkbox">
                                             <Checkbox
                                                 color="primary"
@@ -1415,7 +1416,7 @@ const SubscriptionsView = ({
                                     <TableCell sx={{ fontWeight: 700 }}>Contact</TableCell>
                                     <TableCell sx={{ fontWeight: 700 }}>Plan</TableCell>
                                     <TableCell sx={{ fontWeight: 700 }}>Status</TableCell>
-                                    {canManageSubscriptions && <TableCell sx={{ fontWeight: 700 }}>WA Alerts</TableCell>}
+                                    {canServeAtDesk && <TableCell sx={{ fontWeight: 700 }}>WA Alerts</TableCell>}
                                     {canServeAtDesk && <TableCell sx={{ fontWeight: 700 }}>Balance</TableCell>}
                                     <TableCell sx={{ fontWeight: 700 }}>Expiry Date</TableCell>
                                     {canServeAtDesk && <TableCell sx={{ fontWeight: 700 }}>Actions</TableCell>}
@@ -1430,15 +1431,15 @@ const SubscriptionsView = ({
                                     return (
                                         <TableRow
                                             hover
-                                            onClick={canManageSubscriptions ? (event) => handleSelectClick(event, customer.id) : undefined}
+                                            onClick={canServeAtDesk ? (event) => handleSelectClick(event, customer.id) : undefined}
                                             role="checkbox"
                                             aria-checked={isItemSelected}
                                             tabIndex={-1}
                                             key={customer.id}
                                             selected={isItemSelected}
-                                            sx={{ cursor: canManageSubscriptions ? 'pointer' : 'default', '&.Mui-selected': { backgroundColor: alpha(theme.palette.primary.main, 0.08) } }}
+                                            sx={{ cursor: canServeAtDesk ? 'pointer' : 'default', '&.Mui-selected': { backgroundColor: alpha(theme.palette.primary.main, 0.08) } }}
                                         >
-                                            {canManageSubscriptions && (
+                                            {canServeAtDesk && (
                                                 <TableCell padding="checkbox">
                                                     <Checkbox
                                                         color="primary"
@@ -1479,7 +1480,7 @@ const SubscriptionsView = ({
                                                     {renderUpstreamStatusChip(customer)}
                                                 </Box>
                                             </TableCell>
-                                            {canManageSubscriptions && (
+                                            {canServeAtDesk && (
                                                 <TableCell onClick={(e) => e.stopPropagation()}>
                                                     <Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />
                                                 </TableCell>
@@ -1570,20 +1571,17 @@ const SubscriptionsView = ({
                                 {sectors && sectors.map(s => <MenuItem key={s.id} value={s.name}>{s.name}</MenuItem>)}
                             </TextField>
                         </Grid>
-                        {!isCashierOnly && (
-                            <Grid item xs={12} md={6}>
-                                <TextField fullWidth select label="Reseller (Optional)" value={editingCustomer?.reseller_id || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, reseller_id: e.target.value })}>
-                                    <MenuItem value="">None</MenuItem>
-                                    {resellers && resellers.map(r => <MenuItem key={r.id} value={r.id}>{r.name}</MenuItem>)}
-                                </TextField>
-                            </Grid>
-                        )}
+                        <Grid item xs={12} md={6}>
+                            <TextField fullWidth select label="Reseller (Optional)" value={editingCustomer?.reseller_id || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, reseller_id: e.target.value })}>
+                                <MenuItem value="">None</MenuItem>
+                                {resellers && resellers.map(r => <MenuItem key={r.id} value={r.id}>{r.name}</MenuItem>)}
+                            </TextField>
+                        </Grid>
                         <Grid item xs={12} md={6}>
                             <TextField fullWidth select label="Subscription Plan" value={editingCustomer?.subscription_plan_id || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, subscription_plan_id: e.target.value })}>
                                 {subscriptionPlans.map(plan => (<MenuItem key={plan.id} value={plan.id}>{plan.name} - ${plan.price}</MenuItem>))}
                             </TextField>
                         </Grid>
-                        {!isCashierOnly && (<>
                         {businessSettings?.network_mode === 'upstream_bridge' && (
                             <>
                                 <Grid item xs={12} md={6}>
@@ -1623,9 +1621,9 @@ const SubscriptionsView = ({
                         </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount ($)" value={editingCustomer?.discount || 0} onChange={(e) => setEditingCustomer({ ...editingCustomer, discount: parseFloat(e.target.value) || 0 })} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={editingCustomer?.cost_override ?? ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
-                        <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Account Balance ($)" value={editingCustomer?.balance !== undefined ? editingCustomer.balance : 0} helperText="Negative value = Customer owes money. 0 = Paid." onChange={(e) => setEditingCustomer({ ...editingCustomer, balance: parseFloat(e.target.value) || 0 })} /></Grid>
+                        {!isCashierOnly && <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Account Balance ($)" value={editingCustomer?.balance !== undefined ? editingCustomer.balance : 0} helperText="Negative value = Customer owes money. 0 = Paid." onChange={(e) => setEditingCustomer({ ...editingCustomer, balance: parseFloat(e.target.value) || 0 })} /></Grid>}
 
-                        {businessSettings?.network_mode === 'local_mikrotik' && editingCustomer?.network_device_id && editingCustomer?.pppoe_username && (
+                        {!isCashierOnly && businessSettings?.network_mode === 'local_mikrotik' && editingCustomer?.network_device_id && editingCustomer?.pppoe_username && (
                             <Grid item xs={12}>
                                 <Box sx={{ p: 2, borderRadius: '12px', border: `1px solid ${alpha(theme.palette.divider, 0.15)}`, bgcolor: '#f8fafc' }}>
                                     <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
@@ -1663,7 +1661,7 @@ const SubscriptionsView = ({
                                 </Box>
                             </Grid>
                         )}
-                        {businessSettings?.network_mode === 'upstream_bridge' && editingCustomer?.upstream_provider_id && editingCustomer?.upstream_username && (
+                        {!isCashierOnly && businessSettings?.network_mode === 'upstream_bridge' && editingCustomer?.upstream_provider_id && editingCustomer?.upstream_username && (
                             <Grid item xs={12}>
                                 <Box sx={{ p: 2, borderRadius: '12px', border: `1px solid ${alpha(theme.palette.divider, 0.15)}`, bgcolor: '#f8fafc' }}>
                                     <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
@@ -1715,7 +1713,6 @@ const SubscriptionsView = ({
                                 </Box>
                             </Grid>
                         )}
-                        </>)}
                     </Grid>
                 </DialogContent>
                 <DialogActions>

@@ -70,9 +70,10 @@ def test_admin_role_unaffected_by_the_new_guard(client):
 
 
 # --- 'cashier': the office front-desk role ---------------------------------
-# Serves walk-in customers: collects payments, edits/renews/cancels/activates
-# a single subscription. Below finance: cannot confirm a payment as received,
-# delete customers, run bulk actions, or touch money/network fields on edit.
+# Serves walk-in customers: adds and fully edits customers, renews/cancels/
+# activates (single and bulk), adds charges, collects payments. Below
+# finance: can never record money as received (confirm payment, pre-payment,
+# or edit the balance), and cannot delete.
 
 def _first_unpaid_payment_id(client, admin_hdr, customer_id):
     payments = client.get(f"/api/payments?customer_id={customer_id}", headers=admin_hdr).get_json()["payments"]
@@ -93,32 +94,64 @@ def test_cashier_can_edit_renew_cancel_and_activate(client):
     assert client.put(f"/api/customers/{customer_id}/activate_subscription", headers=cashier_hdr).status_code == 200
 
 
-def test_cashier_cannot_edit_money_or_network_fields(client):
+def test_cashier_can_fully_edit_but_not_the_balance(client):
     admin_hdr = make_tenant(client, "Biz F", "f_admin")
     cashier_hdr = _create_user(client, admin_hdr, "f_cashier", "cashier")
     customer_id = _setup_customer(client, admin_hdr)
 
-    for field, value in [("balance", 100), ("discount", 5), ("cost_override", 1),
-                         ("reseller_id", ""), ("upstream_username", "x"), ("onu_mac_address", "")]:
-        r = client.put(f"/api/customers/{customer_id}", headers=cashier_hdr, json={"name": "C", field: value})
-        assert r.status_code == 403, field
-
+    r = client.put(f"/api/customers/{customer_id}", headers=cashier_hdr,
+                   json={"name": "C", "discount": 5, "cost_override": 1, "reseller_id": "",
+                         "upstream_username": "x", "onu_mac_address": ""})
+    assert r.status_code == 200, r.get_json()
     customer = appmod.Customer.query.get(customer_id)
-    assert float(customer.balance) != 100
+    assert float(customer.discount) == 5 and customer.upstream_username == "x"
+
+    before = float(customer.balance)
+    r = client.put(f"/api/customers/{customer_id}", headers=cashier_hdr, json={"name": "C", "balance": 100})
+    assert r.status_code == 403
+    assert float(appmod.Customer.query.get(customer_id).balance) == before
 
 
-def test_cashier_cannot_delete_or_run_bulk_actions(client):
+def test_cashier_can_add_customers_and_run_bulk_renew_cancel(client):
     admin_hdr = make_tenant(client, "Biz G", "g_admin")
     cashier_hdr = _create_user(client, admin_hdr, "g_cashier", "cashier")
     customer_id = _setup_customer(client, admin_hdr)
+    plan_id = appmod.Customer.query.get(customer_id).subscription_plan_id
+
+    r = client.post("/api/customers", headers=cashier_hdr,
+                    json={"name": "Walk-in", "phone": "9", "address": "z", "subscription_plan_id": plan_id,
+                          "subscription_start_date": "2026-01-01"})
+    assert r.status_code in (200, 201), r.get_json()
+    assert client.get("/api/customer-form-options", headers=cashier_hdr).status_code == 200
+    assert client.post("/api/customers/bulk_renew_subscription", headers=cashier_hdr,
+                       json={"customer_ids": [customer_id]}).status_code == 200
+    assert client.post("/api/customers/bulk_cancel_subscription", headers=cashier_hdr,
+                       json={"customer_ids": [customer_id]}).status_code == 200
+
+
+def test_cashier_cannot_delete(client):
+    admin_hdr = make_tenant(client, "Biz K", "k_admin")
+    cashier_hdr = _create_user(client, admin_hdr, "k_cashier", "cashier")
+    customer_id = _setup_customer(client, admin_hdr)
 
     assert client.delete(f"/api/customers/{customer_id}", headers=cashier_hdr).status_code == 403
-    assert client.post("/api/customers/bulk_renew_subscription", headers=cashier_hdr,
-                       json={"customer_ids": [customer_id]}).status_code == 403
-    assert client.post("/api/customers/bulk_cancel_subscription", headers=cashier_hdr,
-                       json={"customer_ids": [customer_id]}).status_code == 403
     assert client.post("/api/customers/bulk_delete", headers=cashier_hdr,
                        json={"customer_ids": [customer_id]}).status_code == 403
+
+
+def test_cashier_can_add_a_charge_but_not_a_received_payment(client):
+    admin_hdr = make_tenant(client, "Biz L", "l_admin")
+    cashier_hdr = _create_user(client, admin_hdr, "l_cashier", "cashier")
+    customer_id = _setup_customer(client, admin_hdr)
+
+    r = client.post("/api/payments", headers=cashier_hdr,
+                    json={"customer_id": customer_id, "amount": 5, "reason": "router"})
+    assert r.status_code in (200, 201), r.get_json()
+    r = client.post("/api/payments", headers=cashier_hdr,
+                    json={"customer_id": customer_id, "amount": 5, "reason": "prepaid", "pre_payment": True})
+    assert r.status_code == 403
+    r = client.post("/api/payments/generate_future", headers=cashier_hdr, json={"customer_id": customer_id, "until_date": "2026-12-31"})
+    assert r.status_code == 200, r.get_json()
 
 
 def test_cashier_can_collect_but_not_confirm_payment(client):

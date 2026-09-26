@@ -1716,17 +1716,21 @@ const handlePrint = () => {
                                 onChange={(e) => setNewPayment({ ...newPayment, reason: e.target.value })}
                             />
                         </Grid>
-                        <Grid item xs={12}>
-                            <FormControlLabel
-                                control={
-                                    <Checkbox
-                                        checked={newPayment.pre_payment}
-                                        onChange={(e) => setNewPayment({ ...newPayment, pre_payment: e.target.checked })}
-                                    />
-                                }
-                                label="Pre-Payment"
-                            />
-                        </Grid>
+                        {/* A pre-payment is recorded as already received -- only
+                            finance/admin may do that (add_payment refuses it for a cashier). */}
+                        {(userRoles.includes('admin') || userRoles.includes('finance')) && (
+                            <Grid item xs={12}>
+                                <FormControlLabel
+                                    control={
+                                        <Checkbox
+                                            checked={newPayment.pre_payment}
+                                            onChange={(e) => setNewPayment({ ...newPayment, pre_payment: e.target.checked })}
+                                        />
+                                    }
+                                    label="Pre-Payment"
+                                />
+                            </Grid>
+                        )}
                     </Grid>
                 </DialogContent>
                 <DialogActions>

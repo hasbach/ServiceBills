@@ -114,6 +114,7 @@ const rawApiService = {
 
     // Reseller API methods
     fetchResellers: () => api.get('/resellers'),
+    fetchCustomerFormOptions: () => api.get('/customer-form-options'),
     addReseller: (data) => api.post('/resellers', data),
     updateReseller: (id, data) => api.put(`/resellers/${id}`, data),
     deleteReseller: (id) => api.delete(`/resellers/${id}`),

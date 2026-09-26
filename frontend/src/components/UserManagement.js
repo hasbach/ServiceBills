@@ -237,7 +237,7 @@ const UserManagement = () => {
                                 </MenuItem>
                                 <MenuItem value="cashier">
                                     <Checkbox checked={formData.role.indexOf('cashier') > -1} />
-                                    <ListItemText primary="Office Cashier (Collect Payments, Renew/Edit/Cancel Subscriptions)" />
+                                    <ListItemText primary="Office Cashier (Customers, Subscriptions, Collect Payments — no confirm)" />
                                 </MenuItem>
                             </Select>
                         </FormControl>
