@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import useWindowRows, { chunkRows } from './useWindowRows';
 import {
     Box,
     Typography,
@@ -15,6 +16,7 @@ import {
     Divider,
     alpha,
     useTheme,
+    useMediaQuery,
     TextField,
     MenuItem,
     DialogTitle,
@@ -418,6 +420,122 @@ const PaymentCardItem = React.memo(({
                 </CardContent>
             </Card>
         </Fade>
+    );
+});
+
+// One list-view row, memoized: the row markup used to live inline in
+// PaymentsView, so every checkbox tick re-rendered every row (~2s with 300
+// payments). `actions` is a stable object forwarding to the view's latest
+// handlers; the role flags are booleans so they compare by value.
+const PaymentListRow = React.memo(function PaymentListRow({
+    payment, index, sel, canCollect, isAdminOrFinance, waSettings, actions, measureRef,
+}) {
+    const theme = useTheme();
+    // Same colors as PaymentsView's getStatusColor/getPaymentTypeColor.
+    const paymentStatusColor = (isPaid) => (isPaid ? theme.palette.success.main : theme.palette.error.main);
+    const paymentTypeColor = (isPrePayment) => (isPrePayment ? theme.palette.secondary.main : theme.palette.primary.main);
+    return (
+        <TableRow
+            ref={measureRef}
+            data-index={index}
+            hover
+            selected={sel}
+            sx={{ '&.Mui-selected': { bgcolor: alpha(theme.palette.primary.main, 0.06) } }}
+        >
+            <TableCell padding="checkbox">
+                <Checkbox checked={sel} onChange={() => actions.handleSelectOne(payment.id)} />
+            </TableCell>
+            <TableCell>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                    <Avatar sx={{ width: 32, height: 32, fontSize: '0.85rem', fontWeight: 700, background: `linear-gradient(135deg, ${paymentTypeColor(payment.pre_payment)}, ${alpha(paymentTypeColor(payment.pre_payment), 0.7)})` }}>
+                        {(payment.customer_name || 'N').charAt(0).toUpperCase()}
+                    </Avatar>
+                    <Box>
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>{payment.customer_name || '—'}</Typography>
+                        {payment.customer_address && (
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{payment.customer_address}</Typography>
+                        )}
+                        {payment.customer_phone && (
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{payment.customer_phone}</Typography>
+                        )}
+                    </Box>
+                </Box>
+            </TableCell>
+            <TableCell><Typography variant="body2">{new Date(payment.date).toLocaleDateString()}</Typography></TableCell>
+            <TableCell><Typography variant="body2">{payment.paid_at ? new Date(payment.paid_at).toLocaleDateString() : '—'}</Typography></TableCell>
+            <TableCell>
+                <Typography variant="body2" sx={{ fontWeight: 700, color: paymentStatusColor(payment.paid) }}>
+                    ${(parseFloat(payment.amount) || 0).toFixed(2)}
+                </Typography>
+            </TableCell>
+            <TableCell>
+                <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                    <Chip label={payment.paid ? 'Paid' : 'Unpaid'} size="small"
+                        sx={{ bgcolor: alpha(paymentStatusColor(payment.paid), 0.1), color: paymentStatusColor(payment.paid), fontWeight: 600, border: `1px solid ${alpha(paymentStatusColor(payment.paid), 0.25)}` }}
+                    />
+                    {payment.is_gratis && (
+                        <Chip label="GRATIS" size="small" title={payment.gratis_note || ''}
+                            sx={{ bgcolor: alpha(theme.palette.info.main, 0.1), color: theme.palette.info.main, fontWeight: 700, border: `1px solid ${alpha(theme.palette.info.main, 0.25)}` }}
+                        />
+                    )}
+                </Box>
+            </TableCell>
+            <TableCell>
+                {payment.pre_payment ? (
+                    <Chip label="Pre-Pay" size="small" sx={{ bgcolor: alpha(theme.palette.secondary.main, 0.1), color: theme.palette.secondary.main, fontWeight: 600 }} />
+                ) : '—'}
+            </TableCell>
+            <TableCell sx={{ whiteSpace: 'nowrap' }}>
+                {!payment.paid && (
+                    (!payment.collected && canCollect) ||
+                    (payment.collected && isAdminOrFinance)
+                ) && (
+                    <Tooltip title={payment.collected ? "Confirm Receipt" : "Collect"}>
+                        <IconButton size="small" color="success" onClick={() => actions.openMarkPaidDialog(payment)}>
+                            <CheckCircleIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                )}
+                {!payment.paid && isAdminOrFinance && (
+                    <Tooltip title="Mark Gratis (Free)">
+                        <IconButton size="small" color="info" onClick={() => actions.openMarkGratisDialog(payment)}>
+                            <CardGiftcardIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                )}
+                {isAdminOrFinance && (
+                    <Tooltip title="Print Receipt">
+                        <IconButton size="small" color="primary" onClick={() => actions.handlePrepareReceipt(payment.id)}>
+                            <PrintIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                )}
+                {isAdminOrFinance && waSettings.enabled && waSettings.mode === 'deeplink' && (payment.paid || payment.collected) && (() => {
+                    const waLink = actions.buildWhatsAppLink(payment);
+                    return waLink ? (
+                        <Tooltip title="Send via WhatsApp">
+                            <IconButton size="small" component="a" href={waLink} target="_blank" rel="noopener noreferrer" sx={{ color: '#25D366' }}>
+                                <WhatsAppIcon fontSize="small" />
+                            </IconButton>
+                        </Tooltip>
+                    ) : null;
+                })()}
+                {payment.paid && isAdminOrFinance && (
+                    <Tooltip title="Revert to Pending">
+                        <IconButton size="small" sx={{ color: '#F59E0B' }} onClick={() => actions.openRevertDialog(payment)}>
+                            <UndoIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                )}
+                {isAdminOrFinance && (
+                    <Tooltip title="Delete">
+                        <IconButton size="small" color="error" onClick={() => actions.handleDeletePayment(payment.id)}>
+                            <DeleteIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                )}
+            </TableCell>
+        </TableRow>
     );
 });
 
@@ -973,7 +1091,6 @@ const PaymentsView = () => {
     const handleSelectOne = (id) => {
         setSelected(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
     };
-    const isSelected = (id) => selected.includes(id);
     const handlePrepareReceipt = async (paymentId) => {
         try {
             const response = await apiService.fetchReceipt(paymentId);
@@ -1156,6 +1273,40 @@ const handlePrint = () => {
 
     const totalRevenue = React.useMemo(() => getTotalRevenue(payments), [payments]);
     const currentMonthRevenue = React.useMemo(() => getCurrentMonthRevenue(payments), [payments]);
+
+    const isAdminOrFinanceRole = userRoles.includes('admin') || userRoles.includes('finance');
+    const canCollectRole = isAdminOrFinanceRole || userRoles.includes('collector');
+    const latestRowHandlersRef = useRef(null);
+    latestRowHandlersRef.current = {
+        handleSelectOne, openMarkPaidDialog, openMarkGratisDialog, handlePrepareReceipt,
+        buildWhatsAppLink, openRevertDialog, handleDeletePayment,
+    };
+    const rowActions = React.useMemo(() => {
+        const h = () => latestRowHandlersRef.current;
+        return {
+            handleSelectOne: (...a) => h().handleSelectOne(...a),
+            openMarkPaidDialog: (...a) => h().openMarkPaidDialog(...a),
+            openMarkGratisDialog: (...a) => h().openMarkGratisDialog(...a),
+            handlePrepareReceipt: (...a) => h().handlePrepareReceipt(...a),
+            buildWhatsAppLink: (...a) => h().buildWhatsAppLink(...a),
+            openRevertDialog: (...a) => h().openRevertDialog(...a),
+            handleDeletePayment: (...a) => h().handleDeletePayment(...a),
+        };
+    }, []);
+
+    // Virtualized rendering (see useWindowRows): the page lists every
+    // matching payment with no paging, so a few hundred unpaid payments used
+    // to mean a few hundred mounted cards/rows. Grid rows follow the old
+    // Grid breakpoints (1 column, 2 from sm, 3 from lg).
+    const isLgUp = useMediaQuery(theme.breakpoints.up('lg'));
+    const isSmUp = useMediaQuery(theme.breakpoints.up('sm'));
+    const paymentGridColumns = isLgUp ? 3 : isSmUp ? 2 : 1;
+    const paymentGridRows = React.useMemo(() => chunkRows(payments, paymentGridColumns), [payments, paymentGridColumns]);
+    const isPaymentGrid = viewMode === 'grid';
+    const paymentRowKey = useCallback((i) => (isPaymentGrid
+        ? `g${paymentGridColumns}:${paymentGridRows[i]?.[0]?.id ?? i}`
+        : `l:${payments[i]?.id ?? i}`), [isPaymentGrid, paymentGridColumns, paymentGridRows, payments]);
+    const listRows = useWindowRows(isPaymentGrid ? paymentGridRows.length : payments.length, isPaymentGrid ? 330 : 64, paymentRowKey);
 
     // PaymentCard wraps the module-level _PaymentCard so React.memo works properly.
     // Handlers are collected into one stable object to minimise re-renders.
@@ -1518,13 +1669,22 @@ const handlePrint = () => {
                     </Box>
                 </Fade>
             ) : viewMode === 'grid' ? (
-                <Grid container spacing={3}>
-                    {payments.map((payment, index) => (
-                        <Grid item xs={12} sm={6} lg={4} key={payment.id}>
-                            <PaymentCard payment={payment} index={index} />
-                        </Grid>
+                <div ref={listRows.anchorRef}>
+                    <div style={{ height: listRows.padTop }} />
+                    {listRows.items.map((vr) => (
+                        <Box
+                            key={vr.key}
+                            data-index={vr.index}
+                            ref={listRows.virtualizer.measureElement}
+                            sx={{ display: 'grid', gridTemplateColumns: `repeat(${paymentGridColumns}, minmax(0, 1fr))`, columnGap: '24px', pb: '8px', alignItems: 'start' }}
+                        >
+                            {(paymentGridRows[vr.index] || []).map((payment) => (
+                                <PaymentCard key={payment.id} payment={payment} />
+                            ))}
+                        </Box>
                     ))}
-                </Grid>
+                    <div style={{ height: listRows.padBottom }} />
+                </div>
             ) : (
                 // --- LIST VIEW ---
                 <Paper sx={{ borderRadius: '16px', overflow: 'hidden' }}>
@@ -1559,112 +1719,30 @@ const handlePrint = () => {
                                     <TableCell sx={{ fontWeight: 700 }}>Actions</TableCell>
                                 </TableRow>
                             </TableHead>
-                            <TableBody>
-                                {payments.map((payment) => {
-                                    const sel = isSelected(payment.id);
+                            <TableBody ref={listRows.anchorRef}>
+                                {listRows.padTop > 0 && (
+                                    <tr aria-hidden="true" style={{ height: listRows.padTop }}><td colSpan={8} style={{ padding: 0, border: 0 }} /></tr>
+                                )}
+                                {listRows.items.map((vr) => {
+                                    const payment = payments[vr.index];
+                                    if (!payment) return null;
                                     return (
-                                        <TableRow
+                                        <PaymentListRow
                                             key={payment.id}
-                                            hover
-                                            selected={sel}
-                                            sx={{ '&.Mui-selected': { bgcolor: alpha(theme.palette.primary.main, 0.06) } }}
-                                        >
-                                            <TableCell padding="checkbox">
-                                                <Checkbox checked={sel} onChange={() => handleSelectOne(payment.id)} />
-                                            </TableCell>
-                                            <TableCell>
-                                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
-                                                    <Avatar sx={{ width: 32, height: 32, fontSize: '0.85rem', fontWeight: 700, background: `linear-gradient(135deg, ${getPaymentTypeColor(payment.pre_payment)}, ${alpha(getPaymentTypeColor(payment.pre_payment), 0.7)})` }}>
-                                                        {(payment.customer_name || 'N').charAt(0).toUpperCase()}
-                                                    </Avatar>
-                                                    <Box>
-                                                        <Typography variant="body2" sx={{ fontWeight: 600 }}>{payment.customer_name || '—'}</Typography>
-                                                        {payment.customer_address && (
-                                                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{payment.customer_address}</Typography>
-                                                        )}
-                                                        {payment.customer_phone && (
-                                                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{payment.customer_phone}</Typography>
-                                                        )}
-                                                    </Box>
-                                                </Box>
-                                            </TableCell>
-                                            <TableCell><Typography variant="body2">{new Date(payment.date).toLocaleDateString()}</Typography></TableCell>
-                                            <TableCell><Typography variant="body2">{payment.paid_at ? new Date(payment.paid_at).toLocaleDateString() : '—'}</Typography></TableCell>
-                                            <TableCell>
-                                                <Typography variant="body2" sx={{ fontWeight: 700, color: getStatusColor(payment.paid) }}>
-                                                    ${(parseFloat(payment.amount) || 0).toFixed(2)}
-                                                </Typography>
-                                            </TableCell>
-                                            <TableCell>
-                                                <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
-                                                    <Chip label={payment.paid ? 'Paid' : 'Unpaid'} size="small"
-                                                        sx={{ bgcolor: alpha(getStatusColor(payment.paid), 0.1), color: getStatusColor(payment.paid), fontWeight: 600, border: `1px solid ${alpha(getStatusColor(payment.paid), 0.25)}` }}
-                                                    />
-                                                    {payment.is_gratis && (
-                                                        <Chip label="GRATIS" size="small" title={payment.gratis_note || ''}
-                                                            sx={{ bgcolor: alpha(theme.palette.info.main, 0.1), color: theme.palette.info.main, fontWeight: 700, border: `1px solid ${alpha(theme.palette.info.main, 0.25)}` }}
-                                                        />
-                                                    )}
-                                                </Box>
-                                            </TableCell>
-                                            <TableCell>
-                                                {payment.pre_payment ? (
-                                                    <Chip label="Pre-Pay" size="small" sx={{ bgcolor: alpha(theme.palette.secondary.main, 0.1), color: theme.palette.secondary.main, fontWeight: 600 }} />
-                                                ) : '—'}
-                                            </TableCell>
-                                            <TableCell sx={{ whiteSpace: 'nowrap' }}>
-                                                {!payment.paid && (
-                                                    (!payment.collected && (userRoles.includes('collector') || userRoles.includes('admin') || userRoles.includes('finance'))) ||
-                                                    (payment.collected && (userRoles.includes('admin') || userRoles.includes('finance')))
-                                                ) && (
-                                                    <Tooltip title={payment.collected ? "Confirm Receipt" : "Collect"}>
-                                                        <IconButton size="small" color="success" onClick={() => openMarkPaidDialog(payment)}>
-                                                            <CheckCircleIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
-                                                )}
-                                                {!payment.paid && (userRoles.includes('admin') || userRoles.includes('finance')) && (
-                                                    <Tooltip title="Mark Gratis (Free)">
-                                                        <IconButton size="small" color="info" onClick={() => openMarkGratisDialog(payment)}>
-                                                            <CardGiftcardIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
-                                                )}
-                                                {(userRoles.includes('admin') || userRoles.includes('finance')) && (
-                                                    <Tooltip title="Print Receipt">
-                                                        <IconButton size="small" color="primary" onClick={() => handlePrepareReceipt(payment.id)}>
-                                                            <PrintIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
-                                                )}
-                                                {(userRoles.includes('admin') || userRoles.includes('finance')) && waSettings.enabled && waSettings.mode === 'deeplink' && (payment.paid || payment.collected) && (() => {
-                                                    const waLink = buildWhatsAppLink(payment);
-                                                    return waLink ? (
-                                                        <Tooltip title="Send via WhatsApp">
-                                                            <IconButton size="small" component="a" href={waLink} target="_blank" rel="noopener noreferrer" sx={{ color: '#25D366' }}>
-                                                                <WhatsAppIcon fontSize="small" />
-                                                            </IconButton>
-                                                        </Tooltip>
-                                                    ) : null;
-                                                })()}
-                                                {payment.paid && (userRoles.includes('admin') || userRoles.includes('finance')) && (
-                                                    <Tooltip title="Revert to Pending">
-                                                        <IconButton size="small" sx={{ color: '#F59E0B' }} onClick={() => openRevertDialog(payment)}>
-                                                            <UndoIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
-                                                )}
-                                                {(userRoles.includes('admin') || userRoles.includes('finance')) && (
-                                                    <Tooltip title="Delete">
-                                                        <IconButton size="small" color="error" onClick={() => handleDeletePayment(payment.id)}>
-                                                            <DeleteIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
-                                                )}
-                                            </TableCell>
-                                        </TableRow>
+                                            payment={payment}
+                                            index={vr.index}
+                                            sel={selected.includes(payment.id)}
+                                            canCollect={canCollectRole}
+                                            isAdminOrFinance={isAdminOrFinanceRole}
+                                            waSettings={waSettings}
+                                            actions={rowActions}
+                                            measureRef={listRows.virtualizer.measureElement}
+                                        />
                                     );
                                 })}
+                                {listRows.padBottom > 0 && (
+                                    <tr aria-hidden="true" style={{ height: listRows.padBottom }}><td colSpan={8} style={{ padding: 0, border: 0 }} /></tr>
+                                )}
                             </TableBody>
                         </Table>
                     </TableContainer>

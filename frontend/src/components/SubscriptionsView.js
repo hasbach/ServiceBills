@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback, useLayoutEffect } from 'react';
-import { useWindowVirtualizer } from '@tanstack/react-virtual';
+import React, { useState, useEffect, useCallback } from 'react';
+import useWindowRows, { chunkRows } from './useWindowRows';
 import {
     Box,
     Typography,
@@ -89,39 +89,6 @@ const getPlanColor = (planName) => {
 const EXPIRY_DAYS = Array.from({ length: 31 }, (_, i) => i + 1);
 
 const GRID_ROW_GAP_PX = 24;
-
-// Only the rows near the viewport are in the DOM; `padTop`/`padBottom` are
-// spacer heights standing in for everything above/below, so the page keeps
-// its real scroll height and the browser scrollbar behaves normally. The
-// page scrolls the window (not an inner box), hence useWindowVirtualizer;
-// scrollMargin is where row 0 starts on the page, re-measured each render
-// because the header/filters/add-form above it change height. Rows are
-// measured after render (measureElement + ResizeObserver), so a card whose
-// payments panel expands just grows its row.
-function useWindowRows(count, estimateSize, itemKey) {
-    const anchorRef = React.useRef(null);
-    const [scrollMargin, setScrollMargin] = useState(0);
-    // Deliberately no deps: re-measure after every render. It only sets
-    // state when the offset actually moved, so it settles in one pass.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    useLayoutEffect(() => {
-        const el = anchorRef.current;
-        if (!el) return;
-        const margin = Math.round(el.getBoundingClientRect().top + window.scrollY);
-        if (Math.abs(margin - scrollMargin) > 1) setScrollMargin(margin);
-    });
-    const virtualizer = useWindowVirtualizer({
-        count,
-        estimateSize: () => estimateSize,
-        overscan: 4,
-        scrollMargin,
-        getItemKey: itemKey,
-    });
-    const items = virtualizer.getVirtualItems();
-    const padTop = items.length ? items[0].start - scrollMargin : 0;
-    const padBottom = items.length ? virtualizer.getTotalSize() - (items[items.length - 1].end - scrollMargin) : 0;
-    return { anchorRef, virtualizer, items, padTop: Math.max(0, padTop), padBottom: Math.max(0, padBottom) };
-}
 
 // Shared empty list so a collapsed card's `payments` prop never changes.
 const NO_PAYMENTS = [];
@@ -1406,11 +1373,7 @@ const SubscriptionsView = ({
     const isLg = useMediaQuery(theme.breakpoints.up('lg'));
     const isMd = useMediaQuery(theme.breakpoints.up('md'));
     const gridColumns = isLg ? 3 : isMd ? 2 : 1;
-    const gridRows = React.useMemo(() => {
-        const rows = [];
-        for (let i = 0; i < sortedCustomers.length; i += gridColumns) rows.push(sortedCustomers.slice(i, i + gridColumns));
-        return rows;
-    }, [sortedCustomers, gridColumns]);
+    const gridRows = React.useMemo(() => chunkRows(sortedCustomers, gridColumns), [sortedCustomers, gridColumns]);
     const isGridView = viewMode === 'grid';
     const rowKey = useCallback((i) => (isGridView
         ? `g${gridColumns}:${gridRows[i]?.[0]?.id ?? i}`
