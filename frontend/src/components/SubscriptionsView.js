@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useLayoutEffect } from 'react';
+import { useWindowVirtualizer } from '@tanstack/react-virtual';
 import {
     Box,
     Typography,
@@ -13,6 +14,7 @@ import {
     Divider,
     alpha,
     useTheme,
+    useMediaQuery,
     TextField,
     MenuItem,
     Table,
@@ -86,6 +88,41 @@ const getPlanColor = (planName) => {
 
 const EXPIRY_DAYS = Array.from({ length: 31 }, (_, i) => i + 1);
 
+const GRID_ROW_GAP_PX = 24;
+
+// Only the rows near the viewport are in the DOM; `padTop`/`padBottom` are
+// spacer heights standing in for everything above/below, so the page keeps
+// its real scroll height and the browser scrollbar behaves normally. The
+// page scrolls the window (not an inner box), hence useWindowVirtualizer;
+// scrollMargin is where row 0 starts on the page, re-measured each render
+// because the header/filters/add-form above it change height. Rows are
+// measured after render (measureElement + ResizeObserver), so a card whose
+// payments panel expands just grows its row.
+function useWindowRows(count, estimateSize, itemKey) {
+    const anchorRef = React.useRef(null);
+    const [scrollMargin, setScrollMargin] = useState(0);
+    // Deliberately no deps: re-measure after every render. It only sets
+    // state when the offset actually moved, so it settles in one pass.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    useLayoutEffect(() => {
+        const el = anchorRef.current;
+        if (!el) return;
+        const margin = Math.round(el.getBoundingClientRect().top + window.scrollY);
+        if (Math.abs(margin - scrollMargin) > 1) setScrollMargin(margin);
+    });
+    const virtualizer = useWindowVirtualizer({
+        count,
+        estimateSize: () => estimateSize,
+        overscan: 4,
+        scrollMargin,
+        getItemKey: itemKey,
+    });
+    const items = virtualizer.getVirtualItems();
+    const padTop = items.length ? items[0].start - scrollMargin : 0;
+    const padBottom = items.length ? virtualizer.getTotalSize() - (items[items.length - 1].end - scrollMargin) : 0;
+    return { anchorRef, virtualizer, items, padTop: Math.max(0, padTop), padBottom: Math.max(0, padBottom) };
+}
+
 // Shared empty list so a collapsed card's `payments` prop never changes.
 const NO_PAYMENTS = [];
 
@@ -103,8 +140,7 @@ const GridCustomerCard = React.memo(function GridCustomerCard({
     const theme = useTheme();
     const plan = customer.subscription_plan;
     return (
-        <Grid item xs={12} md={6} lg={4} key={customer.id}>
-                <Card sx={{ position: 'relative', overflow: 'visible', transition: 'all 0.3s', '&:hover': { transform: 'translateY(-4px)', boxShadow: `0 12px 24px ${alpha(theme.palette.common.black, 0.15)}` }, borderRadius: '16px', border: `1px solid ${alpha(theme.palette.divider, 0.08)}`, mb: 2 }}>
+                <Card sx={{ position: 'relative', overflow: 'visible', transition: 'all 0.3s', '&:hover': { transform: 'translateY(-4px)', boxShadow: `0 12px 24px ${alpha(theme.palette.common.black, 0.15)}` }, borderRadius: '16px', border: `1px solid ${alpha(theme.palette.divider, 0.08)}` }}>
                     <Box sx={{ position: 'absolute', top: 0, left: 0, right: 0, height: 4, background: `linear-gradient(90deg, ${getStatusColor(customer.is_subscription_active)}, ${alpha(getStatusColor(customer.is_subscription_active), 0.7)})` }} />
                     <CardContent sx={{ p: 3 }}>
                         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 2 }}>
@@ -192,19 +228,20 @@ const GridCustomerCard = React.memo(function GridCustomerCard({
                         </Collapse>
                     </CardContent>
                 </Card>
-        </Grid>
     );
 });
 
 const ListCustomerRow = React.memo(function ListCustomerRow({
     customer, index, isItemSelected, isSyncing, networkMode,
-    canServeAtDesk, canManageSubscriptions, actions,
+    canServeAtDesk, canManageSubscriptions, actions, measureRef,
 }) {
     const theme = useTheme();
     const labelId = `enhanced-table-checkbox-${index}`;
     const plan = customer.subscription_plan;
     return (
         <TableRow
+            ref={measureRef}
+            data-index={index}
             hover
             onClick={canServeAtDesk ? (event) => actions.handleSelectClick(event, customer.id) : undefined}
             role="checkbox"
@@ -1362,6 +1399,24 @@ const SubscriptionsView = ({
     // server -- re-sorting here used to override Sort By with expiry date.
     const sortedCustomers = customers;
 
+    // Virtualized rendering (see useWindowRows): with "Items per page: all"
+    // the page used to mount every card at once and freeze for seconds.
+    // Grid view is virtualized by rows of cards, matching the old Grid
+    // breakpoints (1 column, 2 from md, 3 from lg).
+    const isLg = useMediaQuery(theme.breakpoints.up('lg'));
+    const isMd = useMediaQuery(theme.breakpoints.up('md'));
+    const gridColumns = isLg ? 3 : isMd ? 2 : 1;
+    const gridRows = React.useMemo(() => {
+        const rows = [];
+        for (let i = 0; i < sortedCustomers.length; i += gridColumns) rows.push(sortedCustomers.slice(i, i + gridColumns));
+        return rows;
+    }, [sortedCustomers, gridColumns]);
+    const isGridView = viewMode === 'grid';
+    const rowKey = useCallback((i) => (isGridView
+        ? `g${gridColumns}:${gridRows[i]?.[0]?.id ?? i}`
+        : `l:${sortedCustomers[i]?.id ?? i}`), [isGridView, gridColumns, gridRows, sortedCustomers]);
+    const windowRows = useWindowRows(isGridView ? gridRows.length : sortedCustomers.length, isGridView ? 420 : 88, rowKey);
+
     // OPTIMIZED: Memoize expensive revenue calculation to prevent re-computation on every render
     const estimatedRevenue = React.useMemo(() => {
         return customers
@@ -1524,7 +1579,7 @@ const SubscriptionsView = ({
                         <MenuItem value="address">Address</MenuItem>
                     </TextField>
                     <TextField select label="Items per page" value={itemsPerPage} onChange={(e) => { setItemsPerPage(Number(e.target.value)); setCurrentPage(1); }} sx={{ minWidth: 120 }}>
-                        <MenuItem value={10}>10</MenuItem><MenuItem value={25}>25</MenuItem><MenuItem value={50}>50</MenuItem><MenuItem value={100}>100</MenuItem><MenuItem value={1000}>all</MenuItem>
+                        <MenuItem value={10}>10</MenuItem><MenuItem value={25}>25</MenuItem><MenuItem value={50}>50</MenuItem><MenuItem value={100}>100</MenuItem><MenuItem value={100000}>all</MenuItem>
                     </TextField>
                     {/* --- NEW: View Mode Toggle --- */}
                     <ToggleButtonGroup
@@ -1548,8 +1603,16 @@ const SubscriptionsView = ({
                 <EmptyState />
             ) : viewMode === 'grid' ? (
                 // --- GRID VIEW (Original) ---
-                <Grid container spacing={3}>
-                    {sortedCustomers.map((customer) => {
+                <div ref={windowRows.anchorRef}>
+                    <div style={{ height: windowRows.padTop }} />
+                    {windowRows.items.map((vr) => (
+                        <Box
+                            key={vr.key}
+                            data-index={vr.index}
+                            ref={windowRows.virtualizer.measureElement}
+                            sx={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: `${GRID_ROW_GAP_PX}px`, pb: `${GRID_ROW_GAP_PX}px`, alignItems: 'start' }}
+                        >
+                            {(gridRows[vr.index] || []).map((customer) => {
                         const isExpanded = expandedCustomerId === customer.id;
                         return (
                             <GridCustomerCard
@@ -1565,8 +1628,11 @@ const SubscriptionsView = ({
                                 actions={cardActions}
                             />
                         );
-                    })}
-                </Grid>
+                            })}
+                        </Box>
+                    ))}
+                    <div style={{ height: windowRows.padBottom }} />
+                </div>
             ) : (
                 // --- LIST VIEW (New) ---
                 <Paper sx={{ width: '100%', mb: 2, borderRadius: '16px', overflow: 'hidden' }}>
@@ -1604,12 +1670,19 @@ const SubscriptionsView = ({
                                     {canServeAtDesk && <TableCell sx={{ fontWeight: 700 }}>Actions</TableCell>}
                                 </TableRow>
                             </TableHead>
-                            <TableBody>
-                                {sortedCustomers.map((customer, index) => (
+                            <TableBody ref={windowRows.anchorRef}>
+                                {windowRows.padTop > 0 && (
+                                    <tr aria-hidden="true" style={{ height: windowRows.padTop }}><td colSpan={10} style={{ padding: 0, border: 0 }} /></tr>
+                                )}
+                                {windowRows.items.map((vr) => {
+                                    const customer = sortedCustomers[vr.index];
+                                    if (!customer) return null;
+                                    return (
                                     <ListCustomerRow
                                         key={customer.id}
                                         customer={customer}
-                                        index={index}
+                                        index={vr.index}
+                                        measureRef={windowRows.virtualizer.measureElement}
                                         isItemSelected={selected.indexOf(customer.id) !== -1}
                                         isSyncing={syncingCustomerIds.has(customer.id)}
                                         networkMode={businessSettings?.network_mode}
@@ -1617,7 +1690,11 @@ const SubscriptionsView = ({
                                         canManageSubscriptions={canManageSubscriptions}
                                         actions={cardActions}
                                     />
-                                ))}
+                                    );
+                                })}
+                                {windowRows.padBottom > 0 && (
+                                    <tr aria-hidden="true" style={{ height: windowRows.padBottom }}><td colSpan={10} style={{ padding: 0, border: 0 }} /></tr>
+                                )}
                             </TableBody>
                         </Table>
                     </TableContainer>
