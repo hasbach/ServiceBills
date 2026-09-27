@@ -970,6 +970,9 @@ class Expense(db.Model):
     # add_expense) -- what actually identifies a payroll expense for reporting
     # purposes, independent of whatever the category happens to be named.
     employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=True)
+    # Only meaningful with employee_id: this payroll payment was an advance
+    # (paid ahead of the salary accrual), so reports can tell the two apart.
+    is_advance = db.Column(db.Boolean, nullable=False, default=False, server_default=db.false())
     is_credit = db.Column(db.Boolean, default=False)
     amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     description = db.Column(db.String(200), nullable=False)
@@ -986,6 +989,7 @@ class Expense(db.Model):
             'supplier_id': self.supplier_id,
             'employee_name': self.employee.name if self.employee else None,
             'employee_id': self.employee_id,
+            'is_advance': bool(self.is_advance),
             'is_credit': self.is_credit,
             'amount': float(self.amount),
             'description': self.description,
@@ -1079,7 +1083,11 @@ class MonthlyProfitEstimate(db.Model):
     month = db.Column(db.String(7), nullable=False)  # 'YYYY-MM'
     estimated_income = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
     estimated_cost = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
-    estimated_profit = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)  # denormalized: income - cost
+    # Monthly salaries of the employees active that month (see
+    # recalculate_estimated_profit). Months frozen before this column existed
+    # read 0 -- they never included payroll.
+    estimated_payroll = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0, server_default='0')
+    estimated_profit = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)  # denormalized: income - cost - payroll
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (db.UniqueConstraint('tenant_id', 'month', name='uq_monthly_profit_estimate_tenant_month'),)
 
@@ -1089,6 +1097,7 @@ class MonthlyProfitEstimate(db.Model):
             'month': self.month,
             'estimated_income': float(self.estimated_income),
             'estimated_cost': float(self.estimated_cost),
+            'estimated_payroll': float(self.estimated_payroll or 0),
             'estimated_profit': float(self.estimated_profit),
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None
         }
@@ -2021,12 +2030,15 @@ def _maybe_create_customer_payment_link(payment, customer):
 # home-grown ALTERs. Tests build their own schema via tests/conftest.py.
 
 def admin_required():
+    """Caller must hold the 'admin' role. Checked by membership in the
+    comma-separated role string (like _jwt_roles() callers elsewhere), not
+    equality: a user with 'admin,finance' used to see admin-only pages in the
+    frontend (which checks membership) yet get 403 from every request."""
     def wrapper(fn):
         @wraps(fn)
         def decorator(*args, **kwargs):
             verify_jwt_in_request()
-            claims = get_jwt()
-            if claims.get('role') == 'admin':
+            if 'admin' in _jwt_roles():
                 return fn(*args, **kwargs)
             else:
                 return jsonify(msg="Admins only!"), 403
@@ -3044,7 +3056,10 @@ def generate_missing_salary_charges(tenant_id):
                         employee_id=employee.id,
                         type='salary',
                         amount=employee.monthly_salary,
-                        period=next_charge_date.strftime('%Y-%m'),
+                        # Accrued at the END of the month worked (hired Oct 1
+                        # -> charged Nov 1), so the period is the month the
+                        # salary is for, not the month the charge lands in.
+                        period=(next_charge_date - relativedelta(months=1)).strftime('%Y-%m'),
                         date=next_charge_date,
                         reason='Monthly salary accrual'
                     )
@@ -3092,6 +3107,17 @@ def recalculate_estimated_profit(tenant_id):
             estimated_cost += effective_cost * factor
 
         month = datetime.utcnow().strftime('%Y-%m')
+
+        # Payroll: a month's salary for every employee active this month and
+        # hired before it ends -- what the business will owe for this month.
+        next_month_start = (datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                            + relativedelta(months=1))
+        estimated_payroll = float(db.session.query(func.coalesce(func.sum(Employee.monthly_salary), 0.0)).filter(
+            Employee.tenant_id == tenant_id,
+            Employee.active.is_(True),
+            Employee.hire_date < next_month_start,
+        ).scalar() or 0.0)
+
         estimate = MonthlyProfitEstimate.query.filter_by(tenant_id=tenant_id, month=month).first()
         if not estimate:
             estimate = MonthlyProfitEstimate(tenant_id=tenant_id, month=month)
@@ -3099,7 +3125,8 @@ def recalculate_estimated_profit(tenant_id):
 
         estimate.estimated_income = estimated_income
         estimate.estimated_cost = estimated_cost
-        estimate.estimated_profit = estimated_income - estimated_cost
+        estimate.estimated_payroll = estimated_payroll
+        estimate.estimated_profit = estimated_income - estimated_cost - estimated_payroll
 
         db.session.commit()
     except Exception as e:
@@ -9639,6 +9666,7 @@ def get_financial_report():
             MonthlyProfitEstimate.month <= end_month
         ).all()
         estimate_data = {e.month: e.estimated_profit for e in estimate_query}
+        estimate_payroll_data = {e.month: float(e.estimated_payroll or 0) for e in estimate_query}
 
         # Combine results
         months_set = set(
@@ -9681,6 +9709,7 @@ def get_financial_report():
         total_expenses_supplier = 0.0
         total_expenses_payroll = 0.0
         total_estimated_profit = 0.0
+        total_estimated_payroll = 0.0
         total_variance = 0.0
 
         for m in sorted(months_set):
@@ -9689,6 +9718,7 @@ def get_financial_report():
 
             estimated_profit = estimate_data.get(m)
             data['estimated_profit'] = estimated_profit
+            data['estimated_payroll'] = estimate_payroll_data.get(m)
             data['variance'] = (data['profit'] - estimated_profit) if estimated_profit is not None else None
 
             monthly_data.append(data)
@@ -9700,6 +9730,7 @@ def get_financial_report():
             total_expenses_payroll += data['expenses_payroll']
             if estimated_profit is not None:
                 total_estimated_profit += estimated_profit
+                total_estimated_payroll += data['estimated_payroll'] or 0.0
                 total_variance += data['variance']
 
         total_profit = total_income - total_expenses
@@ -9718,6 +9749,7 @@ def get_financial_report():
                 'expenses_payroll': total_expenses_payroll,
                 'profit': total_profit,
                 'estimated_profit': total_estimated_profit,
+                'estimated_payroll': total_estimated_payroll,
                 'variance': total_variance
             }
         }), 200
@@ -12958,6 +12990,7 @@ def add_employee():
         )
         db.session.add(new_employee)
         db.session.commit()
+        recalculate_estimated_profit(current_tenant_id())  # payroll is part of the estimate
         return jsonify(new_employee.to_dict()), 201
     except Exception as e:
         db.session.rollback()
@@ -12991,6 +13024,7 @@ def update_employee(employee_id):
             employee.balance = float(data['balance'])
 
         db.session.commit()
+        recalculate_estimated_profit(current_tenant_id())  # salary/active/hire date feed the estimate
         return jsonify(employee.to_dict()), 200
     except Exception as e:
         db.session.rollback()
@@ -13012,6 +13046,7 @@ def delete_employee(employee_id):
 
         db.session.delete(employee)
         db.session.commit()
+        recalculate_estimated_profit(current_tenant_id())
         return jsonify({'message': 'Employee deleted successfully!'}), 200
     except Exception as e:
         db.session.rollback()
@@ -13065,6 +13100,78 @@ def add_employee_charge(employee_id):
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
 
+def _charge_balance_effect(charge_type, amount):
+    """What a charge does to Employee.balance: salary/bonus add, deduction subtracts."""
+    return -float(amount) if charge_type == 'deduction' else float(amount)
+
+
+@app.route('/api/employees/<int:employee_id>/charges/<int:charge_id>', methods=['PUT'])
+@admin_required()
+def update_employee_charge(employee_id, charge_id):
+    """Correct a salary/bonus/deduction entry. The balance is moved by the
+    difference (old effect undone, new one applied), so it stays equal to what
+    it would be had the entry been right the first time. A salary charge may
+    be set to 0 to void a month without deleting it (see delete below)."""
+    employee = tenant_query(Employee).filter_by(id=employee_id).first()
+    charge = tenant_query(SalaryCharge).filter_by(id=charge_id, employee_id=employee_id).first()
+    if not employee or not charge:
+        return jsonify({'message': 'Charge not found!'}), 404
+    data = request.json or {}
+    new_type = data.get('type', charge.type)
+    if new_type not in ('salary', 'bonus', 'deduction'):
+        return jsonify({'error': "type must be 'salary', 'bonus', or 'deduction'"}), 400
+    try:
+        new_amount = float(data['amount']) if 'amount' in data else float(charge.amount)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Amount must be a number'}), 400
+    if not math.isfinite(new_amount) or new_amount < 0 or (new_amount == 0 and new_type != 'salary'):
+        return jsonify({'error': 'Amount must be positive (a salary charge may be 0 to void that month).'}), 400
+    if 'period' in data and data['period'] and not re.fullmatch(r'\d{4}-\d{2}', str(data['period'])):
+        return jsonify({'error': 'period must be YYYY-MM'}), 400
+    try:
+        employee.balance = (float(employee.balance or 0)
+                            - _charge_balance_effect(charge.type, charge.amount)
+                            + _charge_balance_effect(new_type, new_amount))
+        charge.type = new_type
+        charge.amount = new_amount
+        if data.get('period'):
+            charge.period = data['period']
+        if 'reason' in data:
+            charge.reason = data['reason'] or ''
+        db.session.commit()
+        return jsonify({'charge': charge.to_dict(), 'employee': employee.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/employees/<int:employee_id>/charges/<int:charge_id>', methods=['DELETE'])
+@admin_required()
+def delete_employee_charge(employee_id, charge_id):
+    """Remove a charge and undo its effect on the balance. The employee's
+    LATEST salary charge can't be deleted: the monthly accrual resumes from
+    it, so deleting it would just recreate it on the next daily run -- set its
+    amount to 0 instead (or deactivate the employee to stop accruals)."""
+    employee = tenant_query(Employee).filter_by(id=employee_id).first()
+    charge = tenant_query(SalaryCharge).filter_by(id=charge_id, employee_id=employee_id).first()
+    if not employee or not charge:
+        return jsonify({'message': 'Charge not found!'}), 404
+    if charge.type == 'salary':
+        latest = tenant_query(SalaryCharge).filter_by(employee_id=employee_id, type='salary') \
+            .order_by(SalaryCharge.date.desc(), SalaryCharge.id.desc()).first()
+        if latest and latest.id == charge.id:
+            return jsonify({'error': "This is the latest salary charge; the monthly accrual would recreate it. "
+                                     "Edit its amount to 0 instead, or deactivate the employee."}), 400
+    try:
+        employee.balance = float(employee.balance or 0) - _charge_balance_effect(charge.type, charge.amount)
+        db.session.delete(charge)
+        db.session.commit()
+        return jsonify({'message': 'Charge deleted.', 'employee': employee.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
 @app.route('/api/employees/<int:employee_id>/payments', methods=['GET'])
 @admin_required()
 def get_employee_payments(employee_id):
@@ -13114,7 +13221,8 @@ def record_employee_payment(employee_id):
             amount=amount,
             description=note or default_description,
             date=payment_date,
-            is_credit=False
+            is_credit=False,
+            is_advance=is_advance
         )
         db.session.add(new_expense)
 
@@ -13143,6 +13251,10 @@ def get_employee_history(employee_id):
         title = charge_titles[c.type]
         history.append({
             'id': f"chg_{c.id}",
+            'charge_id': c.id,
+            'period': c.period,
+            'reason': c.reason,
+            'raw_amount': float(c.amount),
             'type': c.type,
             'title': title,
             'description': c.reason or title,
@@ -13156,8 +13268,8 @@ def get_employee_history(employee_id):
     for p in payments:
         history.append({
             'id': f"exp_{p.id}",
-            'type': 'payment',
-            'title': 'Payment Made',
+            'type': 'advance' if p.is_advance else 'payment',
+            'title': 'Advance Paid' if p.is_advance else 'Payment Made',
             'description': p.description,
             'amount': -float(p.amount),
             'date': p.date.strftime('%Y-%m-%d %H:%M:%S')

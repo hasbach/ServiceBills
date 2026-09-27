@@ -178,6 +178,9 @@ const EnhancedReportsView = () => {
             <Paper elevation={3} sx={{ p: 2, textAlign: 'center', bgcolor: '#faf5ff', flex: 1, mx: 1, minWidth: '200px', mb: 2 }}>
                <Typography variant="h6" sx={{ color: '#a855f7' }}>Estimated Profit</Typography>
                <Typography variant="h5" fontWeight="bold">{formatCurrency(reportData.totals.estimated_profit)}</Typography>
+               {reportData.totals.estimated_payroll > 0 && (
+                 <Typography variant="caption" color="text.secondary">after {formatCurrency(reportData.totals.estimated_payroll)} estimated payroll</Typography>
+               )}
             </Paper>
           </Box>
 
@@ -192,6 +195,7 @@ const EnhancedReportsView = () => {
                   <TableCell align="right">Income</TableCell>
                   <TableCell align="right">Expenses</TableCell>
                   <TableCell align="right">Profit</TableCell>
+                  <TableCell align="right">Est. Payroll</TableCell>
                   <TableCell align="right">Estimated Profit</TableCell>
                   <TableCell align="right">Variance</TableCell>
                 </TableRow>
@@ -203,6 +207,7 @@ const EnhancedReportsView = () => {
                     <TableCell align="right" sx={{ color: 'success.main' }}>{formatCurrency(row.income)}</TableCell>
                     <TableCell align="right" sx={{ color: 'error.main' }}>{formatCurrency(row.expenses)}</TableCell>
                     <TableCell align="right" sx={{ color: 'primary.main', fontWeight: 'bold' }}>{formatCurrency(row.profit)}</TableCell>
+                    <TableCell align="right" sx={{ color: 'text.secondary' }}>{row.estimated_payroll == null ? '—' : formatCurrency(row.estimated_payroll)}</TableCell>
                     <TableCell align="right" sx={{ color: '#a855f7' }}>{row.estimated_profit == null ? '—' : formatCurrency(row.estimated_profit)}</TableCell>
                     <TableCell align="right" sx={{ color: row.variance == null ? 'text.secondary' : (row.variance >= 0 ? 'success.main' : 'error.main'), fontWeight: 'bold' }}>
                       {row.variance == null ? '—' : formatCurrency(row.variance)}

@@ -39,6 +39,8 @@ function EmployeesView() {
     const [historyDialog, setHistoryDialog] = useState({ open: false, employee: null, history: [] });
     const [fixBalanceInput, setFixBalanceInput] = useState('');
     const [historyLoading, setHistoryLoading] = useState(false);
+    // Correcting a salary/bonus/deduction entry: { charge_id, type, amount, period, reason }
+    const [editCharge, setEditCharge] = useState(null);
 
     const loadEmployees = () => {
         setLoading(true);
@@ -141,6 +143,35 @@ function EmployeesView() {
             loadEmployees();
         } catch (err) {
             setSnackbar({ open: true, message: 'Error updating balance.', severity: 'error' });
+        }
+    };
+
+    const handleSaveEditedCharge = async (e) => {
+        e.preventDefault();
+        if (!historyDialog.employee || !editCharge) return;
+        try {
+            await apiService.updateEmployeeCharge(historyDialog.employee.id, editCharge.charge_id, {
+                type: editCharge.type, amount: editCharge.amount, period: editCharge.period, reason: editCharge.reason,
+            });
+            setSnackbar({ open: true, message: 'Entry updated.', severity: 'success' });
+            setEditCharge(null);
+            handleOpenHistory(historyDialog.employee);
+            loadEmployees();
+        } catch (err) {
+            setSnackbar({ open: true, message: err.response?.data?.error || 'Error updating entry.', severity: 'error' });
+        }
+    };
+
+    const handleDeleteCharge = async (h) => {
+        if (!historyDialog.employee) return;
+        if (!window.confirm(`Delete this ${h.title.toLowerCase()} of $${Math.abs(h.amount).toFixed(2)}? The balance owed is adjusted to match.`)) return;
+        try {
+            await apiService.deleteEmployeeCharge(historyDialog.employee.id, h.charge_id);
+            setSnackbar({ open: true, message: 'Entry deleted.', severity: 'success' });
+            handleOpenHistory(historyDialog.employee);
+            loadEmployees();
+        } catch (err) {
+            setSnackbar({ open: true, message: err.response?.data?.error || 'Error deleting entry.', severity: 'error' });
         }
     };
 
@@ -350,8 +381,10 @@ function EmployeesView() {
                                     <TableRow>
                                         <TableCell><b>Date</b></TableCell>
                                         <TableCell><b>Type</b></TableCell>
+                                        <TableCell><b>Period</b></TableCell>
                                         <TableCell><b>Description</b></TableCell>
                                         <TableCell align="right"><b>Amount</b></TableCell>
+                                        <TableCell align="right"><b>Actions</b></TableCell>
                                     </TableRow>
                                 </TableHead>
                                 <TableBody>
@@ -359,17 +392,39 @@ function EmployeesView() {
                                         <TableRow key={h.id}>
                                             <TableCell>{h.date}</TableCell>
                                             <TableCell>
-                                                <Chip size="small" label={h.title} />
+                                                <Chip size="small" label={h.title}
+                                                    color={h.type === 'advance' ? 'warning' : h.type === 'payment' ? 'success' : 'default'}
+                                                    variant={h.type === 'advance' ? 'filled' : 'outlined'} />
                                             </TableCell>
+                                            <TableCell>{h.period || '—'}</TableCell>
                                             <TableCell>{h.description}</TableCell>
                                             <TableCell align="right" sx={{ fontWeight: 600, color: h.amount > 0 ? 'error.main' : 'success.main' }}>
                                                 {h.amount > 0 ? `+$${h.amount.toFixed(2)}` : `-$${Math.abs(h.amount).toFixed(2)}`}
+                                            </TableCell>
+                                            <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                                                {h.charge_id && (
+                                                    <>
+                                                        <Tooltip title="Edit entry">
+                                                            <IconButton size="small" color="primary" onClick={() => setEditCharge({
+                                                                charge_id: h.charge_id, type: h.type, amount: h.raw_amount,
+                                                                period: h.period || '', reason: h.reason || '',
+                                                            })}>
+                                                                <EditIcon fontSize="small" />
+                                                            </IconButton>
+                                                        </Tooltip>
+                                                        <Tooltip title="Delete entry">
+                                                            <IconButton size="small" color="error" onClick={() => handleDeleteCharge(h)}>
+                                                                <DeleteIcon fontSize="small" />
+                                                            </IconButton>
+                                                        </Tooltip>
+                                                    </>
+                                                )}
                                             </TableCell>
                                         </TableRow>
                                     ))}
                                     {historyDialog.history.length === 0 && (
                                         <TableRow>
-                                            <TableCell colSpan={4} align="center" sx={{ py: 3, color: 'text.secondary' }}>No action history found.</TableCell>
+                                            <TableCell colSpan={6} align="center" sx={{ py: 3, color: 'text.secondary' }}>No action history found.</TableCell>
                                         </TableRow>
                                     )}
                                 </TableBody>
@@ -380,6 +435,38 @@ function EmployeesView() {
                 <DialogActions>
                     <Button onClick={() => setHistoryDialog({ open: false, employee: null, history: [] })}>Close</Button>
                 </DialogActions>
+            </Dialog>
+
+            {/* Edit a salary / bonus / deduction entry */}
+            <Dialog open={Boolean(editCharge)} onClose={() => setEditCharge(null)} maxWidth="xs" fullWidth>
+                <form onSubmit={handleSaveEditedCharge}>
+                    <DialogTitle>Edit Entry</DialogTitle>
+                    <DialogContent dividers>
+                        <Typography variant="body2" sx={{ mb: 2 }}>
+                            The balance owed moves by the difference. To void a month's salary, set its amount to 0.
+                        </Typography>
+                        <FormControl fullWidth margin="dense">
+                            <InputLabel>Type</InputLabel>
+                            <Select label="Type" value={editCharge?.type || 'bonus'}
+                                onChange={(ev) => setEditCharge({ ...editCharge, type: ev.target.value })}>
+                                <MenuItem value="salary">Salary</MenuItem>
+                                <MenuItem value="bonus">Bonus</MenuItem>
+                                <MenuItem value="deduction">Deduction</MenuItem>
+                            </Select>
+                        </FormControl>
+                        <TextField fullWidth margin="dense" label="Amount" type="number" required
+                            inputProps={{ step: '0.01', min: editCharge?.type === 'salary' ? '0' : '0.01' }}
+                            value={editCharge?.amount ?? ''} onChange={(ev) => setEditCharge({ ...editCharge, amount: ev.target.value })} />
+                        <TextField fullWidth margin="dense" label="Period (month it is for)" type="month" InputLabelProps={{ shrink: true }}
+                            value={editCharge?.period || ''} onChange={(ev) => setEditCharge({ ...editCharge, period: ev.target.value })} />
+                        <TextField fullWidth margin="dense" label="Reason" value={editCharge?.reason || ''}
+                            onChange={(ev) => setEditCharge({ ...editCharge, reason: ev.target.value })} />
+                    </DialogContent>
+                    <DialogActions>
+                        <Button onClick={() => setEditCharge(null)}>Cancel</Button>
+                        <Button type="submit" variant="contained">Save</Button>
+                    </DialogActions>
+                </form>
             </Dialog>
         </Box>
     );
