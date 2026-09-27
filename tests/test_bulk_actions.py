@@ -171,3 +171,62 @@ def test_bulk_delete_customers(client):
     # Tenant B's customer survives.
     listed_b = client.get("/api/customers", headers=b).get_json()["customers"]
     assert len(listed_b) == 1
+
+
+def test_bulk_renew_sends_whatsapp_after_the_response_not_during_it(client, monkeypatch):
+    """Each WhatsApp send is a live HTTP call to Meta; 200 of them inline took
+    1-2 minutes (past gunicorn's 120s timeout). Bulk renew now commits every
+    renewal, returns, and hands the sends to a background greenlet."""
+    import app as appmod
+    hdr = make_tenant(client, "Biz WA", "wa_admin")
+    plan_id = _make_plan(client, hdr)
+    ids = [_make_customer(client, hdr, plan_id, name=f"C{i}") for i in range(3)]
+
+    sent, background = [], []
+    monkeypatch.setattr(appmod, "send_whatsapp_message",
+                        lambda customer, event_type, context=None: sent.append((customer.id, event_type, context)))
+    monkeypatch.setattr(appmod.whatsapp_inbox, "run_background",
+                        lambda flask_app, fn, pool=None: background.append(fn))
+
+    r = client.post("/api/customers/bulk_renew_subscription", headers=hdr, json={"customer_ids": ids})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert len(body["succeeded"]) == 3 and body["notifications_queued"] == 3
+    assert sent == []            # nothing sent while the request was open
+    assert len(background) == 1  # one background job for the whole batch
+
+    background[0]()
+    assert sorted(cid for cid, _, _ in sent) == sorted(ids)
+    assert {ev for _, ev, _ in sent} == {"subscription_renewed"}
+    assert all(ctx["expiry_date"] for _, _, ctx in sent)
+
+
+def test_single_renew_still_sends_whatsapp_inline(client, monkeypatch):
+    import app as appmod
+    hdr = make_tenant(client, "Biz WA1", "wa1_admin")
+    cid = _make_customer(client, hdr, _make_plan(client, hdr))
+    sent = []
+    monkeypatch.setattr(appmod, "send_whatsapp_message",
+                        lambda customer, event_type, context=None: sent.append((customer.id, event_type)))
+
+    assert client.post(f"/api/customers/{cid}/renew_subscription", headers=hdr).status_code == 200
+    assert sent == [(cid, "subscription_renewed")]
+
+
+def test_failed_meta_template_lookup_is_not_repeated_per_message(monkeypatch):
+    import app as appmod
+    calls = []
+
+    class Fail:
+        ok = False
+
+    monkeypatch.setattr(appmod.requests, "get", lambda *a, **k: calls.append(1) or Fail())
+    appmod._template_def_cache.clear()
+
+    class S:
+        access_token, business_account_id, phone_number_id, api_version = "t", "acct", "1", "v19.0"
+
+    for _ in range(5):
+        assert appmod.get_meta_template_definition(S(), "missing_tmpl") is None
+    assert len(calls) == 1
+    appmod._template_def_cache.clear()

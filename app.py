@@ -3634,6 +3634,10 @@ def run_scheduled_job_command(job_name):
 # advisory lock already makes a second trigger for the *same* job name a
 # no-op, so this only matters for many *different* job names firing at once.
 SCHEDULED_JOB_TRIGGER_POOL = _GeventPool(3) if gevent is not None else None
+# Background senders for bulk actions' WhatsApp notifications (one greenlet
+# per bulk request, sending its batch sequentially) -- bounded for the same
+# reason as the pools above.
+BULK_NOTIFY_GREENLET_POOL = _GeventPool(3) if gevent is not None else None
 
 
 @app.route('/api/internal/scheduled-jobs/<job_name>', methods=['POST'])
@@ -7187,7 +7191,10 @@ def get_meta_template_definition(settings, template_name):
     now = time.time()
     if cache_key in _template_def_cache:
         ts, tmpl_def = _template_def_cache[cache_key]
-        if now - ts < 600:  # 10 min cache
+        # 10 min for a found template; a failed lookup (None) is remembered
+        # for 60s so a bulk send doesn't repeat the (up to 5s) failing request
+        # once per recipient.
+        if now - ts < (600 if tmpl_def is not None else 60):
             return tmpl_def
 
     try:
@@ -7206,7 +7213,8 @@ def get_meta_template_definition(settings, template_name):
                 return data[0]
     except Exception as e:
         logging.warning(f"Could not fetch template def for {template_name}: {e}")
-    
+
+    _template_def_cache[cache_key] = (now, None)
     return None
 
 def build_meta_template_payload(settings, template_name, default_language='en', user_body_params=None, user_header_params=None):
@@ -8709,12 +8717,25 @@ class _ActionError(Exception):
         self.status_code = status_code
 
 
-def _renew_subscription_core(customer):
+def _renew_subscription_core(customer, notify_later=None):
     """Renew one customer's subscription: extend expiry, bill (reseller credit
     or new pending payment), and notify. Raises _ActionError for a missing
     plan or unrecognized billing cycle. Caller commits are handled inside
     (mirrors the original function's commit points) since WhatsApp sends must
-    happen after the billing commit."""
+    happen after the billing commit.
+
+    notify_later: when a list is passed (bulk renew), the WhatsApp sends are
+    appended to it as zero-arg callables instead of run here -- each one is a
+    live HTTP call to Meta, and doing 200 of them inline took 1-2 minutes,
+    past gunicorn's 120s timeout. The callables close over plain values only
+    (never this session's ORM objects), so they're safe to run later in a
+    background greenlet with its own app context."""
+    def _notify(send):
+        if notify_later is not None:
+            notify_later.append(send)
+        else:
+            send()
+
     subscription_plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
     if not subscription_plan:
         raise _ActionError('Subscription plan not found for this customer!', 404)
@@ -8763,20 +8784,25 @@ def _renew_subscription_core(customer):
                 db.session.add(reseller_payment)
                 db.session.commit()
 
-                try:
-                    class FakeCustomer:
-                        phone = reseller.phone
-                        whatsapp_notifications_enabled = True
-                        id = reseller.id
-                        name = reseller.name
+                r_phone, r_id, r_name = reseller.phone, reseller.id, reseller.name
+                r_balance, c_name, amount = reseller.balance, customer.name, renewal_amount
 
-                    send_whatsapp_message(
-                        FakeCustomer(),
-                        event_type='reseller_customer_renewed',
-                        context={'amount': renewal_amount, 'balance': reseller.balance, 'customer_name': customer.name}
-                    )
-                except Exception as wa_error:
-                    logging.error(f"Failed to send WA message on renew to reseller: {wa_error}")
+                def _send_reseller():
+                    try:
+                        class FakeCustomer:
+                            phone = r_phone
+                            whatsapp_notifications_enabled = True
+                            id = r_id
+                            name = r_name
+
+                        send_whatsapp_message(
+                            FakeCustomer(),
+                            event_type='reseller_customer_renewed',
+                            context={'amount': amount, 'balance': r_balance, 'customer_name': c_name}
+                        )
+                    except Exception as wa_error:
+                        logging.error(f"Failed to send WA message on renew to reseller: {wa_error}")
+                _notify(_send_reseller)
         else:
             new_payment = Payment(
                 customer_id=customer.id,
@@ -8791,14 +8817,20 @@ def _renew_subscription_core(customer):
             customer.balance -= renewal_amount
             db.session.commit()
 
-            try:
-                send_whatsapp_message(
-                    customer,
-                    event_type='subscription_renewed',
-                    context={'expiry_date': new_expiry_date.strftime('%Y-%m-%d')}
-                )
-            except Exception as wa_error:
-                logging.error(f"Failed to send WA message on renew: {wa_error}")
+            c_id, c_tenant_id = customer.id, customer.tenant_id
+            expiry_str = new_expiry_date.strftime('%Y-%m-%d')
+
+            def _send_customer():
+                try:
+                    # Re-read by id: when deferred this runs in a different
+                    # session, where the caller's ORM object is detached.
+                    c = Customer.query.filter_by(id=c_id, tenant_id=c_tenant_id).first()
+                    if c:
+                        send_whatsapp_message(c, event_type='subscription_renewed',
+                                              context={'expiry_date': expiry_str})
+                except Exception as wa_error:
+                    logging.error(f"Failed to send WA message on renew: {wa_error}")
+            _notify(_send_customer)
     else:
         db.session.commit()
 
@@ -8847,10 +8879,11 @@ def bulk_renew_subscriptions():
 
     succeeded = []
     failed = [{'id': cid, 'error': 'Customer not found'} for cid in customer_ids if cid not in found_ids]
+    pending_notifications = []
 
     for customer in customers:
         try:
-            result = _renew_subscription_core(customer)
+            result = _renew_subscription_core(customer, notify_later=pending_notifications)
             succeeded.append(result)
         except _ActionError as e:
             db.session.rollback()
@@ -8860,7 +8893,17 @@ def bulk_renew_subscriptions():
             traceback.print_exc()
             failed.append({'id': customer.id, 'error': str(e)})
 
-    return jsonify({'succeeded': succeeded, 'failed': failed}), 200
+    # Every renewal above is already committed; the WhatsApp messages go out
+    # after this response, one after another in a single background greenlet
+    # (each send already swallows and logs its own failure).
+    if pending_notifications:
+        def _send_all():
+            for send in pending_notifications:
+                send()
+        whatsapp_inbox.run_background(app, _send_all, pool=BULK_NOTIFY_GREENLET_POOL)
+
+    return jsonify({'succeeded': succeeded, 'failed': failed,
+                    'notifications_queued': len(pending_notifications)}), 200
 
 # --- SECTOR ENDPOINTS ---
 
