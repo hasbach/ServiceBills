@@ -184,6 +184,8 @@ const rawApiService = {
     recordSupplierPayment: (id, data) => api.post(`/suppliers/${id}/payments`, data),
     fetchSupplierHistory: (id) => api.get(`/suppliers/${id}/history`),
     fixSupplierBalance: (id, data) => api.put(`/suppliers/${id}/fix-balance`, data),
+    updateSupplierPayment: (supplierId, paymentId, data) => api.put(`/suppliers/${supplierId}/payments/${paymentId}`, data),
+    deleteSupplierPayment: (supplierId, paymentId) => api.delete(`/suppliers/${supplierId}/payments/${paymentId}`),
 
     // Employee / Payroll API methods
     fetchEmployees: () => api.get('/employees'),

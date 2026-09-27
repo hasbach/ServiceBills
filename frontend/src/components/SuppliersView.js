@@ -17,7 +17,11 @@ import { useAppContext } from '../context/AppContext';
 
 function SuppliersView() {
     const theme = useTheme();
-    const { apiService, setSnackbar } = useAppContext();
+    const { apiService, setSnackbar, user } = useAppContext();
+    // Correcting a recorded payment (edit/delete) is admin-only -- also
+    // enforced by the backend (_admin_only_error in app.py).
+    const isAdmin = (user?.role || '').split(',').map(r => r.trim().toLowerCase()).includes('admin');
+    const [editPayment, setEditPayment] = useState(null); // { payment_id, amount, payment_date, payment_method, reference_note }
     const [suppliers, setSuppliers] = useState([]);
     const [loading, setLoading] = useState(true);
 
@@ -105,6 +109,43 @@ function SuppliersView() {
             loadSuppliers();
         } catch (err) {
             setSnackbar({ open: true, message: 'Error updating balance.', severity: 'error' });
+        }
+    };
+
+    const handleSaveEditedPayment = async (e) => {
+        e.preventDefault();
+        if (!historyDialog.supplier || !editPayment) return;
+        try {
+            const payload = {
+                amount: editPayment.amount,
+                payment_method: editPayment.payment_method,
+                reference_note: editPayment.reference_note,
+            };
+            // Only send the date when it was changed: the field is day-only,
+            // so re-sending it would reset the payment's time to midnight.
+            if (editPayment.payment_date && editPayment.payment_date !== editPayment.original_date) {
+                payload.payment_date = editPayment.payment_date;
+            }
+            await apiService.updateSupplierPayment(historyDialog.supplier.id, editPayment.payment_id, payload);
+            setSnackbar({ open: true, message: 'Payment updated.', severity: 'success' });
+            setEditPayment(null);
+            handleOpenHistory(historyDialog.supplier);
+            loadSuppliers();
+        } catch (err) {
+            setSnackbar({ open: true, message: err.response?.data?.error || 'Error updating payment.', severity: 'error' });
+        }
+    };
+
+    const handleDeletePayment = async (h) => {
+        if (!historyDialog.supplier) return;
+        if (!window.confirm(`Delete this payment of $${Math.abs(h.amount).toFixed(2)}? The amount will be added back to the balance owed.`)) return;
+        try {
+            await apiService.deleteSupplierPayment(historyDialog.supplier.id, h.payment_id);
+            setSnackbar({ open: true, message: 'Payment deleted.', severity: 'success' });
+            handleOpenHistory(historyDialog.supplier);
+            loadSuppliers();
+        } catch (err) {
+            setSnackbar({ open: true, message: err.response?.data?.error || 'Error deleting payment.', severity: 'error' });
         }
     };
 
@@ -250,6 +291,7 @@ function SuppliersView() {
                                         <TableCell><b>Type</b></TableCell>
                                         <TableCell><b>Items Bought / Description</b></TableCell>
                                         <TableCell align="right"><b>Amount</b></TableCell>
+                                        {isAdmin && <TableCell align="right"><b>Actions</b></TableCell>}
                                     </TableRow>
                                 </TableHead>
                                 <TableBody>
@@ -267,11 +309,36 @@ function SuppliersView() {
                                             <TableCell align="right" sx={{ fontWeight: 600, color: h.amount > 0 ? 'error.main' : 'success.main' }}>
                                                 {h.amount > 0 ? `+$${h.amount.toFixed(2)}` : `-$${Math.abs(h.amount).toFixed(2)}`}
                                             </TableCell>
+                                            {isAdmin && (
+                                                <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                                                    {h.type === 'payment' && h.payment_id && (
+                                                        <>
+                                                            <Tooltip title="Edit payment">
+                                                                <IconButton size="small" color="primary" onClick={() => setEditPayment({
+                                                                    payment_id: h.payment_id,
+                                                                    amount: Math.abs(h.amount),
+                                                                    payment_date: (h.date || '').slice(0, 10),
+                                                                    original_date: (h.date || '').slice(0, 10),
+                                                                    payment_method: h.payment_method || '',
+                                                                    reference_note: h.reference_note || '',
+                                                                })}>
+                                                                    <EditIcon fontSize="small" />
+                                                                </IconButton>
+                                                            </Tooltip>
+                                                            <Tooltip title="Delete payment">
+                                                                <IconButton size="small" color="error" onClick={() => handleDeletePayment(h)}>
+                                                                    <DeleteIcon fontSize="small" />
+                                                                </IconButton>
+                                                            </Tooltip>
+                                                        </>
+                                                    )}
+                                                </TableCell>
+                                            )}
                                         </TableRow>
                                     ))}
                                     {historyDialog.history.length === 0 && (
                                         <TableRow>
-                                            <TableCell colSpan={4} align="center" sx={{ py: 3, color: 'text.secondary' }}>No action history found.</TableCell>
+                                            <TableCell colSpan={isAdmin ? 5 : 4} align="center" sx={{ py: 3, color: 'text.secondary' }}>No action history found.</TableCell>
                                         </TableRow>
                                     )}
                                 </TableBody>
@@ -282,6 +349,31 @@ function SuppliersView() {
                 <DialogActions>
                     <Button onClick={() => setHistoryDialog({ open: false, supplier: null, history: [] })}>Close</Button>
                 </DialogActions>
+            </Dialog>
+
+            {/* Edit Supplier Payment Dialog (admin only) */}
+            <Dialog open={Boolean(editPayment)} onClose={() => setEditPayment(null)} maxWidth="xs" fullWidth>
+                <form onSubmit={handleSaveEditedPayment}>
+                    <DialogTitle>Edit Payment</DialogTitle>
+                    <DialogContent dividers>
+                        <Typography variant="body2" sx={{ mb: 2 }}>
+                            Changing the amount adjusts the supplier's balance owed by the difference.
+                        </Typography>
+                        <TextField fullWidth margin="dense" label="Amount Paid" type="number" required
+                            inputProps={{ step: "0.01", min: "0.01" }}
+                            value={editPayment?.amount ?? ''} onChange={e => setEditPayment({ ...editPayment, amount: e.target.value })} />
+                        <TextField fullWidth margin="dense" label="Payment Date" type="date" InputLabelProps={{ shrink: true }}
+                            value={editPayment?.payment_date || ''} onChange={e => setEditPayment({ ...editPayment, payment_date: e.target.value })} />
+                        <TextField fullWidth margin="dense" label="Payment Method"
+                            value={editPayment?.payment_method || ''} onChange={e => setEditPayment({ ...editPayment, payment_method: e.target.value })} />
+                        <TextField fullWidth margin="dense" label="Note" multiline rows={2}
+                            value={editPayment?.reference_note || ''} onChange={e => setEditPayment({ ...editPayment, reference_note: e.target.value })} />
+                    </DialogContent>
+                    <DialogActions>
+                        <Button onClick={() => setEditPayment(null)}>Cancel</Button>
+                        <Button type="submit" variant="contained">Save</Button>
+                    </DialogActions>
+                </form>
             </Dialog>
         </Box>
     );

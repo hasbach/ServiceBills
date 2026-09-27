@@ -12795,6 +12795,76 @@ def record_supplier_payment(supplier_id):
         return jsonify({'error': str(e)}), 400
 
 
+def _admin_only_error():
+    """403 response unless the caller holds 'admin' (checked by membership,
+    so a combined role like 'admin,finance' counts -- unlike admin_required(),
+    which compares the whole role string)."""
+    if 'admin' not in _jwt_roles():
+        return jsonify({'error': 'Only an administrator can change a recorded supplier payment.'}), 403
+    return None
+
+
+@app.route('/api/suppliers/<int:supplier_id>/payments/<int:payment_id>', methods=['PUT'])
+@jwt_required()
+def update_supplier_payment(supplier_id, payment_id):
+    """Admin-only correction of a recorded supplier payment. The supplier's
+    balance moves by the difference, so it stays what it would have been had
+    the payment been entered correctly the first time."""
+    denied = _admin_only_error()
+    if denied:
+        return denied
+    payment = tenant_query(SupplierPayment).filter_by(id=payment_id, supplier_id=supplier_id).first()
+    if not payment:
+        return jsonify({'message': 'Payment not found!'}), 404
+    supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
+    data = request.json or {}
+    try:
+        if 'amount' in data:
+            try:
+                new_amount = _parse_positive_amount(data['amount'])
+            except ValueError as ve:
+                return jsonify({'error': str(ve)}), 400
+            # Paying reduced the balance by the old amount; undo that, apply the new one.
+            supplier.balance = float(supplier.balance or 0) + float(payment.amount) - new_amount
+            payment.amount = new_amount
+        if data.get('payment_date'):
+            try:
+                payment.payment_date = datetime.strptime(data['payment_date'], '%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'Invalid payment_date. Use YYYY-MM-DD.'}), 400
+        if 'payment_method' in data:
+            payment.payment_method = data['payment_method'] or ''
+        if 'reference_note' in data:
+            payment.reference_note = data['reference_note'] or ''
+        db.session.commit()
+        return jsonify({'message': 'Payment updated.', 'supplier': supplier.to_dict(), 'payment': payment.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/suppliers/<int:supplier_id>/payments/<int:payment_id>', methods=['DELETE'])
+@jwt_required()
+def delete_supplier_payment(supplier_id, payment_id):
+    """Admin-only removal of a recorded supplier payment; the amount goes back
+    onto the supplier's balance owed."""
+    denied = _admin_only_error()
+    if denied:
+        return denied
+    payment = tenant_query(SupplierPayment).filter_by(id=payment_id, supplier_id=supplier_id).first()
+    if not payment:
+        return jsonify({'message': 'Payment not found!'}), 404
+    supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
+    try:
+        supplier.balance = float(supplier.balance or 0) + float(payment.amount)
+        db.session.delete(payment)
+        db.session.commit()
+        return jsonify({'message': 'Payment deleted.', 'supplier': supplier.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
 @app.route('/api/suppliers/<int:supplier_id>/history', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
@@ -12822,8 +12892,11 @@ def get_supplier_history(supplier_id):
         history.append({
             'id': f"pay_{p.id}",
             'type': 'payment',
+            'payment_id': p.id,
             'title': f"Payment Made ({p.payment_method})" if p.payment_method else "Payment Made",
             'description': p.reference_note or 'Payment to supplier',
+            'payment_method': p.payment_method,
+            'reference_note': p.reference_note,
             'amount': -float(p.amount),
             'date': p.payment_date.strftime('%Y-%m-%d %H:%M:%S')
         })
