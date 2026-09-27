@@ -3765,12 +3765,20 @@ def get_customers():
         reseller_id = request.args.get('reseller_id')
         sort_by = request.args.get('sort_by', 'expiry_date') # name, address, expiry_date
         sort_desc = request.args.get('sort_desc', 'true').lower() == 'true'
+        # 'active' / 'canceled' / 'all' (default, for callers that predate it).
+        # Filtered here rather than in the browser so pagination counts and
+        # page sizes reflect what's actually shown.
+        status = request.args.get('status', 'all').lower()
 
         # Build the query with join to subscription plan
         query = tenant_query(Customer).options(db.joinedload(Customer.subscription_plan))
 
         if reseller_id:
             query = query.filter(Customer.reseller_id == reseller_id)
+        if status == 'active':
+            query = query.filter(Customer.is_subscription_active.is_(True))
+        elif status == 'canceled':
+            query = query.filter(Customer.is_subscription_active.isnot(True))
 
         if search_query:
             # OPTIMIZED: Use prefix matching for better index usage
@@ -3791,10 +3799,12 @@ def get_customers():
         else:
             order_col = Customer.subscription_expiry_date
         
+        # Customer.id breaks ties (many customers share an expiry date) so a
+        # row can't appear on two pages or on neither.
         if sort_desc:
-            query = query.order_by(order_col.desc())
+            query = query.order_by(order_col.desc(), Customer.id.desc())
         else:
-            query = query.order_by(order_col.asc())
+            query = query.order_by(order_col.asc(), Customer.id.asc())
 
         pagination = query.paginate(page=page, per_page=per_page, error_out=False)
         

@@ -20,9 +20,12 @@ const PRODUCT_LABELS = { proradius: 'PROradius', radiusnew: 'radiusnew', krypton
 // Upstream RADIUS operator the tenant is a subreseller of (mode: 'upstream_bridge').
 // Data-model + manual tracking only -- no portal automation exists yet, see
 // docs/superpowers/specs/2026-08-12-network-enforcement-design.md, Concept A.
-const UpstreamProviderManagementView = ({ customers = [] }) => {
+const UpstreamProviderManagementView = () => {
     const { setSnackbar } = useAppContext();
     const [providers, setProviders] = useState([]);
+    // Every customer for the renewal-cost picker -- this used to reuse the
+    // Subscriptions page's current (paginated, status-filtered) list.
+    const [customers, setCustomers] = useState([]);
     const [loading, setLoading] = useState(true);
 
     const [editDialogOpen, setEditDialogOpen] = useState(false);
@@ -41,6 +44,9 @@ const UpstreamProviderManagementView = ({ customers = [] }) => {
 
     useEffect(() => {
         loadProviders();
+        apiService.fetchCustomers(1, 9999, '', 'name', '', 'all', false)
+            .then(res => setCustomers(res.customers || []))
+            .catch(err => console.error('Failed to load customers', err));
     }, []);
 
     const loadProviders = async () => {

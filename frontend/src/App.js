@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     Button, AppBar, Toolbar, Typography, Box, CircularProgress,
     Snackbar, Alert, IconButton, Drawer, List, ListItem, ListItemButton,
@@ -125,7 +125,8 @@ const MainApp = ({
     refetchCustomers, refetchSubscriptionPlans, setSnackbar, setBusinessSettings,
     currentPage, setCurrentPage, itemsPerPage, setItemsPerPage,
     searchQuery, setSearchQuery, customerSortBy, setCustomerSortBy,
-    customerResellerId, setCustomerResellerId
+    customerResellerId, setCustomerResellerId,
+    customerStatus, setCustomerStatus
 }) => {
     const { user, logout } = useAppContext();
     const theme = useTheme();
@@ -319,11 +320,11 @@ const MainApp = ({
             case 'resellers': return <ResellerManagementView />;
             case 'suppliers': return <SuppliersView />;
             case 'employees': return <EmployeesView />;
-            case 'upstream-providers': return <UpstreamProviderManagementView customers={customers} />;
+            case 'upstream-providers': return <UpstreamProviderManagementView />;
             case 'network-devices': return <NetworkDeviceManagementView />;
             case 'network-tree': return <NetworkTreeView />;
             case 'network-map': return <NetworkMapPage />;
-            case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
+            case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} customerStatus={customerStatus} setCustomerStatus={setCustomerStatus} />;
             case 'payments': return <PaymentsView />;
             case 'receipts': return <ReceiptsView />;
             case 'expenses': return <ExpensesView />;
@@ -337,7 +338,7 @@ const MainApp = ({
             case 'billing': return hasRole('admin') ? <BillingView /> : <Typography>Access Denied</Typography>;
             default:
                 if (hasRole('employee') || hasRole('technician')) return <ServiceManagementView />;
-                return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} />;
+                return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} customerStatus={customerStatus} setCustomerStatus={setCustomerStatus} />;
         }
     };
 
@@ -427,6 +428,7 @@ const AppContent = () => {
     const [searchQuery, setSearchQuery] = useState('');
     const [customerSortBy, setCustomerSortBy] = useState('expiry_date');
     const [customerResellerId, setCustomerResellerId] = useState('');
+    const [customerStatus, setCustomerStatus] = useState('active'); // 'active' | 'canceled' | 'all'
 
     useEffect(() => {
         if (businessSettings) {
@@ -469,10 +471,22 @@ const AppContent = () => {
         }
     }, [canManagePlans, setSnackbar]);
 
-    const refetchCustomers = useCallback(async (page = 1, per_page = 25, searchQuery = '', sortBy = 'expiry_date', resellerId = '') => {
+    // Latest Subscriptions query (page, filters, sort), read at call time so
+    // refetchCustomers() always reloads exactly what's on screen -- callers
+    // after an edit/renew/etc. used to pass only (page, perPage, search) and
+    // silently drop the sort and reseller filter.
+    const customerQueryRef = useRef(null);
+    const customerFetchSeqRef = useRef(0);
+    const refetchCustomers = useCallback(async () => {
+        const q = customerQueryRef.current;
+        if (!q) return;
+        // Ignore a slower, older response landing after a newer one.
+        const seq = ++customerFetchSeqRef.current;
         try {
-            // The apiService.fetchCustomers already returns the data object.
-            const response = await apiService.fetchCustomers(page, per_page, searchQuery, sortBy, resellerId);
+            // Server does the status filter and the ordering; ascending, so
+            // Expiry Date lists the nearest expiry first and Name/Address A-Z.
+            const response = await apiService.fetchCustomers(q.page, q.perPage, q.search, q.sortBy, q.resellerId, q.status, false);
+            if (seq !== customerFetchSeqRef.current) return;
             setCustomers(response.customers || []);
             setPagination({
                 total: response.total,
@@ -495,12 +509,19 @@ const AppContent = () => {
         return () => clearTimeout(timerId);
     }, [searchQuery]);
 
-    // Auto-fetch when pagination state changes
+    customerQueryRef.current = {
+        page: currentPage, perPage: itemsPerPage, search: debouncedSearchQuery,
+        sortBy: customerSortBy, resellerId: customerResellerId, status: customerStatus,
+    };
+
+    // Auto-fetch when pagination/filter state changes. This is also the
+    // initial customers load -- loadInitialData below no longer fetches its
+    // own (unpaginated, per_page=999) copy that raced this one.
     useEffect(() => {
         if (isAuthenticated && !isSuperadmin) {
-            refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery, customerSortBy, customerResellerId);
+            refetchCustomers();
         }
-    }, [currentPage, itemsPerPage, debouncedSearchQuery, customerSortBy, customerResellerId, isAuthenticated, isSuperadmin, refetchCustomers]);
+    }, [currentPage, itemsPerPage, debouncedSearchQuery, customerSortBy, customerResellerId, customerStatus, isAuthenticated, isSuperadmin, refetchCustomers]);
 
     useEffect(() => {
         if (isAuthenticated && !isSuperadmin) {
@@ -508,19 +529,12 @@ const AppContent = () => {
                 setLoading(true);
                 try {
                     // --- FIX: Correctly await and destructure responses ---
-                    const [customersRes, plansRes, settingsRes] = await Promise.all([
-                        apiService.fetchCustomers(),
+                    const [plansRes, settingsRes] = await Promise.all([
                         canManagePlans ? apiService.fetchSubscriptionPlans() : Promise.resolve([]),
                         apiService.fetchBusinessSettings(),
                     ]);
 
                     // --- FIX: Remove the extra .data access ---
-                    setCustomers(customersRes.customers || []);
-                    setPagination({
-                        total: customersRes.total,
-                        pages: customersRes.pages,
-                        currentPage: customersRes.current_page
-                    });
                     setSubscriptionPlans(plansRes || []);
                     if (settingsRes.data?.settings) {
                         setBusinessSettings(settingsRes.data.settings);
@@ -586,6 +600,8 @@ const AppContent = () => {
         setCustomerSortBy={setCustomerSortBy}
         customerResellerId={customerResellerId}
         setCustomerResellerId={setCustomerResellerId}
+        customerStatus={customerStatus}
+        setCustomerStatus={setCustomerStatus}
     />;
 };
 

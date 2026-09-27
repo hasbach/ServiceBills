@@ -190,3 +190,24 @@ def test_customer_list_includes_upstream_provider_name(client):
 
     rows = client.get("/api/customers", headers=admin_hdr).get_json()["customers"]
     assert rows[0]["upstream_provider_name"] == "Terra"
+
+
+def test_customer_list_filters_status_and_keeps_requested_order_on_the_server(client):
+    admin_hdr = make_tenant(client, "Biz M", "m_admin")
+    plan_id = client.post("/api/subscription_plans", headers=admin_hdr,
+                          json={"name": "P", "price": 10, "billing_cycle": "monthly"}).get_json()["plan"]["id"]
+    ids = {}
+    for name, start in [("Charlie", "2026-01-01"), ("Alice", "2026-03-01"), ("Bob", "2026-02-01")]:
+        ids[name] = client.post("/api/customers", headers=admin_hdr,
+                                json={"name": name, "phone": "1", "address": "a", "subscription_plan_id": plan_id,
+                                      "subscription_start_date": start}).get_json()["customer_id"]
+    client.put(f"/api/customers/{ids['Bob']}/cancel_subscription", headers=admin_hdr)
+
+    def names(**params):
+        r = client.get("/api/customers", headers=admin_hdr, query_string={"sort_desc": "false", **params}).get_json()
+        return [c["name"] for c in r["customers"]], r["total"]
+
+    assert names(status="active", sort_by="name") == (["Alice", "Charlie"], 2)
+    assert names(status="active", sort_by="expiry_date") == (["Charlie", "Alice"], 2)
+    assert names(status="canceled") == (["Bob"], 1)
+    assert names(sort_by="name")[1] == 3  # default 'all' for callers that don't send status

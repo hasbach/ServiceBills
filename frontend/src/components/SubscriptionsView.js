@@ -213,7 +213,9 @@ const SubscriptionsView = ({
     customerSortBy,
     setCustomerSortBy,
     customerResellerId,
-    setCustomerResellerId
+    setCustomerResellerId,
+    customerStatus,
+    setCustomerStatus
 }) => {
     const theme = useTheme();
     const { apiService, user } = useAppContext();
@@ -290,7 +292,9 @@ const SubscriptionsView = ({
 
     // --- NEW STATE ---
     const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'list'
-    const [statusFilter, setStatusFilter] = useState('active'); // 'active', 'canceled', 'all'
+    // Status filter lives in App.js with the other list filters and is
+    // applied by the server (see get_customers' `status`).
+    const statusFilter = customerStatus || 'active';
     const [resellers, setResellers] = useState([]);
     const [sectors, setSectors] = useState([]);
     const [upstreamProviders, setUpstreamProviders] = useState([]);
@@ -408,7 +412,7 @@ const SubscriptionsView = ({
             setSnackbar({ open: true, message: error.response?.data?.error || error.response?.data?.message || 'Failed to sync upstream status', severity: 'error' });
         } finally {
             setSyncingCustomerIds(prev => { const next = new Set(prev); next.delete(customerId); return next; });
-            refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery);
+            refetchCustomers();
         }
     };
 
@@ -509,12 +513,12 @@ const SubscriptionsView = ({
             if (expandedCustomerId) {
                 fetchCustomerPayments(expandedCustomerId); // Refresh payments for the expanded customer
             }
-            refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery); // Refetch customer list to update balance
+            refetchCustomers(); // Refetch customer list to update balance
         } catch (error) {
             console.error("Error marking payment paid:", error);
             setSnackbar({ open: true, message: 'Failed to mark payment as paid. ' + (error.response?.data?.error || error.message), severity: 'error' });
         }
-    }, [apiService, setSnackbar, expandedCustomerId, fetchCustomerPayments, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery]);
+    }, [apiService, setSnackbar, expandedCustomerId, fetchCustomerPayments, refetchCustomers]);
 
     // Cashier counterpart of handleMarkPaid: records the cash as collected
     // (action 'collect'); finance/admin confirm receipt later on Payments.
@@ -565,19 +569,19 @@ const SubscriptionsView = ({
             try {
                 await apiService.deleteCustomer(customerId);
                 setSnackbar({ open: true, message: 'Customer deleted successfully!', severity: 'success' });
-                refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery);
+                refetchCustomers();
             } catch (error) {
                 console.error("Error deleting customer:", error);
                 setSnackbar({ open: true, message: 'Failed to delete customer. ' + (error.response?.data?.error || error.message), severity: 'error' });
             }
         }
-    }, [apiService, setSnackbar, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery]);
+    }, [apiService, setSnackbar, refetchCustomers]);
 
     const handleSubscriptionAction = useCallback(async (action, customerId, confirmMessage) => {
         if (window.confirm(confirmMessage)) {
             try {
                 const response = await action(customerId);
-                refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery);
+                refetchCustomers();
 
                 const customer = (customers || []).find(c => c.id === customerId);
                 const isRenewal = action === apiService.renewSubscription;
@@ -617,19 +621,19 @@ const SubscriptionsView = ({
                 setSnackbar({ open: true, message: `Failed to complete action. ${error.response?.data?.message || error.message}`, severity: 'error' });
             }
         }
-    }, [apiService, setSnackbar, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery, customers, waSettings]);
+    }, [apiService, setSnackbar, refetchCustomers, customers, waSettings]);
     const handleToggleWA = useCallback(async (customer) => {
         try {
             await apiService.updateCustomer(customer.id, {
                 whatsapp_notifications_enabled: !customer.whatsapp_notifications_enabled
             });
             setSnackbar({ open: true, message: 'WhatsApp notifications preference updated', severity: 'success' });
-            refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery);
+            refetchCustomers();
         } catch (error) {
             console.error('Error toggling WA:', error);
             setSnackbar({ open: true, message: 'Failed to update preference', severity: 'error' });
         }
-    }, [apiService, setSnackbar, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery]);
+    }, [apiService, setSnackbar, refetchCustomers]);
 
     const handleSendWAReminder = useCallback((customerOrId) => {
         const customer = typeof customerOrId === 'object' ? customerOrId : customers.find(c => c.id === customerOrId);
@@ -686,7 +690,7 @@ const SubscriptionsView = ({
         try {
             setSnackbar({ open: true, message: 'Preparing export...', severity: 'info' });
             // Fetch all customers matching current filters (per_page=9999)
-            const response = await apiService.fetchCustomers(1, 9999, debouncedSearchQuery, customerSortBy, customerResellerId);
+            const response = await apiService.fetchCustomers(1, 9999, debouncedSearchQuery, customerSortBy, customerResellerId, statusFilter, false);
             const allCustomers = response.customers || [];
             
             if (allCustomers.length === 0) {
@@ -753,7 +757,7 @@ const SubscriptionsView = ({
             });
 
             setSelected([]); // Clear selection
-            refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery); // Refresh data
+            refetchCustomers(); // Refresh data
         } catch (error) {
             console.error(`Error performing bulk ${actionName}:`, error);
             setSnackbar({
@@ -995,7 +999,7 @@ const SubscriptionsView = ({
 
             setEditDialogOpen(false);
             setEditingCustomer(null);
-            refetchCustomers(currentPage, itemsPerPage, debouncedSearchQuery);
+            refetchCustomers();
 
         } catch (error) {
             console.error('Error updating customer:', error);
@@ -1005,7 +1009,7 @@ const SubscriptionsView = ({
                 severity: 'error'
             });
         }
-    }, [editingCustomer, isCashierOnly, apiService, setSnackbar, refetchCustomers, currentPage, itemsPerPage, debouncedSearchQuery]);
+    }, [editingCustomer, isCashierOnly, apiService, setSnackbar, refetchCustomers]);
 
     const handleAddCustomer = useCallback(async () => {
         if (!newCustomer.name || !newCustomer.phone || !newCustomer.address || !newCustomer.subscription_plan_id) {
@@ -1021,12 +1025,13 @@ const SubscriptionsView = ({
             setSnackbar({ open: true, message: 'Customer added successfully!', severity: 'success' });
             setShowAddCustomerForm(false);
             setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', reseller_id: '', upstream_provider_id: '', upstream_username: '', network_device_id: '', pppoe_username: '', onu_mac_address: '', cpe_mac_address: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
-            refetchCustomers(1, itemsPerPage, ''); // Go to first page after adding
+            // Go to the first page after adding (the page change refetches).
+            if (currentPage !== 1) setCurrentPage(1); else refetchCustomers();
         } catch (error) {
             console.error('Error adding customer:', error);
             setSnackbar({ open: true, message: 'Failed to add customer. ' + (error.response?.data?.error || error.message), severity: 'error' });
         }
-    }, [newCustomer, apiService, setSnackbar, refetchCustomers, itemsPerPage]);
+    }, [newCustomer, apiService, setSnackbar, refetchCustomers, currentPage, setCurrentPage]);
 
     const handlePageChange = (event, value) => {
         setCurrentPage(value);
@@ -1089,21 +1094,9 @@ const SubscriptionsView = ({
         </Fade>
     );
 
-    // --- NEW: Memoized sorted customers list ---
-    const sortedCustomers = React.useMemo(() => {
-        let filtered = [...customers];
-        if (statusFilter === 'active') {
-            filtered = filtered.filter(c => c.is_subscription_active);
-        } else if (statusFilter === 'canceled') {
-            filtered = filtered.filter(c => !c.is_subscription_active);
-        }
-        return filtered.sort((a, b) => {
-            // Sort by expiration date (nearest first)
-            const dateA = new Date(a.subscription_expiry_date);
-            const dateB = new Date(b.subscription_expiry_date);
-            return dateA - dateB;
-        });
-    }, [customers, statusFilter]);
+    // Already filtered by status and ordered by the chosen Sort By on the
+    // server -- re-sorting here used to override Sort By with expiry date.
+    const sortedCustomers = customers;
 
     // OPTIMIZED: Memoize expensive revenue calculation to prevent re-computation on every render
     const estimatedRevenue = React.useMemo(() => {
@@ -1246,7 +1239,7 @@ const SubscriptionsView = ({
             <Paper sx={{ p: 2, mb: 3, borderRadius: '16px' }}>
                 <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', flexWrap: 'wrap' }}>
                     <DebouncedSearchInput placeholder="Search by name, phone, or address..." value={searchQuery} onChange={handleSearchChange} InputProps={{ startAdornment: <SearchIcon sx={{ mr: 1, color: 'text.secondary' }} /> }} sx={{ flex: 1, minWidth: 250 }} />
-                    <TextField select label="Status" value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setCurrentPage(1); }} sx={{ minWidth: 150 }}>
+                    <TextField select label="Status" value={statusFilter} onChange={(e) => { setCustomerStatus(e.target.value); setCurrentPage(1); }} sx={{ minWidth: 150 }}>
                         <MenuItem value="active">Active</MenuItem>
                         <MenuItem value="canceled">Canceled</MenuItem>
                         <MenuItem value="all">All</MenuItem>
