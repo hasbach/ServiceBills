@@ -17,6 +17,7 @@ import { apiService, useAppContext } from '../context/AppContext';
 import pollNetworkJob from './pollNetworkJob';
 import { STATUS_COLOR, STATUS_LABEL, NOT_CHECKED } from './deviceStatus';
 import { formatStamp } from './formatStamp';
+import DirectAccessHelp from './DirectAccessHelp';
 
 // Exported for testing: given the job pollNetworkJob resolved for a Test
 // Connection request, what the toast should say. The initial POST's
@@ -302,6 +303,10 @@ const NetworkDeviceManagementView = () => {
                     Add Device
                 </Button>
             </Box>
+
+            {/* Collapsed by default; shown in both modes so a tenant on the agent
+                can see the no-install alternative too. */}
+            <DirectAccessHelp />
 
             {/* No agent in 'direct' mode -- rendering this would just be noise. */}
             {accessMode === 'agent' && (
