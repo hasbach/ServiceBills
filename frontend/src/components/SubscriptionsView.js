@@ -9,7 +9,6 @@ import {
     CardContent,
     Chip,
     Fade,
-    Slide,
     Grid,
     Divider,
     alpha,
@@ -79,6 +78,249 @@ export function shouldShowNetworkStatusChips(mikrotikStatus) {
 }
 
 // --- NEW: Toolbar for bulk actions ---
+const getStatusColor = (isActive) => (isActive ? '#10B981' : '#EF4444');
+const getPlanColor = (planName) => {
+    const colors = { 'basic': '#4F46E5', 'premium': '#10B981', 'pro': '#F59E0B', 'enterprise': '#8B5CF6', 'default': '#6B7280' };
+    return colors[planName?.toLowerCase()] || colors.default;
+};
+
+// Shared empty list so a collapsed card's `payments` prop never changes.
+const NO_PAYMENTS = [];
+
+// One customer card / table row, memoized: SubscriptionsView holds a lot of
+// state (dialogs, form fields, search, selection...) and every change used to
+// rebuild every card -- ~12ms each, so 25 cards froze each click for ~0.3s
+// and 100 for ~1.3s. Now a card re-renders only when its own props change.
+// `actions` is a stable object (see cardActions) whose methods forward to the
+// parent's latest handlers; isSyncing/networkMode are props (not read from
+// the parent's closure) so the upstream chip still updates when they change.
+const GridCustomerCard = React.memo(function GridCustomerCard({
+    customer, isExpanded, payments, loadingPayments, isSyncing, networkMode,
+    canServeAtDesk, canManageSubscriptions, actions,
+}) {
+    const theme = useTheme();
+    const plan = customer.subscription_plan;
+    return (
+        <Grid item xs={12} md={6} lg={4} key={customer.id}>
+                <Card sx={{ position: 'relative', overflow: 'visible', transition: 'all 0.3s', '&:hover': { transform: 'translateY(-4px)', boxShadow: `0 12px 24px ${alpha(theme.palette.common.black, 0.15)}` }, borderRadius: '16px', border: `1px solid ${alpha(theme.palette.divider, 0.08)}`, mb: 2 }}>
+                    <Box sx={{ position: 'absolute', top: 0, left: 0, right: 0, height: 4, background: `linear-gradient(90deg, ${getStatusColor(customer.is_subscription_active)}, ${alpha(getStatusColor(customer.is_subscription_active), 0.7)})` }} />
+                    <CardContent sx={{ p: 3 }}>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 2 }}>
+                            <Box sx={{ display: 'flex', gap: 2, flex: 1 }}>
+                                <Avatar sx={{ width: 56, height: 56, background: `linear-gradient(135deg, ${getPlanColor(plan?.name)}, ${alpha(getPlanColor(plan?.name), 0.7)})`, fontSize: '1.5rem', fontWeight: 700 }}>{customer.name.charAt(0).toUpperCase()}</Avatar>
+                                <Box sx={{ flex: 1 }}>
+                                    <Typography variant="h6" sx={{ fontWeight: 700, mb: 0.5 }}>{customer.name}</Typography>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}><PhoneIcon sx={{ fontSize: 14, color: 'text.secondary' }} /><Typography variant="body2" color="text.secondary">{customer.phone}</Typography></Box>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><LocationOnIcon sx={{ fontSize: 14, color: 'text.secondary' }} /><Typography variant="body2" color="text.secondary">{customer.address}</Typography>
+                                        {customer.sector && (
+                                            <>
+                                                <Typography variant="body2" color="text.secondary" sx={{ mx: 0.5 }}>•</Typography>
+                                                <Chip size="small" label={`Sector: ${customer.sector}`} variant="outlined" sx={{ height: 20, fontSize: '0.7rem' }} />
+                                            </>
+                                        )}
+                                    </Box>
+                                    {customer.upstream_provider_name && (
+                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 0.5 }}><CloudIcon sx={{ fontSize: 14, color: 'text.secondary' }} /><Typography variant="body2" color="text.secondary">{customer.upstream_provider_name}</Typography></Box>
+                                    )}
+                                </Box>
+                            </Box>
+                            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, alignItems: 'flex-end' }}>
+                                {canServeAtDesk && (
+                                    <FormControlLabel
+                                        control={<Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => actions.handleToggleWA(customer)} color="primary" />}
+                                        label={<Typography variant="caption" sx={{ fontWeight: 600 }}>WA Alerts</Typography>}
+                                        labelPlacement="start"
+                                        sx={{ m: 0 }}
+                                    />
+                                )}
+                                <Chip label={customer.is_subscription_active ? 'Active' : 'Canceled'} size="small" sx={{ backgroundColor: alpha(getStatusColor(customer.is_subscription_active), 0.1), color: getStatusColor(customer.is_subscription_active), fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(getStatusColor(customer.is_subscription_active), 0.2)}` }} />
+                                {canServeAtDesk && (
+                                    <Chip label={`Balance: $${customer.balance.toFixed(2)}`} size="small" sx={{ backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1), color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.2)}` }} />
+                                )}
+                                {actions.renderUpstreamStatusChip(customer, isSyncing, networkMode)}
+                            </Box>
+                        </Box>
+                        <Divider sx={{ my: 2, opacity: 0.6 }} />
+                        <Grid container spacing={2} sx={{ mb: 2 }}>
+                            <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Plan</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{plan?.name || 'N/A'}</Typography></Box></Grid>
+                            <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Price</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>${((plan?.price || 0) - customer.discount).toFixed(2)}</Typography></Box></Grid>
+                            <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Start Date</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{new Date(customer.subscription_start_date).toLocaleDateString()}</Typography></Box></Grid>
+                            <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Expiry Date</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{new Date(customer.subscription_expiry_date).toLocaleDateString()}</Typography></Box></Grid>
+                        </Grid>
+                        {canServeAtDesk && (
+                            <>
+                                <Divider sx={{ my: 2, opacity: 0.6 }} />
+                                <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                                    <Button size="small" variant="outlined" startIcon={isExpanded ? <VisibilityOffIcon /> : <VisibilityIcon />} onClick={() => actions.fetchCustomerPayments(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>{isExpanded ? 'Hide' : 'Payments'}</Button>
+                                    <Button size="small" variant="outlined" color="info" startIcon={<EditIcon />} onClick={() => actions.openEditCustomerDialog(customer)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Edit</Button>
+                                    <Button size="small" variant="outlined" color="success" startIcon={<RefreshIcon />} onClick={() => actions.renew(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Renew</Button>
+                                    <Button size="small" variant="outlined" color="primary" startIcon={<ChatIcon />} onClick={() => actions.handleSendWAReminder(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>WA Reminder</Button>
+                                    {customer.is_subscription_active ? (
+                                        <Button size="small" variant="outlined" color="warning" startIcon={<CancelIcon />} onClick={() => actions.cancel(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Cancel</Button>
+                                    ) : (
+                                        <Button size="small" variant="outlined" color="success" startIcon={<PlayArrowIcon />} onClick={() => actions.activate(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Activate</Button>
+                                    )}
+                                    {canManageSubscriptions && (
+                                        <Button size="small" variant="outlined" color="error" startIcon={<DeleteIcon />} onClick={() => actions.handleDeleteCustomer(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Delete</Button>
+                                    )}
+                                </Box>
+                            </>
+                        )}
+                        <Collapse in={isExpanded} unmountOnExit>
+                            <Box sx={{ mt: 3, p: 2, backgroundColor: alpha(theme.palette.primary.main, 0.02), borderRadius: '12px' }}>
+                                <Typography variant="h6" sx={{ mb: 2, fontWeight: 700 }}>Payments</Typography>
+                                {loadingPayments ? <CircularProgress size={24} /> : (
+                                    <TableContainer>
+                                        <Table size="small">
+                                            <TableHead><TableRow><TableCell sx={{ fontWeight: 700 }}>Date</TableCell><TableCell sx={{ fontWeight: 700 }}>Amount</TableCell><TableCell sx={{ fontWeight: 700 }}>Status</TableCell><TableCell sx={{ fontWeight: 700 }}>Actions</TableCell></TableRow></TableHead>
+                                            <TableBody>
+                                                {payments.length > 0 ? payments.map(p => (
+                                                    <TableRow key={p.id}>
+                                                        <TableCell>{new Date(p.date).toLocaleDateString()}</TableCell>
+                                                        <TableCell sx={{ fontWeight: 600 }}>${p.amount.toFixed(2)}</TableCell>
+                                                        <TableCell><Chip label={p.paid ? 'Paid' : 'Unpaid'} size="small" color={p.paid ? 'success' : 'error'} variant="outlined" /></TableCell>
+                                                        <TableCell>{actions.renderPaymentAction(p)}</TableCell>
+                                                    </TableRow>
+                                                )) : <TableRow><TableCell colSpan={4} sx={{ textAlign: 'center', py: 3 }}><Typography variant="body2" color="text.secondary">No payments found</Typography></TableCell></TableRow>}
+                                            </TableBody>
+                                        </Table>
+                                    </TableContainer>
+                                )}
+                            </Box>
+                        </Collapse>
+                    </CardContent>
+                </Card>
+        </Grid>
+    );
+});
+
+const ListCustomerRow = React.memo(function ListCustomerRow({
+    customer, index, isItemSelected, isSyncing, networkMode,
+    canServeAtDesk, canManageSubscriptions, actions,
+}) {
+    const theme = useTheme();
+    const labelId = `enhanced-table-checkbox-${index}`;
+    const plan = customer.subscription_plan;
+    return (
+        <TableRow
+            hover
+            onClick={canServeAtDesk ? (event) => actions.handleSelectClick(event, customer.id) : undefined}
+            role="checkbox"
+            aria-checked={isItemSelected}
+            tabIndex={-1}
+            key={customer.id}
+            selected={isItemSelected}
+            sx={{ cursor: canServeAtDesk ? 'pointer' : 'default', '&.Mui-selected': { backgroundColor: alpha(theme.palette.primary.main, 0.08) } }}
+        >
+            {canServeAtDesk && (
+                <TableCell padding="checkbox">
+                    <Checkbox
+                        color="primary"
+                        checked={isItemSelected}
+                        inputProps={{ 'aria-labelledby': labelId }}
+                    />
+                </TableCell>
+            )}
+            <TableCell component="th" id={labelId} scope="row" padding="none">
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, p: 1 }}>
+                    <Avatar sx={{ background: `linear-gradient(135deg, ${getPlanColor(plan?.name)}, ${alpha(getPlanColor(plan?.name), 0.7)})` }}>
+                        {customer.name.charAt(0).toUpperCase()}
+                    </Avatar>
+                    <Box>
+                        <Typography variant="body1" sx={{ fontWeight: 600 }}>{customer.name}</Typography>
+                        <Typography variant="body2" color="text.secondary">{customer.address}</Typography>
+                        {customer.upstream_provider_name && <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>Upstream: {customer.upstream_provider_name}</Typography>}
+                        {customer.sector && <Typography variant="caption" color="text.secondary">Sector: {customer.sector}</Typography>}
+                    </Box>
+                </Box>
+            </TableCell>
+            <TableCell>{customer.phone}</TableCell>
+            <TableCell>
+                <Typography variant="body2" sx={{ fontWeight: 500 }}>{plan?.name || 'N/A'}</Typography>
+                <Typography variant="caption" color="text.secondary">${((plan?.price || 0) - customer.discount).toFixed(2)}</Typography>
+            </TableCell>
+            <TableCell>
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, alignItems: 'flex-start' }}>
+                    <Chip
+                        label={customer.is_subscription_active ? 'Active' : 'Canceled'}
+                        size="small"
+                        sx={{
+                            backgroundColor: alpha(getStatusColor(customer.is_subscription_active), 0.1),
+                            color: getStatusColor(customer.is_subscription_active),
+                            fontWeight: 600,
+                        }}
+                    />
+                    {actions.renderUpstreamStatusChip(customer, isSyncing, networkMode)}
+                </Box>
+            </TableCell>
+            {canServeAtDesk && (
+                <TableCell onClick={(e) => e.stopPropagation()}>
+                    <Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => actions.handleToggleWA(customer)} color="primary" />
+                </TableCell>
+            )}
+            {canServeAtDesk && (
+                <TableCell>
+                    <Chip
+                        label={`$${customer.balance.toFixed(2)}`}
+                        size="small"
+                        sx={{
+                            backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1),
+                            color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main,
+                            fontWeight: 600,
+                        }}
+                    />
+                </TableCell>
+            )}
+            <TableCell>{new Date(customer.subscription_expiry_date).toLocaleDateString()}</TableCell>
+            {canServeAtDesk && (
+                <TableCell onClick={(e) => e.stopPropagation()} sx={{ whiteSpace: 'nowrap' }}>
+                    {/* Stop propagation so clicking buttons doesn't select the row */}
+                    <Tooltip title="Payments History">
+                        <IconButton size="small" color="secondary" onClick={() => actions.fetchCustomerPayments(customer.id, customer)}>
+                            <ReceiptIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                    <Tooltip title="Edit">
+                        <IconButton size="small" color="info" onClick={() => actions.openEditCustomerDialog(customer)}>
+                            <EditIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                    <Tooltip title="Renew">
+                        <IconButton size="small" color="success" onClick={() => actions.renew(customer.id)}>
+                            <RefreshIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                    <Tooltip title="WA Reminder">
+                        <IconButton size="small" color="primary" onClick={() => actions.handleSendWAReminder(customer.id)}>
+                            <ChatIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                    {customer.is_subscription_active ? (
+                        <Tooltip title="Cancel">
+                            <IconButton size="small" color="warning" onClick={() => actions.cancel(customer.id)}>
+                                <CancelIcon fontSize="small" />
+                            </IconButton>
+                        </Tooltip>
+                    ) : (
+                        <Tooltip title="Activate">
+                            <IconButton size="small" color="success" onClick={() => actions.activate(customer.id)}>
+                                <PlayArrowIcon fontSize="small" />
+                            </IconButton>
+                        </Tooltip>
+                    )}
+                    {canManageSubscriptions && (
+                        <Tooltip title="Delete">
+                            <IconButton size="small" color="error" onClick={() => actions.handleDeleteCustomer(customer.id)}>
+                                <DeleteIcon fontSize="small" />
+                            </IconButton>
+                        </Tooltip>
+                    )}
+                </TableCell>
+            )}
+        </TableRow>
+    );
+});
+
 const EnhancedTableToolbar = ({ numSelected, onRenew, onCancel, onDelete, disabled }) => {
     const theme = useTheme();
     return (
@@ -354,11 +596,6 @@ const SubscriptionsView = ({
     }, [viewMode, customers, statusFilter]);
 
 
-    const getStatusColor = (isActive) => (isActive ? '#10B981' : '#EF4444');
-    const getPlanColor = (planName) => {
-        const colors = { 'basic': '#4F46E5', 'premium': '#10B981', 'pro': '#F59E0B', 'enterprise': '#8B5CF6', 'default': '#6B7280' };
-        return colors[planName?.toLowerCase()] || colors.default;
-    };
     // 'blocked'/'near_expiry'/'quota_exceeded' are Krypton-only values (see
     // upstream_portal_krypton.py) -- deliberately NOT copying Krypton's own
     // portal colors (it renders blocked=orange, offline=light blue) since
@@ -1066,7 +1303,30 @@ const SubscriptionsView = ({
         setSelected(newSelected);
     };
 
-    const isSelected = (id) => selected.indexOf(id) !== -1;
+    // Stable across renders so the memoized cards/rows don't re-render just
+    // because the parent did; each method calls the latest handler.
+    const latestHandlersRef = React.useRef(null);
+    latestHandlersRef.current = {
+        fetchCustomerPayments, openEditCustomerDialog, handleSubscriptionAction,
+        handleSendWAReminder, handleDeleteCustomer, handleToggleWA, handleSelectClick,
+        renderUpstreamStatusChip, renderPaymentAction,
+    };
+    const cardActions = React.useMemo(() => {
+        const h = () => latestHandlersRef.current;
+        return {
+            fetchCustomerPayments: (...a) => h().fetchCustomerPayments(...a),
+            openEditCustomerDialog: (...a) => h().openEditCustomerDialog(...a),
+            handleSendWAReminder: (...a) => h().handleSendWAReminder(...a),
+            handleDeleteCustomer: (...a) => h().handleDeleteCustomer(...a),
+            handleToggleWA: (...a) => h().handleToggleWA(...a),
+            handleSelectClick: (...a) => h().handleSelectClick(...a),
+            renderUpstreamStatusChip: (customer) => h().renderUpstreamStatusChip(customer),
+            renderPaymentAction: (p) => h().renderPaymentAction(p),
+            renew: (id) => h().handleSubscriptionAction(apiService.renewSubscription, id, "Renew subscription? (Reseller customers will have their reseller charged, others will get a new pending payment)"),
+            cancel: (id) => h().handleSubscriptionAction(apiService.cancelSubscription, id, "Cancel subscription?"),
+            activate: (id) => h().handleSubscriptionAction(apiService.activateSubscription, id, "Activate subscription?"),
+        };
+    }, [apiService]);
     // --- End of NEW Selection Logic ---
 
     // Memoize search input handler to prevent lag
@@ -1162,7 +1422,7 @@ const SubscriptionsView = ({
                 </Box>
             </Paper>
 
-            <Collapse in={showAddCustomerForm}>
+            <Collapse in={showAddCustomerForm} unmountOnExit>
                 <Paper sx={{ p: 4, borderRadius: '20px', background: 'linear-gradient(135deg, #ffffff 0%, #f8fafc 100%)', border: `1px solid ${alpha(theme.palette.divider, 0.08)}`, mb: 4 }}>
                     <Typography variant="h6" sx={{ mb: 3, fontWeight: 700 }}>Add New Customer</Typography>
                     <Grid container spacing={3}>
@@ -1279,102 +1539,21 @@ const SubscriptionsView = ({
             ) : viewMode === 'grid' ? (
                 // --- GRID VIEW (Original) ---
                 <Grid container spacing={3}>
-                    {sortedCustomers.map((customer, index) => {
-                        const plan = customer.subscription_plan;
+                    {sortedCustomers.map((customer) => {
                         const isExpanded = expandedCustomerId === customer.id;
                         return (
-                            <Grid item xs={12} md={6} lg={4} key={customer.id}>
-                                <Slide in={true} direction="up" timeout={300 + index * 50}>
-                                    <Card sx={{ position: 'relative', overflow: 'visible', transition: 'all 0.3s', '&:hover': { transform: 'translateY(-4px)', boxShadow: `0 12px 24px ${alpha(theme.palette.common.black, 0.15)}` }, borderRadius: '16px', border: `1px solid ${alpha(theme.palette.divider, 0.08)}`, mb: 2 }}>
-                                        <Box sx={{ position: 'absolute', top: 0, left: 0, right: 0, height: 4, background: `linear-gradient(90deg, ${getStatusColor(customer.is_subscription_active)}, ${alpha(getStatusColor(customer.is_subscription_active), 0.7)})` }} />
-                                        <CardContent sx={{ p: 3 }}>
-                                            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 2 }}>
-                                                <Box sx={{ display: 'flex', gap: 2, flex: 1 }}>
-                                                    <Avatar sx={{ width: 56, height: 56, background: `linear-gradient(135deg, ${getPlanColor(plan?.name)}, ${alpha(getPlanColor(plan?.name), 0.7)})`, fontSize: '1.5rem', fontWeight: 700 }}>{customer.name.charAt(0).toUpperCase()}</Avatar>
-                                                    <Box sx={{ flex: 1 }}>
-                                                        <Typography variant="h6" sx={{ fontWeight: 700, mb: 0.5 }}>{customer.name}</Typography>
-                                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}><PhoneIcon sx={{ fontSize: 14, color: 'text.secondary' }} /><Typography variant="body2" color="text.secondary">{customer.phone}</Typography></Box>
-                                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><LocationOnIcon sx={{ fontSize: 14, color: 'text.secondary' }} /><Typography variant="body2" color="text.secondary">{customer.address}</Typography>
-                                                            {customer.sector && (
-                                                                <>
-                                                                    <Typography variant="body2" color="text.secondary" sx={{ mx: 0.5 }}>•</Typography>
-                                                                    <Chip size="small" label={`Sector: ${customer.sector}`} variant="outlined" sx={{ height: 20, fontSize: '0.7rem' }} />
-                                                                </>
-                                                            )}
-                                                        </Box>
-                                                        {customer.upstream_provider_name && (
-                                                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 0.5 }}><CloudIcon sx={{ fontSize: 14, color: 'text.secondary' }} /><Typography variant="body2" color="text.secondary">{customer.upstream_provider_name}</Typography></Box>
-                                                        )}
-                                                    </Box>
-                                                </Box>
-                                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, alignItems: 'flex-end' }}>
-                                                    {canServeAtDesk && (
-                                                        <FormControlLabel
-                                                            control={<Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />}
-                                                            label={<Typography variant="caption" sx={{ fontWeight: 600 }}>WA Alerts</Typography>}
-                                                            labelPlacement="start"
-                                                            sx={{ m: 0 }}
-                                                        />
-                                                    )}
-                                                    <Chip label={customer.is_subscription_active ? 'Active' : 'Canceled'} size="small" sx={{ backgroundColor: alpha(getStatusColor(customer.is_subscription_active), 0.1), color: getStatusColor(customer.is_subscription_active), fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(getStatusColor(customer.is_subscription_active), 0.2)}` }} />
-                                                    {canServeAtDesk && (
-                                                        <Chip label={`Balance: $${customer.balance.toFixed(2)}`} size="small" sx={{ backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1), color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.2)}` }} />
-                                                    )}
-                                                    {renderUpstreamStatusChip(customer)}
-                                                </Box>
-                                            </Box>
-                                            <Divider sx={{ my: 2, opacity: 0.6 }} />
-                                            <Grid container spacing={2} sx={{ mb: 2 }}>
-                                                <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Plan</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{plan?.name || 'N/A'}</Typography></Box></Grid>
-                                                <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Price</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>${((plan?.price || 0) - customer.discount).toFixed(2)}</Typography></Box></Grid>
-                                                <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Start Date</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{new Date(customer.subscription_start_date).toLocaleDateString()}</Typography></Box></Grid>
-                                                <Grid item xs={6}><Box><Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>Expiry Date</Typography><Typography variant="body2" sx={{ fontWeight: 600 }}>{new Date(customer.subscription_expiry_date).toLocaleDateString()}</Typography></Box></Grid>
-                                            </Grid>
-                                            {canServeAtDesk && (
-                                                <>
-                                                    <Divider sx={{ my: 2, opacity: 0.6 }} />
-                                                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                                                        <Button size="small" variant="outlined" startIcon={isExpanded ? <VisibilityOffIcon /> : <VisibilityIcon />} onClick={() => fetchCustomerPayments(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>{isExpanded ? 'Hide' : 'Payments'}</Button>
-                                                        <Button size="small" variant="outlined" color="info" startIcon={<EditIcon />} onClick={() => openEditCustomerDialog(customer)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Edit</Button>
-                                                        <Button size="small" variant="outlined" color="success" startIcon={<RefreshIcon />} onClick={() => handleSubscriptionAction(apiService.renewSubscription, customer.id, "Renew subscription? (Reseller customers will have their reseller charged, others will get a new pending payment)")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Renew</Button>
-                                                        <Button size="small" variant="outlined" color="primary" startIcon={<ChatIcon />} onClick={() => handleSendWAReminder(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>WA Reminder</Button>
-                                                        {customer.is_subscription_active ? (
-                                                            <Button size="small" variant="outlined" color="warning" startIcon={<CancelIcon />} onClick={() => handleSubscriptionAction(apiService.cancelSubscription, customer.id, "Cancel subscription?")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Cancel</Button>
-                                                        ) : (
-                                                            <Button size="small" variant="outlined" color="success" startIcon={<PlayArrowIcon />} onClick={() => handleSubscriptionAction(apiService.activateSubscription, customer.id, "Activate subscription?")} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Activate</Button>
-                                                        )}
-                                                        {canManageSubscriptions && (
-                                                            <Button size="small" variant="outlined" color="error" startIcon={<DeleteIcon />} onClick={() => handleDeleteCustomer(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Delete</Button>
-                                                        )}
-                                                    </Box>
-                                                </>
-                                            )}
-                                            <Collapse in={isExpanded}>
-                                                <Box sx={{ mt: 3, p: 2, backgroundColor: alpha(theme.palette.primary.main, 0.02), borderRadius: '12px' }}>
-                                                    <Typography variant="h6" sx={{ mb: 2, fontWeight: 700 }}>Payments</Typography>
-                                                    {loadingPayments ? <CircularProgress size={24} /> : (
-                                                        <TableContainer>
-                                                            <Table size="small">
-                                                                <TableHead><TableRow><TableCell sx={{ fontWeight: 700 }}>Date</TableCell><TableCell sx={{ fontWeight: 700 }}>Amount</TableCell><TableCell sx={{ fontWeight: 700 }}>Status</TableCell><TableCell sx={{ fontWeight: 700 }}>Actions</TableCell></TableRow></TableHead>
-                                                                <TableBody>
-                                                                    {payments.length > 0 ? payments.map(p => (
-                                                                        <TableRow key={p.id}>
-                                                                            <TableCell>{new Date(p.date).toLocaleDateString()}</TableCell>
-                                                                            <TableCell sx={{ fontWeight: 600 }}>${p.amount.toFixed(2)}</TableCell>
-                                                                            <TableCell><Chip label={p.paid ? 'Paid' : 'Unpaid'} size="small" color={p.paid ? 'success' : 'error'} variant="outlined" /></TableCell>
-                                                                            <TableCell>{renderPaymentAction(p)}</TableCell>
-                                                                        </TableRow>
-                                                                    )) : <TableRow><TableCell colSpan={4} sx={{ textAlign: 'center', py: 3 }}><Typography variant="body2" color="text.secondary">No payments found</Typography></TableCell></TableRow>}
-                                                                </TableBody>
-                                                            </Table>
-                                                        </TableContainer>
-                                                    )}
-                                                </Box>
-                                            </Collapse>
-                                        </CardContent>
-                                    </Card>
-                                </Slide>
-                            </Grid>
+                            <GridCustomerCard
+                                key={customer.id}
+                                customer={customer}
+                                isExpanded={isExpanded}
+                                payments={isExpanded ? payments : NO_PAYMENTS}
+                                loadingPayments={isExpanded && loadingPayments}
+                                isSyncing={syncingCustomerIds.has(customer.id)}
+                                networkMode={businessSettings?.network_mode}
+                                canServeAtDesk={canServeAtDesk}
+                                canManageSubscriptions={canManageSubscriptions}
+                                actions={cardActions}
+                            />
                         );
                     })}
                 </Grid>
@@ -1416,130 +1595,19 @@ const SubscriptionsView = ({
                                 </TableRow>
                             </TableHead>
                             <TableBody>
-                                {sortedCustomers.map((customer, index) => {
-                                    const isItemSelected = isSelected(customer.id);
-                                    const labelId = `enhanced-table-checkbox-${index}`;
-                                    const plan = customer.subscription_plan;
-
-                                    return (
-                                        <TableRow
-                                            hover
-                                            onClick={canServeAtDesk ? (event) => handleSelectClick(event, customer.id) : undefined}
-                                            role="checkbox"
-                                            aria-checked={isItemSelected}
-                                            tabIndex={-1}
-                                            key={customer.id}
-                                            selected={isItemSelected}
-                                            sx={{ cursor: canServeAtDesk ? 'pointer' : 'default', '&.Mui-selected': { backgroundColor: alpha(theme.palette.primary.main, 0.08) } }}
-                                        >
-                                            {canServeAtDesk && (
-                                                <TableCell padding="checkbox">
-                                                    <Checkbox
-                                                        color="primary"
-                                                        checked={isItemSelected}
-                                                        inputProps={{ 'aria-labelledby': labelId }}
-                                                    />
-                                                </TableCell>
-                                            )}
-                                            <TableCell component="th" id={labelId} scope="row" padding="none">
-                                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, p: 1 }}>
-                                                    <Avatar sx={{ background: `linear-gradient(135deg, ${getPlanColor(plan?.name)}, ${alpha(getPlanColor(plan?.name), 0.7)})` }}>
-                                                        {customer.name.charAt(0).toUpperCase()}
-                                                    </Avatar>
-                                                    <Box>
-                                                        <Typography variant="body1" sx={{ fontWeight: 600 }}>{customer.name}</Typography>
-                                                        <Typography variant="body2" color="text.secondary">{customer.address}</Typography>
-                                                        {customer.upstream_provider_name && <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>Upstream: {customer.upstream_provider_name}</Typography>}
-                                                        {customer.sector && <Typography variant="caption" color="text.secondary">Sector: {customer.sector}</Typography>}
-                                                    </Box>
-                                                </Box>
-                                            </TableCell>
-                                            <TableCell>{customer.phone}</TableCell>
-                                            <TableCell>
-                                                <Typography variant="body2" sx={{ fontWeight: 500 }}>{plan?.name || 'N/A'}</Typography>
-                                                <Typography variant="caption" color="text.secondary">${((plan?.price || 0) - customer.discount).toFixed(2)}</Typography>
-                                            </TableCell>
-                                            <TableCell>
-                                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, alignItems: 'flex-start' }}>
-                                                    <Chip
-                                                        label={customer.is_subscription_active ? 'Active' : 'Canceled'}
-                                                        size="small"
-                                                        sx={{
-                                                            backgroundColor: alpha(getStatusColor(customer.is_subscription_active), 0.1),
-                                                            color: getStatusColor(customer.is_subscription_active),
-                                                            fontWeight: 600,
-                                                        }}
-                                                    />
-                                                    {renderUpstreamStatusChip(customer)}
-                                                </Box>
-                                            </TableCell>
-                                            {canServeAtDesk && (
-                                                <TableCell onClick={(e) => e.stopPropagation()}>
-                                                    <Switch size="small" checked={customer.whatsapp_notifications_enabled !== false} onChange={() => handleToggleWA(customer)} color="primary" />
-                                                </TableCell>
-                                            )}
-                                            {canServeAtDesk && (
-                                                <TableCell>
-                                                    <Chip
-                                                        label={`$${customer.balance.toFixed(2)}`}
-                                                        size="small"
-                                                        sx={{
-                                                            backgroundColor: alpha(customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main, 0.1),
-                                                            color: customer.balance >= 0 ? theme.palette.success.main : theme.palette.error.main,
-                                                            fontWeight: 600,
-                                                        }}
-                                                    />
-                                                </TableCell>
-                                            )}
-                                            <TableCell>{new Date(customer.subscription_expiry_date).toLocaleDateString()}</TableCell>
-                                            {canServeAtDesk && (
-                                                <TableCell onClick={(e) => e.stopPropagation()} sx={{ whiteSpace: 'nowrap' }}>
-                                                    {/* Stop propagation so clicking buttons doesn't select the row */}
-                                                    <Tooltip title="Payments History">
-                                                        <IconButton size="small" color="secondary" onClick={() => fetchCustomerPayments(customer.id, customer)}>
-                                                            <ReceiptIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
-                                                    <Tooltip title="Edit">
-                                                        <IconButton size="small" color="info" onClick={() => openEditCustomerDialog(customer)}>
-                                                            <EditIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
-                                                    <Tooltip title="Renew">
-                                                        <IconButton size="small" color="success" onClick={() => handleSubscriptionAction(apiService.renewSubscription, customer.id, "Renew subscription? (Reseller customers will have their reseller charged, others will get a new pending payment)")}>
-                                                            <RefreshIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
-                                                    <Tooltip title="WA Reminder">
-                                                        <IconButton size="small" color="primary" onClick={() => handleSendWAReminder(customer.id)}>
-                                                            <ChatIcon fontSize="small" />
-                                                        </IconButton>
-                                                    </Tooltip>
-                                                    {customer.is_subscription_active ? (
-                                                        <Tooltip title="Cancel">
-                                                            <IconButton size="small" color="warning" onClick={() => handleSubscriptionAction(apiService.cancelSubscription, customer.id, "Cancel subscription?")}>
-                                                                <CancelIcon fontSize="small" />
-                                                            </IconButton>
-                                                        </Tooltip>
-                                                    ) : (
-                                                        <Tooltip title="Activate">
-                                                            <IconButton size="small" color="success" onClick={() => handleSubscriptionAction(apiService.activateSubscription, customer.id, "Activate subscription?")}>
-                                                                <PlayArrowIcon fontSize="small" />
-                                                            </IconButton>
-                                                        </Tooltip>
-                                                    )}
-                                                    {canManageSubscriptions && (
-                                                        <Tooltip title="Delete">
-                                                            <IconButton size="small" color="error" onClick={() => handleDeleteCustomer(customer.id)}>
-                                                                <DeleteIcon fontSize="small" />
-                                                            </IconButton>
-                                                        </Tooltip>
-                                                    )}
-                                                </TableCell>
-                                            )}
-                                        </TableRow>
-                                    );
-                                })}
+                                {sortedCustomers.map((customer, index) => (
+                                    <ListCustomerRow
+                                        key={customer.id}
+                                        customer={customer}
+                                        index={index}
+                                        isItemSelected={selected.indexOf(customer.id) !== -1}
+                                        isSyncing={syncingCustomerIds.has(customer.id)}
+                                        networkMode={businessSettings?.network_mode}
+                                        canServeAtDesk={canServeAtDesk}
+                                        canManageSubscriptions={canManageSubscriptions}
+                                        actions={cardActions}
+                                    />
+                                ))}
                             </TableBody>
                         </Table>
                     </TableContainer>
