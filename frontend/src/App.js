@@ -126,7 +126,8 @@ const MainApp = ({
     currentPage, setCurrentPage, itemsPerPage, setItemsPerPage,
     searchQuery, setSearchQuery, customerSortBy, setCustomerSortBy,
     customerResellerId, setCustomerResellerId,
-    customerStatus, setCustomerStatus
+    customerStatus, setCustomerStatus,
+    customerExpiryDay, setCustomerExpiryDay
 }) => {
     const { user, logout } = useAppContext();
     const theme = useTheme();
@@ -324,7 +325,7 @@ const MainApp = ({
             case 'network-devices': return <NetworkDeviceManagementView />;
             case 'network-tree': return <NetworkTreeView />;
             case 'network-map': return <NetworkMapPage />;
-            case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} customerStatus={customerStatus} setCustomerStatus={setCustomerStatus} />;
+            case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} customerStatus={customerStatus} setCustomerStatus={setCustomerStatus} customerExpiryDay={customerExpiryDay} setCustomerExpiryDay={setCustomerExpiryDay} />;
             case 'payments': return <PaymentsView />;
             case 'receipts': return <ReceiptsView />;
             case 'expenses': return <ExpensesView />;
@@ -338,7 +339,7 @@ const MainApp = ({
             case 'billing': return hasRole('admin') ? <BillingView /> : <Typography>Access Denied</Typography>;
             default:
                 if (hasRole('employee') || hasRole('technician')) return <ServiceManagementView />;
-                return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} customerStatus={customerStatus} setCustomerStatus={setCustomerStatus} />;
+                return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} customerStatus={customerStatus} setCustomerStatus={setCustomerStatus} customerExpiryDay={customerExpiryDay} setCustomerExpiryDay={setCustomerExpiryDay} />;
         }
     };
 
@@ -429,6 +430,7 @@ const AppContent = () => {
     const [customerSortBy, setCustomerSortBy] = useState('expiry_date');
     const [customerResellerId, setCustomerResellerId] = useState('');
     const [customerStatus, setCustomerStatus] = useState('active'); // 'active' | 'canceled' | 'all'
+    const [customerExpiryDay, setCustomerExpiryDay] = useState(''); // '' = any day, else 1-31
 
     useEffect(() => {
         if (businessSettings) {
@@ -485,7 +487,7 @@ const AppContent = () => {
         try {
             // Server does the status filter and the ordering; ascending, so
             // Expiry Date lists the nearest expiry first and Name/Address A-Z.
-            const response = await apiService.fetchCustomers(q.page, q.perPage, q.search, q.sortBy, q.resellerId, q.status, false);
+            const response = await apiService.fetchCustomers(q.page, q.perPage, q.search, q.sortBy, q.resellerId, q.status, false, q.expiryDay);
             if (seq !== customerFetchSeqRef.current) return;
             setCustomers(response.customers || []);
             setPagination({
@@ -512,6 +514,7 @@ const AppContent = () => {
     customerQueryRef.current = {
         page: currentPage, perPage: itemsPerPage, search: debouncedSearchQuery,
         sortBy: customerSortBy, resellerId: customerResellerId, status: customerStatus,
+        expiryDay: customerExpiryDay,
     };
 
     // Auto-fetch when pagination/filter state changes. This is also the
@@ -521,7 +524,7 @@ const AppContent = () => {
         if (isAuthenticated && !isSuperadmin) {
             refetchCustomers();
         }
-    }, [currentPage, itemsPerPage, debouncedSearchQuery, customerSortBy, customerResellerId, customerStatus, isAuthenticated, isSuperadmin, refetchCustomers]);
+    }, [currentPage, itemsPerPage, debouncedSearchQuery, customerSortBy, customerResellerId, customerStatus, customerExpiryDay, isAuthenticated, isSuperadmin, refetchCustomers]);
 
     useEffect(() => {
         if (isAuthenticated && !isSuperadmin) {
@@ -602,6 +605,8 @@ const AppContent = () => {
         setCustomerResellerId={setCustomerResellerId}
         customerStatus={customerStatus}
         setCustomerStatus={setCustomerStatus}
+        customerExpiryDay={customerExpiryDay}
+        setCustomerExpiryDay={setCustomerExpiryDay}
     />;
 };
 

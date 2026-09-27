@@ -211,3 +211,27 @@ def test_customer_list_filters_status_and_keeps_requested_order_on_the_server(cl
     assert names(status="active", sort_by="expiry_date") == (["Charlie", "Alice"], 2)
     assert names(status="canceled") == (["Bob"], 1)
     assert names(sort_by="name")[1] == 3  # default 'all' for callers that don't send status
+
+
+def test_customer_list_filters_by_expiry_day_of_month(client):
+    admin_hdr = make_tenant(client, "Biz N", "n_admin")
+    plan_id = client.post("/api/subscription_plans", headers=admin_hdr,
+                          json={"name": "P", "price": 10, "billing_cycle": "monthly"}).get_json()["plan"]["id"]
+    from datetime import datetime
+    for name, expiry in [("Day1 A", datetime(2026, 10, 1, 9)), ("Day1 B", datetime(2026, 11, 1, 20)),
+                         ("Day15", datetime(2026, 10, 15))]:
+        cid = client.post("/api/customers", headers=admin_hdr,
+                          json={"name": name, "phone": "1", "address": "a", "subscription_plan_id": plan_id,
+                                "subscription_start_date": "2026-09-01"}).get_json()["customer_id"]
+        appmod.Customer.query.get(cid).subscription_expiry_date = expiry
+    appmod.db.session.commit()
+
+    def names(**params):
+        r = client.get("/api/customers", headers=admin_hdr, query_string={"sort_by": "name", "sort_desc": "false", **params})
+        return [c["name"] for c in r.get_json()["customers"]]
+
+    assert names(expiry_day=1) == ["Day1 A", "Day1 B"]
+    assert names(expiry_day=15) == ["Day15"]
+    assert names(expiry_day=2) == []
+    assert len(names(expiry_day="")) == 3  # blank = no filter
+    assert len(names(expiry_day=40)) == 3  # out of range = no filter

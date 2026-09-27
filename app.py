@@ -3779,6 +3779,12 @@ def get_customers():
             query = query.filter(Customer.is_subscription_active.is_(True))
         elif status == 'canceled':
             query = query.filter(Customer.is_subscription_active.isnot(True))
+        # Day of the month the subscription ends on (1-31) -- the same stored
+        # day renewals keep (see _renew_subscription_core), e.g. everyone due
+        # on the 1st. Anything else (absent, blank, out of range) = no filter.
+        expiry_day = request.args.get('expiry_day', type=int)
+        if expiry_day and 1 <= expiry_day <= 31:
+            query = query.filter(db.extract('day', Customer.subscription_expiry_date) == expiry_day)
 
         if search_query:
             # OPTIMIZED: Use prefix matching for better index usage

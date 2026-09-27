@@ -84,6 +84,8 @@ const getPlanColor = (planName) => {
     return colors[planName?.toLowerCase()] || colors.default;
 };
 
+const EXPIRY_DAYS = Array.from({ length: 31 }, (_, i) => i + 1);
+
 // Shared empty list so a collapsed card's `payments` prop never changes.
 const NO_PAYMENTS = [];
 
@@ -457,7 +459,9 @@ const SubscriptionsView = ({
     customerResellerId,
     setCustomerResellerId,
     customerStatus,
-    setCustomerStatus
+    setCustomerStatus,
+    customerExpiryDay,
+    setCustomerExpiryDay
 }) => {
     const theme = useTheme();
     const { apiService, user } = useAppContext();
@@ -927,7 +931,7 @@ const SubscriptionsView = ({
         try {
             setSnackbar({ open: true, message: 'Preparing export...', severity: 'info' });
             // Fetch all customers matching current filters (per_page=9999)
-            const response = await apiService.fetchCustomers(1, 9999, debouncedSearchQuery, customerSortBy, customerResellerId, statusFilter, false);
+            const response = await apiService.fetchCustomers(1, 9999, debouncedSearchQuery, customerSortBy, customerResellerId, statusFilter, false, customerExpiryDay || '');
             const allCustomers = response.customers || [];
             
             if (allCustomers.length === 0) {
@@ -1507,6 +1511,12 @@ const SubscriptionsView = ({
                     <TextField select label="Reseller" value={customerResellerId || ''} onChange={(e) => setCustomerResellerId(e.target.value)} sx={{ minWidth: 150 }}>
                         <MenuItem value="">All Resellers</MenuItem>
                         {resellers && resellers.map(r => <MenuItem key={r.id} value={r.id}>{r.name}</MenuItem>)}
+                    </TextField>
+                    {/* Day of the month the subscription ends on -- e.g. everyone due on the 1st. Filtered on the server. */}
+                    <TextField select label="Expiry Day" value={customerExpiryDay || ''} onChange={(e) => { setCustomerExpiryDay(e.target.value); setCurrentPage(1); }} sx={{ minWidth: 130 }}
+                        SelectProps={{ MenuProps: { PaperProps: { sx: { maxHeight: 320 } } } }}>
+                        <MenuItem value="">Any day</MenuItem>
+                        {EXPIRY_DAYS.map(d => <MenuItem key={d} value={d}>Day {d}</MenuItem>)}
                     </TextField>
                     <TextField select label="Sort By" value={customerSortBy || 'expiry_date'} onChange={(e) => setCustomerSortBy(e.target.value)} sx={{ minWidth: 150 }}>
                         <MenuItem value="expiry_date">Expiry Date</MenuItem>

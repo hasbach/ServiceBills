@@ -198,8 +198,8 @@ const rawApiService = {
     fixEmployeeBalance: (id, data) => api.put(`/employees/${id}/fix-balance`, data),
 
 
-    fetchCustomers: async (page = 1, perPage = 999, searchQuery = '', sort_by = 'expiry_date', reseller_id = '', status = 'all', sortDesc = true) => {
-        const response = await api.get(`/customers`, { params: { page: page, per_page: perPage, search: searchQuery, sort_by: sort_by, reseller_id: reseller_id, status: status, sort_desc: sortDesc } });
+    fetchCustomers: async (page = 1, perPage = 999, searchQuery = '', sort_by = 'expiry_date', reseller_id = '', status = 'all', sortDesc = true, expiryDay = '') => {
+        const response = await api.get(`/customers`, { params: { page: page, per_page: perPage, search: searchQuery, sort_by: sort_by, reseller_id: reseller_id, status: status, sort_desc: sortDesc, expiry_day: expiryDay } });
         return response.data; // Returns the data object directly
     },
     addCustomer: (customerData) => api.post(`/customers`, customerData),
