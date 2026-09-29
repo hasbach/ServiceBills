@@ -1160,7 +1160,10 @@ class Payment(db.Model):
     # so collected_via is how the frontend shows "via Whish" instead of
     # nothing. None means staff-collected/legacy. See the 2026-08-27 plan
     # amendment's investigation note.
-    collected_via = db.Column(db.String(20), nullable=True)  # None | 'whish'
+    # 'whish_transfer' is set by staff (PUT /api/payments/<id>/method) for money
+    # the customer sent straight to the business's Whish account, outside the
+    # payment-link gateway -- not cash, so the daily cash report skips it too.
+    collected_via = db.Column(db.String(20), nullable=True)  # None | 'whish' | 'whish_transfer'
     whish_transaction_number = db.Column(db.String(64), nullable=True)
     addon_purchases = db.relationship('AddonPurchase', backref='payment', lazy=True)
 
@@ -5095,11 +5098,46 @@ def customer_whish_payments_report():
     query = query.order_by(CustomerPaymentLink.created_at.desc())
 
     rows = []
-    for link in query.all():
-        d = link.to_dict()
-        d['customer_name'] = link.customer.name
-        d['customer_phone'] = link.customer.phone
-        rows.append(d)
+    if status != 'manual_transfer':
+        for link in query.all():
+            d = link.to_dict()
+            d['customer_name'] = link.customer.name
+            d['customer_phone'] = link.customer.phone
+            d['source'] = 'payment_link'
+            rows.append(d)
+
+    # Money sent straight to the business's Whish account (marked by staff,
+    # see set_payment_method) -- no payment link behind it, but still Whish
+    # money, so it belongs in this report. Filtered by when it was received.
+    if not status or status == 'manual_transfer':
+        received_at = func.coalesce(Payment.collected_at, Payment.paid_at)
+        transfers = tenant_query(Payment).filter(
+            Payment.collected_via == 'whish_transfer',
+            Payment.reverted_at.is_(None),
+        ).options(db.joinedload(Payment.customer))
+        if start_date:
+            transfers = transfers.filter(received_at >= start_date)
+        if end_date:
+            transfers = transfers.filter(received_at <= end_date)
+        for p in transfers.all():
+            when = p.collected_at or p.paid_at
+            amount = p.collected_amount if (p.collected and not p.paid and p.collected_amount) else p.amount
+            rows.append({
+                'id': f'transfer_{p.id}',
+                'customer_id': p.customer_id,
+                'payment_id': p.id,
+                'amount': float(amount),
+                'currency': p.currency,
+                'whish_transaction_number': p.whish_transaction_number,
+                'status': 'manual_transfer',
+                'created_at': when.strftime('%Y-%m-%d %H:%M:%S') if when else None,
+                'expires_at': None,
+                'completed_at': p.paid_at.strftime('%Y-%m-%d %H:%M:%S') if p.paid_at else None,
+                'customer_name': p.customer.name if p.customer else '',
+                'customer_phone': p.customer.phone if p.customer else '',
+                'source': 'manual_transfer',
+            })
+        rows.sort(key=lambda r: r.get('created_at') or '', reverse=True)
     return jsonify({"links": rows}), 200
 
 @app.route('/api/reports/customer-numbers', methods=['GET'])
@@ -5363,6 +5401,51 @@ def mark_payment_as_paid(payment_id):
         return jsonify({'error': str(e)}), 400
 
 
+PAYMENT_METHODS_STAFF_SETTABLE = ('cash', 'whish_transfer')
+
+
+@app.route('/api/payments/<int:payment_id>/method', methods=['PUT'])
+@jwt_required()
+def set_payment_method(payment_id):
+    """Record how a collected/paid payment actually arrived: 'cash' (the
+    default, collected_via NULL) or 'whish_transfer' (the customer sent it to
+    the business's Whish account directly, not through a payment link).
+
+    Admin/finance only: it moves the money out of (or back into) a
+    collector's cash total on the daily cash report. Payments settled by the
+    Whish gateway itself (collected_via='whish') can't be changed -- that
+    record came from Whish, not from staff."""
+    roles = _jwt_roles()
+    if 'admin' not in roles and 'finance' not in roles:
+        return jsonify({'message': 'Only finance or admin can change how a payment was received.'}), 403
+    payment = tenant_query(Payment).filter_by(id=payment_id).first()
+    if not payment:
+        return jsonify({'message': 'Payment not found!'}), 404
+    if not (payment.collected or payment.paid):
+        return jsonify({'message': 'Only a collected or paid payment has a payment method.'}), 400
+    if payment.is_gratis or payment.is_refund:
+        return jsonify({'message': 'A gratis or refund entry has no payment method to change.'}), 400
+    if payment.collected_via == 'whish':
+        return jsonify({'message': 'This payment was settled through a Whish payment link; its method cannot be changed.'}), 400
+
+    data = request.json or {}
+    method = (data.get('method') or '').strip().lower()
+    if method not in PAYMENT_METHODS_STAFF_SETTABLE:
+        return jsonify({'message': "method must be 'cash' or 'whish_transfer'."}), 400
+    reference = (data.get('reference') or '').strip()[:64] or None
+
+    if method == 'whish_transfer':
+        payment.collected_via = 'whish_transfer'
+        payment.whish_transaction_number = reference
+    else:
+        payment.collected_via = None
+        payment.whish_transaction_number = None
+    db.session.commit()
+    return jsonify({'message': 'Payment method updated.', 'payment_id': payment.id,
+                    'collected_via': payment.collected_via,
+                    'whish_transaction_number': payment.whish_transaction_number}), 200
+
+
 @app.route('/api/payments/<int:payment_id>/mark_gratis', methods=['PUT'])
 @jwt_required()
 def mark_payment_gratis(payment_id):
@@ -5453,6 +5536,11 @@ def revert_payment(payment_id):
         payment.collected_at = None
         payment.collected_by_id = None
         payment.collected_amount = None
+        # A staff-set Whish-transfer mark belongs to the collection being
+        # undone; gateway ('whish') history is left alone.
+        if payment.collected_via == 'whish_transfer':
+            payment.collected_via = None
+            payment.whish_transaction_number = None
         payment.is_gratis = False
         payment.gratis_note = None
         payment.reverted_at = datetime.utcnow()

@@ -60,6 +60,7 @@ import {
     CardGiftcard as CardGiftcardIcon,
     Phone as PhoneIcon,
     Undo as UndoIcon,
+    SwapHoriz as MethodIcon,
     ContentCopy as ContentCopyIcon,
     Link as LinkIcon,
     Email as EmailIcon
@@ -261,13 +262,19 @@ const PrintableReceipt = React.forwardRef(({ receiptData }, ref) => {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Whether staff can switch how this payment was received (cash <-> Whish
+// transfer). Mirrors set_payment_method in app.py: collected or paid, not
+// gratis/refund, and not settled by the Whish gateway itself.
+const canChangeMethod = (payment) =>
+    (payment.collected || payment.paid) && !payment.is_gratis && !payment.is_refund && payment.collected_via !== 'whish';
+
 // _PaymentCard — module-level so React.memo actually memoizes between renders.
 // All event-handler props are passed in via cardHandlers (stable useMemo object).
 // ─────────────────────────────────────────────────────────────────────────────
 const PaymentCardItem = React.memo(({
     payment,
     getStatusColor, getPaymentTypeColor,
-    openMarkPaidDialog, openMarkGratisDialog, openRevertDialog, handlePrepareReceipt, handleDeletePayment,
+    openMarkPaidDialog, openMarkGratisDialog, openRevertDialog, openMethodDialog, handlePrepareReceipt, handleDeletePayment,
     buildWhatsAppLink, waSettings, userRoles,
     twsEnabled, handleSendPaymentLink, sendLinkLoading,
 }) => {
@@ -336,6 +343,10 @@ const PaymentCardItem = React.memo(({
                         <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 1 }}>
                             <Chip label={payment.paid ? 'Paid' : (payment.collected ? (payment.collected_amount ? `Collected ($${payment.collected_amount.toFixed(2)})` : 'Collected') : 'Unpaid')} size="small"
                                 sx={{ backgroundColor: alpha(getStatusColor(payment.paid), 0.1), color: getStatusColor(payment.paid), fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(getStatusColor(payment.paid), 0.2)}` }} />
+                            {payment.collected_via === 'whish_transfer' && (
+                                <Chip label="Whish transfer" size="small" title={payment.whish_transaction_number ? `Ref: ${payment.whish_transaction_number}` : ''}
+                                    sx={{ mr: 0.5, backgroundColor: alpha('#E11D48', 0.08), color: '#E11D48', fontWeight: 700, fontSize: '0.75rem', border: `1px solid ${alpha('#E11D48', 0.25)}` }} />
+                            )}
                             {payment.is_gratis && (
                                 <Chip label="GRATIS" size="small" title={payment.gratis_note || ''}
                                     sx={{ backgroundColor: alpha(theme.palette.info.main, 0.1), color: theme.palette.info.main, fontWeight: 700, fontSize: '0.75rem', border: `1px solid ${alpha(theme.palette.info.main, 0.2)}` }} />
@@ -406,6 +417,11 @@ const PaymentCardItem = React.memo(({
                                 </Button>
                             ) : null;
                         })()}
+                        {isAdminOrFinance && canChangeMethod(payment) && (
+                            <Button size="small" variant="outlined" startIcon={<MethodIcon />} onClick={() => openMethodDialog(payment)} sx={{ borderColor: alpha('#E11D48', 0.3), color: '#E11D48', '&:hover': { borderColor: '#E11D48', backgroundColor: alpha('#E11D48', 0.05) } }}>
+                                Method
+                            </Button>
+                        )}
                         {payment.paid && isAdminOrFinance && (
                             <Button size="small" variant="outlined" startIcon={<UndoIcon />} onClick={() => openRevertDialog(payment)} sx={{ borderColor: alpha('#F59E0B', 0.3), color: '#F59E0B', '&:hover': { borderColor: '#F59E0B', backgroundColor: alpha('#F59E0B', 0.05) } }}>
                                 Revert
@@ -478,6 +494,11 @@ const PaymentListRow = React.memo(function PaymentListRow({
                             sx={{ bgcolor: alpha(theme.palette.info.main, 0.1), color: theme.palette.info.main, fontWeight: 700, border: `1px solid ${alpha(theme.palette.info.main, 0.25)}` }}
                         />
                     )}
+                    {payment.collected_via === 'whish_transfer' && (
+                        <Chip label="Whish transfer" size="small" title={payment.whish_transaction_number ? `Ref: ${payment.whish_transaction_number}` : ''}
+                            sx={{ bgcolor: alpha('#E11D48', 0.08), color: '#E11D48', fontWeight: 700, border: `1px solid ${alpha('#E11D48', 0.25)}` }}
+                        />
+                    )}
                 </Box>
             </TableCell>
             <TableCell>
@@ -520,6 +541,13 @@ const PaymentListRow = React.memo(function PaymentListRow({
                         </Tooltip>
                     ) : null;
                 })()}
+                {isAdminOrFinance && canChangeMethod(payment) && (
+                    <Tooltip title="Change payment method (cash / Whish transfer)">
+                        <IconButton size="small" sx={{ color: '#E11D48' }} onClick={() => actions.openMethodDialog(payment)}>
+                            <MethodIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                )}
                 {payment.paid && isAdminOrFinance && (
                     <Tooltip title="Revert to Pending">
                         <IconButton size="small" sx={{ color: '#F59E0B' }} onClick={() => actions.openRevertDialog(payment)}>
@@ -566,6 +594,9 @@ const PaymentsView = () => {
     const [markGratisSubmitting, setMarkGratisSubmitting] = useState(false);
     // Revert-payment dialog
     const [revertDialog, setRevertDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
+    // Cash vs Whish transfer for a collected/paid payment (see canChangeMethod).
+    const [methodDialog, setMethodDialog] = useState({ open: false, payment: null, method: 'cash', reference: '' });
+    const [methodSubmitting, setMethodSubmitting] = useState(false);
     const [revertReason, setRevertReason] = useState('');
     const [revertSubmitting, setRevertSubmitting] = useState(false);
     const [waSettings, setWaSettings] = useState({ enabled: false, mode: 'deeplink', deeplink_msg_payment: 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!', deeplink_msg_payment_link: 'Hi {customer_name}, here is your payment link: {pay_url}' });
@@ -989,6 +1020,30 @@ const PaymentsView = () => {
     };
 
     // --- Open the revert-payment dialog ---
+    const openMethodDialog = (payment) => {
+        setMethodDialog({
+            open: true, payment,
+            method: payment.collected_via === 'whish_transfer' ? 'whish_transfer' : 'cash',
+            reference: payment.collected_via === 'whish_transfer' ? (payment.whish_transaction_number || '') : '',
+        });
+    };
+
+    const handleSaveMethod = async () => {
+        if (methodSubmitting || !methodDialog.payment) return;
+        setMethodSubmitting(true);
+        try {
+            await apiService.setPaymentMethod(methodDialog.payment.id, methodDialog.method,
+                methodDialog.method === 'whish_transfer' ? methodDialog.reference : '');
+            setSnackbar({ open: true, message: methodDialog.method === 'whish_transfer' ? 'Marked as Whish transfer.' : 'Marked as cash.', severity: 'success' });
+            setMethodDialog({ open: false, payment: null, method: 'cash', reference: '' });
+            fetchPayments();
+        } catch (error) {
+            setSnackbar({ open: true, message: error.response?.data?.message || 'Failed to change payment method.', severity: 'error' });
+        } finally {
+            setMethodSubmitting(false);
+        }
+    };
+
     const openRevertDialog = (payment) => {
         setRevertDialog({ open: true, paymentId: payment.id, outstanding: payment.amount, customerName: payment.customer_name });
         setRevertReason('');
@@ -1279,7 +1334,7 @@ const handlePrint = () => {
     const latestRowHandlersRef = useRef(null);
     latestRowHandlersRef.current = {
         handleSelectOne, openMarkPaidDialog, openMarkGratisDialog, handlePrepareReceipt,
-        buildWhatsAppLink, openRevertDialog, handleDeletePayment,
+        buildWhatsAppLink, openRevertDialog, openMethodDialog, handleDeletePayment,
     };
     const rowActions = React.useMemo(() => {
         const h = () => latestRowHandlersRef.current;
@@ -1290,6 +1345,7 @@ const handlePrint = () => {
             handlePrepareReceipt: (...a) => h().handlePrepareReceipt(...a),
             buildWhatsAppLink: (...a) => h().buildWhatsAppLink(...a),
             openRevertDialog: (...a) => h().openRevertDialog(...a),
+            openMethodDialog: (...a) => h().openMethodDialog(...a),
             handleDeletePayment: (...a) => h().handleDeletePayment(...a),
         };
     }, []);
@@ -1316,6 +1372,7 @@ const handlePrint = () => {
         openMarkPaidDialog,
         openMarkGratisDialog,
         openRevertDialog,
+        openMethodDialog,
         handlePrepareReceipt,
         handleDeletePayment,
         buildWhatsAppLink,
@@ -1878,6 +1935,33 @@ const handlePrint = () => {
                     >
                         Confirm Gratis
                     </Button>
+                </DialogActions>
+            </Dialog>
+
+            <Dialog open={methodDialog.open} onClose={() => !methodSubmitting && setMethodDialog({ open: false, payment: null, method: 'cash', reference: '' })} maxWidth="xs" fullWidth>
+                <DialogTitle>Payment Method</DialogTitle>
+                <DialogContent>
+                    <Typography variant="body2" sx={{ mb: 2 }}>
+                        How did {methodDialog.payment?.customer_name || 'the customer'} pay{methodDialog.payment ? ` $${(parseFloat(methodDialog.payment.amount) || 0).toFixed(2)}` : ''}?
+                    </Typography>
+                    <TextField select fullWidth label="Method" value={methodDialog.method}
+                        onChange={(e) => setMethodDialog({ ...methodDialog, method: e.target.value })}>
+                        <MenuItem value="cash">Cash</MenuItem>
+                        <MenuItem value="whish_transfer">Whish transfer (sent directly to our Whish account)</MenuItem>
+                    </TextField>
+                    {methodDialog.method === 'whish_transfer' && (
+                        <TextField fullWidth sx={{ mt: 2 }} label="Whish reference (optional)" value={methodDialog.reference}
+                            inputProps={{ maxLength: 64 }}
+                            onChange={(e) => setMethodDialog({ ...methodDialog, reference: e.target.value })}
+                            helperText="Transaction number from the Whish app, if you have it" />
+                    )}
+                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 2 }}>
+                        A Whish transfer is not counted as cash in the Daily Cash report and is listed in the Customer Whish Payments report.
+                    </Typography>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setMethodDialog({ open: false, payment: null, method: 'cash', reference: '' })} disabled={methodSubmitting}>Cancel</Button>
+                    <Button variant="contained" onClick={handleSaveMethod} disabled={methodSubmitting}>Save</Button>
                 </DialogActions>
             </Dialog>
 

@@ -306,7 +306,7 @@ const EnhancedReportsView = () => {
                 <TableCell>{link.customer_phone}</TableCell>
                 <TableCell align="right">{link.amount}</TableCell>
                 <TableCell>{link.currency}</TableCell>
-                <TableCell>{link.status}</TableCell>
+                <TableCell>{link.source === 'manual_transfer' ? 'Manual Whish transfer' : link.status}</TableCell>
                 <TableCell>{link.whish_transaction_number || '-'}</TableCell>
                 <TableCell>{link.created_at}</TableCell>
                 <TableCell>{link.completed_at || '-'}</TableCell>
@@ -314,7 +314,7 @@ const EnhancedReportsView = () => {
             ))}
             {rows.length === 0 && (
               <TableRow>
-                <TableCell colSpan={8} align="center" sx={{ py: 3, color: 'text.secondary' }}>No Whish payment links found for this period.</TableCell>
+                <TableCell colSpan={8} align="center" sx={{ py: 3, color: 'text.secondary' }}>No Whish payments found for this period.</TableCell>
               </TableRow>
             )}
           </TableBody>

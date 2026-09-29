@@ -221,6 +221,7 @@ const rawApiService = {
     markPaymentAsPaid: (paymentId, data = {}) => api.put(`/payments/${paymentId}/mark_paid`, data),
     markPaymentGratis: (paymentId, note) => api.put(`/payments/${paymentId}/mark_gratis`, { note }),
     revertPayment: (paymentId, reason) => api.put(`/payments/${paymentId}/revert`, { reason }),
+    setPaymentMethod: (paymentId, method, reference) => api.put(`/payments/${paymentId}/method`, { method, reference }),
     cancelSubscription: (customerId) => api.put(`/customers/${customerId}/cancel_subscription`),
     activateSubscription: (customerId) => api.put(`/customers/${customerId}/activate_subscription`),
     deleteCustomer: (customerId) => api.delete(`/customers/${customerId}`),
