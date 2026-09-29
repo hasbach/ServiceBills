@@ -87,7 +87,9 @@ Unknown keys in overrides or licenses are ignored.
   - `/api/agent/jobs*` (`@agent_token_required`) → `network`
   - `/api/whatsapp/webhook` → `whatsapp` (still return 200 to Meta, just
     don't process; AI dispatch additionally checks `ai_cs`)
-  - `/api/pay/*`, `/api/pay-attempt/*`, `/api/customer-whish/*` → `whish_payments`
+  - `/api/pay/*` entry pages (branding, lookup, view, checkout) → `whish_payments`.
+    Payment completion callbacks (`/api/pay-attempt/*`, `/api/customer-whish/*`)
+    are never gated — money may already have moved.
 - Cross-module tools: `/api/cs-agent/tools/network-diagnostic` also requires
   `network`; `/api/cs-agent/tools/send-payment-link` also requires
   `whish_payments`. When missing, the tool returns a polite "not available"
