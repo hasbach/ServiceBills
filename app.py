@@ -139,7 +139,7 @@ limiter = Limiter(key_func=get_remote_address, app=app, storage_uri="memory://",
 # functions, so importing it here does not create a circular import.
 from tenancy import (
     current_tenant_id, current_tenant, tenant_query, new_for_tenant, get_tenant_settings,
-    tenant_required, superadmin_required,
+    tenant_required, superadmin_required, require_module,
 )
 from crypto import EncryptedString
 import storage
@@ -10215,6 +10215,7 @@ def collect_reseller_payment(reseller_id):
 @app.route('/api/upstream-providers', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def get_upstream_providers():
     providers = tenant_query(UpstreamProvider).order_by(UpstreamProvider.name).all()
     result = []
@@ -10227,6 +10228,7 @@ def get_upstream_providers():
 @app.route('/api/upstream-providers', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def create_upstream_provider():
     data = request.json
     try:
@@ -10249,6 +10251,7 @@ def create_upstream_provider():
 @app.route('/api/upstream-providers/<int:provider_id>', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def update_upstream_provider(provider_id):
     data = request.json
     provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
@@ -10278,6 +10281,7 @@ def update_upstream_provider(provider_id):
 @app.route('/api/upstream-providers/<int:provider_id>', methods=['DELETE'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def delete_upstream_provider(provider_id):
     try:
         provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
@@ -10299,6 +10303,7 @@ def delete_upstream_provider(provider_id):
 @app.route('/api/upstream-providers/<int:provider_id>/history', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def get_upstream_provider_history(provider_id):
     provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
     if not provider:
@@ -10310,6 +10315,7 @@ def get_upstream_provider_history(provider_id):
 @app.route('/api/upstream-providers/<int:provider_id>/topup', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def topup_upstream_provider(provider_id):
     """Manual prepaid-credit top-up -- decreases balance, the same direction the
     real portal's own balance figure moves when the tenant pays the upstream."""
@@ -10339,6 +10345,7 @@ def topup_upstream_provider(provider_id):
 @app.route('/api/upstream-providers/<int:provider_id>/renewal-cost', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def record_upstream_renewal_cost(provider_id):
     """Manual record of what a customer's renewal cost upstream -- how the
     tenant tracks real per-customer cost until portal automation exists."""
@@ -10384,6 +10391,7 @@ def record_upstream_renewal_cost(provider_id):
 # other scheduler jobs -- see the comment there for why.
 @app.route('/api/customers/<int:customer_id>/upstream-status-sync', methods=['POST'])
 @jwt_required()
+@require_module('upstream_sync')
 def sync_customer_upstream_status(customer_id):
     customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
@@ -10462,6 +10470,7 @@ def _resolve_parent_device_id(raw_parent_id, device_id=None):
 @app.route('/api/network-devices', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def get_network_devices():
     devices = tenant_query(NetworkDevice).order_by(NetworkDevice.name).all()
     return jsonify([d.to_dict() for d in devices]), 200
@@ -10469,6 +10478,7 @@ def get_network_devices():
 @app.route('/api/network-devices', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def create_network_device():
     data = request.json
     try:
@@ -10517,6 +10527,7 @@ def create_network_device():
 @app.route('/api/network-devices/<int:device_id>', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def update_network_device(device_id):
     data = request.json
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
@@ -10576,6 +10587,7 @@ def update_network_device(device_id):
 @app.route('/api/network-devices/<int:device_id>', methods=['DELETE'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def delete_network_device(device_id):
     try:
         device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
@@ -10603,6 +10615,7 @@ def delete_network_device(device_id):
 @app.route('/api/network-devices/<int:device_id>/check-now', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def check_network_device_now(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
@@ -10618,6 +10631,7 @@ def check_network_device_now(device_id):
 @app.route('/api/network-devices/<int:device_id>/test-connection', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def test_network_device_connection(device_id):
     """Ask the device to prove it is reachable and the credential works.
 
@@ -10638,6 +10652,7 @@ def test_network_device_connection(device_id):
 @app.route('/api/network-devices/<int:device_id>/interface-labels', methods=['PATCH'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def set_network_device_interface_label(device_id):
     data = request.json
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
@@ -11266,6 +11281,8 @@ def agent_poll_job():
     the legitimate agent's own rate (one poll every DEFAULT_POLL_SECONDS=2s,
     i.e. 30/min).
     """
+    if not modules.is_enabled(db.session.get(Tenant, g.network_agent.tenant_id), 'network'):
+        return modules.disabled_response('network')
     agent = g.network_agent
     agent.last_seen_at = datetime.utcnow()
     version = (request.headers.get('X-Agent-Version') or '')[:20]
@@ -11465,6 +11482,8 @@ def _stamp_device_status_from_agent(job, status):
 @limiter.limit("120 per minute")
 @agent_token_required()
 def agent_post_result(job_id):
+    if not modules.is_enabled(db.session.get(Tenant, g.network_agent.tenant_id), 'network'):
+        return modules.disabled_response('network')
     agent = g.network_agent
     agent.last_seen_at = datetime.utcnow()
     job = NetworkAgentJob.query.filter_by(
@@ -11914,6 +11933,7 @@ def _with_interface_labels(job, payload):
 @app.route('/api/network-jobs/<int:job_id>', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_network_job(job_id):
     job = tenant_query(NetworkAgentJob).filter_by(id=job_id).first()
     if not job:
@@ -11932,6 +11952,7 @@ def get_network_job(job_id):
 @app.route('/api/network-agents', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def list_network_agents():
     agents = tenant_query(NetworkAgent).order_by(NetworkAgent.name).all()
     return jsonify([a.to_dict() for a in agents]), 200
@@ -11940,6 +11961,7 @@ def list_network_agents():
 @app.route('/api/network-agents', methods=['POST'])
 @jwt_required()
 @admin_required()
+@require_module('network')
 def create_network_agent():
     if tenant_query(NetworkAgent).first():
         return jsonify({'error': 'This tenant already has an agent. '
@@ -11961,6 +11983,7 @@ def create_network_agent():
 @app.route('/api/network-agents/<int:agent_id>/regenerate-token', methods=['POST'])
 @jwt_required()
 @admin_required()
+@require_module('network')
 def regenerate_network_agent_token(agent_id):
     agent = tenant_query(NetworkAgent).filter_by(id=agent_id).first()
     if not agent:
@@ -11977,6 +12000,7 @@ def regenerate_network_agent_token(agent_id):
 @app.route('/api/network-tree', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_network_tree():
     """The device skeleton plus each device's last known result -- no device is
     contacted here. Live data is refreshed per-device, on demand, via the
@@ -11991,6 +12015,7 @@ def get_network_tree():
 @app.route('/api/network-tree/olt/<int:device_id>/refresh', methods=['POST'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def refresh_olt_onus(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
@@ -12105,6 +12130,7 @@ def _propose_label_matches(onus, customers):
 @app.route('/api/network-tree/olt/<int:device_id>/label-matches', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def get_onu_label_matches(device_id):
     """Two-phase. Without job_id: start a walk and return the job. With
     job_id: compute proposals from that job's stored ONU list.
@@ -12180,6 +12206,7 @@ def get_onu_label_matches(device_id):
 @app.route('/api/network-tree/olt/<int:device_id>/label-matches/apply', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def apply_onu_label_matches(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
@@ -12283,6 +12310,7 @@ def _apply_cpe_locations(result, tenant_id=None):
 @app.route('/api/network-tree/olt/<int:device_id>/locate-customers', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def locate_customers(device_id):
     """Start a CPE-location walk. Writes nothing -- the apply step does that,
     so the agent (which may run the walk) never touches customer records."""
@@ -12301,6 +12329,7 @@ def locate_customers(device_id):
            methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def apply_customer_locations(device_id):
     """Second half of the two-call locate flow: authenticated as the logged-in
     admin (never the agent), this is the only path that writes a customer's
@@ -12473,6 +12502,7 @@ def _require_olt(device_id):
 @app.route('/api/network-map/olts', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_network_map_olts():
     olts = (tenant_query(NetworkDevice)
             .filter_by(device_type='vsol_olt')
@@ -12483,6 +12513,7 @@ def get_network_map_olts():
 @app.route('/api/network-map', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_network_map():
     device_id = request.args.get('olt_device_id', type=int)
     device, err = _require_olt(device_id)
@@ -12508,6 +12539,7 @@ def get_network_map():
 @app.route('/api/network-map/unplaced-onus', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_unplaced_onus():
     device_id = request.args.get('olt_device_id', type=int)
     device, err = _require_olt(device_id)
@@ -12738,6 +12770,7 @@ def _validate_node_payload(payload, device_id, node=None):
 @app.route('/api/network-map/nodes', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def create_network_node():
     payload = request.json or {}
     # Coerced the same way and for the same reason as parent_node_id (see
@@ -12762,6 +12795,7 @@ def create_network_node():
 @app.route('/api/network-map/nodes/<int:node_id>', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def update_network_node(node_id):
     node = tenant_query(NetworkNode).filter_by(id=node_id).first()
     if not node:
@@ -12779,6 +12813,7 @@ def update_network_node(node_id):
 @app.route('/api/network-map/nodes/<int:node_id>', methods=['DELETE'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def delete_network_node(node_id):
     node = tenant_query(NetworkNode).filter_by(id=node_id).first()
     if not node:
@@ -12813,6 +12848,7 @@ def _customer_network_context(customer_id):
 
 @app.route('/api/customers/<int:customer_id>/network-status', methods=['POST'])
 @jwt_required()
+@require_module('network')
 def get_customer_network_status(customer_id):
     """Queue the two reads that describe a customer's PPPoE state.
 
@@ -12905,6 +12941,7 @@ def _perform_customer_write(customer_id, action):
 @app.route('/api/customers/<int:customer_id>/network-suspend', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def suspend_customer_network(customer_id):
     return _perform_customer_write(customer_id, 'suspend')
 
@@ -12912,6 +12949,7 @@ def suspend_customer_network(customer_id):
 @app.route('/api/customers/<int:customer_id>/network-unsuspend', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def unsuspend_customer_network(customer_id):
     return _perform_customer_write(customer_id, 'unsuspend')
 
