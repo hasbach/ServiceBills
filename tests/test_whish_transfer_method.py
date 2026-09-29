@@ -7,6 +7,13 @@ import app as appmod
 from tests.conftest import make_tenant
 
 
+def _pro(client, tenant_name):
+    """Pro bundle includes the whish_payments module the report route needs."""
+    with client.application.app_context():
+        appmod.Tenant.query.filter_by(name=tenant_name).first().plan = 'pro'
+        appmod.db.session.commit()
+
+
 def _login(client, username, password="pw"):
     r = client.post("/api/login", json={"username": username, "password": password})
     return {"Authorization": f"Bearer {r.get_json()['access_token']}"}
@@ -36,6 +43,7 @@ def _cash_total(client, hdr):
 
 def test_marking_whish_transfer_moves_it_out_of_cash_and_into_whish_report(client):
     hdr = make_tenant(client, "Biz W1", "w1_admin")
+    _pro(client, "Biz W1")
     pid = _paid_payment(client, hdr)
     assert _cash_total(client, hdr) == 50
 
@@ -144,6 +152,7 @@ def test_collect_defaults_to_cash_and_rejects_unknown_method(client):
 
 def test_whish_transfer_collected_by_cashier_stays_out_of_cash_after_confirm(client):
     hdr = make_tenant(client, "Biz W7", "w7_admin")
+    _pro(client, "Biz W7")
     client.post("/api/users", headers=hdr, json={"username": "w7_cash", "password": "pw", "role": "cashier"})
     pid = _unpaid(client, hdr, price=60)
     client.put(f"/api/payments/{pid}/mark_paid", headers=_login(client, "w7_cash"),

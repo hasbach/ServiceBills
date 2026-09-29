@@ -5140,6 +5140,7 @@ def get_unpaid_payments():
 
 @app.route('/api/reports/customer-whish-payments', methods=['GET'])
 @jwt_required()
+@require_module('whish_payments')
 def customer_whish_payments_report():
     query = tenant_query(CustomerPaymentLink).join(Customer)
     status = request.args.get('status')
@@ -6544,6 +6545,7 @@ def save_whatsapp_settings():
 @app.route('/api/tenant-whish-settings', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def get_tenant_whish_settings():
     settings = tenant_query(TenantWhishSettings).first()
     if settings:
@@ -6557,14 +6559,10 @@ def get_tenant_whish_settings():
 @app.route('/api/tenant-whish-settings', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def save_tenant_whish_settings():
     data = request.json or {}
     tenant = current_tenant()
-    # Plan-gating: this whole feature is Pro-only -- see the spec's Resolved
-    # product decision #2. Mirrors the exact pattern save_whatsapp_settings
-    # already uses for whatsapp_api mode.
-    if not plans.limits(tenant.plan)["whish_customer_payments"]:
-        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
     try:
         settings = tenant_query(TenantWhishSettings).first()
         if not settings:
@@ -6591,6 +6589,7 @@ def save_tenant_whish_settings():
 @app.route('/api/tenant/whish/public-pay-link', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def get_public_pay_link():
     """Staff-facing: the tenant-wide self-service Whish payment page's
     current link, if one has been generated yet (Task 20). slug is None
@@ -6607,6 +6606,7 @@ def get_public_pay_link():
 @app.route('/api/tenant/whish/public-pay-link/regenerate', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def regenerate_public_pay_link():
     """Staff-facing: (re)generate the tenant-wide self-service Whish payment
     page's slug (Task 20). Same Pro-plan gate as Task 3's settings save --
@@ -6617,8 +6617,6 @@ def regenerate_public_pay_link():
     leaked somewhere unwanted), not something to do casually. The frontend
     must warn staff of that before calling this."""
     tenant = current_tenant()
-    if not plans.limits(tenant.plan)["whish_customer_payments"]:
-        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
     tenant.public_pay_slug = secrets.token_urlsafe(12)
     db.session.commit()
     return jsonify({
@@ -6637,7 +6635,7 @@ def public_tenant_pay_branding(slug):
     customer-specific) so the limit here is generous compared to the lookup
     route below."""
     tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
-    if not tenant:
+    if not tenant or not modules.is_enabled(tenant, 'whish_payments'):
         return jsonify({"error": "not found"}), 404
     bs = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
     return jsonify({
@@ -6661,7 +6659,7 @@ def public_tenant_pay_lookup(slug):
     uniqueness constraint (e.g. a household sharing one number across two
     family members' subscriptions); see Task 17's Judgment call."""
     tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
-    if not tenant:
+    if not tenant or not modules.is_enabled(tenant, 'whish_payments'):
         return jsonify({"error": "not found"}), 404
 
     phone = (request.get_json(silent=True) or {}).get('phone', '').strip()
@@ -6747,7 +6745,7 @@ def _apply_whish_debt_then_prepayment(customer, attempt):
 @limiter.limit("10 per minute")
 def public_tenant_pay_checkout(slug):
     tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
-    if not tenant:
+    if not tenant or not modules.is_enabled(tenant, 'whish_payments'):
         return jsonify({"error": "not found"}), 404
 
     body = request.get_json(silent=True) or {}
@@ -6884,6 +6882,9 @@ def public_pay_view(view_token):
     }
     if not link:
         return jsonify(invalid_response), 200
+    link_tenant = db.session.get(Tenant, link.tenant_id)
+    if not link_tenant or not modules.is_enabled(link_tenant, 'whish_payments'):
+        return jsonify(invalid_response), 200
     if link.status == 'stale' or link.status == 'expired':
         return jsonify(invalid_response), 200
     if link.status == 'pending' and link.expires_at < datetime.utcnow():
@@ -6906,6 +6907,9 @@ def public_pay_view(view_token):
 def public_pay_checkout(view_token):
     link = CustomerPaymentLink.query.filter_by(view_token=view_token).first()
     if not link:
+        return jsonify({"msg": "Payment link not found."}), 404
+    link_tenant = db.session.get(Tenant, link.tenant_id)
+    if not link_tenant or not modules.is_enabled(link_tenant, 'whish_payments'):
         return jsonify({"msg": "Payment link not found."}), 404
     if link.status != 'pending' or link.expires_at < datetime.utcnow():
         return jsonify({"msg": "This payment link is no longer valid."}), 409
@@ -7017,6 +7021,7 @@ def customer_whish_failure():
 @app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/resend', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def resend_customer_payment_link(customer_id, payment_id):
     """Generate a fresh CustomerPaymentLink for an existing pending Payment.
     Leaves any prior link for that Payment alone -- the old link is left to
@@ -7032,8 +7037,6 @@ def resend_customer_payment_link(customer_id, payment_id):
         return jsonify({"msg": "This payment is already paid -- nothing to send a link for."}), 409
 
     tenant = current_tenant()
-    if not plans.limits(tenant.plan)["whish_customer_payments"]:
-        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
     whish_settings = tenant_query(TenantWhishSettings).filter_by(enabled=True).first()
     if not whish_settings:
         return jsonify({"msg": "Whish customer payments are not configured for this business yet."}), 402
@@ -7059,6 +7062,7 @@ def resend_customer_payment_link(customer_id, payment_id):
 @app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/email', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def email_customer_payment_link(customer_id, payment_id):
     """Send a payment link to a staff-typed, ad-hoc email address -- this
     codebase has no persisted Customer.email column and isn't adding one

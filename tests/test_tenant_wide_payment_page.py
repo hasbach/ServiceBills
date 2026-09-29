@@ -40,6 +40,7 @@ def _make_branded_tenant(app, client, business_name, logo_url=None):
     with app.app_context():
         tenant = appmod.Tenant.query.filter_by(name=business_name).first()
         tenant.public_pay_slug = secrets.token_urlsafe(12)
+        tenant.plan = 'pro'  # pro bundle includes the whish_payments module
         bs = appmod.BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
         if not bs:
             bs = appmod.BusinessSettings(tenant_id=tenant.id, business_name=business_name, address="Beirut", mobile="+96170000000")
@@ -396,7 +397,7 @@ def _make_pro_tenant(client, business_name, admin_name):
 def test_regenerate_public_pay_slug_requires_pro(client, app):
     hdr = make_tenant(client, "Biz Slug1", "slug1_admin")  # Free plan by default
     r = client.post("/api/tenant/whish/public-pay-link/regenerate", headers=hdr)
-    assert r.status_code == 402
+    assert r.status_code == 403 and r.get_json()["module"] == "whish_payments"
 
 
 def test_regenerate_public_pay_slug_sets_and_changes_it(client, app):
