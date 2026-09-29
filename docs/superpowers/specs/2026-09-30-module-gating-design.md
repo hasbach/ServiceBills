@@ -47,8 +47,8 @@ def is_enabled(tenant, key) -> bool
 Algorithm:
 
 1. If an on-prem license provider is active (hook filled by sub-project 2;
-   in this sub-project it is `None`), candidate = `ALWAYS_ON | {m for m, exp in
-   license.modules.items() if exp >= today}`.
+   in this sub-project it is `None`), candidate = `ALWAYS_ON | {m for m, v in
+   license.modules.items() if v["expires_at"] >= today}`.
 2. Otherwise (SaaS): candidate = `ALWAYS_ON | PLAN_MODULES[tenant.plan]`, then
    apply `tenant.module_overrides` (`{"network": true, "ai_cs": false}`) —
    `true` adds, `false` removes. Overrides never remove `ALWAYS_ON` keys.

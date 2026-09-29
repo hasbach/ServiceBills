@@ -31,7 +31,7 @@ New config `DEPLOYMENT_MODE` = `saas` (default) | `onprem`. In `onprem`:
 - `LICENSE_SERVER_URL` env var, default `https://servicebills.onrender.com`.
 - New unauthenticated `GET /api/system/info` returns `deployment_mode`,
   `app_version`, `setup_required`, and a non-sensitive license summary
-  (`state`, `base_expires_at`, `trial`). Used by the frontend before login and
+  (`state`, `base.expires_at`, `trial`). Used by the frontend before login and
   by the updater script (sub-project 3).
 
 ## First-run setup wizard
@@ -64,15 +64,27 @@ Payload:
   "business_name": "…",
   "machine_id": "hex|null",
   "trial": false,
-  "base_expires_at": "2036-09-30",
-  "modules": {"network": "2027-09-30", "whatsapp": "2027-03-30"},
+  "base": {"term": "lifetime", "expires_at": "2036-09-30"},
+  "modules": {
+    "network":  {"term": "yearly",  "expires_at": "2027-09-30"},
+    "whatsapp": {"term": "monthly", "expires_at": "2026-10-30"}
+  },
   "issued_at": "2026-09-30T12:00:00Z"
 }
 ```
 
-- Base license covers `core` + `office` until `base_expires_at` (typically
-  10 years for a purchase; 30 days for a trial). Trials have `modules: {}`.
-- Each paid module has its own expiry; an expired module is simply off.
+- **Terms.** The base license and every paid module each have a `term`:
+  `monthly` (1 calendar month), `yearly` (12 months) or `lifetime`
+  (10 years), plus `trial` (30 days, base only). The base license covers
+  `core` + `office` until `base.expires_at`. Trials have `modules: {}`.
+  Any mix is allowed, e.g. a lifetime base with a monthly `whatsapp` and a
+  yearly `network`.
+- `expires_at` is authoritative; `term` is informational (shown in the UI and
+  used by the super-admin renew action). An expired module is simply off; an
+  expired base puts the app in view-only mode.
+- **Renewal** (super-admin): renewing base or a module by one term extends
+  from `max(today, current expires_at)`, so renewing early never loses days.
+  Changing the term (e.g. monthly → yearly) applies from the same point.
 - `machine_id` must equal the running `MACHINE_ID` (null only accepted before
   first activation binds it — the server always returns a bound license).
 - Keys: the Ed25519 **private** key lives only on the SaaS as the Render
@@ -106,7 +118,7 @@ invalid signature, or clock rollback.
 - Frontend: a persistent red banner "ServiceBills is in view-only mode —
   enter a license" linking to Settings → License; write buttons disabled via a
   `readOnly` flag from context.
-- Warning banner (amber) from 7 days before `base_expires_at`, and per module
+- Warning banner (amber) from 7 days before `base.expires_at`, and per module
   from 7 days before its expiry.
 - Data is never deleted or altered by the license state.
 
@@ -125,15 +137,14 @@ invalid signature, or clock rollback.
 New model `OnpremLicense`: `id` (uuid = license_id), `license_key` (short
 human code, e.g. `SB-XXXX-XXXX-XXXX`, unique), `business_name`,
 `owner_phone`, `machine_id` (null until activated), `trial` bool,
-`base_expires_at`, `modules` JSON, `revoked` bool, `notes`, `created_at`,
+`base_term`, `base_expires_at`, `modules` JSON (`{key: {term, expires_at}}`), `revoked` bool, `notes`, `created_at`,
 `activated_at`, `last_refresh_at`, `last_app_version`.
 
 Public endpoints (rate-limited, no JWT):
 
 - `POST /api/licenses/trial` `{business_name, owner_phone, machine_id}` → if
   any license with this `machine_id` already exists (trial or paid): 409
-  `trial_already_used`. Else create a trial (`base_expires_at = today + 30
-  days`) bound to the machine and return the signed license.
+  `trial_already_used`. Else create a trial (`base = {term: trial, expires_at: today + 30 days}`) bound to the machine and return the signed license.
 - `POST /api/licenses/activate` `{license_key, machine_id}` → unknown/revoked:
   404/403; unbound: bind to machine; bound to another machine: 409
   `license_in_use`; returns signed license.
@@ -147,7 +158,7 @@ Super-admin (`@superadmin_required`, SaaS only):
   dates, modules, revoke, unbind machine for a hardware change),
   `GET /api/admin/licenses/<id>/file` (download signed `.key`).
 - SuperAdminView gets a **Licenses** tab: list (trials show as leads with
-  phone), create/renew dialog with a date per module, download button.
+  phone), create/renew dialog: base term + one row per module (term picker, computed expiry, editable date, "Renew +1 term" button), download button.
 
 ## Refresh behaviour
 
@@ -176,7 +187,7 @@ Super-admin (`@superadmin_required`, SaaS only):
 
 Image build args `APP_VERSION` and `APP_RELEASE_DATE` → env → shown in the UI
 footer and sent on refresh. The app refuses to start (clear log + setup page
-message) if `APP_RELEASE_DATE > base_expires_at` of a non-trial license —
+message) if `APP_RELEASE_DATE > base.expires_at` of a non-trial license —
 updates are only valid while the base license is. (A trial may run any
 version.)
 
