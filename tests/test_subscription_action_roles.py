@@ -235,3 +235,40 @@ def test_customer_list_filters_by_expiry_day_of_month(client):
     assert names(expiry_day=2) == []
     assert len(names(expiry_day="")) == 3  # blank = no filter
     assert len(names(expiry_day=40)) == 3  # out of range = no filter
+
+
+def test_cashier_reads_whatsapp_deeplink_settings_without_secrets(client):
+    """The cashier's Collect only opens a wa.me link if the page can see that
+    WhatsApp is on -- the full settings endpoint is admin/finance (it holds
+    the Meta token), so the page reads the secrets-free slice instead."""
+    admin_hdr = make_tenant(client, "Biz WA", "wa_admin")
+    cashier_hdr = _create_user(client, admin_hdr, "wa_cashier", "cashier")
+    collector_hdr = _create_user(client, admin_hdr, "wa_collector", "collector")
+    employee_hdr = _create_user(client, admin_hdr, "wa_employee", "employee")
+    client.post("/api/whatsapp-settings", headers=admin_hdr, json={
+        "mode": "deeplink", "enabled": True, "access_token": "SECRET-TOKEN",
+        "app_secret": "SECRET-APP", "deeplink_msg_payment": "Got ${amount}, {customer_name}"})
+
+    assert client.get("/api/whatsapp-settings", headers=cashier_hdr).status_code == 403
+    for hdr in (cashier_hdr, collector_hdr, admin_hdr):
+        r = client.get("/api/whatsapp-settings/deeplink", headers=hdr)
+        assert r.status_code == 200
+        s = r.get_json()["settings"]
+        assert s["enabled"] is True and s["mode"] == "deeplink"
+        assert s["deeplink_msg_payment"] == "Got ${amount}, {customer_name}"
+        assert "SECRET" not in r.get_data(as_text=True)
+    assert client.get("/api/whatsapp-settings/deeplink", headers=employee_hdr).status_code == 403
+
+
+def test_cashier_collect_sends_api_template(client, monkeypatch):
+    admin_hdr = make_tenant(client, "Biz WA2", "wa2_admin")
+    cashier_hdr = _create_user(client, admin_hdr, "wa2_cashier", "cashier")
+    customer_id = _setup_customer(client, admin_hdr)
+    payment_id = _first_unpaid_payment_id(client, admin_hdr, customer_id)
+    sent = []
+    monkeypatch.setattr(appmod, "send_whatsapp_message",
+                        lambda customer, event_type, context=None: sent.append((customer.id, event_type, context)))
+
+    r = client.put(f"/api/payments/{payment_id}/mark_paid", headers=cashier_hdr, json={"action": "collect"})
+    assert r.status_code == 200
+    assert sent and sent[0][0] == customer_id and sent[0][1] == "payment_paid"

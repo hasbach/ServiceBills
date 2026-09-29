@@ -6292,6 +6292,27 @@ def get_whatsapp_settings():
         'last_forwarding_keepalive_sent_at': None,
     }}), 200
 
+@app.route('/api/whatsapp-settings/deeplink', methods=['GET'])
+@jwt_required()
+def get_whatsapp_deeplink_settings():
+    """The slice of WhatsApp settings a front-desk role needs to open a wa.me
+    deep link after collecting a payment or renewing: on/off, mode and the
+    message texts. GET /api/whatsapp-settings stays admin/finance because it
+    returns the Meta access token and app secret -- a cashier or collector
+    calling it got a 403 the page swallowed, so it treated WhatsApp as off and
+    never opened the link."""
+    if not any(r in ('admin', 'finance', 'cashier', 'collector') for r in _jwt_roles()):
+        return jsonify(msg="Not authorized"), 403
+    settings = tenant_query(WhatsAppSettings).first()
+    full = settings.to_dict() if settings else {}
+    return jsonify({'settings': {
+        'enabled': bool(full.get('enabled', False)),
+        'mode': full.get('mode') or 'deeplink',
+        'deeplink_msg_payment': full.get('deeplink_msg_payment') or 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
+        'deeplink_msg_renewal': full.get('deeplink_msg_renewal') or 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
+        'deeplink_msg_payment_link': full.get('deeplink_msg_payment_link') or 'Hi {customer_name}, here is your payment link: {pay_url}',
+    }}), 200
+
 @app.route('/api/whatsapp-settings', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
