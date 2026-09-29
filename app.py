@@ -22,6 +22,7 @@ except ImportError:
 
 import re
 import difflib
+import modules
 import hmac
 import hashlib
 import math
@@ -214,9 +215,13 @@ class Tenant(db.Model):
     # The tenant-wide self-service Whish payment page's URL slug (2026-08-27
     # plan amendment) -- null until staff first generate it (Task 20).
     public_pay_slug = db.Column(db.String(32), nullable=True, unique=True, index=True)
+    # Super-admin per-tenant module overrides on top of the plan bundle,
+    # e.g. {"network": true, "ai_cs": false}. NULL = none. See modules.py.
+    module_overrides = db.Column(db.JSON, nullable=True)
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "slug": self.slug,
+                "modules": sorted(modules.enabled_for(self)),
                 "status": self.status, "plan": self.plan,
                 # ISO-8601 with an explicit UTC 'Z' marker -- naive '%Y-%m-%d %H:%M:%S'
                 # was silently parsed as browser-LOCAL time by `new Date(...)` on the
