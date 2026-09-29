@@ -588,6 +588,9 @@ const PaymentsView = () => {
     // Mark-as-Paid dialog
     const [markPaidDialog, setMarkPaidDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
     const [markPaidAmount, setMarkPaidAmount] = useState('');
+    // Chosen when collecting (not when confirming receipt): cash or a direct Whish transfer.
+    const [markPaidMethod, setMarkPaidMethod] = useState('cash');
+    const [markPaidReference, setMarkPaidReference] = useState('');
     // Mark-as-Gratis dialog
     const [markGratisDialog, setMarkGratisDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
     const [markGratisNote, setMarkGratisNote] = useState('');
@@ -898,7 +901,9 @@ const PaymentsView = () => {
 
     // --- Open the mark-as-paid dialog ---
     const openMarkPaidDialog = (payment) => {
-        setMarkPaidDialog({ open: true, paymentId: payment.id, outstanding: payment.amount, customerName: payment.customer_name, collectedAmount: payment.collected_amount });
+        setMarkPaidDialog({ open: true, paymentId: payment.id, outstanding: payment.amount, customerName: payment.customer_name, collectedAmount: payment.collected_amount, collecting: !payment.collected });
+        setMarkPaidMethod('cash');
+        setMarkPaidReference('');
         const defaultAmount = (payment.collected && payment.collected_amount) ? payment.collected_amount : payment.amount;
         setMarkPaidAmount(String(defaultAmount));
     };
@@ -929,6 +934,10 @@ const PaymentsView = () => {
         }
 
         let payload = { action };
+        if (action === 'collect') {
+            payload.method = markPaidMethod;
+            if (markPaidMethod === 'whish_transfer' && markPaidReference.trim()) payload.reference = markPaidReference.trim();
+        }
         if (amountReceived < currentOutstandingAmount) {
             payload.partial_payment = true;
             payload.partial_amount = amountReceived;
@@ -1892,6 +1901,20 @@ const handlePrint = () => {
                         InputProps={{ inputProps: { min: 0.01, step: 0.01 } }}
                         helperText={parseFloat(markPaidAmount) < markPaidDialog.outstanding ? 'Partial payment — balance will be updated' : 'Full payment'}
                     />
+                    {markPaidDialog.collecting && (
+                        <>
+                            <TextField select fullWidth sx={{ mt: 2 }} label="Paid by" value={markPaidMethod}
+                                onChange={(e) => setMarkPaidMethod(e.target.value)}>
+                                <MenuItem value="cash">Cash</MenuItem>
+                                <MenuItem value="whish_transfer">Whish transfer (sent directly to our Whish account)</MenuItem>
+                            </TextField>
+                            {markPaidMethod === 'whish_transfer' && (
+                                <TextField fullWidth sx={{ mt: 2 }} label="Whish reference (optional)" value={markPaidReference}
+                                    inputProps={{ maxLength: 64 }} onChange={(e) => setMarkPaidReference(e.target.value)}
+                                    helperText="Not counted as cash on the Daily Cash report" />
+                            )}
+                        </>
+                    )}
                 </DialogContent>
                 <DialogActions>
                     <Button onClick={() => setMarkPaidDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' })}>Cancel</Button>

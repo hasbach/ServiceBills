@@ -5273,7 +5273,21 @@ def mark_payment_as_paid(payment_id):
         if action == 'collect':
             if not is_collector:
                 return jsonify({'message': 'Unauthorized to collect payments.'}), 403
-            
+
+            # How the money arrived, chosen by whoever collects it: cash
+            # (default) or a transfer straight to the business's Whish account
+            # -- same values as set_payment_method, which finance can still use
+            # to correct it afterwards.
+            method = (data.get('method') or 'cash').strip().lower()
+            if method not in PAYMENT_METHODS_STAFF_SETTABLE:
+                return jsonify({'message': "method must be 'cash' or 'whish_transfer'."}), 400
+            if method == 'whish_transfer':
+                payment.collected_via = 'whish_transfer'
+                payment.whish_transaction_number = (data.get('reference') or '').strip()[:64] or None
+            elif payment.collected_via == 'whish_transfer':
+                payment.collected_via = None
+                payment.whish_transaction_number = None
+
             # Save the collected amount
             partial_payment_flag = data.get('partial_payment', False)
             if partial_payment_flag:

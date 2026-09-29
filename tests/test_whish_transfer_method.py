@@ -108,3 +108,47 @@ def test_revert_clears_the_transfer_mark(client):
     assert client.put(f"/api/payments/{pid}/revert", headers=hdr, json={"reason": "wrong customer"}).status_code == 200
     p = appmod.Payment.query.get(pid)
     assert (p.collected_via, p.whish_transaction_number) == (None, None)
+
+
+def _unpaid(client, hdr, price=40):
+    plan = client.post("/api/subscription_plans", headers=hdr,
+                       json={"name": "P", "price": price, "billing_cycle": "monthly"}).get_json()["plan"]["id"]
+    cid = client.post("/api/customers", headers=hdr, json={
+        "name": "C", "phone": "1", "address": "a", "subscription_plan_id": plan,
+        "subscription_start_date": "2026-01-01"}).get_json()["customer_id"]
+    return next(p["id"] for p in client.get("/api/payments", headers=hdr, query_string={"customer_id": cid})
+                .get_json()["payments"] if not p["paid"])
+
+
+def test_cashier_and_collector_can_pick_whish_transfer_when_collecting(client):
+    hdr = make_tenant(client, "Biz W5", "w5_admin")
+    for role in ("cashier", "collector"):
+        client.post("/api/users", headers=hdr, json={"username": f"w5_{role}", "password": "pw", "role": role})
+        pid = _unpaid(client, hdr)
+        r = client.put(f"/api/payments/{pid}/mark_paid", headers=_login(client, f"w5_{role}"),
+                       json={"action": "collect", "method": "whish_transfer", "reference": f"REF-{role}"})
+        assert r.status_code == 200, (role, r.get_json())
+        p = appmod.Payment.query.get(pid)
+        assert (p.collected, p.paid, p.collected_via, p.whish_transaction_number) == (True, False, "whish_transfer", f"REF-{role}")
+
+
+def test_collect_defaults_to_cash_and_rejects_unknown_method(client):
+    hdr = make_tenant(client, "Biz W6", "w6_admin")
+    pid = _unpaid(client, hdr)
+    assert client.put(f"/api/payments/{pid}/mark_paid", headers=hdr,
+                      json={"action": "collect", "method": "card"}).status_code == 400
+    assert appmod.Payment.query.get(pid).collected is False
+    assert client.put(f"/api/payments/{pid}/mark_paid", headers=hdr, json={"action": "collect"}).status_code == 200
+    assert appmod.Payment.query.get(pid).collected_via is None
+
+
+def test_whish_transfer_collected_by_cashier_stays_out_of_cash_after_confirm(client):
+    hdr = make_tenant(client, "Biz W7", "w7_admin")
+    client.post("/api/users", headers=hdr, json={"username": "w7_cash", "password": "pw", "role": "cashier"})
+    pid = _unpaid(client, hdr, price=60)
+    client.put(f"/api/payments/{pid}/mark_paid", headers=_login(client, "w7_cash"),
+               json={"action": "collect", "method": "whish_transfer"})
+    client.put(f"/api/payments/{pid}/mark_paid", headers=hdr, json={"action": "pay"})
+    assert _cash_total(client, hdr) == 0
+    rows = client.get("/api/reports/customer-whish-payments", headers=hdr, query_string=_today()).get_json()["links"]
+    assert [r["payment_id"] for r in rows if r["source"] == "manual_transfer"] == [pid]

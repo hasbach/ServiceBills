@@ -789,20 +789,34 @@ const SubscriptionsView = ({
 
     // Cashier counterpart of handleMarkPaid: records the cash as collected
     // (action 'collect'); finance/admin confirm receipt later on Payments.
-    const handleCollectPayment = useCallback(async (paymentId, currentAmount) => {
-        const input = prompt(`Enter amount collected for Payment ID ${paymentId} (Outstanding: ${currentAmount.toFixed(2)}):`, currentAmount.toFixed(2));
-        if (input === null) return;
-        const amountCollected = parseFloat(input);
+    // The cashier's Collect used to be a browser prompt() (amount only); it's a
+    // dialog now so the cashier can also say how the money arrived.
+    const [collectDialog, setCollectDialog] = useState({ open: false, paymentId: null, outstanding: 0, amount: '', method: 'cash', reference: '' });
+    const [collectSubmitting, setCollectSubmitting] = useState(false);
+    const closeCollectDialog = () => setCollectDialog({ open: false, paymentId: null, outstanding: 0, amount: '', method: 'cash', reference: '' });
+
+    const handleCollectPayment = useCallback((paymentId, currentAmount) => {
+        setCollectDialog({ open: true, paymentId, outstanding: currentAmount, amount: currentAmount.toFixed(2), method: 'cash', reference: '' });
+    }, []);
+
+    const submitCollectPayment = useCallback(async () => {
+        const { paymentId, outstanding: currentAmount, method, reference } = collectDialog;
+        const amountCollected = parseFloat(collectDialog.amount);
         if (isNaN(amountCollected) || amountCollected <= 0) {
             setSnackbar({ open: true, message: 'Please enter a valid positive amount.', severity: 'warning' });
             return;
         }
+        if (collectSubmitting) return;
+        setCollectSubmitting(true);
         try {
             const response = await apiService.markPaymentAsPaid(paymentId, {
                 action: 'collect',
                 partial_payment: amountCollected < currentAmount,
-                partial_amount: amountCollected
+                partial_amount: amountCollected,
+                method,
+                ...(method === 'whish_transfer' && reference.trim() ? { reference: reference.trim() } : {}),
             });
+            closeCollectDialog();
             setSnackbar({ open: true, message: response.data.message, severity: 'success' });
 
             // Deep-link mode: open the "payment received" message, same as
@@ -845,8 +859,10 @@ const SubscriptionsView = ({
         } catch (error) {
             console.error("Error collecting payment:", error);
             setSnackbar({ open: true, message: 'Failed to collect payment. ' + (error.response?.data?.message || error.message), severity: 'error' });
+        } finally {
+            setCollectSubmitting(false);
         }
-    }, [apiService, setSnackbar, expandedCustomerId, paymentsModalCustomer, fetchCustomerPayments, payments, customers, waSettings]);
+    }, [collectDialog, collectSubmitting, apiService, setSnackbar, expandedCustomerId, paymentsModalCustomer, fetchCustomerPayments, payments, customers, waSettings]);
 
     const renderPaymentAction = (p) => {
         if (p.paid) return null;
@@ -1923,6 +1939,37 @@ const SubscriptionsView = ({
                 </DialogContent>
                 <DialogActions>
                     <Button onClick={() => { setPaymentsModalCustomer(null); setPayments([]); }}>Close</Button>
+                </DialogActions>
+            </Dialog>
+
+            {/* Cashier: collect a payment */}
+            <Dialog open={collectDialog.open} onClose={() => !collectSubmitting && closeCollectDialog()} maxWidth="xs" fullWidth>
+                <DialogTitle sx={{ fontWeight: 700 }}>Collect Payment</DialogTitle>
+                <DialogContent>
+                    <Typography variant="body2" sx={{ mb: 2, color: 'text.secondary' }}>
+                        Outstanding: <strong>${(collectDialog.outstanding || 0).toFixed(2)}</strong>
+                    </Typography>
+                    <TextField fullWidth autoFocus type="number" label="Amount collected" value={collectDialog.amount}
+                        onChange={(e) => setCollectDialog({ ...collectDialog, amount: e.target.value })}
+                        InputProps={{ inputProps: { min: 0.01, step: 0.01 } }}
+                        helperText={parseFloat(collectDialog.amount) < collectDialog.outstanding ? 'Partial payment' : 'Full payment'} />
+                    <TextField select fullWidth sx={{ mt: 2 }} label="Paid by" value={collectDialog.method}
+                        onChange={(e) => setCollectDialog({ ...collectDialog, method: e.target.value })}>
+                        <MenuItem value="cash">Cash</MenuItem>
+                        <MenuItem value="whish_transfer">Whish transfer (sent directly to our Whish account)</MenuItem>
+                    </TextField>
+                    {collectDialog.method === 'whish_transfer' && (
+                        <TextField fullWidth sx={{ mt: 2 }} label="Whish reference (optional)" value={collectDialog.reference}
+                            inputProps={{ maxLength: 64 }} onChange={(e) => setCollectDialog({ ...collectDialog, reference: e.target.value })}
+                            helperText="Not counted as cash on the Daily Cash report" />
+                    )}
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={closeCollectDialog} disabled={collectSubmitting}>Cancel</Button>
+                    <Button variant="contained" onClick={submitCollectPayment} disabled={collectSubmitting}
+                        startIcon={collectSubmitting ? <CircularProgress size={16} color="inherit" /> : null}>
+                        Collect
+                    </Button>
                 </DialogActions>
             </Dialog>
 
