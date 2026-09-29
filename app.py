@@ -6441,6 +6441,7 @@ def list_exchange_rates():
 @app.route('/api/whatsapp-settings', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def get_whatsapp_settings():
     settings = tenant_query(WhatsAppSettings).first()
     if settings:
@@ -6485,8 +6486,11 @@ def get_whatsapp_deeplink_settings():
         return jsonify(msg="Not authorized"), 403
     settings = tenant_query(WhatsAppSettings).first()
     full = settings.to_dict() if settings else {}
+    # Core payment screens call this to build a wa.me link, so it is never
+    # gated (403): with the whatsapp module off it reports "not configured".
+    _wa_on = modules.is_enabled(current_tenant(), 'whatsapp')
     return jsonify({'settings': {
-        'enabled': bool(full.get('enabled', False)),
+        'enabled': bool(full.get('enabled', False)) and _wa_on,
         'mode': full.get('mode') or 'deeplink',
         'deeplink_msg_payment': full.get('deeplink_msg_payment') or 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
         'deeplink_msg_renewal': full.get('deeplink_msg_renewal') or 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
@@ -6496,6 +6500,7 @@ def get_whatsapp_deeplink_settings():
 @app.route('/api/whatsapp-settings', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def save_whatsapp_settings():
     data = request.json
     try:
@@ -7084,6 +7089,7 @@ def email_customer_payment_link(customer_id, payment_id):
 
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
 @jwt_required()
+@require_module('whatsapp')
 def subscribe_waba():
     try:
         settings = tenant_query(WhatsAppSettings).first()
@@ -7114,6 +7120,7 @@ def _parse_meta_error(resp):
 
 @app.route('/api/whatsapp/templates', methods=['GET'])
 @jwt_required()
+@require_module('whatsapp')
 def get_whatsapp_templates():
     templates = tenant_query(WhatsAppTemplate).order_by(WhatsAppTemplate.created_at.desc()).all()
     return jsonify({'templates': [t.to_dict() for t in templates]}), 200
@@ -7122,6 +7129,7 @@ def get_whatsapp_templates():
 @app.route('/api/whatsapp/templates/sync', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def sync_whatsapp_templates():
     settings = tenant_query(WhatsAppSettings).first()
     if not settings or settings.mode != 'api':
@@ -7193,6 +7201,7 @@ def _validate_template_components(components):
 @app.route('/api/whatsapp/templates', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def create_whatsapp_template():
     settings = tenant_query(WhatsAppSettings).first()
     if not settings or settings.mode != 'api':
@@ -7240,6 +7249,7 @@ def create_whatsapp_template():
 @app.route('/api/whatsapp/templates/<int:template_id>', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def update_whatsapp_template(template_id):
     settings = tenant_query(WhatsAppSettings).first()
     if not settings or settings.mode != 'api':
@@ -7282,6 +7292,7 @@ def update_whatsapp_template(template_id):
 @app.route('/api/whatsapp/templates/<int:template_id>', methods=['DELETE'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def delete_whatsapp_template(template_id):
     settings = tenant_query(WhatsAppSettings).first()
     if not settings or settings.mode != 'api':
@@ -7309,6 +7320,7 @@ def delete_whatsapp_template(template_id):
 @app.route('/api/whatsapp/templates/upload-sample', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def upload_whatsapp_template_sample():
     """Uploads a sample media file for a media (image/video/document) HEADER
     component via Meta's resumable-upload API, returning the 'handle' Meta
@@ -8237,6 +8249,7 @@ def submit_feedback():
 
 @app.route('/api/payment-reminders', methods=['POST'])
 @jwt_required()
+@require_module('whatsapp')
 def create_payment_reminder():
     data = request.json
     reminder = PaymentReminder(
@@ -8251,6 +8264,7 @@ def create_payment_reminder():
 
 @app.route('/api/customers/<int:customer_id>/send-whatsapp-reminder', methods=['POST'])
 @jwt_required()
+@require_module('whatsapp')
 def trigger_whatsapp_reminder(customer_id):
     customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
@@ -8274,6 +8288,7 @@ def trigger_whatsapp_reminder(customer_id):
 
 @app.route('/api/messages/bulk_send', methods=['POST'])
 @jwt_required()
+@require_module('whatsapp')
 def send_bulk_messages():
     # Only allow admin
     current_username = get_jwt_identity()
@@ -8515,6 +8530,10 @@ def whatsapp_webhook():
                             logging.warning(f"WhatsApp template status webhook: signature mismatch for tenant_id={tpl_settings.tenant_id}; rejecting.")
                             return jsonify({'error': 'Invalid signature'}), 401
 
+                        if not modules.is_enabled(db.session.get(Tenant, tpl_settings.tenant_id), 'whatsapp'):
+                            logging.info(f"WhatsApp template status webhook: whatsapp module disabled for tenant_id={tpl_settings.tenant_id}; skipping.")
+                            continue
+
                         tpl_name = val.get('message_template_name')
                         tpl_language = val.get('message_template_language')
                         tpl_new_status = val.get('event')
@@ -8558,6 +8577,14 @@ def whatsapp_webhook():
                     if not hmac.compare_digest(expected_sig, provided_sig):
                         logging.warning(f"WhatsApp webhook: signature mismatch for tenant_id={settings.tenant_id}; rejecting.")
                         return jsonify({'error': 'Invalid signature'}), 401
+
+                    # Module gate: a tenant without the whatsapp module gets nothing
+                    # processed, but Meta still receives 200 (it retries otherwise).
+                    _wh_tenant = db.session.get(Tenant, settings.tenant_id)
+                    if not modules.is_enabled(_wh_tenant, 'whatsapp'):
+                        logging.info(f"WhatsApp webhook: whatsapp module disabled for tenant_id={settings.tenant_id}; skipping.")
+                        continue
+                    _ai_cs_on = modules.is_enabled(_wh_tenant, 'ai_cs')
 
                     if len(matches) > 1:
                         logging.warning(f"WhatsApp webhook: {len(matches)} settings rows share phone_number_id={incoming_pnid} "
@@ -8729,7 +8756,7 @@ def whatsapp_webhook():
                             if cs_settings is None or cs_settings.is_active:
                                 cs_agent_active = True
 
-                        ai_will_run = bool(cs_agent_active and getattr(settings, 'auto_reply_enabled', True))
+                        ai_will_run = bool(cs_agent_active and _ai_cs_on and getattr(settings, 'auto_reply_enabled', True))
                         ai_paused = False
                         if inbox_conv is not None:
                             try:
@@ -13564,6 +13591,8 @@ def cs_agent_config():
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     if request.method == 'POST':
         data = request.get_json(silent=True) or {}
@@ -13628,6 +13657,8 @@ def cs_tool_lookup_customer():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
     
     phone = (
         request.args.get('phone') or 
@@ -13655,6 +13686,8 @@ def cs_tool_customer_status():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     customer_id = request.args.get('customer_id', type=int) or request.args.get('id', type=int)
     if not customer_id and request.is_json:
@@ -13678,6 +13711,10 @@ def cs_tool_network_diagnostic():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'network'):
+        return jsonify({"available": False, "message": "Network diagnostics are not available for this business. Offer to open a support ticket instead."}), 200
 
     data = (request.get_json(silent=True) or {}) if request.is_json else {}
     raw_id = data.get('customer_id') or request.args.get('customer_id') or request.args.get('id')
@@ -13705,6 +13742,10 @@ def cs_tool_send_payment_link():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'whish_payments'):
+        return jsonify({"available": False, "message": "Online payment links are not available for this business. Tell the customer how to pay at the office instead."}), 200
 
     data = (request.get_json(silent=True) or {}) if request.is_json else {}
     raw_id = data.get('customer_id') or request.args.get('customer_id') or request.args.get('id')
@@ -13727,6 +13768,8 @@ def cs_tool_escalate():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     data = (request.get_json(silent=True) or {}) if request.is_json else {}
     raw_id = data.get('customer_id') or request.args.get('customer_id') or request.args.get('id')
@@ -13757,6 +13800,8 @@ def cs_get_recent_tickets():
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     limit = min(int(request.args.get('limit', 15)), 50)
     tickets = SupportTicket.query.filter_by(tenant_id=tenant_id).order_by(SupportTicket.id.desc()).limit(limit).all()
@@ -13812,6 +13857,8 @@ def cs_agent_memory():
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     if request.method == 'POST':
         data = request.get_json(silent=True) or {}
@@ -13849,6 +13896,8 @@ def cs_agent_memory_recent_logs():
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     limit = min(int(request.args.get('limit', 50)), 100)
     logs = CSAgentMessageLog.query.filter_by(tenant_id=tenant_id).order_by(
@@ -13863,6 +13912,8 @@ def cs_agent_memory_update(entry_id):
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     data = request.get_json(silent=True) or {}
     if 'is_active' not in data:
@@ -13880,6 +13931,8 @@ def cs_agent_memory_delete(entry_id):
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     ok = cs_agent_tools.delete_knowledge_entry(appmod, tenant_id, entry_id)
     if not ok:

@@ -32,6 +32,8 @@ def setup_wa_tenant(app, client, business, username, pnid, secret="s3cret", toke
         appmod.db.session.add(appmod.WhatsAppSettings(
             tenant_id=tid, phone_number_id=pnid, enabled=True, mode="api",
             app_secret=secret, access_token=token, api_version="v19.0"))
+        # The webhook only runs the AI for tenants that have the ai_cs module.
+        appmod.db.session.get(appmod.Tenant, tid).module_overrides = {"ai_cs": True}
         appmod.db.session.commit()
     return hdr, tid
 
