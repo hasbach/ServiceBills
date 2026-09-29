@@ -3266,6 +3266,8 @@ def send_daily_whatsapp_keepalive(tenant_id):
     what actually opens the session the raw text/media forward in the webhook
     handler depends on. See
     docs/superpowers/specs/2026-08-12-whatsapp-forwarding-keepalive.md."""
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'whatsapp'):
+        return
     settings = WhatsAppSettings.query.filter_by(tenant_id=tenant_id).first()
     if not settings or settings.mode != 'api' or not settings.enabled:
         return
@@ -3434,6 +3436,8 @@ def auto_sync_upstream_status_for_tenant(tenant_id):
     timeout) doesn't stop the rest of this tenant's customers, and one
     tenant's failure doesn't stop the next tenant (see the _with_context
     wrapper below)."""
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'upstream_sync'):
+        return
     settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).first()
     if not settings or not settings.upstream_sync_automation_enabled:
         return
@@ -3563,6 +3567,8 @@ def refresh_agent_mode_network_status_for_tenant(tenant_id):
     failure does not abort the rest of this tenant's devices -- refresh_
     agent_mode_network_status_with_context already does the same at the
     tenant level, above this."""
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'network'):
+        return
     settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).first()
     if not settings or settings.network_access_mode != 'agent':
         return
