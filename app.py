@@ -818,6 +818,9 @@ class Customer(db.Model):
     # exactly one customer, which is what lets the OLT place them without
     # anyone having to know which ONU they are on.
     cpe_mac_address = db.Column(db.String(20), nullable=True, index=True)
+    # Free-text staff notes about this subscription (shown on the
+    # Subscriptions card). Capped at CUSTOMER_NOTES_MAX_LEN on write.
+    notes = db.Column(db.Text, nullable=True)
     # When that CPE was last located. Null means never. Compared against the
     # newest completed cpe_locations job to tell a confirmed placement from a
     # remembered one -- see the tree's "last seen" marker.
@@ -3877,6 +3880,7 @@ def get_customers():
                 'pppoe_username': c.pppoe_username,
                 'onu_mac_address': c.onu_mac_address,
                 'cpe_mac_address': c.cpe_mac_address,
+                'notes': c.notes,
                 'subscription_plan': c.subscription_plan.to_dict() if c.subscription_plan else None
             }
             customers_with_plans.append(customer_dict)
@@ -4036,7 +4040,8 @@ def add_customer():
             network_device_id=data.get('network_device_id') or None,
             pppoe_username=data.get('pppoe_username') or None,
             onu_mac_address=onu_mac_address,
-            cpe_mac_address=cpe_mac_address
+            cpe_mac_address=cpe_mac_address,
+            notes=_clean_customer_notes(data.get('notes'))
         )
         db.session.add(new_customer)
         db.session.flush() # Flush to get new_customer.id
@@ -4364,6 +4369,9 @@ def update_customer(customer_id):
             
         if 'whatsapp_notifications_enabled' in data:
             customer.whatsapp_notifications_enabled = bool(data['whatsapp_notifications_enabled'])
+
+        if 'notes' in data:
+            customer.notes = _clean_customer_notes(data['notes'])
         
         db.session.commit()
         recalculate_estimated_profit(customer.tenant_id)
@@ -4388,7 +4396,8 @@ def update_customer(customer_id):
                 'network_device_id': customer.network_device_id,
                 'pppoe_username': customer.pppoe_username,
                 'onu_mac_address': customer.onu_mac_address,
-                'cpe_mac_address': customer.cpe_mac_address
+                'cpe_mac_address': customer.cpe_mac_address,
+                'notes': customer.notes
             }
         }), 200
 
@@ -4403,6 +4412,15 @@ def update_customer(customer_id):
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+
+
+CUSTOMER_NOTES_MAX_LEN = 2000
+
+
+def _clean_customer_notes(raw):
+    """Normalize a customer's notes field: blank -> None, trimmed, capped."""
+    text = (raw or '').strip() if isinstance(raw, str) else ('' if raw is None else str(raw).strip())
+    return text[:CUSTOMER_NOTES_MAX_LEN] or None
 
 
 def _delete_customer_core(customer):

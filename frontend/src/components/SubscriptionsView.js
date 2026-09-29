@@ -46,6 +46,7 @@ import {
     Phone as PhoneIcon,
     LocationOn as LocationOnIcon,
     Cloud as CloudIcon,
+    StickyNote2Outlined as NotesIcon,
     Visibility as VisibilityIcon,
     VisibilityOff as VisibilityOffIcon,
     Delete as DeleteIcon,
@@ -126,6 +127,18 @@ const GridCustomerCard = React.memo(function GridCustomerCard({
                                     </Box>
                                     {customer.upstream_provider_name && (
                                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 0.5 }}><CloudIcon sx={{ fontSize: 14, color: 'text.secondary' }} /><Typography variant="body2" color="text.secondary">{customer.upstream_provider_name}</Typography></Box>
+                                    )}
+                                    {customer.notes && (
+                                        <Tooltip title={<span style={{ whiteSpace: 'pre-wrap' }}>{customer.notes}</span>} placement="bottom-start">
+                                            <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, mt: 0.5 }}>
+                                                <NotesIcon sx={{ fontSize: 14, color: 'text.secondary', mt: '3px' }} />
+                                                {/* Clamped to 3 lines so a long note can't stretch the card; full text in the tooltip. */}
+                                                <Typography variant="body2" color="text.secondary"
+                                                    sx={{ fontStyle: 'italic', whiteSpace: 'pre-wrap', wordBreak: 'break-word', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                                                    {customer.notes}
+                                                </Typography>
+                                            </Box>
+                                        </Tooltip>
                                     )}
                                 </Box>
                             </Box>
@@ -236,6 +249,14 @@ const ListCustomerRow = React.memo(function ListCustomerRow({
                         <Typography variant="body1" sx={{ fontWeight: 600 }}>{customer.name}</Typography>
                         <Typography variant="body2" color="text.secondary">{customer.address}</Typography>
                         {customer.upstream_provider_name && <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>Upstream: {customer.upstream_provider_name}</Typography>}
+                        {customer.notes && (
+                            <Tooltip title={<span style={{ whiteSpace: 'pre-wrap' }}>{customer.notes}</span>}>
+                                <Typography variant="caption" color="text.secondary"
+                                    sx={{ display: 'block', fontStyle: 'italic', maxWidth: 280, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                    Note: {customer.notes}
+                                </Typography>
+                            </Tooltip>
+                        )}
                         {customer.sector && <Typography variant="caption" color="text.secondary">Sector: {customer.sector}</Typography>}
                     </Box>
                 </Box>
@@ -503,6 +524,7 @@ const SubscriptionsView = ({
         cost_override: '',
         subscription_start_date: new Date().toISOString().split('T')[0],
         additional_payment_amount: 0.0,
+        notes: '',
     });
     const [expandedCustomerId, setExpandedCustomerId] = useState(null);
     const [paymentsModalCustomer, setPaymentsModalCustomer] = useState(null);
@@ -1242,6 +1264,7 @@ const SubscriptionsView = ({
                 upstream_username: editingCustomer.upstream_username || "",
                 network_device_id: editingCustomer.network_device_id || "",
                 pppoe_username: editingCustomer.pppoe_username || "",
+                notes: editingCustomer.notes || "",
             };
             if (isCashierOnly) delete payload.balance;
 
@@ -1299,7 +1322,7 @@ const SubscriptionsView = ({
             await apiService.addCustomer(newCustomer);
             setSnackbar({ open: true, message: 'Customer added successfully!', severity: 'success' });
             setShowAddCustomerForm(false);
-            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', reseller_id: '', upstream_provider_id: '', upstream_username: '', network_device_id: '', pppoe_username: '', onu_mac_address: '', cpe_mac_address: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0 });
+            setNewCustomer({ name: '', phone: '', address: '', sector: '', subscription_plan_id: '', reseller_id: '', upstream_provider_id: '', upstream_username: '', network_device_id: '', pppoe_username: '', onu_mac_address: '', cpe_mac_address: '', discount: 0.0, cost_override: '', subscription_start_date: new Date().toISOString().split('T')[0], additional_payment_amount: 0.0, notes: '' });
             // Go to the first page after adding (the page change refetches).
             if (currentPage !== 1) setCurrentPage(1); else refetchCustomers();
         } catch (error) {
@@ -1540,6 +1563,7 @@ const SubscriptionsView = ({
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={newCustomer.cost_override} onChange={(e) => setNewCustomer({ ...newCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="date" label="Subscription Start Date" value={newCustomer.subscription_start_date} onChange={(e) => setNewCustomer({ ...newCustomer, subscription_start_date: e.target.value })} InputLabelProps={{ shrink: true }} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Additional Payment Amount" value={newCustomer.additional_payment_amount} onChange={(e) => setNewCustomer({ ...newCustomer, additional_payment_amount: parseFloat(e.target.value) || 0.0 })} helperText="For one-time charges on creation" /></Grid>
+                        <Grid item xs={12}><TextField fullWidth multiline minRows={2} label="Notes (Optional)" value={newCustomer.notes || ''} onChange={(e) => setNewCustomer({ ...newCustomer, notes: e.target.value })} inputProps={{ maxLength: 2000 }} helperText="Shown on the subscription card" /></Grid>
                     </Grid>
                     <Box sx={{ display: 'flex', gap: 2, mt: 3 }}>
                         <Button variant="contained" onClick={handleAddCustomer} sx={{ borderRadius: '12px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5 }}>Add Customer</Button>
@@ -1762,6 +1786,7 @@ const SubscriptionsView = ({
                         </Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Discount ($)" value={editingCustomer?.discount || 0} onChange={(e) => setEditingCustomer({ ...editingCustomer, discount: parseFloat(e.target.value) || 0 })} /></Grid>
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={editingCustomer?.cost_override ?? ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
+                        <Grid item xs={12}><TextField fullWidth multiline minRows={2} label="Notes (Optional)" value={editingCustomer?.notes || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, notes: e.target.value })} inputProps={{ maxLength: 2000 }} helperText="Shown on the subscription card" /></Grid>
                         {!isCashierOnly && <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Account Balance ($)" value={editingCustomer?.balance !== undefined ? editingCustomer.balance : 0} helperText="Negative value = Customer owes money. 0 = Paid." onChange={(e) => setEditingCustomer({ ...editingCustomer, balance: parseFloat(e.target.value) || 0 })} /></Grid>}
 
                         {!isCashierOnly && businessSettings?.network_mode === 'local_mikrotik' && editingCustomer?.network_device_id && editingCustomer?.pppoe_username && (
