@@ -69,6 +69,38 @@ import { useAppContext } from '../context/AppContext.js';
 import { escapeHtml } from '../utils/escapeHtml.js';
 
 
+// Totals for the current filters, computed by the server over every matching
+// payment (GET /api/payments -> totals), not just the rows loaded here.
+const TOTAL_TILES = [
+    { key: 'collected', label: 'Collected', color: '#0EA5E9' },
+    { key: 'uncollected', label: 'Uncollected', color: '#F59E0B' },
+    { key: 'unpaid', label: 'Unpaid', color: '#EF4444' },
+    { key: 'paid', label: 'Paid', color: '#10B981' },
+];
+
+function PaymentTotalsBar({ totals, loading }) {
+    const fmt = (v) => `$${(Number(v) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    return (
+        <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', md: 'repeat(4, minmax(0, 1fr))' }, gap: 2, mb: 3 }}>
+            {TOTAL_TILES.map(({ key, label, color }) => {
+                const t = totals?.[key];
+                return (
+                    <Paper key={key} elevation={0} sx={{ p: 2, borderRadius: '12px', border: `1px solid ${alpha(color, 0.25)}`, bgcolor: alpha(color, 0.04) }}>
+                        <Typography variant="caption" sx={{ fontWeight: 700, color, textTransform: 'uppercase', letterSpacing: 0.5 }}>{label}</Typography>
+                        <Typography variant="h6" sx={{ fontWeight: 800, lineHeight: 1.3 }}>
+                            {loading && !t ? '…' : fmt(t?.amount)}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                            {t ? `${t.count} payment${t.count === 1 ? '' : 's'}` : '—'}
+                            {key === 'collected' && t?.awaiting_count ? ` · ${fmt(t.awaiting_amount)} awaiting confirmation` : ''}
+                        </Typography>
+                    </Paper>
+                );
+            })}
+        </Box>
+    );
+}
+
 // Revenue helpers — kept outside component so they are never recreated
 const getTotalRevenue = (payments) => {
     if (!Array.isArray(payments)) return 0;
@@ -588,6 +620,7 @@ const PaymentsView = () => {
     // Mark-as-Paid dialog
     const [markPaidDialog, setMarkPaidDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
     const [markPaidAmount, setMarkPaidAmount] = useState('');
+    const [paymentTotals, setPaymentTotals] = useState(null);
     // Chosen when collecting (not when confirming receipt): cash or a direct Whish transfer.
     const [markPaidMethod, setMarkPaidMethod] = useState('cash');
     const [markPaidReference, setMarkPaidReference] = useState('');
@@ -787,6 +820,7 @@ const PaymentsView = () => {
                 params.paid_date_end
             );
             setPayments(response.data.payments || []); // FIX: Access the 'payments' key from the response
+            setPaymentTotals(response.data.totals || null);
         } catch (error) {
             console.error("Error fetching payments:", error);
             setSnackbar({ open: true, message: 'Failed to load payments.', severity: 'error' });
@@ -1718,6 +1752,9 @@ const handlePrint = () => {
                     </Grid>
                 </Paper>
             )}
+
+            {/* Totals for whatever the filters above currently select */}
+            <PaymentTotalsBar totals={paymentTotals} loading={loading} />
 
             {/* Payments List */}
             {loading ? (

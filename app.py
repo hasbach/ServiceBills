@@ -4920,6 +4920,13 @@ def get_payments():
     if search_query:
         # 🔥 Add search filter (case-insensitive)
         query = query.filter(Customer.name.ilike(f"%{search_query}%"))
+
+    # Totals over EVERYTHING matching the filters above (not just this page),
+    # so e.g. "collected today" shows its real sum. Amounts are converted to
+    # the reporting currency with each payment's locked rate, like the other
+    # reports.
+    totals = _payment_totals(query)
+
     # Sorting payments
     sort_by = request.args.get('sort_by', 'billed_date')
     sort_desc = request.args.get('sort_desc', 'true').lower() == 'true'
@@ -4971,7 +4978,55 @@ def get_payments():
              } for p in pagination.items],
         'total': pagination.total,
         'pages': pagination.pages,
-        'current_page': page})
+        'current_page': page,
+        'totals': totals})
+
+
+def _payment_totals(filtered_query):
+    """Count + amount per bucket for an already-filtered Payment query:
+    - collected: collected (whether or not finance has confirmed it since),
+      summed by the amount actually collected; `awaiting` is the part not
+      yet confirmed as paid;
+    - uncollected: not collected and not paid;
+    - unpaid: everything not yet paid (collected-awaiting + uncollected);
+    - paid: confirmed paid, excluding gratis (no money changed hands)."""
+    rate = func.coalesce(Payment.fx_rate_to_reporting, 1)
+    due = Payment.amount * rate
+    got = func.coalesce(Payment.collected_amount, Payment.amount) * rate
+    is_paid = Payment.paid.is_(True)
+    not_paid = db.or_(Payment.paid.is_(False), Payment.paid.is_(None))
+    is_collected = Payment.collected.is_(True)
+    not_collected = db.or_(Payment.collected.is_(False), Payment.collected.is_(None))
+    not_gratis = db.or_(Payment.is_gratis.is_(False), Payment.is_gratis.is_(None))
+
+    def bucket(cond, value):
+        return (func.coalesce(func.sum(db.case((cond, 1), else_=0)), 0),
+                func.coalesce(func.sum(db.case((cond, value), else_=0)), 0))
+
+    columns = []
+    for cond, value in (
+        (is_collected, got),
+        (db.and_(is_collected, not_paid), got),
+        (db.and_(not_collected, not_paid), due),
+        (not_paid, due),
+        (db.and_(is_paid, not_gratis), due),
+    ):
+        columns.extend(bucket(cond, value))
+
+    row = filtered_query.order_by(None).with_entities(*columns).one()
+    vals = [float(v or 0) for v in row]
+    pairs = [{'count': int(vals[i]), 'amount': round(vals[i + 1], 2)} for i in range(0, len(vals), 2)]
+    collected, awaiting, uncollected, unpaid, paid = pairs
+    collected['awaiting_count'] = awaiting['count']
+    collected['awaiting_amount'] = awaiting['amount']
+    settings = tenant_query(BusinessSettings).first()
+    return {
+        'collected': collected,
+        'uncollected': uncollected,
+        'unpaid': unpaid,
+        'paid': paid,
+        'currency': (settings.reporting_currency if settings else 'USD'),
+    }
 
 
 def _detach_payment_dependents(payment):
