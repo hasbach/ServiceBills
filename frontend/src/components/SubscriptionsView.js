@@ -513,7 +513,7 @@ const SubscriptionsView = ({
     const [waSettings, setWaSettings] = useState({ enabled: false, mode: 'deeplink', deeplink_msg_renewal: 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!' });
 
     useEffect(() => {
-        apiService.fetchWhatsAppSettings().then(res => {
+        apiService.fetchWhatsAppDeeplinkSettings().then(res => {
             if (res.data?.settings) setWaSettings(res.data.settings);
         }).catch(() => {});
     }, [apiService]);
@@ -782,6 +782,36 @@ const SubscriptionsView = ({
                 partial_amount: amountCollected
             });
             setSnackbar({ open: true, message: response.data.message, severity: 'success' });
+
+            // Deep-link mode: open the "payment received" message, same as
+            // collecting from the Payments page. (API mode sends the template
+            // server-side in mark_payment_as_paid.)
+            const payment = (payments || []).find(p => p.id === paymentId) || {};
+            const customer = paymentsModalCustomer
+                || (customers || []).find(c => c.id === (payment.customer_id ?? expandedCustomerId)) || {};
+            const phone = (customer.phone || '').replace(/\D/g, '');
+            if (waSettings.enabled && waSettings.mode === 'deeplink' && phone) {
+                const msg = (waSettings.deeplink_msg_payment || 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!')
+                    .replace('{customer_name}', customer.name || '')
+                    .replace('{amount}', amountCollected.toFixed(2));
+                const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+                try {
+                    window.open(waUrl, '_blank', 'noopener,noreferrer');
+                } catch (e) {
+                    console.warn('Popup blocked, use snackbar link:', e);
+                }
+                setSnackbar({
+                    open: true,
+                    message: `${response.data.message || 'Payment collected!'} — WhatsApp link ready`,
+                    severity: 'success',
+                    action: (
+                        <Button color="inherit" size="small" onClick={() => window.open(waUrl, '_blank', 'noopener,noreferrer')} sx={{ fontWeight: 700, textDecoration: 'underline' }}>
+                            Open WhatsApp
+                        </Button>
+                    )
+                });
+            }
+
             if (paymentsModalCustomer) {
                 fetchCustomerPayments(paymentsModalCustomer.id, paymentsModalCustomer);
             } else if (expandedCustomerId) {
@@ -794,7 +824,7 @@ const SubscriptionsView = ({
             console.error("Error collecting payment:", error);
             setSnackbar({ open: true, message: 'Failed to collect payment. ' + (error.response?.data?.message || error.message), severity: 'error' });
         }
-    }, [apiService, setSnackbar, expandedCustomerId, paymentsModalCustomer, fetchCustomerPayments]);
+    }, [apiService, setSnackbar, expandedCustomerId, paymentsModalCustomer, fetchCustomerPayments, payments, customers, waSettings]);
 
     const renderPaymentAction = (p) => {
         if (p.paid) return null;

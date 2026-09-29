@@ -573,7 +573,7 @@ const PaymentsView = () => {
 
     // Fetch WhatsApp settings once
     useEffect(() => {
-        apiService.fetchWhatsAppSettings().then(res => {
+        apiService.fetchWhatsAppDeeplinkSettings().then(res => {
             if (res.data?.settings) setWaSettings(res.data.settings);
         }).catch(() => {});
     }, [apiService]);

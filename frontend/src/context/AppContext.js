@@ -235,6 +235,8 @@ const rawApiService = {
         headers: { 'Content-Type': 'multipart/form-data' }
     }),
     fetchWhatsAppSettings: () => api.get('/whatsapp-settings'),
+    // Secrets-free subset (enabled/mode/deep-link texts) readable by cashier/collector.
+    fetchWhatsAppDeeplinkSettings: () => api.get('/whatsapp-settings/deeplink'),
     saveWhatsAppSettings: (data) => api.post('/whatsapp-settings', data),
     subscribeWaba: () => api.post('/whatsapp/subscribe-waba'),
     tenantWhishSettings: () => api.get('/tenant-whish-settings'),
