@@ -219,6 +219,17 @@ class OnpremLicense(db.Model):
     last_app_version = db.Column(db.String(40), nullable=True)
 
 
+class Release(db.Model):
+    """SaaS only: published ServiceBills on-prem releases (served by /api/updates/latest)."""
+    __tablename__ = "release"
+    id = db.Column(db.Integer, primary_key=True)
+    version = db.Column(db.String(20), unique=True, nullable=False)   # MAJOR.MINOR.PATCH
+    release_date = db.Column(db.String(10), nullable=False)           # ISO date
+    notes = db.Column(db.Text, nullable=True)
+    min_upgrade_from = db.Column(db.String(20), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 class InstalledLicense(db.Model):
     """On-prem only: the single (id=1) installed license row."""
     __tablename__ = "installed_license"
@@ -228,6 +239,7 @@ class InstalledLicense(db.Model):
     last_seen_at = db.Column(db.DateTime, nullable=True)
     last_refresh_at = db.Column(db.DateTime, nullable=True)
     last_refresh_error = db.Column(db.String(500), nullable=True)
+    revision = db.Column(db.Integer, nullable=False, default=0, server_default='0')
 
 
 class Tenant(db.Model):
@@ -2306,16 +2318,23 @@ def has_pending_reseller_charge(customer_id, billing_date, tenant_id):
     return existing_charge is not None
 
 
-def _create_tenant_with_admin(business_name, username, password, email=None, plan="free"):
-    """Create a tenant (unique slug), seed its defaults and an admin user. Flushes, never commits."""
+def _create_tenant_with_admin(business_name, username, password, email=None, plan="free", tenant=None):
+    """Create a tenant (unique slug), seed its defaults and an admin user. Flushes, never commits.
+
+    Pass an existing, still-unclaimed `tenant` to adopt it instead of creating a new
+    one (on-prem setup: migration b9f49987a15b always inserts a placeholder
+    'Default Business' tenant, even into an empty database)."""
     slug = re.sub(r'[^a-z0-9]+', '-', business_name.lower()).strip('-')[:80] or 'tenant'
     base = slug
     i = 1
-    while Tenant.query.filter_by(slug=slug).first():
+    while Tenant.query.filter(Tenant.slug == slug, Tenant.id != (tenant.id if tenant else None)).first():
         i += 1
         slug = f"{base}-{i}"
-    tenant = Tenant(name=business_name, slug=slug, plan=plan)
-    db.session.add(tenant)
+    if tenant is None:
+        tenant = Tenant(name=business_name, slug=slug, plan=plan)
+        db.session.add(tenant)
+    else:
+        tenant.name, tenant.slug, tenant.plan = business_name, slug, plan
     db.session.flush()  # assign tenant.id before creating the user
     seed_default_expense_categories(tenant.id)
 
@@ -9083,6 +9102,9 @@ onprem.register(app, sys.modules[__name__])
 
 import license_server_routes
 license_server_routes.register(app, sys.modules[__name__])
+
+import release_routes
+release_routes.register(app, sys.modules[__name__])
 
 @app.route('/api/reports/revenue', methods=['GET'])
 @jwt_required()

@@ -2,12 +2,13 @@
 license state, read-only enforcement and /api/license endpoints.
 
 Operational requirements for on-prem deployments:
-  * Run with WEB_CONCURRENCY=1. The license state cache (and its invalidation after
-    setup / activation / refresh) is per-process, so several workers could disagree
-    for up to CACHE_SECONDS.
+  * The license state cache is per-process, but each entry is tagged with the
+    InstalledLicense.revision it was computed from, so workers notice changes made
+    by other workers on the next call.
   * Every container (app, scheduler, ...) must run with the identical TZ setting:
     expiry is evaluated against the local calendar date (date.today()).
 """
+import json
 import logging
 import os
 import time
@@ -24,7 +25,9 @@ log = logging.getLogger(__name__)
 
 # Route families that exist only in the SaaS deployment.
 ONPREM_BLOCKED = ("/api/register", "/api/admin/", "/api/billing/", "/api/stripe/",
-                  "/api/licenses/", "/api/internal/")
+                  "/api/licenses/", "/api/internal/", "/api/updates/")
+# Exact-match SaaS-only paths (a prefix match would be too broad for SPA routes).
+ONPREM_BLOCKED_EXACT = ("/download",)
 
 # Writes to these prefixes stay allowed while the license is read-only.
 READONLY_ALLOW = ("/api/login", "/api/logout", "/api/setup", "/api/license", "/api/system/info",
@@ -32,7 +35,7 @@ READONLY_ALLOW = ("/api/login", "/api/logout", "/api/setup", "/api/license", "/a
 CACHE_SECONDS = 60
 
 _pubkey_cache = None
-_state_cache = None  # (timestamp, LicenseState)
+_state_cache = None  # (timestamp, revision, LicenseState)
 
 
 def _cfg(key):
@@ -56,7 +59,7 @@ def _saas_blocked(path):
 def _deployment_mode_guard():
     p = request.path
     if is_onprem():
-        if any(p == x.rstrip("/") or p.startswith(x) for x in ONPREM_BLOCKED):
+        if p in ONPREM_BLOCKED_EXACT or any(p == x.rstrip("/") or p.startswith(x) for x in ONPREM_BLOCKED):
             return jsonify({"error": "not found"}), 404
     elif _saas_blocked(p):
         return jsonify({"error": "not found"}), 404
@@ -89,7 +92,7 @@ def _row(create=False):
     from app import db, InstalledLicense
     row = db.session.get(InstalledLicense, 1)
     if row is None and create:
-        row = InstalledLicense(id=1, revoked=False)
+        row = InstalledLicense(id=1, revoked=False, revision=0)
         db.session.add(row)
     return row
 
@@ -132,14 +135,25 @@ def _compute_state():
                         release_date=_cfg("APP_RELEASE_DATE"), revoked=bool(row.revoked))
 
 
+def _db_revision():
+    """Current revision of the license row (-1 when there is none). One cheap query;
+    lets every worker notice a license change made by another worker."""
+    from app import db, InstalledLicense
+    with db.session.no_autoflush:
+        rev = db.session.query(InstalledLicense.revision).filter_by(id=1).scalar()
+    return -1 if rev is None else rev
+
+
 def current_state():
     global _state_cache
     if not _machine_id():  # never licensed without a machine identity
         return lic.LicenseState("readonly", "machine_mismatch")
-    if _state_cache and time.time() - _state_cache[0] < CACHE_SECONDS:
-        return _state_cache[1]
+    rev = _db_revision()
+    c = _state_cache
+    if c and time.time() - c[0] < CACHE_SECONDS and c[1] == rev:
+        return c[2]
     st = _compute_state()
-    _state_cache = (time.time(), st)
+    _state_cache = (time.time(), rev, st)
     return st
 
 
@@ -158,6 +172,7 @@ def store_license(text, from_server=False, commit=True):
             raise lic.LicenseError("revoked")
     row.license_text = text
     row.revoked = False
+    row.revision = (row.revision or 0) + 1
     if from_server:
         # A license fresh from the server proves the server's clock: forgive an
         # earlier local clock jump by letting last_seen_at move backward, here only.
@@ -194,6 +209,7 @@ def refresh_license():
                     (403, "revoked"), (409, "license_in_use"), (404, "unknown_license")):
                 # revoked, moved to another computer (unbind), or deleted server-side
                 row.revoked = True
+                row.revision = (row.revision or 0) + 1
                 row.last_refresh_error = None
                 row.last_refresh_at = datetime.utcnow()
             else:
@@ -227,8 +243,7 @@ def _readonly_guard():
     p = request.path
     if not p.startswith("/api/") or any(p == a or p.startswith(a + "/") for a in READONLY_ALLOW):
         return None
-    from app import Tenant
-    if Tenant.query.first() is None:  # setup phase
+    if not _claimed_tenant_exists():  # setup phase
         return None
     st = current_state()
     if st.state == "readonly":
@@ -252,18 +267,35 @@ def license_body():
             "machine_id": _machine_id()}
 
 
+def _claimed_tenant_exists():
+    """True once some tenant has a user. A fresh database is NOT empty: migration
+    b9f49987a15b always inserts a placeholder 'Default Business' tenant, so the
+    presence of a tenant row alone does not mean setup was done."""
+    from app import db, User
+    return db.session.query(User.id).filter(User.tenant_id.isnot(None)).first() is not None
+
+
+def _unclaimed_tenant():
+    """The placeholder tenant setup should adopt (a tenant with no users), or None."""
+    from app import db, Tenant, User
+    claimed = db.session.query(User.tenant_id).filter(User.tenant_id.isnot(None))
+    return Tenant.query.filter(~Tenant.id.in_(claimed)).order_by(Tenant.id).first()
+
+
 def _setup_required():
     if not is_onprem():
         return False
-    from app import Tenant
-    return Tenant.query.first() is None
+    return not _claimed_tenant_exists()
 
 
 def _setup_required_guard():
     if not is_onprem():
         return None
     p = request.path
-    if not p.startswith("/api/") or p.startswith("/api/setup") or p.startswith("/api/system/info"):
+    # /api/health must answer before setup too: Docker's healthcheck and the
+    # installer's wait loop poll it on a brand-new, not-yet-set-up install.
+    if (not p.startswith("/api/") or p.startswith("/api/setup") or p.startswith("/api/system/info")
+            or p == "/api/health"):
         return None
     if _setup_required():
         return jsonify({"setup_required": True}), 409
@@ -306,6 +338,23 @@ def _fetch_license_text(data, business_name, owner_phone):
     return None, (jsonify(msg="License server error"), 502)
 
 
+def update_status():
+    """Installer/updater status from the host-mounted state.json, or None."""
+    path = _cfg("ONPREM_STATE_FILE") or os.environ.get("ONPREM_STATE_FILE")
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+    except (OSError, ValueError) as e:
+        log.debug("cannot read update state file %s: %s", path, e)
+        return None
+    return {"current": data.get("current"), "previous": data.get("previous"),
+            "last_update": data.get("last_update")}
+
+
 def system_info():
     onprem = is_onprem()
     license_info = None
@@ -318,12 +367,15 @@ def system_info():
             license_info = {"state": st.state, "reason": st.reason,
                             "base_expires_at": st.base_expires_at,
                             "trial": bool((st.payload or {}).get("trial"))}
-    return {
+    info = {
         "deployment_mode": "onprem" if onprem else "saas",
         "app_version": _cfg("APP_VERSION"),
         "setup_required": _setup_required(),
         "license": license_info,
     }
+    if onprem:
+        info["update"] = update_status()
+    return info
 
 
 def register(app, appmod):
@@ -368,15 +420,21 @@ def register(app, appmod):
             return err
         try:
             tenant, _user = appmod._create_tenant_with_admin(
-                vals["business_name"].strip(), vals["username"], vals["password"], plan="pro")
+                vals["business_name"].strip(), vals["username"], vals["password"], plan="pro",
+                tenant=_unclaimed_tenant())
             # Seed the business profile so the header/receipts show the real name
             # instead of the "Default Business" placeholder.
-            db.session.add(appmod.BusinessSettings(
-                tenant_id=tenant.id, business_name=vals["business_name"].strip()[:200],
-                address="", mobile=vals["owner_phone"].strip()[:20]))
+            bs = appmod.BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+            if bs is None:
+                bs = appmod.BusinessSettings(tenant_id=tenant.id, address="")
+                db.session.add(bs)
+            bs.business_name = vals["business_name"].strip()[:200]
+            bs.mobile = vals["owner_phone"].strip()[:20]
             store_license(text, from_server=data.get("mode") != "file", commit=False)
             # a concurrent setup may have created a tenant since our first check
-            if appmod.Tenant.query.filter(appmod.Tenant.id != tenant.id).first() is not None:
+            others = db.session.query(appmod.User.id).filter(
+                appmod.User.tenant_id.isnot(None), appmod.User.tenant_id != tenant.id).first()
+            if others is not None:
                 db.session.rollback()
                 return jsonify(msg="Setup already completed"), 409
             db.session.commit()

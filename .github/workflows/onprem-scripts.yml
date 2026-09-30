@@ -1,0 +1,57 @@
+name: On-prem Scripts CI
+
+on:
+  pull_request:
+    paths:
+      - 'onprem/**'
+      - '.github/workflows/onprem-scripts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PowerShell modules
+        shell: powershell
+        run: |
+          # Windows PowerShell 5.1 (the shell customers run) needs the NuGet provider first.
+          Install-PackageProvider NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
+          Install-Module Pester -RequiredVersion 5.6.1 -Force -Scope CurrentUser -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Pester
+        shell: powershell
+        run: |
+          Import-Module Pester -RequiredVersion 5.6.1
+          # Tests dot-source ..\scripts\*.ps1 relative to their own folder (onprem/tests -> onprem/scripts).
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'onprem/tests'
+          $cfg.Run.Exit = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          $findings = Invoke-ScriptAnalyzer -Path onprem/scripts -Recurse -Severity Warning,Error
+          if ($findings) {
+            $findings | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize -Wrap | Out-String -Width 200 | Write-Host
+            throw "$(@($findings).Count) PSScriptAnalyzer finding(s)"
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer (dummy values)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc /DAppVersion=0.0.0 /DGhcrUser=x /DGhcrToken=x onprem\installer\ServiceBills.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }

@@ -1,0 +1,63 @@
+name: servicebills
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: servicebills
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: servicebills
+      TZ: ${TZ:-UTC}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U servicebills"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  web:
+    image: ghcr.io/hasbach/servicebills:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://servicebills:${POSTGRES_PASSWORD}@db:5432/servicebills
+      DEPLOYMENT_MODE: onprem
+      DISABLE_AUTO_CREATE_ALL: "1"
+      WEB_CONCURRENCY: "3"
+      STORAGE_BACKEND: local
+      UPLOAD_FOLDER: /app/uploads
+      ONPREM_STATE_FILE: /onprem/state.json
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads:/app/uploads
+      - ./state:/onprem:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)\""]
+      interval: 10s
+      timeout: 6s
+      retries: 30
+      start_period: 60s
+  scheduler:
+    image: ghcr.io/hasbach/servicebills:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://servicebills:${POSTGRES_PASSWORD}@db:5432/servicebills
+      DEPLOYMENT_MODE: onprem
+      DISABLE_AUTO_CREATE_ALL: "1"
+      STORAGE_BACKEND: local
+      UPLOAD_FOLDER: /app/uploads
+    command: ["flask", "run-scheduler"]
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      web:
+        condition: service_healthy
+volumes:
+  pgdata:
+  uploads:

@@ -1,0 +1,71 @@
+name: On-prem Compose Smoke Test
+
+on:
+  pull_request:
+    paths:
+      - 'onprem/**'
+      - 'Dockerfile'
+      - 'onprem.py'
+      - 'license*.py'
+      - '.github/workflows/onprem-smoke.yml'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t ghcr.io/hasbach/servicebills:smoke .
+
+      - name: Write .env and state.json
+        run: |
+          FERNET=$(python3 -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())")
+          {
+            echo "JWT_SECRET_KEY=$(openssl rand -hex 32)"
+            echo "FERNET_KEY=$FERNET"
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)"
+            echo "MACHINE_ID=ci-machine"
+            echo "TZ=UTC"
+            echo "IMAGE_TAG=smoke"
+            echo "APP_BASE_URL=http://localhost:8000"
+          } > onprem/.env
+          mkdir -p onprem/state
+          echo '{}' > onprem/state/state.json
+
+      - name: Start stack
+        run: docker compose -f onprem/docker-compose.yml --env-file onprem/.env up -d
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/api/health; then exit 0; fi
+            sleep 5
+          done
+          echo "Health check timed out"
+          exit 1
+
+      - name: Assert endpoints
+        run: |
+          curl -fsS http://localhost:8000/api/setup/status > setup.json
+          cat setup.json
+          python3 -c "import json; d=json.load(open('setup.json')); assert d.get('setup_required') is True, d"
+          curl -fsS http://localhost:8000/api/system/info > info.json
+          cat info.json
+          python3 -c "import json; d=json.load(open('info.json')); assert d.get('deployment_mode') == 'onprem', d"
+
+      - name: Assert scheduler running
+        run: |
+          sleep 10
+          docker compose -f onprem/docker-compose.yml --env-file onprem/.env ps --status running --services | grep -qx scheduler
+
+      - name: Print logs on failure
+        if: failure()
+        run: docker compose -f onprem/docker-compose.yml --env-file onprem/.env logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f onprem/docker-compose.yml --env-file onprem/.env down -v

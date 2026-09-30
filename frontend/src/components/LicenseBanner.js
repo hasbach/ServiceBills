@@ -1,14 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { Alert, Button } from '@mui/material';
 import { useAppContext } from '../context/AppContext.js';
-import { reasonText, expiryWarnings } from '../utils/licenseStatus';
+import { reasonText, expiryWarnings, updateNotice } from '../utils/licenseStatus';
 
 // On-prem only: persistent red banner when read-only, dismissible amber
 // banners for licenses/modules that expire soon.
+const DISMISS_KEY = 'sb:update-notice-dismissed';
+const readDismissed = () => { try { return localStorage.getItem(DISMISS_KEY); } catch (e) { return null; } };
+
 const LicenseBanner = ({ onEnterLicense }) => {
     const { systemInfo, readOnly, apiService, user } = useAppContext();
     const [dismissed, setDismissed] = useState({});
     const [detail, setDetail] = useState(null);
+    const [dismissedUpdate, setDismissedUpdate] = useState(readDismissed);
     const license = systemInfo?.license;
     const isAdmin = (user?.role || '').split(',').map(r => r.trim()).includes('admin');
 
@@ -23,18 +27,31 @@ const LicenseBanner = ({ onEnterLicense }) => {
         return () => { cancelled = true; };
     }, [isAdmin, apiService, systemInfo]);
 
+    const notice = isAdmin ? updateNotice(systemInfo?.update, dismissedUpdate) : null;
+    const dismissUpdate = () => {
+        try { localStorage.setItem(DISMISS_KEY, notice.key); } catch (e) { /* storage unavailable */ }
+        setDismissedUpdate(notice.key);
+    };
+    const updateAlert = notice && (
+        <Alert severity={notice.severity} square onClose={dismissUpdate}>{notice.text}</Alert>
+    );
+
     if (readOnly) {
         return (
-            <Alert severity="error" variant="filled" square
-                action={<Button color="inherit" size="small" onClick={onEnterLicense}>Enter license</Button>}>
-                ServiceBills is in view-only mode. {reasonText(license?.reason)}
-            </Alert>
+            <>
+                <Alert severity="error" variant="filled" square
+                    action={<Button color="inherit" size="small" onClick={onEnterLicense}>Enter license</Button>}>
+                    ServiceBills is in view-only mode. {reasonText(license?.reason)}
+                </Alert>
+                {updateAlert}
+            </>
         );
     }
 
     const warnings = expiryWarnings(detail).filter(w => !dismissed[w.label]);
     return (
         <>
+            {updateAlert}
             {warnings.map(w => (
                 <Alert key={w.label} severity="warning" square onClose={() => setDismissed(d => ({ ...d, [w.label]: true }))}>
                     {w.label} expires {w.daysLeft === 0 ? 'today' : `in ${w.daysLeft} day${w.daysLeft === 1 ? '' : 's'}`} — renew to keep using it.
