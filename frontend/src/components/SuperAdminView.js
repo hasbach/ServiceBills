@@ -3,8 +3,9 @@ import {
     Box, Typography, Table, TableHead, TableRow, TableCell, TableBody,
     Button, Chip, AppBar, Toolbar, CircularProgress, Paper, Alert, Stack,
     Dialog, DialogTitle, DialogContent, DialogActions, TextField, ToggleButton, ToggleButtonGroup,
-    Switch, Link,
+    Switch, Link, Tabs, Tab,
 } from '@mui/material';
+import LicensesAdmin from './LicensesAdmin.js';
 import { useAppContext } from '../context/AppContext.js';
 
 // Presets shown in the grant/extend dialog. 'custom' hands plan_expires_at
@@ -47,6 +48,7 @@ const SuperAdminView = () => {
     const [granting, setGranting] = useState(false);
     const [modulesTarget, setModulesTarget] = useState(null); // tenant whose modules dialog is open
     const [modulesBusy, setModulesBusy] = useState(false);
+    const [tab, setTab] = useState(0);
 
     const load = useCallback(() => {
         apiService.adminTenants().then((r) => setTenants(r.data)).catch(() => setTenants([]));
@@ -138,7 +140,12 @@ const SuperAdminView = () => {
                     <Button onClick={logout}>Logout</Button>
                 </Toolbar>
             </AppBar>
-            <Box sx={{ p: { xs: 2, md: 3 } }}>
+            <Tabs value={tab} onChange={(e, v) => setTab(v)} sx={{ px: { xs: 2, md: 3 } }}>
+                <Tab label="Tenants" />
+                <Tab label="On-prem licenses" />
+            </Tabs>
+            {tab === 1 && <Box sx={{ p: { xs: 2, md: 3 } }}><LicensesAdmin /></Box>}
+            <Box sx={{ p: { xs: 2, md: 3 }, display: tab === 0 ? 'block' : 'none' }}>
                 {/* Pending "contact us to upgrade" requests */}
                 {requests.length > 0 && (
                     <Alert severity="info" sx={{ mb: 3 }}>

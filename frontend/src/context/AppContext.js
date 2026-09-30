@@ -126,6 +126,11 @@ const rawApiService = {
     adminReactivateTenant: (id) => api.post(`/admin/tenants/${id}/reactivate`),
     adminDeleteTenant: (id) => api.delete(`/admin/tenants/${id}`),
     adminSetPlan: (id, plan, extra = {}) => api.post(`/admin/tenants/${id}/set-plan`, { plan, ...extra }),
+    adminLicenses: () => api.get('/admin/licenses'),
+    adminCreateLicense: (body) => api.post('/admin/licenses', body),
+    adminUpdateLicense: (id, body) => api.patch(`/admin/licenses/${id}`, body),
+    adminRenewLicense: (id, scope, term) => api.post(`/admin/licenses/${id}/renew`, term ? { scope, term } : { scope }),
+    adminLicenseFile: (id) => api.get(`/admin/licenses/${id}/file`, { responseType: 'text' }),
     adminSetModules: (id, overrides) => api.post(`/admin/tenants/${id}/modules`, { overrides }),
     adminUpgradeRequests: () => api.get('/admin/upgrade-requests'),
 
