@@ -5,7 +5,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useAppContext } from '../context/AppContext.js';
 
 const LoginView = () => {
-    const { login, setSnackbar } = useAppContext();
+    const { login, setSnackbar, isOnprem } = useAppContext();
     const navigate = useNavigate();
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
@@ -82,9 +82,11 @@ const LoginView = () => {
                 <Button type="submit" variant="contained" fullWidth sx={{ mt: 2, py: 1.5 }} disabled={loading}>
                     {loading ? <CircularProgress size={24} /> : 'Login'}
                 </Button>
-                <Button component={Link} to="/register" fullWidth sx={{ mt: 2 }}>
-                    Don't have an account? Register
-                </Button>
+                {!isOnprem && (
+                    <Button component={Link} to="/register" fullWidth sx={{ mt: 2 }}>
+                        Don't have an account? Register
+                    </Button>
+                )}
                 <Button component={Link} to="/forgot-password" fullWidth size="small" sx={{ mt: 1 }}>
                     Forgot password?
                 </Button>

@@ -32,6 +32,8 @@ import ExpenseCategoryManager from './ExpenseCategoryManager.js';
 import UserManagement from './UserManagement.js';
 import SectorManager from './SectorManager.js';
 import WhatsAppTemplatesManager from './WhatsAppTemplatesManager.js';
+import LicenseTab from './LicenseTab.js';
+import WhatsAppPublicUrlHelp from './WhatsAppPublicUrlHelp.js';
 import { formatStamp } from './formatStamp';
 import { describeStaleConnectors } from './connectorFiles';
 
@@ -187,10 +189,10 @@ password = "device password"`}
     </Box>
 );
 
-const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) => {
-    const { apiService, hasModule, modules } = useAppContext();
+const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar, initialTab }) => {
+    const { apiService, hasModule, modules, isOnprem } = useAppContext();
     const theme = useTheme();
-    const [tab, setTab] = useState('business');
+    const [tab, setTab] = useState(initialTab || 'business');
     const SETTINGS_TABS = [
         { key: 'business', label: 'Business Details', icon: <BusinessIcon sx={{ fontSize: 18 }} /> },
         { key: 'wa-notifications', label: 'WhatsApp Notifications', icon: <WhatsAppIcon sx={{ fontSize: 18 }} />, module: 'whatsapp' },
@@ -199,14 +201,16 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
         { key: 'expense-categories', label: 'Expense Categories', icon: <MessageIcon sx={{ fontSize: 18 }} /> },
         { key: 'users', label: 'User Management', icon: <PeopleIcon sx={{ fontSize: 18 }} /> },
         { key: 'sectors', label: 'Sectors', icon: <LocationOnIcon sx={{ fontSize: 18 }} /> },
-    ].filter(t => !t.module || hasModule(t.module));
+        { key: 'license', label: 'License', icon: <LockIcon sx={{ fontSize: 18 }} />, onpremOnly: true },
+    ].filter(t => !t.onpremOnly || isOnprem).filter(t => !t.module || hasModule(t.module));
     const activeTab = SETTINGS_TABS.some(t => t.key === tab) ? tab : 'business';
 
     // ── Business form state ───────────────────────────────────────────────────
     const [bizForm, setBizForm] = useState({
         business_name: '', address: '', mobile: '', email: '', website: '', network_mode: 'none',
         network_access_mode: 'direct',
-        upstream_sync_automation_enabled: false
+        upstream_sync_automation_enabled: false,
+        public_url: ''
     });
     const [logoFile, setLogoFile] = useState(null);
     const [logoPreview, setLogoPreview] = useState(null);
@@ -222,7 +226,8 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
                 website: businessSettings.website || '',
                 network_mode: businessSettings.network_mode || 'none',
                 network_access_mode: businessSettings.network_access_mode || 'direct',
-                upstream_sync_automation_enabled: !!businessSettings.upstream_sync_automation_enabled
+                upstream_sync_automation_enabled: !!businessSettings.upstream_sync_automation_enabled,
+                public_url: businessSettings.public_url || ''
             });
             if (businessSettings.logo_url) {
                 const url = businessSettings.logo_url;
@@ -236,14 +241,15 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
         e.preventDefault();
         setBizLoading(true);
         const fd = new FormData();
-        Object.keys(bizForm).forEach(k => fd.append(k, bizForm[k]));
+        Object.keys(bizForm).forEach(k => { if (k !== 'public_url' || isOnprem) fd.append(k, bizForm[k]); });
         if (logoFile) fd.append('logo', logoFile);
         try {
             const response = await apiService.saveBusinessSettings(fd);
             setBusinessSettings(response.data.settings);
             setSnackbar({ open: true, message: 'Business settings saved!', severity: 'success' });
-        } catch {
-            setSnackbar({ open: true, message: 'Failed to save settings.', severity: 'error' });
+            if (isOnprem) fetchWASettings();
+        } catch (err) {
+            setSnackbar({ open: true, message: err?.response?.data?.msg || 'Failed to save settings.', severity: 'error' });
         } finally {
             setBizLoading(false);
         }
@@ -572,12 +578,15 @@ Read-Host -Prompt "Press Enter to exit"
             .catch(() => {}); // Settings page still works with free-text fallback if this fails
     }, [apiService, modules]); // eslint-disable-line react-hooks/exhaustive-deps
 
+    const [waWebhookUrl, setWaWebhookUrl] = useState('');
+    const [publicUrlHelpOpen, setPublicUrlHelpOpen] = useState(false);
     const fetchWASettings = useCallback(async () => {
         if (!hasModule('whatsapp')) { setWaFetching(false); return; }
         setWaFetching(true);
         try {
             const res = await apiService.fetchWhatsAppSettings();
             if (res.data?.settings) setWaForm(prev => ({ ...DEFAULT_WA, ...res.data.settings }));
+            setWaWebhookUrl(res.data?.webhook_url || '');
         } catch (e) {
             console.error('Failed to load WhatsApp settings', e);
         } finally {
@@ -1200,8 +1209,26 @@ Read-Host -Prompt "Press Enter to exit"
                                         </Grid>
                                         <Grid item xs={12}>
                                             <Alert severity="success" sx={{ borderRadius: '12px', bgcolor: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0', mb: 2 }}>
-                                                <strong>Your Webhook URL for Meta Console:</strong> <code>{window.location.origin}/api/whatsapp/webhook</code>
+                                                <strong>Your Webhook URL for Meta Console:</strong> <code>{waWebhookUrl || `${window.location.origin}/api/whatsapp/webhook`}</code>
                                             </Alert>
+                                            {isOnprem && (
+                                                <Box sx={{ mb: 2 }}>
+                                                    <TextField fullWidth size="small" label="Public URL" placeholder="https://billing.example.com"
+                                                        value={bizForm.public_url}
+                                                        onChange={e => setBizForm(f => ({ ...f, public_url: e.target.value }))}
+                                                        helperText="The internet address of this PC. Used for the WhatsApp webhook and customer payment links." />
+                                                    <Box sx={{ display: 'flex', gap: 1, mt: 1, alignItems: 'center', flexWrap: 'wrap' }}>
+                                                        <Button size="small" variant="outlined" disabled={bizLoading} onClick={handleBizSubmit}
+                                                            sx={{ textTransform: 'none' }}>
+                                                            Save Public URL
+                                                        </Button>
+                                                        <Button size="small" sx={{ textTransform: 'none' }} onClick={() => setPublicUrlHelpOpen(true)}>
+                                                            How do I make this PC reachable from the internet?
+                                                        </Button>
+                                                    </Box>
+                                                    <WhatsAppPublicUrlHelp open={publicUrlHelpOpen} onClose={() => setPublicUrlHelpOpen(false)} />
+                                                </Box>
+                                            )}
                                             <Button variant="outlined" color="primary" onClick={handleLinkWaba} disabled={linkingWaba}
                                                 sx={{ borderRadius: '12px', fontWeight: 600, textTransform: 'none' }}>
                                                 {linkingWaba ? 'Linking to Meta Account...' : '🔗 Force Link Webhook to Meta Account'}
@@ -1440,6 +1467,9 @@ Read-Host -Prompt "Press Enter to exit"
             {activeTab === 'sectors' && (
                 <SectorManager />
             )}
+
+            {/* Tab 7: License (on-prem only) */}
+            {activeTab === 'license' && <LicenseTab setSnackbar={setSnackbar} />}
 
         </Box>
     );

@@ -51,6 +51,18 @@ api.interceptors.response.use(
             }));
         }
 
+        // On-prem: license expired -> server is view-only for writes.
+        if (status === 403 && error.response?.data?.license_readonly) {
+            window.dispatchEvent(new CustomEvent('sb:license-readonly', {
+                detail: { reason: error.response.data.reason }
+            }));
+        }
+
+        // On-prem: first-run setup not finished -> back to the setup wizard.
+        if (status === 409 && error.response?.data?.setup_required) {
+            window.location.assign('/');
+        }
+
         return Promise.reject(error);
     }
 );
@@ -347,6 +359,15 @@ const rawApiService = {
     setPushTopics: (endpoint, topics) => api.put('/push-subscription/topics', { endpoint, topics }),
     unsubscribePush: (endpoint) => api.post('/push-unsubscribe', { endpoint }),
     sendTestPush: (endpoint) => api.post('/push-test', { endpoint }),
+
+    // On-prem edition: system info, first-run setup, license
+    systemInfo: () => api.get('/system/info'),
+    setupStatus: () => api.get('/setup/status'),
+    runSetup: (body) => api.post('/setup', body),
+    getLicense: () => api.get('/license'),
+    activateLicense: (license_key) => api.post('/license', { license_key }),
+    uploadLicenseFile: (license_file) => api.post('/license', { license_file }),
+    refreshLicense: () => api.post('/license/refresh'),
 };
 
 export const apiService = Object.fromEntries(
@@ -421,6 +442,34 @@ export const AppContextProvider = ({ children }) => {
         return () => window.removeEventListener('sb:module-disabled', onModuleDisabled);
     }, []);
 
+    // Deployment info (no auth). null while loading (or if the request failed,
+    // in which case the app behaves as SaaS).
+    const [systemInfo, setSystemInfo] = useState(null);
+    const [systemInfoLoaded, setSystemInfoLoaded] = useState(false);
+    const refreshSystemInfo = React.useCallback(() =>
+        apiService.systemInfo()
+            .then(r => setSystemInfo(r.data || null))
+            .catch(() => setSystemInfo(null))
+            .finally(() => setSystemInfoLoaded(true)),
+    []);
+    useEffect(() => { refreshSystemInfo(); }, [refreshSystemInfo]);
+    useEffect(() => { if (token) refreshSystemInfo(); }, [token, refreshSystemInfo]);
+    const isOnprem = systemInfo?.deployment_mode === 'onprem';
+    const readOnly = isOnprem && systemInfo?.license?.state === 'readonly';
+
+    useEffect(() => {
+        const onReadonly = () => {
+            setSnackbar({
+                open: true,
+                message: 'ServiceBills is in view-only mode — enter a license in Settings → License.',
+                severity: 'warning',
+            });
+            refreshSystemInfo();
+        };
+        window.addEventListener('sb:license-readonly', onReadonly);
+        return () => window.removeEventListener('sb:license-readonly', onReadonly);
+    }, [refreshSystemInfo]);
+
     const hasModule = (key) => key === 'core' || key === 'office' || (Array.isArray(modules) && modules.includes(key));
 
     const login = async (credentials) => {
@@ -445,6 +494,11 @@ export const AppContextProvider = ({ children }) => {
         modules,
         hasModule,
         refreshModules,
+        systemInfo,
+        systemInfoLoaded,
+        isOnprem,
+        readOnly,
+        refreshSystemInfo,
         login,
         logout
     };
