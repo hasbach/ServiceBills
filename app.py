@@ -213,6 +213,17 @@ class OnpremLicense(db.Model):
     last_app_version = db.Column(db.String(40), nullable=True)
 
 
+class InstalledLicense(db.Model):
+    """On-prem only: the single (id=1) installed license row."""
+    __tablename__ = "installed_license"
+    id = db.Column(db.Integer, primary_key=True)
+    license_text = db.Column(db.Text, nullable=True)
+    revoked = db.Column(db.Boolean, nullable=False, default=False)
+    last_seen_at = db.Column(db.DateTime, nullable=True)
+    last_refresh_at = db.Column(db.DateTime, nullable=True)
+    last_refresh_error = db.Column(db.String(500), nullable=True)
+
+
 class Tenant(db.Model):
     __tablename__ = "tenant"
     id = db.Column(db.Integer, primary_key=True)
