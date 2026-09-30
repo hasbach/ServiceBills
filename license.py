@@ -98,7 +98,7 @@ def evaluate(payload, today, machine_id, release_date=None, revoked=False):
         return _readonly("no_license")
     if revoked:
         return _readonly("revoked", payload)
-    if payload.get("machine_id") != machine_id:
+    if not machine_id or not payload.get("machine_id") or payload.get("machine_id") != machine_id:
         return _readonly("machine_mismatch", payload)
     base_exp = ((payload.get("base") or {}).get("expires_at")) or ""
     t = today.isoformat()

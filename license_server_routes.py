@@ -1,5 +1,6 @@
 """SaaS-side license server: public trial / activate / refresh endpoints."""
 import os
+import re
 import secrets
 import uuid
 from datetime import date, datetime
@@ -27,6 +28,33 @@ def signed_license(row):
     return lic.sign(build_payload(row), _signing_key())
 
 
+def normalize_phone(v):
+    """Digits only, international 00 prefix dropped (so +961.. and 00961.. agree)."""
+    d = re.sub(r"\D", "", v or "")
+    if d.startswith("00"):
+        d = d[2:]
+    return d[:40]
+
+
+def _same_phone(a, b):
+    a, b = normalize_phone(a), normalize_phone(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return len(a) >= 8 and len(b) >= 8 and a[-8:] == b[-8:]
+
+
+def _body():
+    d = request.get_json(silent=True)
+    return d if isinstance(d, dict) else {}
+
+
+def _bad_types(d, keys):
+    """True if any of `keys` is present, non-null and not a string."""
+    return any(d.get(k) is not None and not isinstance(d.get(k), str) for k in keys)
+
+
 def register(app, appmod):
     db = appmod.db
     Model = appmod.OnpremLicense
@@ -46,18 +74,32 @@ def register(app, appmod):
     def license_trial():
         if not _signing_key():
             return _not_configured()
-        d = request.get_json(silent=True) or {}
+        d = _body()
+        if _bad_types(d, ("business_name", "machine_id", "owner_phone")):
+            return jsonify({"error": "invalid field type"}), 400
         name = (d.get("business_name") or "").strip()
         machine = (d.get("machine_id") or "").strip()
         if not name or not machine:
             return jsonify({"error": "business_name and machine_id are required"}), 400
         if len(machine) > 128:
             return jsonify({"error": "machine_id too long"}), 400
-        if Model.query.filter_by(machine_id=machine).first():
-            return jsonify({"error": "trial_already_used"}), 409
+        phone = normalize_phone(d.get("owner_phone"))
+        if not phone:
+            return jsonify({"error": "owner_phone is required"}), 400
         now = datetime.utcnow()
+        existing = Model.query.filter_by(machine_id=machine).first()
+        if existing:
+            # Same machine + same phone + a live, never-superseded trial: hand the
+            # same license back so a failed local setup can simply be retried.
+            if (existing.trial and not existing.revoked and _same_phone(existing.owner_phone, phone)
+                    and existing.base_expires_at >= now.date().isoformat()):
+                return jsonify({"license": signed_license(existing)}), 200
+            return jsonify({"error": "trial_already_used"}), 409
+        for other in Model.query.filter(Model.owner_phone.isnot(None)).all():
+            if _same_phone(other.owner_phone, phone):
+                return jsonify({"error": "trial_already_used"}), 409
         row = Model(id=str(uuid.uuid4()), license_key=_new_key(), business_name=name[:200],
-                    owner_phone=(str(d.get("owner_phone") or "").strip()[:40] or None), machine_id=machine, trial=True,
+                    owner_phone=phone, machine_id=machine, trial=True,
                     base_term="trial", base_expires_at=lic.add_term(now.date(), "trial").isoformat(),
                     modules={}, activated_at=now)
         db.session.add(row)
@@ -69,7 +111,9 @@ def register(app, appmod):
     def license_activate():
         if not _signing_key():
             return _not_configured()
-        d = request.get_json(silent=True) or {}
+        d = _body()
+        if _bad_types(d, ("machine_id", "license_key")):
+            return jsonify({"error": "invalid field type"}), 400
         machine = (d.get("machine_id") or "").strip()
         row = Model.query.filter_by(license_key=(d.get("license_key") or "").strip()).first()
         if not row:
@@ -93,16 +137,21 @@ def register(app, appmod):
     def license_refresh():
         if not _signing_key():
             return _not_configured()
-        d = request.get_json(silent=True) or {}
+        d = _body()
+        if _bad_types(d, ("license_id", "app_version")):
+            return jsonify({"error": "invalid field type"}), 400
+        machine = d.get("machine_id")
+        if not isinstance(machine, str) or not machine.strip() or len(machine) > 128:
+            return jsonify({"error": "machine_id is required"}), 400
         row = db.session.get(Model, d.get("license_id") or "")
         if not row:
             return jsonify({"error": "unknown_license"}), 404
         if row.revoked:
             return jsonify({"error": "revoked"}), 403
-        if row.machine_id != d.get("machine_id"):
+        if row.machine_id is None or row.machine_id != machine:
             return jsonify({"error": "license_in_use"}), 409
         row.last_refresh_at = datetime.utcnow()
-        row.last_app_version = (d.get("app_version") or None)
+        row.last_app_version = ((d.get("app_version") or "")[:40] or None)
         db.session.commit()
         return jsonify({"license": signed_license(row)}), 200
 
@@ -138,7 +187,7 @@ def register(app, appmod):
 
     def _phone(d):
         """None if absent/empty, False if too long, else stripped string."""
-        v = str(d.get("owner_phone") or "").strip()
+        v = (d.get("owner_phone") or "").strip()
         if len(v) > 40:
             return False
         return v or None
@@ -152,8 +201,10 @@ def register(app, appmod):
     @app.route("/api/admin/licenses", methods=["POST"])
     @superadmin_required
     def admin_create_license():
-        d = request.get_json(silent=True) or {}
-        name = str(d.get("business_name") or "").strip()
+        d = _body()
+        if _bad_types(d, ("business_name", "owner_phone", "notes")):
+            return _bad("business_name, owner_phone and notes must be strings")
+        name = (d.get("business_name") or "").strip()
         if not name or len(name) > 200:
             return _bad("business_name is required (max 200 chars)")
         phone = _phone(d)
@@ -186,10 +237,17 @@ def register(app, appmod):
         row = db.session.get(Model, lid)
         if not row:
             return jsonify({"msg": "not found"}), 404
-        d = request.get_json(silent=True) or {}
+        d = _body()
         # validate everything first, then apply
+        if _bad_types(d, ("business_name", "owner_phone", "notes")):
+            return _bad("business_name, owner_phone and notes must be strings")
+        if "machine_id" in d:
+            mid = d["machine_id"]
+            if not isinstance(mid, str) or not mid.strip() or len(mid.strip()) > 128:
+                return _bad("machine_id must be a non-empty string (max 128 chars)")
+            mid = mid.strip()
         if "business_name" in d:
-            name = str(d["business_name"] or "").strip()
+            name = (d["business_name"] or "").strip()
             if not name or len(name) > 200:
                 return _bad("business_name is required (max 200 chars)")
         if "owner_phone" in d and _phone(d) is False:
@@ -225,6 +283,8 @@ def register(app, appmod):
             row.revoked = d["revoked"]
         if d.get("unbind_machine") is True:
             row.machine_id = None
+        elif "machine_id" in d:
+            row.machine_id = mid
         if "base_term" in d:
             row.base_term = d["base_term"]
         if "base_expires_at" in d:
@@ -240,7 +300,7 @@ def register(app, appmod):
         row = db.session.get(Model, lid)
         if not row:
             return jsonify({"msg": "not found"}), 404
-        d = request.get_json(silent=True) or {}
+        d = _body()
         scope, term = d.get("scope"), d.get("term")
         if term is not None and term not in TERMS:
             return _bad("invalid term")
@@ -279,6 +339,8 @@ def register(app, appmod):
             return jsonify({"msg": "not found"}), 404
         if not _signing_key():
             return _not_configured()
+        if not row.machine_id:
+            return jsonify({"msg": "License is not bound to a computer yet. Set its machine ID first."}), 409
         return (signed_license(row), 200, {
             "Content-Type": "text/plain; charset=utf-8",
             "Content-Disposition": "attachment; filename=\"servicebills-%s.key\"" % row.license_key})

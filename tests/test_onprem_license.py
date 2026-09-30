@@ -173,3 +173,103 @@ def test_readonly_allowlist_exact_and_writes_blocked(onprem, client):
 def test_readonly_hook_skipped_without_tenant(onprem, client):
     r = client.post("/api/subscription_plans", json={"name": "P"})
     assert "license_readonly" not in (r.get_json(silent=True) or {})
+
+
+# ---- final-review fixes (I1, I2, I4, minors) ---------------------------------
+
+class _R:
+    def __init__(self, code, data):
+        self.status_code, self._d, self.text = code, data, str(data)
+
+    def json(self):
+        return self._d
+
+
+def test_store_license_rejects_unbound_payload(onprem, client):
+    app, priv = onprem
+    import onprem as op, license as lic_
+    with pytest.raises(lic_.LicenseError) as e:
+        op.store_license(_text(priv, machine_id=None))
+    assert str(e.value) == "machine_mismatch"
+    app.config["MACHINE_ID"] = None
+    with pytest.raises(lic_.LicenseError):
+        op.store_license(_text(priv, machine_id=None))
+
+
+def test_missing_machine_id_is_readonly_regardless_of_license(onprem, client):
+    app, priv = onprem
+    hdr, _ = _admin(client)
+    client.post("/api/license", headers=hdr, json={"license_file": _text(priv)})
+    import onprem as op
+    assert op.current_state().state == "valid"
+    app.config["MACHINE_ID"] = None
+    op.invalidate()
+    st = op.current_state()
+    assert st.state == "readonly" and st.reason == "machine_mismatch"
+    assert client.get("/api/system/info").get_json()["license"]["reason"] == "machine_mismatch"
+    r = client.post("/api/subscription_plans", headers=hdr, json={"name": "P", "price": 1, "billing_cycle": "monthly"})
+    assert r.status_code == 403
+
+
+@pytest.mark.parametrize("code,err", [(409, "license_in_use"), (404, "unknown_license")])
+def test_refresh_unbound_or_unknown_revokes_sticky(onprem, client, monkeypatch, code, err):
+    app, priv = onprem
+    hdr, _ = _admin(client)
+    client.post("/api/license", headers=hdr, json={"license_file": _text(priv)})
+    monkeypatch.setattr(appmod.requests, "post", lambda *a, **k: _R(code, {"error": err}))
+    import onprem as op
+    op.refresh_license()
+    assert op.current_state().reason == "revoked"
+    assert appmod.db.session.get(appmod.InstalledLicense, 1).revoked is True
+    # sticky for the same license file
+    r = client.post("/api/license", headers=hdr, json={"license_file": _text(priv)})
+    assert r.status_code == 400 and r.get_json() == {"msg": "revoked"}
+
+
+def test_server_refresh_recovers_from_clock_jump(onprem, client, monkeypatch):
+    app, priv = onprem
+    hdr, _ = _admin(client)
+    client.post("/api/license", headers=hdr, json={"license_file": _text(priv)})
+    row = appmod.db.session.get(appmod.InstalledLicense, 1)
+    row.last_seen_at = datetime.utcnow() + timedelta(days=30)   # clock was wrongly far ahead
+    appmod.db.session.commit()
+    import onprem as op
+    op.invalidate()
+    assert op.current_state().reason == "clock_rollback"
+    monkeypatch.setattr(appmod.requests, "post", lambda *a, **k: _R(200, {"license": _text(priv)}))
+    op.refresh_license()
+    assert op.current_state().state == "valid"
+    assert appmod.db.session.get(appmod.InstalledLicense, 1).last_seen_at < datetime.utcnow() + timedelta(minutes=5)
+
+
+def test_offline_file_does_not_reset_last_seen(onprem, client):
+    app, priv = onprem
+    hdr, _ = _admin(client)
+    client.post("/api/license", headers=hdr, json={"license_file": _text(priv)})
+    row = appmod.db.session.get(appmod.InstalledLicense, 1)
+    row.last_seen_at = datetime.utcnow() + timedelta(days=30)
+    appmod.db.session.commit()
+    import onprem as op
+    client.post("/api/license", headers=hdr, json={"license_file": _text(priv, license_id="L2")})
+    assert op.current_state().reason == "clock_rollback"
+
+
+def test_issued_at_in_future_is_clock_rollback(onprem, client):
+    app, priv = onprem
+    hdr, _ = _admin(client)
+    future = (datetime.utcnow() + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/api/license", headers=hdr, json={"license_file": _text(priv, issued_at=future)})
+    import onprem as op
+    op.invalidate()
+    assert op.current_state().reason == "clock_rollback"
+    near = (datetime.utcnow() + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/api/license", headers=hdr, json={"license_file": _text(priv, license_id="L3", issued_at=near)})
+    op.invalidate()
+    assert op.current_state().state == "valid"
+
+
+@pytest.mark.parametrize("path", ["/api/forgot-password", "/api/reset-password", "/api/whatsapp/webhook"])
+def test_readonly_allows_recovery_and_webhook_posts(onprem, client, path):
+    _admin(client)   # no license -> readonly
+    r = client.post(path, json={})
+    assert not (r.status_code == 403 and (r.get_json() or {}).get("license_readonly"))

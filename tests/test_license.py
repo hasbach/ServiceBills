@@ -99,3 +99,9 @@ def test_warnings_within_seven_days():
     s = lic.evaluate(_payload(), date(2026, 10, 9), "m1")
     assert {"scope": "whatsapp", "expires_at": "2026-10-15"} in s.warnings
     assert all(w["scope"] != "base" for w in s.warnings)
+
+
+@pytest.mark.parametrize("payload_mid,arg_mid", [(None, None), ("", ""), (None, "m1"), ("m1", None), ("m1", ""), ("", "m1")])
+def test_evaluate_falsy_machine_id_is_machine_mismatch(payload_mid, arg_mid):
+    s = lic.evaluate(_payload(machine_id=payload_mid), date(2026, 10, 1), arg_mid)
+    assert s.state == "readonly" and s.reason == "machine_mismatch"

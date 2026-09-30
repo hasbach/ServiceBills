@@ -28,8 +28,9 @@ class WhishAPIError(Exception):
     a network error, or a well-formed response with status=false."""
 
 
-def _headers():
-    site_netloc = urllib.parse.urlparse(Config.APP_BASE_URL).netloc or Config.APP_BASE_URL
+def _headers(base=None):
+    base = base or Config.APP_BASE_URL
+    site_netloc = urllib.parse.urlparse(base).netloc or base
     return {
         "Content-Type": "application/json",
         "channel": Config.WHISH_CHANNEL or "",
@@ -67,8 +68,8 @@ def create_payment(external_id, amount, currency, callback_token, requestee, tar
         # from the callback URLs above (see the reference plugin). This app has
         # no separate thank-you page -- point both at the Billing page directly,
         # since the callback routes above already 302 there once processed.
-        "successRedirectUrl": f"{Config.APP_BASE_URL}/billing?status=success",
-        "failureRedirectUrl": f"{Config.APP_BASE_URL}/billing?status=failed",
+        "successRedirectUrl": f"{base}/billing?status=success",
+        "failureRedirectUrl": f"{base}/billing?status=failed",
         "amount": amount,
         "invoice": invoice,
         "currency": currency,
@@ -77,7 +78,7 @@ def create_payment(external_id, amount, currency, callback_token, requestee, tar
         "email": email,
     }
     try:
-        resp = requests.post(WHISH_CREATE_URL, json=payload, headers=_headers(), timeout=15)
+        resp = requests.post(WHISH_CREATE_URL, json=payload, headers=_headers(base), timeout=15)
     except requests.exceptions.RequestException as e:
         raise WhishAPIError(f"Whish request failed: {e}") from e
 

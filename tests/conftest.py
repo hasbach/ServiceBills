@@ -73,3 +73,12 @@ def make_tenant(client, business_name, username, password="pw"):
                                        "business_name": business_name})
     r = client.post("/api/login", json={"username": username, "password": password})
     return {"Authorization": f"Bearer {r.get_json()['access_token']}"}
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """The limiter keeps in-memory counters process-wide; parametrised tests
+    hitting the public license endpoints would otherwise trip 429s."""
+    from app import limiter
+    limiter.reset()
+    yield

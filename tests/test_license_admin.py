@@ -93,6 +93,7 @@ def test_patch_validation_and_404(client, sa):
 
 def test_download_file_is_verifiable(client, sa, keys):
     lid = _create(client, sa).get_json()["id"]
+    client.patch(f"/api/admin/licenses/{lid}", headers=sa, json={"machine_id": "m-file"})
     r = client.get(f"/api/admin/licenses/{lid}/file", headers=sa)
     assert r.status_code == 200 and "attachment" in r.headers["Content-Disposition"]
     assert lic.verify(r.get_data(as_text=True), keys[1])["license_id"] == lid
@@ -111,3 +112,38 @@ def test_tenant_admin_forbidden(client):
 def test_public_machine_id_cap(client, keys):
     r = client.post("/api/licenses/trial", json={"business_name": "A", "machine_id": "m" * 129})
     assert r.status_code == 400
+
+
+def test_download_file_409_when_unbound(client, sa, keys):
+    lid = _create(client, sa).get_json()["id"]
+    r = client.get(f"/api/admin/licenses/{lid}/file", headers=sa)
+    assert r.status_code == 409 and "not bound" in r.get_json()["msg"]
+
+
+def test_patch_binds_machine_id_manually(client, sa, keys):
+    lid = _create(client, sa).get_json()["id"]
+    r = client.patch(f"/api/admin/licenses/{lid}", headers=sa, json={"machine_id": "  abc123  "})
+    assert r.status_code == 200 and r.get_json()["machine_id"] == "abc123"
+    r = client.get(f"/api/admin/licenses/{lid}/file", headers=sa)
+    assert r.status_code == 200 and lic.verify(r.get_data(as_text=True), keys[1])["machine_id"] == "abc123"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "m" * 129, 5, None, ["x"], {"a": 1}])
+def test_patch_rejects_bad_machine_id(client, sa, bad):
+    lid = _create(client, sa).get_json()["id"]
+    assert client.patch(f"/api/admin/licenses/{lid}", headers=sa, json={"machine_id": bad}).status_code == 400
+
+
+@pytest.mark.parametrize("field", ["business_name", "owner_phone", "notes"])
+@pytest.mark.parametrize("bad", [5, {"a": 1}, ["x"]])
+def test_admin_create_and_patch_reject_non_string(client, sa, field, bad):
+    assert _create(client, sa, **{field: bad}).status_code == 400
+    lid = _create(client, sa).get_json()["id"]
+    assert client.patch(f"/api/admin/licenses/{lid}", headers=sa, json={field: bad}).status_code == 400
+
+
+def test_admin_non_object_body(client, sa):
+    assert client.post("/api/admin/licenses", headers=sa, json=[1]).status_code == 400
+    lid = _create(client, sa).get_json()["id"]
+    assert client.patch(f"/api/admin/licenses/{lid}", headers=sa, json=[1]).status_code == 200
+    assert client.post(f"/api/admin/licenses/{lid}/renew", headers=sa, json=[1]).status_code == 400

@@ -1,7 +1,12 @@
 """On-prem runtime: deployment mode, route-family guard, system info, installed
 license state, read-only enforcement and /api/license endpoints.
 
-Later tasks extend this module (setup wizard).
+Operational requirements for on-prem deployments:
+  * Run with WEB_CONCURRENCY=1. The license state cache (and its invalidation after
+    setup / activation / refresh) is per-process, so several workers could disagree
+    for up to CACHE_SECONDS.
+  * Every container (app, scheduler, ...) must run with the identical TZ setting:
+    expiry is evaluated against the local calendar date (date.today()).
 """
 import logging
 import os
@@ -22,7 +27,8 @@ ONPREM_BLOCKED = ("/api/register", "/api/admin/", "/api/billing/", "/api/stripe/
                   "/api/licenses/", "/api/internal/")
 
 # Writes to these prefixes stay allowed while the license is read-only.
-READONLY_ALLOW = ("/api/login", "/api/logout", "/api/setup", "/api/license", "/api/system/info")
+READONLY_ALLOW = ("/api/login", "/api/logout", "/api/setup", "/api/license", "/api/system/info",
+                  "/api/forgot-password", "/api/reset-password", "/api/whatsapp/webhook")
 CACHE_SECONDS = 60
 
 _pubkey_cache = None
@@ -110,7 +116,13 @@ def _compute_state():
     except lic.LicenseError:
         return lic.LicenseState("readonly", "invalid_signature")
     now = datetime.utcnow()
-    if row.last_seen_at and now < row.last_seen_at - timedelta(days=1):
+    issued = None
+    try:
+        issued = datetime.strptime(payload.get("issued_at") or "", "%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError):
+        pass
+    if (issued and now < issued - timedelta(days=1)) or \
+            (row.last_seen_at and now < row.last_seen_at - timedelta(days=1)):
         base = payload.get("base") or {}
         return lic.LicenseState("readonly", "clock_rollback", payload, set(),
                                 base.get("expires_at"), [])
@@ -122,6 +134,8 @@ def _compute_state():
 
 def current_state():
     global _state_cache
+    if not _machine_id():  # never licensed without a machine identity
+        return lic.LicenseState("readonly", "machine_mismatch")
     if _state_cache and time.time() - _state_cache[0] < CACHE_SECONDS:
         return _state_cache[1]
     st = _compute_state()
@@ -132,7 +146,7 @@ def current_state():
 def store_license(text, from_server=False, commit=True):
     from app import db
     payload = lic.verify(text, public_key())
-    if payload.get("machine_id") != _machine_id():
+    if not _machine_id() or not payload.get("machine_id") or payload.get("machine_id") != _machine_id():
         raise lic.LicenseError("machine_mismatch")
     row = _row(create=True)
     if row.revoked and not from_server and row.license_text:
@@ -144,6 +158,10 @@ def store_license(text, from_server=False, commit=True):
             raise lic.LicenseError("revoked")
     row.license_text = text
     row.revoked = False
+    if from_server:
+        # A license fresh from the server proves the server's clock: forgive an
+        # earlier local clock jump by letting last_seen_at move backward, here only.
+        row.last_seen_at = datetime.utcnow()
     if not commit:  # caller owns the transaction; state is recomputed after its commit
         db.session.flush()
         invalidate()
@@ -172,7 +190,9 @@ def refresh_license():
                 row = _row()
                 row.last_refresh_error = None
                 row.last_refresh_at = datetime.utcnow()
-            elif resp.status_code == 403 and (resp.json() or {}).get("error") == "revoked":
+            elif (resp.status_code, (resp.json() or {}).get("error")) in (
+                    (403, "revoked"), (409, "license_in_use"), (404, "unknown_license")):
+                # revoked, moved to another computer (unbind), or deleted server-side
                 row.revoked = True
                 row.last_refresh_error = None
                 row.last_refresh_at = datetime.utcnow()
@@ -334,18 +354,26 @@ def register(app, appmod):
             data = {}
         if not _setup_required():
             return jsonify(msg="Setup already completed"), 409
+        if not _machine_id():
+            return jsonify(msg="machine_id_missing"), 400
         vals = {k: data.get(k) for k in ("business_name", "username", "password", "owner_phone")}
         if not all(isinstance(v, str) and v.strip() for v in vals.values()):
             return jsonify(msg="business_name, username, password and owner_phone are required"), 400
+        if len(vals["password"]) < 6:
+            return jsonify(msg="Password must be at least 6 characters"), 400
         if appmod.User.query.filter_by(username=vals["username"]).first():
             return jsonify(msg="Username already exists"), 400
         text, err = _fetch_license_text(data, vals["business_name"].strip(), vals["owner_phone"].strip())
         if err:
             return err
         try:
-            appmod._create_tenant_with_admin(vals["business_name"].strip(), vals["username"],
-                                             vals["password"], plan="pro")
+            tenant, _user = appmod._create_tenant_with_admin(
+                vals["business_name"].strip(), vals["username"], vals["password"], plan="pro")
             store_license(text, from_server=data.get("mode") != "file", commit=False)
+            # a concurrent setup may have created a tenant since our first check
+            if appmod.Tenant.query.filter(appmod.Tenant.id != tenant.id).first() is not None:
+                db.session.rollback()
+                return jsonify(msg="Setup already completed"), 409
             db.session.commit()
         except lic.LicenseError as e:
             db.session.rollback()

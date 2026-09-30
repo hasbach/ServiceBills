@@ -108,3 +108,34 @@ def test_wrong_machine_file_leaves_no_tenant(onprem, client):
 
 def test_missing_fields(onprem, client):
     assert client.post("/api/setup", json={"mode": "file"}).status_code == 400
+
+
+def test_setup_refuses_without_machine_id(onprem, client):
+    app, priv = onprem
+    app.config["MACHINE_ID"] = None
+    r = client.post("/api/setup", json=_body(license_file=_text(priv)))
+    assert r.status_code == 400 and r.get_json() == {"msg": "machine_id_missing"}
+    assert appmod.Tenant.query.count() == 0
+
+
+def test_setup_password_min_length(onprem, client):
+    app, priv = onprem
+    r = client.post("/api/setup", json=_body(password="12345", license_file=_text(priv)))
+    assert r.status_code == 400
+    assert appmod.Tenant.query.count() == 0
+
+
+def test_setup_concurrent_tenant_aborts(onprem, client, monkeypatch):
+    app, priv = onprem
+    import onprem as op
+    orig = op.store_license
+
+    def racing(*a, **k):
+        # a second setup slipped a tenant in between our first check and our commit
+        appmod.db.session.add(appmod.Tenant(name="Racer", slug="racer", plan="pro"))
+        appmod.db.session.flush()
+        return orig(*a, **k)
+    monkeypatch.setattr(op, "store_license", racing)
+    r = client.post("/api/setup", json=_body(license_file=_text(priv)))
+    assert r.status_code == 409
+    assert appmod.Tenant.query.count() == 0

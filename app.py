@@ -90,6 +90,10 @@ app = Flask(__name__, static_folder='build', static_url_path='/_assets')
 
 from config import Config
 app.config.from_object(Config)
+if os.environ.get("TRUST_PROXY") == "1":
+    # Behind exactly one reverse proxy (Render): key rate limits on the real client IP.
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
 
 # Error tracking (Phase 2). Dormant/no-op if SENTRY_DSN is unset -- same optional-
