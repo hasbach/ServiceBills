@@ -334,3 +334,101 @@ function Show-SBMessage {
     $r = [Windows.Forms.MessageBox]::Show($Text, $Title, $buttons, [Windows.Forms.MessageBoxIcon]::Information)
     return ($r -eq [Windows.Forms.DialogResult]::Yes)
 }
+
+# ---- Backup / restore / update / uninstall (Task 7) ------------------------
+
+function Remove-SBFirewallRule {
+    param([string]$DisplayName = 'ServiceBills (TCP 8000)')
+    if (Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue) {
+        Remove-NetFirewallRule -DisplayName $DisplayName
+    }
+}
+
+function Get-SBDefaultBackupDir {
+    return (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'ServiceBills Backups')
+}
+
+function Get-SBSettings {
+    $path = Join-Path (Get-SBRoot) 'settings.json'
+    $s = @{ backup_dir = ''; auto_update = $true }
+    if (Test-Path $path) {
+        $raw = [IO.File]::ReadAllText($path)
+        if ($raw.Trim()) {
+            $obj = $raw | ConvertFrom-Json
+            foreach ($p in $obj.PSObject.Properties) { $s[$p.Name] = $p.Value }
+        }
+    }
+    return $s
+}
+
+function Resolve-SBBackupDir {
+    # Configured backup folder, or the default when none was chosen at install time.
+    $dir = [string](Get-SBSettings)['backup_dir']
+    if (-not $dir) { $dir = Get-SBDefaultBackupDir }
+    return $dir
+}
+
+function Get-SBBackupDate {
+    # 'servicebills-20260101-0130.zip' -> [datetime], or $null when the name does not match.
+    param([string]$Name)
+    if ($Name -match '^servicebills-(\d{8})-(\d{4})\.zip$') {
+        $stamp = $Matches[1] + $Matches[2]
+        return [datetime]::ParseExact($stamp, 'yyyyMMddHHmm', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    return $null
+}
+
+function New-SBBackup {
+    # Dumps the database and copies uploads from the running containers into a zip. Returns the zip path.
+    param([string]$Destination)
+    if (-not $Destination) { $Destination = Resolve-SBBackupDir }
+    if (-not (Test-Path $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('sb-backup-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    try {
+        # Binary data never goes through a pipe: dump inside the container, then `docker compose cp`.
+        [void](Invoke-SBCompose -Arguments @('exec', '-T', 'db', 'sh', '-c', 'pg_dump -U servicebills -Fc -f /tmp/sb.dump servicebills'))
+        [void](Invoke-SBCompose -Arguments @('cp', 'db:/tmp/sb.dump', (Join-Path $tmp 'db.dump')))
+        [void](Invoke-SBCompose -Arguments @('exec', '-T', 'db', 'rm', '-f', '/tmp/sb.dump'))
+        [void](Invoke-SBCompose -Arguments @('cp', 'web:/app/uploads', (Join-Path $tmp 'uploads')))
+        $zip = Join-Path $Destination ('servicebills-{0}.zip' -f (Get-Date).ToString('yyyyMMdd-HHmm'))
+        Compress-Archive -Path (Join-Path $tmp '*') -DestinationPath $zip -Force
+    }
+    finally {
+        Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $names = @(Get-ChildItem -Path $Destination -Filter 'servicebills-*.zip' | ForEach-Object { $_.Name })
+    foreach ($old in @(Get-SBBackupsToDelete -names $names)) {
+        Remove-Item -Path (Join-Path $Destination $old) -Force
+    }
+    return $zip
+}
+
+function Restore-SBBackup {
+    # Non-interactive restore core shared by restore.ps1 and the update rollback.
+    # Order matters: the app containers are stopped first (they hold DB connections); the db container
+    # stays up for pg_restore. Uploads are cleared with a one-off `run` of the web image (it mounts the
+    # uploads volume by compose definition, so no volume-name guessing) and refilled with `cp`, which
+    # also works on a stopped container. Then everything is started and we wait for health.
+    # Returns $true when the stack is healthy again.
+    param([string]$Zip)
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('sb-restore-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    try {
+        Expand-Archive -Path $Zip -DestinationPath $tmp -Force
+        [void](Invoke-SBCompose -Arguments @('stop', 'web', 'scheduler'))
+        [void](Invoke-SBCompose -Arguments @('up', '-d', 'db'))
+        [void](Invoke-SBCompose -Arguments @('cp', (Join-Path $tmp 'db.dump'), 'db:/tmp/sb.dump'))
+        [void](Invoke-SBCompose -Arguments @('exec', '-T', 'db', 'sh', '-c', 'pg_restore -U servicebills -d servicebills --clean --if-exists --no-owner /tmp/sb.dump'))
+        [void](Invoke-SBCompose -Arguments @('exec', '-T', 'db', 'rm', '-f', '/tmp/sb.dump'))
+        [void](Invoke-SBCompose -Arguments @('run', '--rm', '--no-deps', '--entrypoint', 'sh', 'web', '-c', 'rm -rf /app/uploads/* /app/uploads/.[!.]*'))
+        if (Test-Path (Join-Path $tmp 'uploads')) {
+            [void](Invoke-SBCompose -Arguments @('cp', ((Join-Path $tmp 'uploads') + '\.'), 'web:/app/uploads'))
+        }
+        [void](Invoke-SBCompose -Arguments @('up', '-d'))
+    }
+    finally {
+        Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return [bool](Wait-SBHealth -Seconds 300)
+}
