@@ -402,10 +402,13 @@ export const AppContextProvider = ({ children }) => {
     const [modules, setModules] = useState(null);
     const refreshModules = React.useCallback(() => {
         if (!token) { setModules(null); return Promise.resolve(); }
+        // Super-admins have no tenant: /tenant/me would 401, and the 401
+        // interceptor above would log them straight back out.
+        if ((user?.role || '').split(',').includes('superadmin')) { setModules([]); return Promise.resolve(); }
         return apiService.tenantMe()
             .then(r => setModules(r.data?.modules || []))
             .catch(() => setModules([]));
-    }, [token]);
+    }, [token, user]);
     useEffect(() => { refreshModules(); }, [refreshModules]);
 
     useEffect(() => {

@@ -330,6 +330,10 @@ const MainApp = ({
 
     // ── renderView ────────────────────────────────────────────────────────────
     const renderView = () => {
+        // Don't mount a gated page before modules load (or while the effect
+        // above redirects away) -- it would fetch and flash a load error.
+        const gatedView = NAV_ITEMS.find(n => n.key === currentView && n.module);
+        if (gatedView && !hasModule(gatedView.module)) return null;
         switch (currentView) {
             case 'dashboard': return <DashboardView />;
             case 'resellers': return <ResellerManagementView />;
