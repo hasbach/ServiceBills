@@ -251,3 +251,173 @@ def test_validate_does_not_see_other_tenant_resellers(client):
     _plan(client, b)
     body = _validate(client, b, [_row(reseller='Shared Name')]).get_json()
     assert body['rows'][0]['status'] == 'error'
+
+
+import app as appmod
+
+
+def _commit(client, headers, rows, new_plans=None):
+    return client.post('/api/customers/import/commit', headers=headers,
+                       data={'file': (_xlsx(rows), 'c.xlsx'),
+                             'new_plans': json.dumps(new_plans or [])},
+                       content_type='multipart/form-data')
+
+
+def _tenant_id(client, headers):
+    with client.application.app_context():
+        from flask_jwt_extended import decode_token
+        return decode_token(headers['Authorization'].split()[1])['tenant_id']
+
+
+@pytest.fixture
+def no_whatsapp(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError('import must not send WhatsApp')
+    monkeypatch.setattr(appmod, 'send_whatsapp_message', boom)
+    monkeypatch.setattr(appmod, '_maybe_create_customer_payment_link', boom)
+
+
+def test_commit_creates_customers_without_billing(client, no_whatsapp):
+    h = make_tenant(client, 'Biz', 'c_basic')
+    _plan(client, h, 'Basic', price=20)
+    expiry = datetime.utcnow() + timedelta(days=20)
+    r = _commit(client, h, [_row(expiry_date=expiry.strftime('%Y-%m-%d'))])
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()['imported'] == 1
+    tid = _tenant_id(client, h)
+    with client.application.app_context():
+        c = appmod.Customer.query.filter_by(tenant_id=tid).one()
+        assert c.subscription_expiry_date.date() == expiry.date()
+        assert c.balance == 0
+        assert appmod.Payment.query.filter_by(customer_id=c.id).count() == 0
+
+
+def test_scheduler_does_not_backbill_imported_customer(client, no_whatsapp):
+    """The billing-anchor rule: next charge lands on expiry, not before."""
+    h = make_tenant(client, 'Biz', 'c_anchor')
+    _plan(client, h, 'Basic', price=20)
+    _plan(client, h, 'Yearly', price=200, cycle='yearly')
+    expiry = datetime.utcnow() + timedelta(days=20)
+    rows = [_row(name='M', phone='1', expiry_date=expiry.strftime('%Y-%m-%d')),
+            _row(name='Y', phone='2', plan='Yearly', expiry_date=expiry.strftime('%Y-%m-%d')),
+            _row(name='O', phone='3', opening_balance=35, expiry_date=expiry.strftime('%Y-%m-%d'))]
+    assert _commit(client, h, rows).status_code == 200
+    tid = _tenant_id(client, h)
+    with client.application.app_context():
+        before = appmod.Payment.query.filter_by(tenant_id=tid).count()
+        appmod.generate_missing_payments(tid)
+        assert appmod.Payment.query.filter_by(tenant_id=tid).count() == before
+        for c in appmod.Customer.query.filter_by(tenant_id=tid).all():
+            assert c.subscription_expiry_date.date() == expiry.date()
+
+
+def test_commit_opening_balance_direct_customer(client, no_whatsapp):
+    h = make_tenant(client, 'Biz', 'c_open')
+    _plan(client, h)
+    assert _commit(client, h, [_row(opening_balance=35)]).status_code == 200
+    tid = _tenant_id(client, h)
+    with client.application.app_context():
+        c = appmod.Customer.query.filter_by(tenant_id=tid).one()
+        p = appmod.Payment.query.filter_by(customer_id=c.id).one()
+        assert p.amount == 35 and p.paid is False
+        assert c.balance == -35
+        assert p.date == c.subscription_start_date
+
+
+def test_commit_opening_balance_reseller_customer(client, no_whatsapp):
+    h = make_tenant(client, 'Biz', 'c_resel')
+    _plan(client, h)
+    r = client.post('/api/resellers', headers=h, json={'name': 'Rami', 'phone': '1', 'type': 'type1'})
+    assert r.status_code in (200, 201), r.get_json()
+    assert _commit(client, h, [_row(reseller='rami', opening_balance=40)]).status_code == 200
+    tid = _tenant_id(client, h)
+    with client.application.app_context():
+        reseller = appmod.Reseller.query.filter_by(tenant_id=tid).one()
+        assert reseller.balance == 40
+        rp = appmod.ResellerPayment.query.filter_by(reseller_id=reseller.id).one()
+        assert rp.type == 'credit_added' and rp.amount == 40
+        assert appmod.Payment.query.filter_by(tenant_id=tid).count() == 0
+
+
+def test_commit_creates_new_plan_and_sector(client, no_whatsapp):
+    h = make_tenant(client, 'Biz', 'c_newplan')
+    r = _commit(client, h, [_row(plan='Fiber 50M', sector='Hamra')],
+                new_plans=[{'name': 'Fiber 50M', 'price': 25, 'billing_cycle': 'yearly'}])
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert body['plans_created'] == 1 and body['sectors_created'] == 1
+    tid = _tenant_id(client, h)
+    with client.application.app_context():
+        plan = appmod.SubscriptionPlan.query.filter_by(tenant_id=tid, name='Fiber 50M').one()
+        assert plan.billing_cycle == 'yearly' and plan.price == 25
+        assert appmod.Sector.query.filter_by(tenant_id=tid, name='Hamra').count() == 1
+        c = appmod.Customer.query.filter_by(tenant_id=tid).one()
+        assert c.sector == 'Hamra'
+        assert c.subscription_expiry_date.year - c.subscription_start_date.year == 1
+
+
+def test_commit_unknown_plan_without_definition_is_skipped(client, no_whatsapp):
+    h = make_tenant(client, 'Biz', 'c_noplan')
+    _plan(client, h)
+    body = _commit(client, h, [_row(name='A', phone='1'), _row(name='B', phone='2', plan='Mystery')]).get_json()
+    assert body['imported'] == 1 and body['skipped'] == 1
+    assert body['skipped_rows'][0]['row'] == 3
+
+
+def test_commit_invalid_plan_definition_is_400(client, no_whatsapp):
+    h = make_tenant(client, 'Biz', 'c_badplan')
+    r = _commit(client, h, [_row(plan='X')], new_plans=[{'name': 'X', 'price': 5, 'billing_cycle': 'weekly'}])
+    assert r.status_code == 400
+
+
+def test_reupload_skips_already_imported(client, no_whatsapp):
+    h = make_tenant(client, 'Biz', 'c_reup')
+    _plan(client, h)
+    rows = [_row(name='A', phone='1'), _row(name='B', phone='2')]
+    assert _commit(client, h, rows).get_json()['imported'] == 2
+    body = _commit(client, h, rows + [_row(name='C', phone='3')]).get_json()
+    assert body['imported'] == 1 and body['skipped'] == 2
+
+
+def test_commit_rolls_back_on_failure(client, no_whatsapp, monkeypatch):
+    """A failure after the first customer was flushed must leave nothing behind."""
+    h = make_tenant(client, 'Biz', 'c_rollback')
+    _plan(client, h)
+    real = ci.cycle_delta
+    calls = {'n': 0}
+    def fail_on_second(cycle):
+        calls['n'] += 1
+        if calls['n'] == 2:
+            raise RuntimeError('boom')
+        return real(cycle)
+    monkeypatch.setattr(ci, 'cycle_delta', fail_on_second)
+    r = _commit(client, h, [_row(name='A', phone='1'), _row(name='B', phone='2')])
+    assert r.status_code == 400
+    assert 'nothing was saved' in r.get_json()['error']
+    tid = _tenant_id(client, h)
+    with client.application.app_context():
+        assert appmod.Customer.query.filter_by(tenant_id=tid).count() == 0
+
+
+def test_commit_requires_admin(client):
+    make_tenant(client, 'Biz', 'c_admin')
+    cashier = auth_headers(client, 'c_cash', role='cashier')
+    assert _commit(client, cashier, [_row()]).status_code == 403
+
+
+def test_error_report_contains_only_skipped_rows(client):
+    h = make_tenant(client, 'Biz', 'c_report')
+    _plan(client, h)
+    r = client.post('/api/customers/import/error_report', headers=h,
+                    data={'file': (_xlsx([_row(name='Good', phone='1'), _row(name='', phone='2')]), 'c.xlsx'),
+                          'new_plans': '[]'},
+                    content_type='multipart/form-data')
+    assert r.status_code == 200
+    assert r.mimetype == XLSX
+    ws = load_workbook(io.BytesIO(r.data))['Customers']
+    header = [c.value for c in ws[1]]
+    assert header == ci.HEADERS + ['errors']
+    data_rows = list(ws.iter_rows(min_row=2, values_only=True))
+    assert len(data_rows) == 1
+    assert data_rows[0][header.index('phone')] == '2'
+    assert 'name is required' in data_rows[0][-1]

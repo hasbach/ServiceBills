@@ -19,7 +19,7 @@ from openpyxl.styles import Font
 from openpyxl.worksheet.datavalidation import DataValidation
 
 import plans
-from tenancy import current_tenant, tenant_query
+from tenancy import current_tenant, current_tenant_id, new_for_tenant, tenant_query
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_ROWS = 5000
@@ -509,6 +509,112 @@ def public_rows(result):
     return [{k: v for k, v in r.items() if k != 'resolved'} for r in result['rows']]
 
 
+def commit_import(appmod, result, plan_defs):
+    """Write every importable row in the caller's transaction and commit once.
+    Migration mode: no back-billing, no Whish links, no WhatsApp. The caller
+    rolls back on any exception."""
+    db = appmod.db
+    importable = [r for r in result['rows'] if r['import']]
+
+    created_plans = {}
+    used_plan_keys = {r['resolved']['plan_key'] for r in importable if r['resolved']['plan'] is None}
+    for key in sorted(used_plan_keys):
+        d = plan_defs[key]
+        plan = new_for_tenant(appmod.SubscriptionPlan, name=d['name'], price=d['price'],
+                              cost=d['cost'], billing_cycle=d['billing_cycle'],
+                              currency=d['currency'], status='active')
+        db.session.add(plan)
+        created_plans[key] = plan
+    db.session.flush()
+
+    existing_sectors = {_key(s.name) for s in tenant_query(appmod.Sector).all()}
+    sectors_created = 0
+    for r in importable:
+        name = r['resolved']['sector']
+        if name and _key(name) not in existing_sectors:
+            db.session.add(new_for_tenant(appmod.Sector, name=name))
+            existing_sectors.add(_key(name))
+            sectors_created += 1
+
+    for r in importable:
+        v = r['resolved']
+        plan = v['plan'] or created_plans[v['plan_key']]
+        # Billing anchor: the scheduler bills from the last payment date, or
+        # from subscription_start_date when there is none, one cycle at a time.
+        # Anchoring one cycle before expiry makes the next charge land on expiry.
+        anchor = v['expiry'] - cycle_delta(plan.billing_cycle)
+        reseller = v['reseller']
+        customer = new_for_tenant(
+            appmod.Customer,
+            name=v['name'], phone=v['phone'], address=v['address'], sector=v['sector'],
+            subscription_plan_id=plan.id,
+            subscription_start_date=anchor, subscription_expiry_date=v['expiry'],
+            is_subscription_active=v['active'], balance=0.0,
+            discount=v['discount'], cost_override=v['cost_override'],
+            reseller_id=reseller.id if reseller else None,
+            upstream_provider_id=v['upstream_provider_id'], upstream_username=v['upstream_username'],
+            network_device_id=v['network_device_id'], pppoe_username=v['pppoe_username'],
+            onu_mac_address=v['onu_mac'], cpe_mac_address=v['cpe_mac'],
+            notes=v['notes'], whatsapp_notifications_enabled=v['whatsapp_enabled'],
+        )
+        db.session.add(customer)
+        db.session.flush()
+
+        amount = v['opening_balance']
+        if amount > 0:
+            if reseller:
+                reseller.balance = (reseller.balance or 0.0) + amount
+                db.session.add(new_for_tenant(
+                    appmod.ResellerPayment, reseller_id=reseller.id, customer_id=customer.id,
+                    amount=amount, type='credit_added', date=anchor,
+                    description=f'Opening balance (import) for customer {customer.name}'))
+            else:
+                db.session.add(new_for_tenant(
+                    appmod.Payment, customer_id=customer.id, amount=amount,
+                    paid=False, date=anchor, pre_payment=False))
+                customer.balance -= amount
+
+    db.session.commit()
+    # Saved already: a failure here must not make the route report "nothing was saved".
+    try:
+        appmod.recalculate_estimated_profit(current_tenant_id())
+    except Exception:
+        appmod.traceback.print_exc()
+
+    skipped = [r for r in result['rows'] if not r['import']]
+    return {
+        'imported': len(importable),
+        'skipped': len(skipped),
+        'plans_created': len(created_plans),
+        'sectors_created': sectors_created,
+        'skipped_rows': [{'row': r['row'], 'messages': r['messages']} for r in skipped],
+    }
+
+
+def build_error_report(raw_rows, result):
+    """An .xlsx of every row that was not imported, in template column order,
+    plus an 'errors' column, ready to fix and re-upload."""
+    by_row = {raw['_row']: raw for raw in raw_rows}
+    wb = Workbook()
+    ws = wb.active
+    ws.title = SHEET_NAME
+    ws.append(HEADERS + ['errors'])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for r in result['rows']:
+        if r['import']:
+            continue
+        raw = by_row[r['row']]
+        values = []
+        for h in HEADERS:
+            v = raw.get(h)
+            values.append(_text(v) if h in TEXT_COLUMNS and v is not None else v)
+        ws.append(values + [' | '.join(r['messages'])])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def register_customer_import_routes(app, appmod):
     def import_admin(fn):
         @wraps(fn)
@@ -533,3 +639,34 @@ def register_customer_import_routes(app, appmod):
         except ImportFileError as e:
             return jsonify({'error': str(e)}), 400
         return jsonify({'rows': public_rows(result), 'summary': result['summary']})
+
+    def _parse_for_commit():
+        raw_rows = read_workbook(request.files.get('file'))
+        plan_defs, plan_errors = normalize_new_plans(appmod, request.form.get('new_plans', '[]'))
+        if plan_errors:
+            raise ImportFileError(' '.join(plan_errors))
+        return raw_rows, plan_defs, validate_rows(appmod, raw_rows, plan_defs)
+
+    @app.route('/api/customers/import/commit', methods=['POST'])
+    @import_admin
+    def customer_import_commit():
+        try:
+            _raw_rows, plan_defs, result = _parse_for_commit()
+        except ImportFileError as e:
+            return jsonify({'error': str(e)}), 400
+        try:
+            return jsonify(commit_import(appmod, result, plan_defs))
+        except Exception as e:
+            appmod.db.session.rollback()
+            appmod.traceback.print_exc()
+            return jsonify({'error': f'Import failed, nothing was saved: {e}'}), 400
+
+    @app.route('/api/customers/import/error_report', methods=['POST'])
+    @import_admin
+    def customer_import_error_report():
+        try:
+            raw_rows, _plan_defs, result = _parse_for_commit()
+        except ImportFileError as e:
+            return jsonify({'error': str(e)}), 400
+        return send_file(io.BytesIO(build_error_report(raw_rows, result)), mimetype=XLSX_MIME,
+                         as_attachment=True, download_name='customer-import-skipped-rows.xlsx')
