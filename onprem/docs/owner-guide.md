@@ -23,6 +23,8 @@ Open the address in a browser, create your admin account and complete the setup 
 
 A backup runs every night at 01:30 and is saved as `servicebills-YYYYMMDD-HHMM.zip` in the backup folder you chose. The newest 14 are kept. Use the "ServiceBills Backup" shortcut to back up right now. Because the folder is normally inside OneDrive or Google Drive, your backups are also copied off this PC.
 
+**Backups contain your business data and keys - keep the backup folder private.** Each backup also holds the two keys that protect saved passwords, so anyone who can open the backup can read that data. When you restore a backup that came from a different installation, the Restore shortcut asks whether to restore its keys as well (needed to read the saved passwords in that backup).
+
 ## Updates
 
 If you chose automatic updates, the PC checks every night at 03:30. Before updating it makes a backup; if the new version does not start correctly it goes back to the previous version by itself. You can also run "ServiceBills Update" from the Start menu at any time.
