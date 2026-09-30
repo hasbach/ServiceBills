@@ -66,7 +66,9 @@ function New-SBFernetKey {
 
 function ConvertTo-SBIanaTimeZone {
     param([string]$windowsId)
-    $path = Join-Path $script:SBScriptDir 'timezones.json'
+    $dir = Join-Path (Get-SBRoot) 'scripts'
+    if (Test-Path variable:script:SBScriptDir) { $dir = $script:SBScriptDir }
+    $path = Join-Path $dir 'timezones.json'
     if ($windowsId -and (Test-Path $path)) {
         $map = Get-Content -Path $path -Raw | ConvertFrom-Json
         $prop = $map.PSObject.Properties[$windowsId]
@@ -254,4 +256,81 @@ function Wait-SBHealth {
         if ($i -lt ($attempts - 1)) { Start-Sleep -Seconds 5 }
     }
     return $false
+}
+
+# ---- Installer / launcher wrappers (Task 6) -------------------------------
+
+function Invoke-SBDockerStdin {
+    # Runs docker with $InputText piped to stdin (used for `docker login --password-stdin`).
+    # The text never appears on the command line.
+    param([string[]]$Arguments, [string]$InputText)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $InputText | & docker @Arguments 2>&1 | ForEach-Object { "$_" }
+    }
+    finally { $ErrorActionPreference = $prev }
+}
+
+function Get-SBComposeArguments {
+    param([string[]]$Arguments)
+    $root = Get-SBRoot
+    return @('compose', '-f', (Join-Path $root 'compose.yml'), '--env-file', (Join-Path $root '.env')) + @($Arguments)
+}
+
+function Invoke-SBCompose {
+    param([string[]]$Arguments)
+    return Invoke-SBDocker -Arguments (Get-SBComposeArguments -Arguments $Arguments)
+}
+
+function Start-SBDockerDesktop {
+    $exe = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
+    if (-not (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue) -and (Test-Path $exe)) {
+        Start-Process -FilePath $exe -WindowStyle Hidden
+    }
+}
+
+function Wait-SBDockerEngine {
+    param([int]$Seconds = 180)
+    $attempts = [Math]::Max(1, [int][Math]::Ceiling($Seconds / 5.0))
+    for ($i = 0; $i -lt $attempts; $i++) {
+        if (Test-SBDockerEngine) { return }
+        if ($i -eq 0) { Start-SBDockerDesktop }
+        if ($i -lt ($attempts - 1)) { Start-Sleep -Seconds 5 }
+    }
+    throw "Docker did not become ready within $Seconds seconds."
+}
+
+function Add-SBFirewallRule {
+    param([string]$DisplayName = 'ServiceBills (TCP 8000)', [int]$Port = 8000)
+    if (Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue) { return }
+    New-NetFirewallRule -DisplayName $DisplayName -Direction Inbound -Protocol TCP -LocalPort $Port -Profile Private -Action Allow | Out-Null
+}
+
+function Set-SBScheduledTask {
+    # Daily task, current user, only when logged on, highest privileges. Replaces an existing task.
+    param([string]$Name, [string]$At, [string]$ScriptName, [string]$ScriptArguments = '')
+    $vbs = Join-Path (Join-Path (Get-SBRoot) 'scripts') 'run-hidden.vbs'
+    $arg = ('"{0}" {1} {2}' -f $vbs, $ScriptName, $ScriptArguments).Trim()
+    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument $arg
+    $trigger = New-ScheduledTaskTrigger -Daily -At $At
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+}
+
+function Remove-SBScheduledTask {
+    param([string]$Name)
+    if (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $Name -Confirm:$false
+    }
+}
+
+function Show-SBMessage {
+    # Returns $true when the user answered Yes (only meaningful with -YesNo).
+    param([string]$Text, [string]$Title = 'ServiceBills', [switch]$YesNo)
+    Add-Type -AssemblyName System.Windows.Forms
+    $buttons = if ($YesNo) { [Windows.Forms.MessageBoxButtons]::YesNo } else { [Windows.Forms.MessageBoxButtons]::OK }
+    $r = [Windows.Forms.MessageBox]::Show($Text, $Title, $buttons, [Windows.Forms.MessageBoxIcon]::Information)
+    return ($r -eq [Windows.Forms.DialogResult]::Yes)
 }
