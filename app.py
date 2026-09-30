@@ -9097,6 +9097,9 @@ def whatsapp_webhook():
 import whatsapp_inbox_routes
 whatsapp_inbox_routes.register_inbox_routes(app, sys.modules[__name__])
 
+import customer_import
+customer_import.register_customer_import_routes(app, sys.modules[__name__])
+
 import onprem
 onprem.register(app, sys.modules[__name__])
 
