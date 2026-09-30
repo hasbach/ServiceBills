@@ -111,6 +111,7 @@ const rawApiService = {
     adminReactivateTenant: (id) => api.post(`/admin/tenants/${id}/reactivate`),
     adminDeleteTenant: (id) => api.delete(`/admin/tenants/${id}`),
     adminSetPlan: (id, plan, extra = {}) => api.post(`/admin/tenants/${id}/set-plan`, { plan, ...extra }),
+    adminSetModules: (id, overrides) => api.post(`/admin/tenants/${id}/modules`, { overrides }),
     adminUpgradeRequests: () => api.get('/admin/upgrade-requests'),
 
     // User Management API methods

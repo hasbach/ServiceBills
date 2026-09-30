@@ -3,6 +3,7 @@ import {
     Box, Typography, Table, TableHead, TableRow, TableCell, TableBody,
     Button, Chip, AppBar, Toolbar, CircularProgress, Paper, Alert, Stack,
     Dialog, DialogTitle, DialogContent, DialogActions, TextField, ToggleButton, ToggleButtonGroup,
+    Switch, Link,
 } from '@mui/material';
 import { useAppContext } from '../context/AppContext.js';
 
@@ -16,6 +17,18 @@ const DURATION_PRESETS = [
     { value: '1_year', label: '+1 year' },
     { value: 'indefinite', label: 'Indefinite' },
     { value: 'custom', label: 'Custom date' },
+];
+
+const PAID_MODULES = [
+    { key: 'whatsapp', label: 'WhatsApp' },
+    { key: 'ai_cs', label: 'AI customer service (needs WhatsApp)' },
+    { key: 'network', label: 'Network' },
+    { key: 'upstream_sync', label: 'Upstream sync' },
+    { key: 'whish_payments', label: 'Whish customer payments' },
+];
+const ALWAYS_ON_MODULES = [
+    { key: 'core', label: 'Core' },
+    { key: 'office', label: 'Office' },
 ];
 
 const formatExpiry = (iso) => {
@@ -32,6 +45,8 @@ const SuperAdminView = () => {
     const [duration, setDuration] = useState('1_month');
     const [customDate, setCustomDate] = useState('');
     const [granting, setGranting] = useState(false);
+    const [modulesTarget, setModulesTarget] = useState(null); // tenant whose modules dialog is open
+    const [modulesBusy, setModulesBusy] = useState(false);
 
     const load = useCallback(() => {
         apiService.adminTenants().then((r) => setTenants(r.data)).catch(() => setTenants([]));
@@ -91,6 +106,20 @@ const SuperAdminView = () => {
     const closeGrantDialog = () => {
         if (granting) return;
         setGrantTarget(null);
+    };
+
+    const changeModule = async (key, value) => {
+        if (!modulesTarget || modulesBusy) return;
+        setModulesBusy(true);
+        try {
+            const r = await apiService.adminSetModules(modulesTarget.id, { [key]: value });
+            if (r?.data?.tenant) setModulesTarget((cur) => ({ ...cur, ...r.data.tenant }));
+            load();
+        } catch (e) {
+            setSnackbar({ open: true, message: e.response?.data?.msg || 'Could not update modules.', severity: 'error' });
+        } finally {
+            setModulesBusy(false);
+        }
     };
 
     const del = (id, name) => {
@@ -165,6 +194,7 @@ const SuperAdminView = () => {
                                             <Button size="small" onClick={() => openGrantDialog(t)}>
                                                 {t.plan === 'pro' ? 'Extend Pro…' : 'Grant Pro…'}
                                             </Button>
+                                            <Button size="small" onClick={() => setModulesTarget(t)}>Modules…</Button>
                                             {t.plan !== 'free' && <Button size="small" onClick={() => setPlan(t.id, 'free')}>Set Free</Button>}
                                             {t.status === 'active'
                                                 ? <Button size="small" onClick={() => act(apiService.adminSuspendTenant, t.id, 'suspended')}>Suspend</Button>
@@ -216,6 +246,53 @@ const SuperAdminView = () => {
                     <Button variant="contained" onClick={submitGrant} disabled={granting}>
                         {granting ? <CircularProgress size={20} /> : 'Grant'}
                     </Button>
+                </DialogActions>
+            </Dialog>
+
+            <Dialog open={!!modulesTarget} onClose={() => setModulesTarget(null)} fullWidth maxWidth="xs">
+                <DialogTitle>Modules — {modulesTarget?.name}</DialogTitle>
+                <DialogContent>
+                    {ALWAYS_ON_MODULES.map((m) => (
+                        <Box key={m.key} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 0.5 }}>
+                            <Box>
+                                <Typography variant="body2">{m.label}</Typography>
+                                <Typography variant="caption" color="text.secondary">always on</Typography>
+                            </Box>
+                            <Switch checked disabled />
+                        </Box>
+                    ))}
+                    {PAID_MODULES.map((m) => {
+                        const overrides = modulesTarget?.module_overrides || {};
+                        const overridden = m.key in overrides;
+                        return (
+                            <Box key={m.key} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 0.5 }}>
+                                <Box>
+                                    <Typography variant="body2">{m.label}</Typography>
+                                    <Typography variant="caption" color="text.secondary">
+                                        {overridden ? 'override' : 'from plan'}
+                                        {overridden && (
+                                            <>
+                                                {' · '}
+                                                <Link component="button" type="button" variant="caption"
+                                                      disabled={modulesBusy}
+                                                      onClick={() => changeModule(m.key, null)}>
+                                                    reset
+                                                </Link>
+                                            </>
+                                        )}
+                                    </Typography>
+                                </Box>
+                                <Switch
+                                    checked={(modulesTarget?.modules || []).includes(m.key)}
+                                    disabled={modulesBusy}
+                                    onChange={(e) => changeModule(m.key, e.target.checked)}
+                                />
+                            </Box>
+                        );
+                    })}
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setModulesTarget(null)}>Close</Button>
                 </DialogActions>
             </Dialog>
         </Box>
