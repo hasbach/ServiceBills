@@ -256,12 +256,6 @@ const rawApiService = {
         fd.append('new_plans', JSON.stringify(newPlans || []));
         return api.post('/customers/import/commit', fd);
     },
-    downloadImportErrorReport: (file, newPlans) => {
-        const fd = new FormData();
-        fd.append('file', file);
-        fd.append('new_plans', JSON.stringify(newPlans || []));
-        return api.post('/customers/import/error_report', fd, { responseType: 'blob' });
-    },
     updateCustomer: (customerId, customerData) => api.put(`/customers/${customerId}`, customerData),
     // --- FIX: Ensure all API calls consistently return response.data ---
     fetchSubscriptionPlans: async () => {

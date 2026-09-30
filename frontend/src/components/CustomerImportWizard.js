@@ -12,6 +12,7 @@ import { useAppContext } from '../context/AppContext';
 
 const STEPS = ['Download template', 'Upload file', 'Review', 'Done'];
 const STATUS_COLOR = { ok: 'success', warning: 'warning', error: 'error' };
+const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
 function saveBlob(blob, filename) {
     const url = window.URL.createObjectURL(blob);
@@ -52,6 +53,7 @@ export default function CustomerImportWizard({ open, onClose, onImported }) {
     const newPlans = useMemo(() => (preview?.summary.unknown_plans || []).map((name) => ({
         name,
         price: planDefs[name]?.price ?? '',
+        cost: planDefs[name]?.cost ?? '',
         billing_cycle: planDefs[name]?.billing_cycle || 'monthly',
         currency: planDefs[name]?.currency || 'USD',
     })), [preview, planDefs]);
@@ -87,7 +89,7 @@ export default function CustomerImportWizard({ open, onClose, onImported }) {
     const handleCommit = async () => {
         setBusy(true); setError('');
         try {
-            const payload = newPlans.map((p) => ({ ...p, price: Number(p.price) }));
+            const payload = newPlans.map((p) => ({ ...p, price: Number(p.price), cost: Number(p.cost || 0) }));
             const res = await apiService.commitCustomerImport(file, payload);
             setResult(res.data);
             setStep(3);
@@ -99,15 +101,9 @@ export default function CustomerImportWizard({ open, onClose, onImported }) {
         }
     };
 
-    const handleErrorReport = async () => {
-        setError('');
-        try {
-            const payload = newPlans.map((p) => ({ ...p, price: Number(p.price) }));
-            const res = await apiService.downloadImportErrorReport(file, payload);
-            saveBlob(res.data, 'customer-import-skipped-rows.xlsx');
-        } catch (err) {
-            setError(await errorText(err, 'Could not build the report.'));
-        }
+    const handleErrorReport = () => {
+        const bytes = Uint8Array.from(atob(result.skipped_report), (c) => c.charCodeAt(0));
+        saveBlob(new Blob([bytes], { type: XLSX_TYPE }), 'customer-import-skipped-rows.xlsx');
     };
 
     const rows = (preview?.rows || []).filter((r) => filter === 'all' || r.status === filter);
@@ -141,7 +137,7 @@ export default function CustomerImportWizard({ open, onClose, onImported }) {
                         <Button variant="outlined" component="label" startIcon={<UploadFileIcon />}>
                             {file ? file.name : 'Choose .xlsx file'}
                             <input hidden type="file" accept=".xlsx"
-                                onChange={(e) => setFile(e.target.files?.[0] || null)} />
+                                onChange={(e) => { setFile(e.target.files?.[0] || null); e.target.value = ''; }} />
                         </Button>
                         <Typography variant="body2" color="text.secondary">Up to 5,000 customers, 5 MB.</Typography>
                     </Stack>
@@ -174,6 +170,8 @@ export default function CustomerImportWizard({ open, onClose, onImported }) {
                                         <TextField label="Plan" value={p.name} size="small" disabled />
                                         <TextField label="Price" type="number" size="small" value={p.price}
                                             onChange={(e) => setPlanField(p.name, 'price', e.target.value)} />
+                                        <TextField label="Cost" type="number" size="small" value={p.cost}
+                                            onChange={(e) => setPlanField(p.name, 'cost', e.target.value)} />
                                         <TextField select label="Cycle" size="small" value={p.billing_cycle}
                                             onChange={(e) => setPlanField(p.name, 'billing_cycle', e.target.value)}>
                                             <MenuItem value="monthly">Monthly</MenuItem>
@@ -227,7 +225,7 @@ export default function CustomerImportWizard({ open, onClose, onImported }) {
                             {result.plans_created > 0 && `, created ${result.plans_created} plans`}
                             {result.sectors_created > 0 && `, created ${result.sectors_created} sectors`}.
                         </Alert>
-                        {result.skipped > 0 && (
+                        {result.skipped > 0 && result.skipped_report && (
                             <>
                                 <Typography>{result.skipped} rows were skipped. Download them, fix them, and upload again.</Typography>
                                 <Button variant="outlined" startIcon={<DownloadIcon />} onClick={handleErrorReport}>

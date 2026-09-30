@@ -405,19 +405,92 @@ def test_commit_requires_admin(client):
     assert _commit(client, cashier, [_row()]).status_code == 403
 
 
-def test_error_report_contains_only_skipped_rows(client):
+def test_read_workbook_ignores_stray_far_cells_quickly():
+    import time
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Customers'
+    ws.append(ci.HEADERS)
+    ws.append([_row().get(h) for h in ci.HEADERS])
+    ws.cell(row=300000, column=1, value='stray')
+    ws.cell(row=2, column=15000, value='far right')
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    started = time.monotonic()
+    rows = ci.read_workbook(_Upload(buf))
+    assert time.monotonic() - started < 10
+    assert len(rows) == 1 and rows[0]['name'] == 'Ali'
+
+
+def test_validate_rejects_oversized_upload(client):
+    h = make_tenant(client, 'Biz', 'v_big')
+    r = client.post('/api/customers/import/validate', headers=h,
+                    data={'file': (io.BytesIO(b'0' * (7 * 1024 * 1024)), 'c.xlsx')},
+                    content_type='multipart/form-data')
+    assert r.status_code == 400
+    assert '5 MB' in r.get_json()['error']
+
+
+def test_validate_rejects_overlong_usernames(client):
+    h = make_tenant(client, 'Biz', 'v_long')
+    _plan(client, h)
+    body = _validate(client, h, [_row(upstream_username='u' * 101)]).get_json()
+    assert body['rows'][0]['status'] == 'error'
+    assert 'upstream_username is longer than 100' in ' '.join(body['rows'][0]['messages'])
+
+
+def test_reupload_of_imported_row_with_mac_is_duplicate_not_error(client, no_whatsapp):
+    h = make_tenant(client, 'Biz', 'c_reup_mac')
+    _plan(client, h)
+    rows = [_row(name='A', phone='1', cpe_mac='AA:BB:CC:DD:EE:02')]
+    assert _commit(client, h, rows).get_json()['imported'] == 1
+    body = _validate(client, h, rows).get_json()
+    assert body['rows'][0]['status'] == 'warning'
+    assert body['rows'][0]['import'] is False
+
+
+def test_validate_expiry_range(client):
+    h = make_tenant(client, 'Biz', 'v_range')
+    _plan(client, h, 'Basic', price=20)
+    two_years_ago = (datetime.utcnow() - timedelta(days=730)).strftime('%Y-%m-%d')
+    ten_days_ago = (datetime.utcnow() - timedelta(days=10)).strftime('%Y-%m-%d')
+    body = _validate(client, h, [
+        _row(name='A', phone='1', expiry_date=two_years_ago),
+        _row(name='B', phone='2', expiry_date=two_years_ago, active='no'),
+        _row(name='C', phone='3', expiry_date='2099-01-01'),
+        _row(name='D', phone='4', expiry_date=ten_days_ago),
+    ]).get_json()
+    assert [r['status'] for r in body['rows']] == ['error', 'ok', 'error', 'warning']
+    assert '1 billing cycle(s) (20 total)' in ' '.join(body['rows'][3]['messages'])
+
+
+def test_plan_only_on_error_row_is_not_listed(client):
+    h = make_tenant(client, 'Biz', 'v_planlist')
+    _plan(client, h)
+    body = _validate(client, h, [_row(name='', plan='Ghost', sector='Nowhere'), _row()]).get_json()
+    assert body['summary']['unknown_plans'] == []
+    assert body['summary']['new_sectors'] == []
+
+
+def test_commit_returns_report_of_skipped_rows_only(client, no_whatsapp):
+    import base64
     h = make_tenant(client, 'Biz', 'c_report')
     _plan(client, h)
-    r = client.post('/api/customers/import/error_report', headers=h,
-                    data={'file': (_xlsx([_row(name='Good', phone='1'), _row(name='', phone='2')]), 'c.xlsx'),
-                          'new_plans': '[]'},
-                    content_type='multipart/form-data')
-    assert r.status_code == 200
-    assert r.mimetype == XLSX
-    ws = load_workbook(io.BytesIO(r.data))['Customers']
+    body = _commit(client, h, [_row(name='Good', phone='1'),
+                               _row(name='', phone='2', notes='bad row')]).get_json()
+    assert body['imported'] == 1 and body['skipped'] == 1
+    ws = load_workbook(io.BytesIO(base64.b64decode(body['skipped_report'])))['Customers']
     header = [c.value for c in ws[1]]
     assert header == ci.HEADERS + ['errors']
-    data_rows = list(ws.iter_rows(min_row=2, values_only=True))
+    data_rows = list(ws.iter_rows(min_row=2))
     assert len(data_rows) == 1
-    assert data_rows[0][header.index('phone')] == '2'
-    assert 'name is required' in data_rows[0][-1]
+    assert data_rows[0][header.index('phone')].value == '2'
+    assert 'name is required' in data_rows[0][-1].value
+
+
+def test_commit_without_skips_has_no_report(client, no_whatsapp):
+    h = make_tenant(client, 'Biz', 'c_noreport')
+    _plan(client, h)
+    body = _commit(client, h, [_row()]).get_json()
+    assert body['skipped'] == 0 and 'skipped_report' not in body

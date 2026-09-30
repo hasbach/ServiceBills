@@ -5,6 +5,7 @@ Migration mode: customers arrive with their current paid-through expiry and
 nothing is billed, linked to Whish, or sent on WhatsApp. Registered from
 app.py via register_customer_import_routes(app, appmod) so app.py doesn't
 grow further."""
+import base64
 import io
 import json
 import math
@@ -23,6 +24,9 @@ from tenancy import current_tenant, current_tenant_id, new_for_tenant, tenant_qu
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_ROWS = 5000
+MAX_COLUMNS = 100
+MAX_TRAILING_BLANK_ROWS = 1000
+MAX_UPLOAD_BYTES = MAX_FILE_BYTES + 1024 * 1024  # + multipart framing
 SHEET_NAME = 'Customers'
 XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
@@ -161,17 +165,29 @@ def read_workbook(file_storage):
         if SHEET_NAME not in wb.sheetnames:
             raise ImportFileError(f"The workbook has no '{SHEET_NAME}' sheet. "
                                   f"Start from the downloaded template.")
-        rows = wb[SHEET_NAME].iter_rows(values_only=True)
-        header_row = next(rows, None) or ()
+        ws = wb[SHEET_NAME]
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, max_col=MAX_COLUMNS,
+                                       values_only=True), None) or ()
         headers = [str(h).strip().lower() if h is not None else '' for h in header_row]
+        while headers and not headers[-1]:
+            headers.pop()
         missing = [h for h in REQUIRED if h not in headers]
         if missing:
             raise ImportFileError('Missing required column(s): ' + ', '.join(missing))
         index = {h: i for i, h in enumerate(headers) if h in HEADERS}
         out = []
-        for row_number, values in enumerate(rows, start=2):
+        blank_run = 0
+        # Bounded width, and stop after a long run of blank rows: one stray
+        # cell far down or to the right would otherwise make openpyxl walk
+        # millions of empty cells and stall the worker for every tenant.
+        for row_number, values in enumerate(
+                ws.iter_rows(min_row=2, max_col=len(headers), values_only=True), start=2):
             if not values or all(_is_blank(v) for v in values):
+                blank_run += 1
+                if blank_run >= MAX_TRAILING_BLANK_ROWS:
+                    break
                 continue
+            blank_run = 0
             if len(out) >= MAX_ROWS:
                 raise ImportFileError(f'Too many rows: the limit is {MAX_ROWS} customers per import.')
             record = {h: (values[i] if i < len(values) else None) for h, i in index.items()}
@@ -187,7 +203,19 @@ def read_workbook(file_storage):
 _TRUE = {'yes', 'y', 'true', '1'}
 _FALSE = {'no', 'n', 'false', '0'}
 _DATE_FORMATS = ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%Y/%m/%d')
-_MAX_LEN = {'name': 100, 'phone': 20, 'address': 200, 'sector': 100}
+_MAX_LEN = {'name': 100, 'phone': 20, 'address': 200, 'sector': 100, 'plan': 100,
+            'upstream_username': 100, 'pppoe_username': 100}
+MAX_EXPIRY_YEARS_AHEAD = 5
+
+
+def _overdue_cycles(expiry, now, billing_cycle):
+    """How many charges the billing run creates for a customer paid through
+    `expiry` (it charges on expiry, then every cycle after, up to now)."""
+    count, due = 0, expiry
+    while due <= now:
+        count += 1
+        due = due + cycle_delta(billing_cycle)
+    return count
 
 
 def cycle_delta(billing_cycle):
@@ -293,6 +321,9 @@ def normalize_new_plans(appmod, raw):
         if not name:
             errors.append('A new plan is missing its name.')
             continue
+        if len(name) > 100:
+            errors.append(f"Plan name '{name[:40]}...' is longer than 100 characters.")
+            continue
         price = _number(item.get('price'), f"Price of plan '{name}'", errors)
         cost = _number(item.get('cost'), f"Cost of plan '{name}'", errors) or 0.0
         cycle = _text(item.get('billing_cycle')) or 'monthly'
@@ -321,8 +352,22 @@ def validate_rows(appmod, raw_rows, plan_defs=None):
     reseller_index = _by_name(tenant_query(appmod.Reseller).all())
     upstream_index = _by_name(tenant_query(appmod.UpstreamProvider).all())
     device_index = _by_name(tenant_query(appmod.NetworkDevice).all())
-    existing_people = {(_key(n), _text(p)) for n, p in
-                       tenant_query(Customer).with_entities(Customer.name, Customer.phone).all()}
+    # One query for everything the per-row checks compare against (instead of
+    # up to three queries per row). Messages mirror _check_cpe_mac_available /
+    # _check_network_link_conflict in app.py.
+    existing_people = set()
+    cpe_holders, pppoe_holders, upstream_holders = {}, {}, {}
+    for c in tenant_query(Customer).with_entities(
+            Customer.name, Customer.phone, Customer.cpe_mac_address,
+            Customer.network_device_id, Customer.pppoe_username,
+            Customer.upstream_provider_id, Customer.upstream_username).all():
+        existing_people.add((_key(c.name), _text(c.phone)))
+        if c.cpe_mac_address:
+            cpe_holders.setdefault(c.cpe_mac_address, c.name)
+        if c.network_device_id and c.pppoe_username:
+            pppoe_holders.setdefault((c.network_device_id, c.pppoe_username), c.name)
+        if c.upstream_provider_id and c.upstream_username:
+            upstream_holders.setdefault((c.upstream_provider_id, c.upstream_username), c.name)
     existing_count = tenant_query(Customer).count()
     limit = plans.limits(current_tenant().plan)['max_customers']
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -402,36 +447,6 @@ def validate_rows(appmod, raw_rows, plan_defs=None):
         if pppoe_username and not _text(raw.get('network_device')):
             errors.append('pppoe_username needs a network_device.')
 
-        onu_mac, err = appmod._validate_mac_address(_text(raw.get('onu_mac')), allow_empty=True)
-        if err:
-            errors.append(f'onu_mac: {err}')
-        cpe_mac, err = appmod._validate_mac_address(_text(raw.get('cpe_mac')), allow_empty=True)
-        if err:
-            errors.append(f'cpe_mac: {err}')
-        if cpe_mac:
-            err = appmod._check_cpe_mac_available(cpe_mac)
-            if err:
-                errors.append(err)
-            elif cpe_mac in seen_cpe:
-                errors.append(f'cpe_mac {cpe_mac} is also on row {seen_cpe[cpe_mac]}.')
-            seen_cpe.setdefault(cpe_mac, row_no)
-
-        err = appmod._check_network_link_conflict(
-            None, device.id if device else None, pppoe_username,
-            provider.id if provider else None, upstream_username)
-        if err:
-            errors.append(err)
-        if device and pppoe_username:
-            k = (device.id, pppoe_username)
-            if k in seen_pppoe:
-                errors.append(f"pppoe_username '{pppoe_username}' is also on row {seen_pppoe[k]}.")
-            seen_pppoe.setdefault(k, row_no)
-        if provider and upstream_username:
-            k = (provider.id, upstream_username)
-            if k in seen_upstream:
-                errors.append(f"upstream_username '{upstream_username}' is also on row {seen_upstream[k]}.")
-            seen_upstream.setdefault(k, row_no)
-
         person = (_key(values['name']), values['phone'])
         if values['name'] and values['phone']:
             if person in existing_people:
@@ -443,8 +458,64 @@ def validate_rows(appmod, raw_rows, plan_defs=None):
             else:
                 seen_people[person] = row_no
 
-        if expiry and active and expiry < today:
-            warnings.append('Expiry date has passed - the customer will be charged on the next billing run.')
+        onu_mac = cpe_mac = None
+        # A skipped duplicate is never written, so its MACs/usernames neither
+        # conflict with anything nor reserve anything for later rows.
+        if not skip_duplicate:
+            onu_mac, err = appmod._validate_mac_address(_text(raw.get('onu_mac')), allow_empty=True)
+            if err:
+                errors.append(f'onu_mac: {err}')
+            cpe_mac, err = appmod._validate_mac_address(_text(raw.get('cpe_mac')), allow_empty=True)
+            if err:
+                errors.append(f'cpe_mac: {err}')
+            if cpe_mac:
+                if cpe_mac in cpe_holders:
+                    errors.append(f'CPE MAC {cpe_mac} is already recorded for {cpe_holders[cpe_mac]}. '
+                                  f'A router belongs to one customer.')
+                elif cpe_mac in seen_cpe:
+                    errors.append(f'cpe_mac {cpe_mac} is also on row {seen_cpe[cpe_mac]}.')
+                seen_cpe.setdefault(cpe_mac, row_no)
+            if device and pppoe_username:
+                k = (device.id, pppoe_username)
+                if k in pppoe_holders:
+                    errors.append(f"Mikrotik username '{pppoe_username}' on this network device is already "
+                                  f"linked to customer '{pppoe_holders[k]}'. Unlink it there first.")
+                elif k in seen_pppoe:
+                    errors.append(f"pppoe_username '{pppoe_username}' is also on row {seen_pppoe[k]}.")
+                seen_pppoe.setdefault(k, row_no)
+            if provider and upstream_username:
+                k = (provider.id, upstream_username)
+                if k in upstream_holders:
+                    errors.append(f"Upstream username '{upstream_username}' on this provider is already "
+                                  f"linked to customer '{upstream_holders[k]}'. Unlink it there first.")
+                elif k in seen_upstream:
+                    errors.append(f"upstream_username '{upstream_username}' is also on row {seen_upstream[k]}.")
+                seen_upstream.setdefault(k, row_no)
+        else:
+            # Still validate for error reporting, but don't reserve them
+            onu_mac, err = appmod._validate_mac_address(_text(raw.get('onu_mac')), allow_empty=True)
+            if err:
+                errors.append(f'onu_mac: {err}')
+            cpe_mac, err = appmod._validate_mac_address(_text(raw.get('cpe_mac')), allow_empty=True)
+            if err:
+                errors.append(f'cpe_mac: {err}')
+
+        if expiry and expiry > today + relativedelta(years=MAX_EXPIRY_YEARS_AHEAD):
+            errors.append(f'expiry_date is more than {MAX_EXPIRY_YEARS_AHEAD} years ahead - check the year.')
+        elif expiry and active and expiry < today - relativedelta(years=1):
+            errors.append('expiry_date is more than a year in the past. Set active to no for a '
+                          'customer who left, or correct the date.')
+        elif expiry and active and expiry < today:
+            cycles = _overdue_cycles(expiry, datetime.utcnow(), billing_cycle or 'monthly')
+            unit_price = None
+            if plan is not None:
+                unit_price = plan.price
+            elif plan_defs and plan_key in plan_defs:
+                unit_price = plan_defs[plan_key]['price']
+            message = f'Expiry date has passed - {cycles} billing cycle(s)'
+            if unit_price is not None:
+                message += f' ({max(unit_price - discount, 0) * cycles:g} total)'
+            warnings.append(message + ' will be charged on the next billing run.')
 
         rows.append({
             'row': row_no,
@@ -497,8 +568,11 @@ def validate_rows(appmod, raw_rows, plan_defs=None):
         'warning': sum(r['status'] == 'warning' for r in rows),
         'error': sum(r['status'] == 'error' for r in rows),
         'importable': sum(r['import'] for r in rows),
-        'unknown_plans': sorted(unknown_plans.values(), key=str.lower),
-        'new_sectors': sorted(new_sectors.values(), key=str.lower),
+        'unknown_plans': sorted({unknown_plans[r['resolved']['plan_key']] for r in rows
+                                 if r['import'] and r['resolved']['plan'] is None}, key=str.lower),
+        'new_sectors': sorted({r['resolved']['sector'] for r in rows
+                               if r['import'] and r['resolved']['sector']
+                               and _key(r['resolved']['sector']) not in sector_index}, key=str.lower),
         'customer_limit': limit,
         'existing_customers': existing_count,
     }
@@ -609,7 +683,14 @@ def build_error_report(raw_rows, result):
         for h in HEADERS:
             v = raw.get(h)
             values.append(_text(v) if h in TEXT_COLUMNS and v is not None else v)
-        ws.append(values + [' | '.join(r['messages'])])
+        row_values = values + [' | '.join(r['messages'])]
+        # Add row cell-by-cell to prevent '=' values from becoming formulas
+        ws.append([None] * len(row_values))  # Create empty row
+        for col_num, v in enumerate(row_values, start=1):
+            cell = ws.cell(row=ws.max_row, column=col_num)
+            cell.value = v
+            if isinstance(v, str) and v.startswith('='):
+                cell.data_type = 's'  # Set after value to prevent formula interpretation
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -625,6 +706,11 @@ def register_customer_import_routes(app, appmod):
             return fn(*args, **kwargs)
         return wrapper
 
+    def _check_upload_size():
+        # Reject before request.files parses the body.
+        if (request.content_length or 0) > MAX_UPLOAD_BYTES:
+            raise ImportFileError('File is larger than 5 MB.')
+
     @app.route('/api/customers/import/template', methods=['GET'])
     @import_admin
     def customer_import_template():
@@ -635,12 +721,14 @@ def register_customer_import_routes(app, appmod):
     @import_admin
     def customer_import_validate():
         try:
+            _check_upload_size()
             result = validate_rows(appmod, read_workbook(request.files.get('file')))
         except ImportFileError as e:
             return jsonify({'error': str(e)}), 400
         return jsonify({'rows': public_rows(result), 'summary': result['summary']})
 
     def _parse_for_commit():
+        _check_upload_size()
         raw_rows = read_workbook(request.files.get('file'))
         plan_defs, plan_errors = normalize_new_plans(appmod, request.form.get('new_plans', '[]'))
         if plan_errors:
@@ -651,22 +739,19 @@ def register_customer_import_routes(app, appmod):
     @import_admin
     def customer_import_commit():
         try:
-            _raw_rows, plan_defs, result = _parse_for_commit()
+            raw_rows, plan_defs, result = _parse_for_commit()
         except ImportFileError as e:
             return jsonify({'error': str(e)}), 400
         try:
-            return jsonify(commit_import(appmod, result, plan_defs))
+            summary = commit_import(appmod, result, plan_defs)
         except Exception as e:
             appmod.db.session.rollback()
             appmod.traceback.print_exc()
             return jsonify({'error': f'Import failed, nothing was saved: {e}'}), 400
-
-    @app.route('/api/customers/import/error_report', methods=['POST'])
-    @import_admin
-    def customer_import_error_report():
-        try:
-            raw_rows, _plan_defs, result = _parse_for_commit()
-        except ImportFileError as e:
-            return jsonify({'error': str(e)}), 400
-        return send_file(io.BytesIO(build_error_report(raw_rows, result)), mimetype=XLSX_MIME,
-                         as_attachment=True, download_name='customer-import-skipped-rows.xlsx')
+        if summary['skipped']:
+            # Built from this commit's own validation, so rows it just
+            # imported are never in it (a re-validation would flag them all
+            # as duplicates).
+            summary['skipped_report'] = base64.b64encode(
+                build_error_report(raw_rows, result)).decode('ascii')
+        return jsonify(summary)
