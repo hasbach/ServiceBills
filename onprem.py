@@ -243,8 +243,7 @@ def _readonly_guard():
     p = request.path
     if not p.startswith("/api/") or any(p == a or p.startswith(a + "/") for a in READONLY_ALLOW):
         return None
-    from app import Tenant
-    if Tenant.query.first() is None:  # setup phase
+    if not _claimed_tenant_exists():  # setup phase
         return None
     st = current_state()
     if st.state == "readonly":
@@ -268,11 +267,25 @@ def license_body():
             "machine_id": _machine_id()}
 
 
+def _claimed_tenant_exists():
+    """True once some tenant has a user. A fresh database is NOT empty: migration
+    b9f49987a15b always inserts a placeholder 'Default Business' tenant, so the
+    presence of a tenant row alone does not mean setup was done."""
+    from app import db, User
+    return db.session.query(User.id).filter(User.tenant_id.isnot(None)).first() is not None
+
+
+def _unclaimed_tenant():
+    """The placeholder tenant setup should adopt (a tenant with no users), or None."""
+    from app import db, Tenant, User
+    claimed = db.session.query(User.tenant_id).filter(User.tenant_id.isnot(None))
+    return Tenant.query.filter(~Tenant.id.in_(claimed)).order_by(Tenant.id).first()
+
+
 def _setup_required():
     if not is_onprem():
         return False
-    from app import Tenant
-    return Tenant.query.first() is None
+    return not _claimed_tenant_exists()
 
 
 def _setup_required_guard():
@@ -404,15 +417,21 @@ def register(app, appmod):
             return err
         try:
             tenant, _user = appmod._create_tenant_with_admin(
-                vals["business_name"].strip(), vals["username"], vals["password"], plan="pro")
+                vals["business_name"].strip(), vals["username"], vals["password"], plan="pro",
+                tenant=_unclaimed_tenant())
             # Seed the business profile so the header/receipts show the real name
             # instead of the "Default Business" placeholder.
-            db.session.add(appmod.BusinessSettings(
-                tenant_id=tenant.id, business_name=vals["business_name"].strip()[:200],
-                address="", mobile=vals["owner_phone"].strip()[:20]))
+            bs = appmod.BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
+            if bs is None:
+                bs = appmod.BusinessSettings(tenant_id=tenant.id, address="")
+                db.session.add(bs)
+            bs.business_name = vals["business_name"].strip()[:200]
+            bs.mobile = vals["owner_phone"].strip()[:20]
             store_license(text, from_server=data.get("mode") != "file", commit=False)
             # a concurrent setup may have created a tenant since our first check
-            if appmod.Tenant.query.filter(appmod.Tenant.id != tenant.id).first() is not None:
+            others = db.session.query(appmod.User.id).filter(
+                appmod.User.tenant_id.isnot(None), appmod.User.tenant_id != tenant.id).first()
+            if others is not None:
                 db.session.rollback()
                 return jsonify(msg="Setup already completed"), 409
             db.session.commit()

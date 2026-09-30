@@ -134,10 +134,32 @@ def test_setup_concurrent_tenant_aborts(onprem, client, monkeypatch):
 
     def racing(*a, **k):
         # a second setup slipped a tenant in between our first check and our commit
-        appmod.db.session.add(appmod.Tenant(name="Racer", slug="racer", plan="pro"))
+        racer = appmod.Tenant(name="Racer", slug="racer", plan="pro")
+        appmod.db.session.add(racer)
+        appmod.db.session.flush()
+        u = appmod.User(username="racer_admin", role="admin", tenant_id=racer.id)
+        u.set_password("pw")
+        appmod.db.session.add(u)
         appmod.db.session.flush()
         return orig(*a, **k)
     monkeypatch.setattr(op, "store_license", racing)
     r = client.post("/api/setup", json=_body(license_file=_text(priv)))
     assert r.status_code == 409
     assert appmod.Tenant.query.count() == 0
+
+
+def test_placeholder_tenant_from_migration_is_adopted(onprem, client):
+    # Migration b9f49987a15b inserts this row into every fresh database.
+    appmod.db.session.add(appmod.Tenant(name="Default Business", slug="default", status="active", plan="pro"))
+    appmod.db.session.commit()
+    assert client.get("/api/setup/status").get_json()["setup_required"] is True
+    assert client.get("/api/system/info").get_json()["setup_required"] is True
+    assert client.get("/api/customers").status_code == 409
+    app, priv = onprem
+    r = client.post("/api/setup", json=_body(license_file=_text(priv)))
+    assert r.status_code == 201, r.get_json()
+    tenants = appmod.Tenant.query.all()
+    assert len(tenants) == 1 and tenants[0].name == "Acme ISP" and tenants[0].slug == "acme-isp"
+    assert tenants[0].plan == "pro"
+    assert appmod.User.query.filter_by(username="boss").first().tenant_id == tenants[0].id
+    assert client.get("/api/setup/status").get_json()["setup_required"] is False

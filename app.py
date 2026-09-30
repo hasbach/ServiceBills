@@ -2318,16 +2318,23 @@ def has_pending_reseller_charge(customer_id, billing_date, tenant_id):
     return existing_charge is not None
 
 
-def _create_tenant_with_admin(business_name, username, password, email=None, plan="free"):
-    """Create a tenant (unique slug), seed its defaults and an admin user. Flushes, never commits."""
+def _create_tenant_with_admin(business_name, username, password, email=None, plan="free", tenant=None):
+    """Create a tenant (unique slug), seed its defaults and an admin user. Flushes, never commits.
+
+    Pass an existing, still-unclaimed `tenant` to adopt it instead of creating a new
+    one (on-prem setup: migration b9f49987a15b always inserts a placeholder
+    'Default Business' tenant, even into an empty database)."""
     slug = re.sub(r'[^a-z0-9]+', '-', business_name.lower()).strip('-')[:80] or 'tenant'
     base = slug
     i = 1
-    while Tenant.query.filter_by(slug=slug).first():
+    while Tenant.query.filter(Tenant.slug == slug, Tenant.id != (tenant.id if tenant else None)).first():
         i += 1
         slug = f"{base}-{i}"
-    tenant = Tenant(name=business_name, slug=slug, plan=plan)
-    db.session.add(tenant)
+    if tenant is None:
+        tenant = Tenant(name=business_name, slug=slug, plan=plan)
+        db.session.add(tenant)
+    else:
+        tenant.name, tenant.slug, tenant.plan = business_name, slug, plan
     db.session.flush()  # assign tenant.id before creating the user
     seed_default_expense_categories(tenant.id)
 
