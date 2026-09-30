@@ -63,12 +63,14 @@ import {
     ViewModule as ViewModuleIcon,
     Chat as ChatIcon,
     Download as DownloadIcon,
-    Receipt as ReceiptIcon
+    Receipt as ReceiptIcon,
+    UploadFile as UploadFileIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import { formatStamp } from './formatStamp';
 import { mergeNetworkStatus } from './mergeNetworkStatus';
 import pollNetworkJob from './pollNetworkJob';
+import CustomerImportWizard from './CustomerImportWizard';
 
 // Whether the Network Status panel should show the finished-state chips.
 // mergeNetworkStatus's `pending` flag stays true until BOTH the secret_status
@@ -502,6 +504,7 @@ const SubscriptionsView = ({
     // restricted roles.
     const userRoles = user?.role ? user.role.split(',').map(r => r.trim().toLowerCase()) : [];
     const canManageSubscriptions = userRoles.includes('admin') || userRoles.includes('finance');
+    const isAdmin = userRoles.includes('admin');
     // 'cashier' (office front desk) sits between the two: adds and fully
     // edits customers, renews/cancels/activates (single and bulk), and
     // *collects* payments -- but can't record money as received (confirm a
@@ -510,6 +513,7 @@ const SubscriptionsView = ({
     const isCashierOnly = !canManageSubscriptions && userRoles.includes('cashier');
     const canServeAtDesk = canManageSubscriptions || isCashierOnly;
     const [showAddCustomerForm, setShowAddCustomerForm] = useState(false);
+    const [importOpen, setImportOpen] = useState(false);
     const [newCustomer, setNewCustomer] = useState({
         name: '',
         phone: '',
@@ -1479,6 +1483,9 @@ const SubscriptionsView = ({
                                 {canManageSubscriptions && <Button variant="contained" startIcon={<DownloadIcon />} onClick={handleExportCSV} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
                                     Export CSV
                                 </Button>}
+                                {isAdmin && <Button variant="contained" startIcon={<UploadFileIcon />} onClick={() => setImportOpen(true)} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
+                                    Import
+                                </Button>}
                                 <Button variant="contained" startIcon={<AddIcon />} onClick={() => setShowAddCustomerForm(!showAddCustomerForm)} sx={{ backgroundColor: 'rgba(255, 255, 255, 0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255, 255, 255, 0.3)', color: 'white', borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: 3, py: 1.5, '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.3)', transform: 'translateY(-2px)', boxShadow: '0 8px 20px rgba(0,0,0,0.2)' }, transition: 'all 0.3s ease' }}>
                                     {showAddCustomerForm ? 'Hide Form' : 'Add Customer'}
                                 </Button>
@@ -2081,6 +2088,7 @@ const SubscriptionsView = ({
                     </Button>
                 </DialogActions>
             </Dialog>
+            <CustomerImportWizard open={importOpen} onClose={() => setImportOpen(false)} onImported={() => { if (currentPage !== 1) setCurrentPage(1); else refetchCustomers(); }} />
         </Box>
     );
 };
