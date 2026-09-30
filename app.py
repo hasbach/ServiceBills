@@ -40,6 +40,8 @@ from sqlalchemy import and_, func, extract
 from werkzeug.utils import secure_filename
 import atexit
 import click
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
 from flask import send_from_directory
 from sqlalchemy.exc import IntegrityError
 from dateutil.relativedelta import relativedelta # REQUIRED: pip install python-dateutil
@@ -3718,6 +3720,58 @@ _SCHEDULED_JOBS = {
     "check_pro_plan_expirations": check_pro_plan_expirations_with_context,
     "refresh_agent_mode_network_status": refresh_agent_mode_network_status_with_context,
 }
+
+
+def _refresh_license_with_context():
+    """Daily on-prem license refresh; a no-op outside on-prem mode."""
+    with app.app_context():
+        if onprem.is_onprem():
+            onprem.refresh_license()
+
+
+_SCHEDULED_JOBS["refresh_license"] = _refresh_license_with_context
+
+# Timetable for the built-in scheduler (`flask run-scheduler`). Must match the
+# cron lines in .github/workflows/scheduled-jobs.yml (a test enforces this).
+SCHEDULE = {
+    "generate_missing_payments": "0 2 * * *",
+    "generate_missing_salary_charges": "10 2 * * *",
+    "recalculate_all_estimated_profits": "20 2 * * *",
+    "send_daily_whatsapp_keepalive": "30 2 * * *",
+    "auto_sync_upstream_status": "40 2 * * *",
+    "check_pro_plan_expirations": "50 2 * * *",
+    "refresh_agent_mode_network_status": "*/15 * * * *",
+}
+ONPREM_EXTRA_SCHEDULE = {"refresh_license": "0 3 * * *"}
+
+
+def onprem_schedule():
+    """SCHEDULE minus SaaS-only billing jobs, plus on-prem extras."""
+    s = {k: v for k, v in SCHEDULE.items() if k != "check_pro_plan_expirations"}
+    s.update(ONPREM_EXTRA_SCHEDULE)
+    return s
+
+
+@app.cli.command("run-scheduler")
+def run_scheduler_command():
+    """Run the built-in blocking scheduler (on-prem installs only)."""
+    if not onprem.is_onprem():
+        raise click.ClickException("run-scheduler is for DEPLOYMENT_MODE=onprem")
+    tz = os.environ.get("TZ")
+    sched = BlockingScheduler(timezone=tz) if tz else BlockingScheduler()
+    for name, expr in onprem_schedule().items():
+        sched.add_job(
+            _run_scheduled_job, CronTrigger.from_crontab(expr, timezone=tz) if tz else CronTrigger.from_crontab(expr),
+            args=[name, _SCHEDULED_JOBS[name]], id=name, name=name,
+            max_instances=1, coalesce=True, misfire_grace_time=3600)
+        logging.info(f"run-scheduler: registered {name} at '{expr}'")
+    sched.add_job(
+        _run_scheduled_job, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=60),
+        args=["refresh_license", _SCHEDULED_JOBS["refresh_license"]],
+        id="refresh_license_startup", name="refresh_license_startup")
+    logging.info("run-scheduler: registered refresh_license startup run in 60s")
+    sched.start()
 
 
 @app.cli.command("run-scheduled-job")
