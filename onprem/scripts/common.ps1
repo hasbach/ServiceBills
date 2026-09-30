@@ -10,9 +10,20 @@ $ErrorActionPreference = 'Stop'
 
 $script:SBScriptDir = $PSScriptRoot
 
+# Windows PowerShell 5.1 may default to old TLS versions; OR in TLS 1.2 without dropping what is enabled.
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+catch { $null = $_ }
+
 function Get-SBRoot {
     if ($env:SERVICEBILLS_ROOT) { return $env:SERVICEBILLS_ROOT }
     return 'C:\ProgramData\ServiceBills'
+}
+
+function Get-SBStatePath {
+    # The state file lives in its own folder so compose can bind-mount the directory (not a single file).
+    return (Join-Path (Join-Path (Get-SBRoot) 'state') 'state.json')
 }
 
 function Compare-SBVersion {
@@ -125,25 +136,52 @@ function ConvertTo-SBEnvText {
     return $sb.ToString()
 }
 
+function Get-SBPrivateIPv4 {
+    # Returns the IPv4 address when it is in a private range, otherwise $null.
+    param([string]$ip)
+    if ($ip -notmatch '^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$') { return $null }
+    $o1 = [int]$Matches[1]
+    $o2 = [int]$Matches[2]
+    if ($o1 -eq 10 -or ($o1 -eq 192 -and $o2 -eq 168) -or ($o1 -eq 172 -and $o2 -ge 16 -and $o2 -le 31)) {
+        return $ip
+    }
+    return $null
+}
+
 function Get-SBLanIp {
-    param([AllowNull()][object[]]$addresses)
+    # Prefers the private IPv4 of the default-route interface (when PreferredInterfaceIndex is given),
+    # then the first private address on a non-virtual adapter, then 'localhost'.
+    param([AllowNull()][object[]]$addresses, [int]$PreferredInterfaceIndex = 0)
     $skip = 'vEthernet|WSL|Docker|Loopback|VirtualBox|VMware'
+    if ($PreferredInterfaceIndex -gt 0) {
+        foreach ($a in @($addresses)) {
+            if ($null -eq $a) { continue }
+            $idx = $a.PSObject.Properties['InterfaceIndex']
+            if (-not $idx -or [int]$idx.Value -ne $PreferredInterfaceIndex) { continue }
+            $ip = Get-SBPrivateIPv4 ([string]$a.IPAddress)
+            if ($ip) { return $ip }
+        }
+    }
     foreach ($a in @($addresses)) {
         if ($null -eq $a) { continue }
         if ($a.InterfaceAlias -match $skip) { continue }
-        $ip = [string]$a.IPAddress
-        if ($ip -notmatch '^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$') { continue }
-        $o1 = [int]$Matches[1]
-        $o2 = [int]$Matches[2]
-        if ($o1 -eq 10 -or ($o1 -eq 192 -and $o2 -eq 168) -or ($o1 -eq 172 -and $o2 -ge 16 -and $o2 -le 31)) {
-            return $ip
-        }
+        $ip = Get-SBPrivateIPv4 ([string]$a.IPAddress)
+        if ($ip) { return $ip }
     }
     return 'localhost'
 }
 
+function Get-SBDefaultRouteInterfaceIndex {
+    try {
+        $route = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Sort-Object RouteMetric) | Select-Object -First 1
+        if ($route) { return [int]$route.InterfaceIndex }
+    }
+    catch { $null = $_ }
+    return 0
+}
+
 function Get-SBLanIpLive {
-    return Get-SBLanIp @(Get-NetIPAddress -AddressFamily IPv4)
+    return Get-SBLanIp -addresses @(Get-NetIPAddress -AddressFamily IPv4) -PreferredInterfaceIndex (Get-SBDefaultRouteInterfaceIndex)
 }
 
 function Get-SBBackupsToDelete {
@@ -316,7 +354,9 @@ function Set-SBScheduledTask {
     $trigger = New-ScheduledTaskTrigger -Daily -At $At
     $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
-    Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+    # Laptops: run when missed (asleep at 01:30), on battery, and allow up to 2 hours.
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+    Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 }
 
 function Remove-SBScheduledTask {
@@ -378,8 +418,75 @@ function Get-SBBackupDate {
     return $null
 }
 
+function New-SBZip {
+    param([string]$SourceDir, [string]$ZipPath)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path $ZipPath) { Remove-Item -Path $ZipPath -Force }
+    [IO.Compression.ZipFile]::CreateFromDirectory($SourceDir, $ZipPath)
+}
+
+function Expand-SBZip {
+    param([string]$ZipPath, [string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+}
+
+function Get-SBKeyNames {
+    return @('FERNET_KEY', 'JWT_SECRET_KEY')
+}
+
+function Select-SBKeys {
+    # Only the two encryption/signing keys out of an env map.
+    param([AllowNull()][System.Collections.IDictionary]$EnvMap)
+    $keys = [ordered]@{}
+    if (-not $EnvMap) { return $keys }
+    foreach ($k in (Get-SBKeyNames)) {
+        if ($EnvMap.Contains($k) -and $EnvMap[$k]) { $keys[$k] = $EnvMap[$k] }
+    }
+    return $keys
+}
+
+function Read-SBBackupKeys {
+    # Returns the env.keys map stored in a backup zip, or $null when the zip has none.
+    param([string]$Zip)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($Zip)
+    try {
+        $entry = $archive.Entries | Where-Object { $_.FullName -eq 'env.keys' } | Select-Object -First 1
+        if (-not $entry) { return $null }
+        $reader = New-Object IO.StreamReader($entry.Open(), (New-Object Text.UTF8Encoding $false))
+        try { $text = $reader.ReadToEnd() }
+        finally { $reader.Dispose() }
+        return (Select-SBKeys (ConvertFrom-SBEnvText $text))
+    }
+    finally { $archive.Dispose() }
+}
+
+function Test-SBKeysDiffer {
+    # True when the backup carries keys that differ from the ones currently in .env.
+    param([AllowNull()][System.Collections.IDictionary]$BackupKeys, [AllowNull()][System.Collections.IDictionary]$CurrentEnv)
+    if (-not $BackupKeys -or $BackupKeys.Count -eq 0) { return $false }
+    foreach ($k in $BackupKeys.Keys) {
+        $cur = $null
+        if ($CurrentEnv -and $CurrentEnv.Contains($k)) { $cur = [string]$CurrentEnv[$k] }
+        if ($cur -ne [string]$BackupKeys[$k]) { return $true }
+    }
+    return $false
+}
+
+function Set-SBEnvKeys {
+    # Merges keys into .env in place (other entries preserved; the file's ACL is kept).
+    param([System.Collections.IDictionary]$Keys)
+    $envPath = Join-Path (Get-SBRoot) '.env'
+    $existing = [ordered]@{}
+    if (Test-Path $envPath) { $existing = ConvertFrom-SBEnvText ([IO.File]::ReadAllText($envPath)) }
+    foreach ($k in $Keys.Keys) { $existing[[string]$k] = $Keys[$k] }
+    [IO.File]::WriteAllText($envPath, (ConvertTo-SBEnvText -Values $existing), (New-Object Text.UTF8Encoding $false))
+}
+
 function New-SBBackup {
-    # Dumps the database and copies uploads from the running containers into a zip. Returns the zip path.
+    # Dumps the database and copies uploads (plus the two keys) from the running containers into a zip.
+    # Returns the zip path.
     param([string]$Destination)
     if (-not $Destination) { $Destination = Resolve-SBBackupDir }
     if (-not (Test-Path $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
@@ -391,8 +498,13 @@ function New-SBBackup {
         [void](Invoke-SBCompose -Arguments @('cp', 'db:/tmp/sb.dump', (Join-Path $tmp 'db.dump')))
         [void](Invoke-SBCompose -Arguments @('exec', '-T', 'db', 'rm', '-f', '/tmp/sb.dump'))
         [void](Invoke-SBCompose -Arguments @('cp', 'web:/app/uploads', (Join-Path $tmp 'uploads')))
+        $envPath = Join-Path (Get-SBRoot) '.env'
+        if (Test-Path $envPath) {
+            $keys = Select-SBKeys (ConvertFrom-SBEnvText ([IO.File]::ReadAllText($envPath)))
+            [IO.File]::WriteAllText((Join-Path $tmp 'env.keys'), (ConvertTo-SBEnvText -Values $keys), (New-Object Text.UTF8Encoding $false))
+        }
         $zip = Join-Path $Destination ('servicebills-{0}.zip' -f (Get-Date).ToString('yyyyMMdd-HHmm'))
-        Compress-Archive -Path (Join-Path $tmp '*') -DestinationPath $zip -Force
+        New-SBZip -SourceDir $tmp -ZipPath $zip
     }
     finally {
         Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -406,29 +518,184 @@ function New-SBBackup {
 
 function Restore-SBBackup {
     # Non-interactive restore core shared by restore.ps1 and the update rollback.
-    # Order matters: the app containers are stopped first (they hold DB connections); the db container
-    # stays up for pg_restore. Uploads are cleared with a one-off `run` of the web image (it mounts the
-    # uploads volume by compose definition, so no volume-name guessing) and refilled with `cp`, which
-    # also works on a stopped container. Then everything is started and we wait for health.
-    # Returns $true when the stack is healthy again.
-    param([string]$Zip)
+    # The app containers are stopped first (they hold DB connections); the db container stays up. The
+    # database is dropped and recreated, then pg_restore runs with --exit-on-error so a bad restore is
+    # never silent. Uploads are cleared with a one-off `run` of the web image and refilled with `cp`.
+    # The app containers are ALWAYS started again (finally), even when a step failed; the failure is
+    # still thrown. With -RestoreKeys the backup's FERNET_KEY / JWT_SECRET_KEY are merged into .env and
+    # the app containers recreated so they pick them up. Returns $true when the stack is healthy again.
+    param([string]$Zip, [switch]$RestoreKeys)
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('sb-restore-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    $completed = $false
+    $keysRestored = $false
     try {
-        Expand-Archive -Path $Zip -DestinationPath $tmp -Force
+        Expand-SBZip -ZipPath $Zip -Destination $tmp
+        if ($RestoreKeys) {
+            $keysFile = Join-Path $tmp 'env.keys'
+            if (Test-Path $keysFile) {
+                Set-SBEnvKeys -Keys (Select-SBKeys (ConvertFrom-SBEnvText ([IO.File]::ReadAllText($keysFile))))
+                $keysRestored = $true
+            }
+        }
         [void](Invoke-SBCompose -Arguments @('stop', 'web', 'scheduler'))
         [void](Invoke-SBCompose -Arguments @('up', '-d', 'db'))
         [void](Invoke-SBCompose -Arguments @('cp', (Join-Path $tmp 'db.dump'), 'db:/tmp/sb.dump'))
-        [void](Invoke-SBCompose -Arguments @('exec', '-T', 'db', 'sh', '-c', 'pg_restore -U servicebills -d servicebills --clean --if-exists --no-owner /tmp/sb.dump'))
+        [void](Invoke-SBCompose -Arguments @('exec', '-T', 'db', 'sh', '-c', 'dropdb -U servicebills --force --if-exists servicebills && createdb -U servicebills servicebills'))
+        [void](Invoke-SBCompose -Arguments @('exec', '-T', 'db', 'sh', '-c', 'pg_restore -U servicebills -d servicebills --no-owner --exit-on-error /tmp/sb.dump'))
         [void](Invoke-SBCompose -Arguments @('exec', '-T', 'db', 'rm', '-f', '/tmp/sb.dump'))
         [void](Invoke-SBCompose -Arguments @('run', '--rm', '--no-deps', '--entrypoint', 'sh', 'web', '-c', 'rm -rf /app/uploads/* /app/uploads/.[!.]*'))
         if (Test-Path (Join-Path $tmp 'uploads')) {
             [void](Invoke-SBCompose -Arguments @('cp', ((Join-Path $tmp 'uploads') + '\.'), 'web:/app/uploads'))
         }
-        [void](Invoke-SBCompose -Arguments @('up', '-d'))
+        $completed = $true
     }
     finally {
+        try {
+            if ($keysRestored) { [void](Invoke-SBCompose -Arguments @('up', '-d', '--force-recreate', 'web', 'scheduler')) }
+            else { [void](Invoke-SBCompose -Arguments @('up', '-d')) }
+        }
+        catch {
+            # Only surface this when nothing else is already failing.
+            if ($completed) { throw }
+        }
         Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
     return [bool](Wait-SBHealth -Seconds 300)
+}
+
+# ---- Final-review additions -------------------------------------------------
+
+function Invoke-SBIcacls {
+    # Thin wrapper around icacls.exe so tests can mock it.
+    param([string[]]$Arguments)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $out = @(& icacls.exe @Arguments 2>&1 | ForEach-Object { "$_" }) }
+    finally { $ErrorActionPreference = $prev }
+    if ($global:LASTEXITCODE -ne 0) {
+        throw ("icacls {0} failed (exit {1}): {2}" -f ($Arguments -join ' '), $global:LASTEXITCODE, ($out -join ' '))
+    }
+}
+
+function Get-SBCurrentUserSid {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+
+function Grant-SBRootAccess {
+    # The installer runs elevated but the day-to-day scripts run as the interactive user, who must be
+    # able to write logs, state and settings under the (ProgramData) root. With UAC elevation the
+    # installing user and the interactive user are the same account.
+    param([string]$Root)
+    $sid = Get-SBCurrentUserSid
+    Invoke-SBIcacls -Arguments @($Root, '/grant', ('*{0}:(OI)(CI)M' -f $sid), '/T', '/C')
+}
+
+function Protect-SBEnvFile {
+    # .env holds secrets: drop inherited access, keep only SYSTEM, Administrators and the installing user.
+    param([string]$EnvPath)
+    $sid = Get-SBCurrentUserSid
+    Invoke-SBIcacls -Arguments @($EnvPath, '/inheritance:r', '/grant:r', '*S-1-5-18:F', '*S-1-5-32-544:F', ('*{0}:M' -f $sid))
+}
+
+function Resolve-SBImageTag {
+    # Never lower an installed version: a SemVer tag on disk beats an older SemVer or an unknown
+    # ('latest') requested tag. Returns the tag to write to .env.
+    param([AllowEmptyString()][string]$Existing, [AllowEmptyString()][string]$Requested)
+    $semver = '^\d+\.\d+\.\d+$'
+    if (-not $Existing) { return $Requested }
+    if ($Existing -notmatch $semver) { return $Requested }
+    if ($Requested -notmatch $semver) { return $Existing }
+    if ((Compare-SBVersion $Existing $Requested) -gt 0) { return $Existing }
+    return $Requested
+}
+
+function Test-SBWebRunning {
+    # True when the web container of an existing install is currently running.
+    if (-not (Test-SBDockerEngine)) { return $false }
+    try {
+        $out = @(Invoke-SBCompose -Arguments @('ps', '--status', 'running', '--services'))
+        return ($out -contains 'web')
+    }
+    catch { return $false }
+}
+
+function Set-SBRunKey {
+    param([string]$Name, [string]$Value)
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+    Set-ItemProperty -Path $key -Name $Name -Value $Value
+}
+
+function Set-SBDockerAutoStart {
+    # Docker Desktop must start when the user logs in, otherwise ServiceBills is down after a reboot.
+    # Newer Docker Desktop keeps settings in settings-store.json, older ones in settings.json (JSON,
+    # key AutoStart). When neither file exists yet (Docker never ran) fall back to an HKCU Run entry.
+    # Returns which mechanism was used: 'settings-store.json', 'settings.json' or 'run-key'.
+    param(
+        [string]$AppData = $env:APPDATA,
+        [string]$ExePath = ''
+    )
+    if (-not $ExePath) { $ExePath = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe' }
+    foreach ($name in @('settings-store.json', 'settings.json')) {
+        $path = Join-Path (Join-Path $AppData 'Docker') $name
+        if (-not (Test-Path $path)) { continue }
+        try {
+            $raw = [IO.File]::ReadAllText($path)
+            $obj = if ($raw.Trim()) { $raw | ConvertFrom-Json } else { New-Object psobject }
+            $prop = $obj.PSObject.Properties | Where-Object { $_.Name -ieq 'AutoStart' } | Select-Object -First 1
+            if ($prop) { $prop.Value = $true }
+            else { $obj | Add-Member -NotePropertyName 'AutoStart' -NotePropertyValue $true }
+            [IO.File]::WriteAllText($path, ($obj | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding $false))
+            return $name
+        }
+        catch { continue }
+    }
+    Set-SBRunKey -Name 'Docker Desktop' -Value ('"{0}"' -f $ExePath)
+    return 'run-key'
+}
+
+function Select-SBBackupFile {
+    # Shows the backup picker; returns the chosen FileInfo or $null.
+    param([string]$Dir)
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $files = @(Get-ChildItem -Path $Dir -Filter 'servicebills-*.zip' -ErrorAction SilentlyContinue |
+            Where-Object { $null -ne (Get-SBBackupDate $_.Name) } | Sort-Object Name -Descending)
+    if ($files.Count -eq 0) {
+        [void](Show-SBMessage -Text "No backups were found in $Dir")
+        return $null
+    }
+    $form = New-Object Windows.Forms.Form
+    $form.Text = 'ServiceBills - Restore'
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object Drawing.Size(420, 380)
+    $form.TopMost = $true
+    $label = New-Object Windows.Forms.Label
+    $label.Text = 'Choose the backup to restore:'
+    $label.Location = New-Object Drawing.Point(12, 10)
+    $label.AutoSize = $true
+    $list = New-Object Windows.Forms.ListBox
+    $list.Location = New-Object Drawing.Point(12, 34)
+    $list.Size = New-Object Drawing.Size(380, 250)
+    foreach ($f in $files) {
+        [void]$list.Items.Add((Get-SBBackupDate $f.Name).ToString('yyyy-MM-dd HH:mm'))
+    }
+    $list.SelectedIndex = 0
+    $ok = New-Object Windows.Forms.Button
+    $ok.Text = 'Restore'
+    $ok.Location = New-Object Drawing.Point(226, 300)
+    $ok.DialogResult = [Windows.Forms.DialogResult]::OK
+    $cancel = New-Object Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.Location = New-Object Drawing.Point(312, 300)
+    $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $form.AcceptButton = $ok
+    $form.CancelButton = $cancel
+    $form.Controls.AddRange(@($label, $list, $ok, $cancel))
+    $result = $form.ShowDialog()
+    $index = $list.SelectedIndex
+    $form.Dispose()
+    if ($result -ne [Windows.Forms.DialogResult]::OK -or $index -lt 0) { return $null }
+    return $files[$index]
 }

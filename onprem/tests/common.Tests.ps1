@@ -223,3 +223,217 @@ Describe 'Docker wrappers' {
         Wait-SBHealth -Seconds 10 | Should -BeFalse
     }
 }
+
+Describe 'Get-SBLanIp with a preferred interface' {
+    BeforeAll {
+        $script:Addrs = @(
+            [pscustomobject]@{ IPAddress = '192.168.56.1'; InterfaceAlias = 'Ethernet 2'; InterfaceIndex = 5 },
+            [pscustomobject]@{ IPAddress = '192.168.1.20'; InterfaceAlias = 'Wi-Fi'; InterfaceIndex = 12 },
+            [pscustomobject]@{ IPAddress = '10.0.0.4'; InterfaceAlias = 'Ethernet'; InterfaceIndex = 3 }
+        )
+    }
+    It 'prefers the default-route interface over list order' {
+        Get-SBLanIp -addresses $script:Addrs -PreferredInterfaceIndex 12 | Should -Be '192.168.1.20'
+        Get-SBLanIp -addresses $script:Addrs -PreferredInterfaceIndex 3 | Should -Be '10.0.0.4'
+    }
+    It 'falls back to the normal order when the preferred interface has no private address' {
+        Get-SBLanIp -addresses $script:Addrs -PreferredInterfaceIndex 99 | Should -Be '192.168.56.1'
+    }
+    It 'works without a preferred interface (unchanged behaviour)' {
+        Get-SBLanIp -addresses $script:Addrs | Should -Be '192.168.56.1'
+    }
+    It 'Get-SBLanIpLive passes the default-route interface index' {
+        Mock Get-NetIPAddress { $script:Addrs }
+        Mock Get-SBDefaultRouteInterfaceIndex { 12 }
+        Get-SBLanIpLive | Should -Be '192.168.1.20'
+    }
+}
+
+Describe 'TLS' {
+    It 'keeps TLS 1.2 enabled after loading the library' {
+        ([int][Net.ServicePointManager]::SecurityProtocol -band [int][Net.SecurityProtocolType]::Tls12) | Should -Be ([int][Net.SecurityProtocolType]::Tls12)
+    }
+}
+
+Describe 'Get-SBStatePath' {
+    It 'is state\state.json under the root' {
+        $old = $env:SERVICEBILLS_ROOT
+        $env:SERVICEBILLS_ROOT = 'C:\x\root'
+        try { Get-SBStatePath | Should -Be 'C:\x\root\state\state.json' }
+        finally { $env:SERVICEBILLS_ROOT = $old }
+    }
+}
+
+Describe 'Write-SBLog on an existing file' {
+    It 'appends to an existing log without failing or truncating' {
+        $dir = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $old = $env:SERVICEBILLS_ROOT
+        $env:SERVICEBILLS_ROOT = $dir
+        try {
+            Write-SBLog 'unit' 'first'
+            $f = @(Get-ChildItem (Join-Path $dir 'logs') -Filter 'unit-*.log')[0]
+            $f.IsReadOnly | Should -BeFalse
+            { Write-SBLog 'unit' 'second' } | Should -Not -Throw
+            $text = Get-Content $f.FullName -Raw
+            $text | Should -Match 'first'
+            $text | Should -Match 'second'
+        }
+        finally {
+            $env:SERVICEBILLS_ROOT = $old
+            Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'Resolve-SBImageTag' {
+    It 'uses the requested tag on a fresh install' { Resolve-SBImageTag -Existing '' -Requested '1.0.0' | Should -Be '1.0.0' }
+    It 'never lowers a SemVer tag' { Resolve-SBImageTag -Existing '1.4.0' -Requested '1.2.0' | Should -Be '1.4.0' }
+    It 'raises to a newer requested tag' { Resolve-SBImageTag -Existing '1.2.0' -Requested '1.4.0' | Should -Be '1.4.0' }
+    It 'keeps a SemVer tag when the requested one is latest' { Resolve-SBImageTag -Existing '1.4.0' -Requested 'latest' | Should -Be '1.4.0' }
+    It 'replaces an unknown existing tag' { Resolve-SBImageTag -Existing 'latest' -Requested '1.0.0' | Should -Be '1.0.0' }
+    It 'stays on latest when both are unknown' { Resolve-SBImageTag -Existing 'latest' -Requested 'latest' | Should -Be 'latest' }
+}
+
+Describe 'permission wrappers' {
+    BeforeEach {
+        $global:SBIcacls = New-Object System.Collections.ArrayList
+        Mock Invoke-SBIcacls { [void]$global:SBIcacls.Add(($Arguments -join ' ')) }
+        Mock Get-SBCurrentUserSid { 'S-1-5-21-1-2-3-1001' }
+    }
+    AfterEach { Remove-Variable -Name SBIcacls -Scope Global -ErrorAction SilentlyContinue }
+    It 'Grant-SBRootAccess grants the user Modify recursively' {
+        Grant-SBRootAccess -Root 'C:\ProgramData\ServiceBills'
+        @($global:SBIcacls) | Should -Contain 'C:\ProgramData\ServiceBills /grant *S-1-5-21-1-2-3-1001:(OI)(CI)M /T /C'
+    }
+    It 'Protect-SBEnvFile removes inheritance and grants only SYSTEM, Administrators and the user' {
+        Protect-SBEnvFile -EnvPath 'C:\r\.env'
+        @($global:SBIcacls) | Should -Contain 'C:\r\.env /inheritance:r /grant:r *S-1-5-18:F *S-1-5-32-544:F *S-1-5-21-1-2-3-1001:M'
+    }
+}
+
+Describe 'Set-SBScheduledTask' {
+    It 'registers with battery / missed-run / 2 hour settings' {
+        $global:SBTaskSettings = $null
+        Mock Register-ScheduledTask { $global:SBTaskSettings = $Settings }
+        try {
+            Set-SBScheduledTask -Name 'ServiceBills Backup' -At '01:30' -ScriptName 'backup.ps1' -ScriptArguments '-Quiet'
+            Should -Invoke Register-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'ServiceBills Backup' }
+            $s = $global:SBTaskSettings
+            $s | Should -Not -BeNullOrEmpty
+            $s.StartWhenAvailable | Should -BeTrue
+            $s.DisallowStartIfOnBatteries | Should -BeFalse
+            $s.StopIfGoingOnBatteries | Should -BeFalse
+            $s.ExecutionTimeLimit | Should -Be 'PT2H'
+        }
+        finally { Remove-Variable -Name SBTaskSettings -Scope Global -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe 'Set-SBDockerAutoStart' {
+    BeforeEach {
+        $script:AppData = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        New-Item -ItemType Directory -Path (Join-Path $script:AppData 'Docker') -Force | Out-Null
+        Mock Set-SBRunKey { }
+    }
+    AfterEach { Remove-Item $script:AppData -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'sets AutoStart in settings-store.json (UTF-8 no BOM), keeping other keys' {
+        $p = Join-Path $script:AppData 'Docker\settings-store.json'
+        [IO.File]::WriteAllText($p, '{"AutoStart": false, "Theme": "dark"}')
+        Set-SBDockerAutoStart -AppData $script:AppData | Should -Be 'settings-store.json'
+        $j = [IO.File]::ReadAllText($p) | ConvertFrom-Json
+        $j.AutoStart | Should -BeTrue
+        $j.Theme | Should -Be 'dark'
+        $b = [IO.File]::ReadAllBytes($p)
+        ($b[0] -eq 0xEF -and $b[1] -eq 0xBB) | Should -BeFalse
+        Should -Invoke Set-SBRunKey -Times 0 -Exactly
+    }
+    It 'adds AutoStart when the key is missing' {
+        $p = Join-Path $script:AppData 'Docker\settings-store.json'
+        [IO.File]::WriteAllText($p, '{"Theme": "dark"}')
+        [void](Set-SBDockerAutoStart -AppData $script:AppData)
+        ([IO.File]::ReadAllText($p) | ConvertFrom-Json).AutoStart | Should -BeTrue
+    }
+    It 'uses legacy settings.json (matching the existing key case) when there is no settings-store.json' {
+        $p = Join-Path $script:AppData 'Docker\settings.json'
+        [IO.File]::WriteAllText($p, '{"autoStart": false}')
+        Set-SBDockerAutoStart -AppData $script:AppData | Should -Be 'settings.json'
+        ([IO.File]::ReadAllText($p) | ConvertFrom-Json).autoStart | Should -BeTrue
+    }
+    It 'prefers settings-store.json when both exist' {
+        [IO.File]::WriteAllText((Join-Path $script:AppData 'Docker\settings-store.json'), '{}')
+        [IO.File]::WriteAllText((Join-Path $script:AppData 'Docker\settings.json'), '{"autoStart": false}')
+        Set-SBDockerAutoStart -AppData $script:AppData | Should -Be 'settings-store.json'
+        ([IO.File]::ReadAllText((Join-Path $script:AppData 'Docker\settings.json')) | ConvertFrom-Json).autoStart | Should -BeFalse
+    }
+    It 'falls back to the HKCU Run value when no settings file exists' {
+        Set-SBDockerAutoStart -AppData $script:AppData -ExePath 'C:\Program Files\Docker\Docker\Docker Desktop.exe' | Should -Be 'run-key'
+        Should -Invoke Set-SBRunKey -Times 1 -Exactly -ParameterFilter {
+            $Name -eq 'Docker Desktop' -and $Value -eq '"C:\Program Files\Docker\Docker\Docker Desktop.exe"'
+        }
+    }
+    It 'falls back to the Run value when the settings file is not valid JSON' {
+        [IO.File]::WriteAllText((Join-Path $script:AppData 'Docker\settings-store.json'), '{not json')
+        Set-SBDockerAutoStart -AppData $script:AppData | Should -Be 'run-key'
+        Should -Invoke Set-SBRunKey -Times 1 -Exactly
+    }
+}
+
+Describe 'zip helpers and backup keys' {
+    BeforeEach {
+        $script:Work = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        New-Item -ItemType Directory -Path (Join-Path $script:Work 'src\uploads\empty') -Force | Out-Null
+        Set-Content -Path (Join-Path $script:Work 'src\db.dump') -Value 'dump'
+        Set-Content -Path (Join-Path $script:Work 'src\uploads\a.txt') -Value 'a'
+        [IO.File]::WriteAllText((Join-Path $script:Work 'src\env.keys'), "FERNET_KEY=fk1`nJWT_SECRET_KEY=jw1`n")
+    }
+    AfterEach { Remove-Item $script:Work -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'New-SBZip / Expand-SBZip round-trip files and empty folders, replacing an existing zip' {
+        $zip = Join-Path $script:Work 'out.zip'
+        Set-Content -Path $zip -Value 'stale'
+        New-SBZip -SourceDir (Join-Path $script:Work 'src') -ZipPath $zip
+        $dest = Join-Path $script:Work 'dest'
+        New-Item -ItemType Directory -Path $dest | Out-Null
+        Expand-SBZip -ZipPath $zip -Destination $dest
+        Test-Path (Join-Path $dest 'db.dump') | Should -BeTrue
+        Test-Path (Join-Path $dest 'uploads\a.txt') | Should -BeTrue
+        Test-Path (Join-Path $dest 'uploads\empty') | Should -BeTrue
+    }
+    It 'Read-SBBackupKeys returns the two keys, or $null for an old backup without env.keys' {
+        $zip = Join-Path $script:Work 'k.zip'
+        New-SBZip -SourceDir (Join-Path $script:Work 'src') -ZipPath $zip
+        $k = Read-SBBackupKeys -Zip $zip
+        $k['FERNET_KEY'] | Should -Be 'fk1'
+        $k['JWT_SECRET_KEY'] | Should -Be 'jw1'
+        Remove-Item (Join-Path $script:Work 'src\env.keys')
+        $zip2 = Join-Path $script:Work 'k2.zip'
+        New-SBZip -SourceDir (Join-Path $script:Work 'src') -ZipPath $zip2
+        Read-SBBackupKeys -Zip $zip2 | Should -BeNullOrEmpty
+    }
+    It 'Test-SBKeysDiffer compares backup keys with the current env' {
+        $b = [ordered]@{ FERNET_KEY = 'a'; JWT_SECRET_KEY = 'b' }
+        Test-SBKeysDiffer -BackupKeys $b -CurrentEnv ([ordered]@{ FERNET_KEY = 'a'; JWT_SECRET_KEY = 'b'; X = 'y' }) | Should -BeFalse
+        Test-SBKeysDiffer -BackupKeys $b -CurrentEnv ([ordered]@{ FERNET_KEY = 'a'; JWT_SECRET_KEY = 'other' }) | Should -BeTrue
+        Test-SBKeysDiffer -BackupKeys $b -CurrentEnv $null | Should -BeTrue
+        Test-SBKeysDiffer -BackupKeys $null -CurrentEnv ([ordered]@{ FERNET_KEY = 'a' }) | Should -BeFalse
+    }
+    It 'Select-SBKeys keeps only FERNET_KEY and JWT_SECRET_KEY' {
+        $k = Select-SBKeys ([ordered]@{ FERNET_KEY = 'a'; JWT_SECRET_KEY = 'b'; POSTGRES_PASSWORD = 'p'; TZ = 'UTC' })
+        @($k.Keys) | Should -Be @('FERNET_KEY', 'JWT_SECRET_KEY')
+    }
+    It 'Set-SBEnvKeys merges keys into .env preserving the rest' {
+        $old = $env:SERVICEBILLS_ROOT
+        $env:SERVICEBILLS_ROOT = Join-Path $script:Work 'root'
+        try {
+            New-Item -ItemType Directory -Path $env:SERVICEBILLS_ROOT -Force | Out-Null
+            [IO.File]::WriteAllText((Join-Path $env:SERVICEBILLS_ROOT '.env'), "FERNET_KEY=old`nPOSTGRES_PASSWORD=pw`n")
+            Set-SBEnvKeys -Keys ([ordered]@{ FERNET_KEY = 'new'; JWT_SECRET_KEY = 'j' })
+            $m = ConvertFrom-SBEnvText ([IO.File]::ReadAllText((Join-Path $env:SERVICEBILLS_ROOT '.env')))
+            $m['FERNET_KEY'] | Should -Be 'new'
+            $m['JWT_SECRET_KEY'] | Should -Be 'j'
+            $m['POSTGRES_PASSWORD'] | Should -Be 'pw'
+        }
+        finally { $env:SERVICEBILLS_ROOT = $old }
+    }
+}

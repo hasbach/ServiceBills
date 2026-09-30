@@ -14,6 +14,7 @@ $ErrorActionPreference = 'Stop'
 
 try {
     Write-SBLog -name 'backup' -message 'Backup started'
+    Wait-SBDockerEngine -Seconds 180
     $zip = New-SBBackup -Destination $Destination
     Write-SBLog -name 'backup' -message "Backup saved: $zip"
     if (-not $Quiet) { [void](Show-SBMessage -Text "Backup saved: $zip") }

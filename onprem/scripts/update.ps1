@@ -1,4 +1,6 @@
-# ServiceBills updater. Checks for a newer release, backs up, updates the image tag, and rolls back on failure.
+# ServiceBills updater. Checks for a newer release, downloads it, backs up, switches the image tag and
+# rolls back on failure. Order matters: download first (nothing changes if it fails), then stop the
+# app, back up, switch, and only restore when the new version does not come up healthy.
 # Exit 0 = updated / nothing to do / skipped, 1 = failed.
 param(
     [switch]$Quiet,
@@ -50,13 +52,20 @@ function Complete-Update {
 
 try {
     $root = Get-SBRoot
-    $script:StatePath = Join-Path $root 'state.json'
+    $script:StatePath = Get-SBStatePath
     $script:EnvPath = Join-Path $root '.env'
     $state = Read-SBState $script:StatePath
     $envMap = ConvertFrom-SBEnvText ([IO.File]::ReadAllText($script:EnvPath))
     $oldTag = if ($envMap.Contains('IMAGE_TAG')) { [string]$envMap['IMAGE_TAG'] } else { 'latest' }
     $stateCurrent = $state['current']
     $statePrevious = $state['previous']
+
+    # Docker Desktop may not be up yet (e.g. right after a reboot or a missed schedule).
+    try { Wait-SBDockerEngine -Seconds 180 }
+    catch {
+        Save-Result -Status 'skipped' -Target '' -Message 'Docker was not ready, will retry' -Current $stateCurrent -Previous $statePrevious
+        Complete-Update -Code 0 -Message 'Docker is not ready yet. The update will be retried.'
+    }
 
     # License gate: ask the running app. If it is down we carry on, since the update may fix it.
     $info = $null
@@ -99,24 +108,34 @@ try {
         Complete-Update -Code 0 -Message 'Please reinstall with the latest ServiceBills Setup.'
     }
 
-    # Pre-update backup.
     Write-UpdateLog "Updating $cur -> $latest"
+
+    # (a) Download the new image FIRST. If this fails nothing has been touched: the app keeps running.
+    try { [void](Invoke-SBDocker -Arguments @('pull', "ghcr.io/hasbach/servicebills:$latest")) }
+    catch {
+        Write-UpdateLog "Pull error: $($_.Exception.Message)"
+        Save-Result -Status 'skipped' -Target $latest -Message 'Download failed, will retry' -Current $stateCurrent -Previous $statePrevious
+        Complete-Update -Code 0 -Message 'The update could not be downloaded. It will be retried later.'
+    }
+
+    # (b) Stop the app so the backup is consistent, (c) back up.
     $zip = $null
     try {
-        Wait-SBDockerEngine -Seconds 60
+        [void](Invoke-SBCompose -Arguments @('stop', 'web', 'scheduler'))
         $zip = New-SBBackup
     }
     catch {
         Write-UpdateLog "Backup error: $($_.Exception.Message)"
+        try { [void](Invoke-SBCompose -Arguments @('up', '-d')) }
+        catch { Write-UpdateLog "Could not restart the app after the failed backup: $($_.Exception.Message)" }
         Save-Result -Status 'failed' -Target $latest -Message 'Backup failed, update not attempted' -Current $stateCurrent -Previous $statePrevious
         Complete-Update -Code 1 -Message 'Backup failed, update not attempted.'
     }
 
-    # Switch image tag, pull, start, wait.
+    # (d) Switch the image tag, start, wait for health.
     $failure = $null
     try {
         Write-Env -Tag $latest
-        [void](Invoke-SBCompose -Arguments @('pull', 'web', 'scheduler'))
         [void](Invoke-SBCompose -Arguments @('up', '-d'))
         if (-not (Wait-SBHealth -Seconds 300)) { throw 'ServiceBills did not pass its health check after the update.' }
     }
@@ -127,17 +146,22 @@ try {
         Complete-Update -Code 0 -Message "ServiceBills was updated to version $latest."
     }
 
-    # Roll back: old image tag + pre-update data.
+    # (e) Only now roll back: old image tag + pre-update data. Keys are never touched by a rollback.
     Write-UpdateLog "Update failed ($failure); rolling back to $oldTag"
-    $rollbackNote = ''
+    $rollbackError = $null
     try {
         Write-Env -Tag $oldTag
         $healthy = Restore-SBBackup -Zip $zip
-        if (-not $healthy) { $rollbackNote = ' (rollback did not pass its health check)' }
+        if (-not $healthy) { $rollbackError = 'the restored version did not pass its health check' }
     }
-    catch { $rollbackNote = " (rollback error: $(($_.Exception.Message -split "\r?\n")[0]))" }
-    Save-Result -Status 'failed' -Target $latest -Message "$failure$rollbackNote" -Current $stateCurrent -Previous $statePrevious
-    Complete-Update -Code 1 -Message "The update to $latest failed and ServiceBills was rolled back. $failure"
+    catch { $rollbackError = ($_.Exception.Message -split "\r?\n")[0] }
+
+    if ($null -eq $rollbackError) {
+        Save-Result -Status 'failed' -Target $latest -Message "$failure (rolled back to $oldTag)" -Current $stateCurrent -Previous $statePrevious
+        Complete-Update -Code 1 -Message "The update to $latest failed and ServiceBills was rolled back. $failure"
+    }
+    Save-Result -Status 'failed' -Target $latest -Message "$failure. ROLLBACK FAILED: $rollbackError. Restore the latest backup manually." -Current $stateCurrent -Previous $statePrevious
+    Complete-Update -Code 1 -Message "The update to $latest failed and the automatic rollback ALSO failed ($rollbackError). Use the Restore shortcut to restore the latest backup, or contact support."
 }
 catch {
     $msg = ($_.Exception.Message -split "\r?\n")[0]

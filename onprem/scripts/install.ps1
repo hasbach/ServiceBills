@@ -30,18 +30,36 @@ function Write-Utf8NoBom {
 try {
     if (-not $SourceDir) { $SourceDir = Split-Path -Parent $PSScriptRoot }
     $root = Get-SBRoot
+    $envPath = Join-Path $root '.env'
+    $statePath = Get-SBStatePath
+
+    # Re-running over an existing install: protect the data first. A failed backup aborts the install.
+    if ((Test-Path $envPath) -and (Test-SBWebRunning)) {
+        Write-InstallLog 'Existing install is running; taking a backup first'
+        try { $preZip = New-SBBackup }
+        catch {
+            $why = $_.Exception.Message.Split([char]10)[0].Trim()
+            throw "Could not back up the existing ServiceBills data before upgrading, so nothing was changed. $why"
+        }
+        Write-InstallLog "Pre-upgrade backup: $preZip"
+    }
 
     Write-InstallLog "Step 1: creating $root and copying files from $SourceDir"
-    foreach ($d in @($root, (Join-Path $root 'logs'), (Join-Path $root 'scripts'))) {
+    foreach ($d in @($root, (Join-Path $root 'logs'), (Join-Path $root 'scripts'), (Split-Path -Parent $statePath))) {
         if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
     }
+    # Let the interactive user write logs, state and settings (the installer itself runs elevated).
+    Grant-SBRootAccess -Root $root
     Copy-Item -Path (Join-Path $SourceDir 'docker-compose.yml') -Destination (Join-Path $root 'compose.yml') -Force
     Copy-Item -Path (Join-Path (Join-Path $SourceDir 'scripts') '*') -Destination (Join-Path $root 'scripts') -Recurse -Force
 
     Write-InstallLog 'Step 2: building .env'
-    $envPath = Join-Path $root '.env'
     $existing = $null
     if (Test-Path $envPath) { $existing = ConvertFrom-SBEnvText ([IO.File]::ReadAllText($envPath)) }
+    $existingTag = ''
+    if ($existing -and $existing.Contains('IMAGE_TAG')) { $existingTag = [string]$existing['IMAGE_TAG'] }
+    # Never lower an installed version (an older Setup, or 'latest', must not downgrade the app).
+    $effectiveTag = Resolve-SBImageTag -Existing $existingTag -Requested $ImageTag
     $generated = [ordered]@{
         JWT_SECRET_KEY    = New-SBSecret
         FERNET_KEY        = New-SBFernetKey
@@ -49,15 +67,23 @@ try {
         MACHINE_ID        = Get-SBMachineId (Read-SBMachineGuid)
         TZ                = ConvertTo-SBIanaTimeZone (Get-TimeZone).Id
         APP_BASE_URL      = 'http://{0}:8000' -f (Get-SBLanIpLive)
-        IMAGE_TAG         = $ImageTag
+        IMAGE_TAG         = $effectiveTag
     }
     $merged = Merge-SBEnv -existing $existing -generated $generated
     Write-Utf8NoBom -Path $envPath -Text (ConvertTo-SBEnvText -Values $merged)
+    Protect-SBEnvFile -EnvPath $envPath
 
-    Write-InstallLog 'Step 3: state.json'
-    $statePath = Join-Path $root 'state.json'
+    Write-InstallLog 'Step 3: state\state.json'
     if (-not (Test-Path $statePath)) {
-        Write-SBState -path $statePath -state @{ current = $ImageTag; previous = $null; last_update = $null }
+        Write-SBState -path $statePath -state @{ current = $effectiveTag; previous = $null; last_update = $null }
+    }
+    else {
+        $state = Read-SBState $statePath
+        if ([string]$state['current'] -ne $effectiveTag) {
+            $prevTag = $state['previous']
+            if ($state['current']) { $prevTag = $state['current'] }
+            Write-SBState -path $statePath -state @{ current = $effectiveTag; previous = $prevTag; last_update = $state['last_update'] }
+        }
     }
 
     Write-InstallLog 'Step 4: settings.json'
@@ -66,7 +92,8 @@ try {
 
     if (-not $NoStart) {
         Write-InstallLog 'Step 5: starting ServiceBills'
-        Wait-SBDockerEngine -Seconds 180
+        try { Wait-SBDockerEngine -Seconds 180 }
+        catch { throw 'Docker is still starting or needs a restart. Restart the PC and run ServiceBills Setup again.' }
         if ($GhcrToken) {
             Write-InstallLog "docker login ghcr.io as $GhcrUser"
             [void](Invoke-SBDockerStdin -Arguments @('login', 'ghcr.io', '-u', $GhcrUser, '--password-stdin') -InputText $GhcrToken)
@@ -90,6 +117,13 @@ try {
     else {
         Remove-SBScheduledTask -Name 'ServiceBills Updater'
     }
+
+    Write-InstallLog 'Step 8: Docker Desktop starts on login'
+    try {
+        $how = Set-SBDockerAutoStart
+        Write-InstallLog "Docker Desktop auto-start configured via $how"
+    }
+    catch { Write-InstallLog "Could not configure Docker Desktop auto-start: $($_.Exception.Message)" }
 
     Write-InstallLog 'Install complete.'
     exit 0

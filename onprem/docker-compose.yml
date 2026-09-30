@@ -32,7 +32,7 @@ services:
       - "8000:8000"
     volumes:
       - uploads:/app/uploads
-      - ./state.json:/onprem/state.json:ro
+      - ./state:/onprem:ro
     depends_on:
       db:
         condition: service_healthy

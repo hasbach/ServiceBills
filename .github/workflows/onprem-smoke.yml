@@ -33,7 +33,8 @@ jobs:
             echo "IMAGE_TAG=smoke"
             echo "APP_BASE_URL=http://localhost:8000"
           } > onprem/.env
-          echo '{}' > onprem/state.json
+          mkdir -p onprem/state
+          echo '{}' > onprem/state/state.json
 
       - name: Start stack
         run: docker compose -f onprem/docker-compose.yml --env-file onprem/.env up -d
