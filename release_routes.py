@@ -70,7 +70,12 @@ def register(app, appmod):
 
     @app.route("/download", methods=["GET"])
     def download_installer():
-        url = _cfg("INSTALLER_URL")
-        if not url:
+        # Trim what was pasted into the Render dashboard; a stray newline would
+        # otherwise make the redirect header raise (500).
+        url = (_cfg("INSTALLER_URL") or "").strip()
+        if (not url.startswith(("https://", "http://")) or any(c.isspace() for c in url)
+                or url.rstrip("/").split("://", 1)[1].split("/", 1)[0] == request.host):
+            if url:
+                current_app.logger.error("INSTALLER_URL is not a usable external http(s) URL: %r", url[:200])
             return jsonify({"error": "installer not available"}), 503
         return redirect(url, code=302)

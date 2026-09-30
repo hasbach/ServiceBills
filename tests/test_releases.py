@@ -76,3 +76,20 @@ def test_onprem_blocks_updates_and_download(app, client):
         assert client.get("/download").status_code == 404
     finally:
         app.config["DEPLOYMENT_MODE"] = "saas"
+
+
+@pytest.mark.parametrize("value", ["https://pub-x.r2.dev/installer/ServiceBills-Setup.exe\n",
+                                   "  https://pub-x.r2.dev/installer/ServiceBills-Setup.exe  "])
+def test_download_trims_pasted_whitespace(client, monkeypatch, value):
+    monkeypatch.setenv("INSTALLER_URL", value)
+    r = client.get("/download")
+    assert r.status_code == 302 and r.headers["Location"] == "https://pub-x.r2.dev/installer/ServiceBills-Setup.exe"
+
+
+@pytest.mark.parametrize("value", ["ftp://x/y.exe", "pub-x.r2.dev/a.exe", "https://a b/c.exe",
+                                   "http://localhost/installer/ServiceBills-Setup.exe"])
+def test_download_rejects_unusable_urls(client, monkeypatch, value):
+    # the last one points back at this app itself (test client host is localhost)
+    monkeypatch.setenv("INSTALLER_URL", value)
+    r = client.get("/download")
+    assert r.status_code == 503 and r.get_json() == {"error": "installer not available"}
