@@ -22,6 +22,7 @@ except ImportError:
 
 import re
 import difflib
+import modules
 import hmac
 import hashlib
 import math
@@ -138,7 +139,7 @@ limiter = Limiter(key_func=get_remote_address, app=app, storage_uri="memory://",
 # functions, so importing it here does not create a circular import.
 from tenancy import (
     current_tenant_id, current_tenant, tenant_query, new_for_tenant, get_tenant_settings,
-    tenant_required, superadmin_required,
+    tenant_required, superadmin_required, require_module,
 )
 from crypto import EncryptedString
 import storage
@@ -214,9 +215,13 @@ class Tenant(db.Model):
     # The tenant-wide self-service Whish payment page's URL slug (2026-08-27
     # plan amendment) -- null until staff first generate it (Task 20).
     public_pay_slug = db.Column(db.String(32), nullable=True, unique=True, index=True)
+    # Super-admin per-tenant module overrides on top of the plan bundle,
+    # e.g. {"network": true, "ai_cs": false}. NULL = none. See modules.py.
+    module_overrides = db.Column(db.JSON, nullable=True)
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "slug": self.slug,
+                "modules": sorted(modules.enabled_for(self)),
                 "status": self.status, "plan": self.plan,
                 # ISO-8601 with an explicit UTC 'Z' marker -- naive '%Y-%m-%d %H:%M:%S'
                 # was silently parsed as browser-LOCAL time by `new Date(...)` on the
@@ -1993,6 +1998,8 @@ def _maybe_create_customer_payment_link(payment, customer):
     at construction) -- confirmed at every one of this task's 10 call sites,
     not assumed."""
     try:
+        if not modules.is_enabled(db.session.get(Tenant, customer.tenant_id), 'whish_payments'):
+            return None
         whish_settings = TenantWhishSettings.query.filter_by(tenant_id=customer.tenant_id, enabled=True).first()
         if not whish_settings:
             return None
@@ -2573,8 +2580,35 @@ def admin_list_tenants():
         d = t.to_dict()
         d["customers"] = Customer.query.filter_by(tenant_id=t.id).count()
         d["users"] = User.query.filter_by(tenant_id=t.id).count()
+        d["module_overrides"] = t.module_overrides or {}
         result.append(d)
     return jsonify(result), 200
+
+
+@app.route('/api/admin/tenants/<int:tid>/modules', methods=['POST'])
+@superadmin_required
+def admin_set_modules(tid):
+    t = db.session.get(Tenant, tid)
+    if not t:
+        return jsonify({"msg": "Tenant not found"}), 404
+    incoming = (request.get_json(silent=True) or {}).get("overrides")
+    if not isinstance(incoming, dict):
+        return jsonify({"msg": "overrides must be an object"}), 400
+    current = dict(t.module_overrides or {})
+    for key, val in incoming.items():
+        if key in modules.ALWAYS_ON:
+            return jsonify({"msg": f"{key} is always on"}), 400
+        if key not in modules.PAID:
+            return jsonify({"msg": f"Unknown module: {key}"}), 400
+        if val is None:
+            current.pop(key, None)
+        elif isinstance(val, bool):
+            current[key] = val
+        else:
+            return jsonify({"msg": f"{key}: expected true, false or null"}), 400
+    t.module_overrides = current or None
+    db.session.commit()
+    return jsonify({"tenant": {**t.to_dict(), "module_overrides": t.module_overrides or {}}}), 200
 
 
 @app.route('/api/admin/tenants/<int:tid>/suspend', methods=['POST'])
@@ -3261,6 +3295,8 @@ def send_daily_whatsapp_keepalive(tenant_id):
     what actually opens the session the raw text/media forward in the webhook
     handler depends on. See
     docs/superpowers/specs/2026-08-12-whatsapp-forwarding-keepalive.md."""
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'whatsapp'):
+        return
     settings = WhatsAppSettings.query.filter_by(tenant_id=tenant_id).first()
     if not settings or settings.mode != 'api' or not settings.enabled:
         return
@@ -3429,6 +3465,8 @@ def auto_sync_upstream_status_for_tenant(tenant_id):
     timeout) doesn't stop the rest of this tenant's customers, and one
     tenant's failure doesn't stop the next tenant (see the _with_context
     wrapper below)."""
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'upstream_sync'):
+        return
     settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).first()
     if not settings or not settings.upstream_sync_automation_enabled:
         return
@@ -3558,6 +3596,8 @@ def refresh_agent_mode_network_status_for_tenant(tenant_id):
     failure does not abort the rest of this tenant's devices -- refresh_
     agent_mode_network_status_with_context already does the same at the
     tenant level, above this."""
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'network'):
+        return
     settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).first()
     if not settings or settings.network_access_mode != 'agent':
         return
@@ -5136,6 +5176,7 @@ def get_unpaid_payments():
 @app.route('/api/reports/customer-whish-payments', methods=['GET'])
 @jwt_required()
 def customer_whish_payments_report():
+    has_links = modules.is_enabled(db.session.get(Tenant, current_tenant_id()), 'whish_payments')
     query = tenant_query(CustomerPaymentLink).join(Customer)
     status = request.args.get('status')
     start_date_str = request.args.get('start_date')
@@ -5153,7 +5194,9 @@ def customer_whish_payments_report():
     query = query.order_by(CustomerPaymentLink.created_at.desc())
 
     rows = []
-    if status != 'manual_transfer':
+    # Tenants without whish_payments keep their manual-transfer history but
+    # never see payment-link rows.
+    if has_links and status != 'manual_transfer':
         for link in query.all():
             d = link.to_dict()
             d['customer_name'] = link.customer.name
@@ -6436,6 +6479,7 @@ def list_exchange_rates():
 @app.route('/api/whatsapp-settings', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def get_whatsapp_settings():
     settings = tenant_query(WhatsAppSettings).first()
     if settings:
@@ -6480,8 +6524,11 @@ def get_whatsapp_deeplink_settings():
         return jsonify(msg="Not authorized"), 403
     settings = tenant_query(WhatsAppSettings).first()
     full = settings.to_dict() if settings else {}
+    # Core payment screens call this to build a wa.me link, so it is never
+    # gated (403): with the whatsapp module off it reports "not configured".
+    _wa_on = modules.is_enabled(current_tenant(), 'whatsapp')
     return jsonify({'settings': {
-        'enabled': bool(full.get('enabled', False)),
+        'enabled': bool(full.get('enabled', False)) and _wa_on,
         'mode': full.get('mode') or 'deeplink',
         'deeplink_msg_payment': full.get('deeplink_msg_payment') or 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
         'deeplink_msg_renewal': full.get('deeplink_msg_renewal') or 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
@@ -6491,6 +6538,7 @@ def get_whatsapp_deeplink_settings():
 @app.route('/api/whatsapp-settings', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def save_whatsapp_settings():
     data = request.json
     try:
@@ -6534,6 +6582,7 @@ def save_whatsapp_settings():
 @app.route('/api/tenant-whish-settings', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def get_tenant_whish_settings():
     settings = tenant_query(TenantWhishSettings).first()
     if settings:
@@ -6547,14 +6596,10 @@ def get_tenant_whish_settings():
 @app.route('/api/tenant-whish-settings', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def save_tenant_whish_settings():
     data = request.json or {}
     tenant = current_tenant()
-    # Plan-gating: this whole feature is Pro-only -- see the spec's Resolved
-    # product decision #2. Mirrors the exact pattern save_whatsapp_settings
-    # already uses for whatsapp_api mode.
-    if not plans.limits(tenant.plan)["whish_customer_payments"]:
-        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
     try:
         settings = tenant_query(TenantWhishSettings).first()
         if not settings:
@@ -6581,6 +6626,7 @@ def save_tenant_whish_settings():
 @app.route('/api/tenant/whish/public-pay-link', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def get_public_pay_link():
     """Staff-facing: the tenant-wide self-service Whish payment page's
     current link, if one has been generated yet (Task 20). slug is None
@@ -6597,6 +6643,7 @@ def get_public_pay_link():
 @app.route('/api/tenant/whish/public-pay-link/regenerate', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def regenerate_public_pay_link():
     """Staff-facing: (re)generate the tenant-wide self-service Whish payment
     page's slug (Task 20). Same Pro-plan gate as Task 3's settings save --
@@ -6607,8 +6654,6 @@ def regenerate_public_pay_link():
     leaked somewhere unwanted), not something to do casually. The frontend
     must warn staff of that before calling this."""
     tenant = current_tenant()
-    if not plans.limits(tenant.plan)["whish_customer_payments"]:
-        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
     tenant.public_pay_slug = secrets.token_urlsafe(12)
     db.session.commit()
     return jsonify({
@@ -6627,7 +6672,7 @@ def public_tenant_pay_branding(slug):
     customer-specific) so the limit here is generous compared to the lookup
     route below."""
     tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
-    if not tenant:
+    if not tenant or not modules.is_enabled(tenant, 'whish_payments'):
         return jsonify({"error": "not found"}), 404
     bs = BusinessSettings.query.filter_by(tenant_id=tenant.id).first()
     return jsonify({
@@ -6651,7 +6696,7 @@ def public_tenant_pay_lookup(slug):
     uniqueness constraint (e.g. a household sharing one number across two
     family members' subscriptions); see Task 17's Judgment call."""
     tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
-    if not tenant:
+    if not tenant or not modules.is_enabled(tenant, 'whish_payments'):
         return jsonify({"error": "not found"}), 404
 
     phone = (request.get_json(silent=True) or {}).get('phone', '').strip()
@@ -6737,7 +6782,7 @@ def _apply_whish_debt_then_prepayment(customer, attempt):
 @limiter.limit("10 per minute")
 def public_tenant_pay_checkout(slug):
     tenant = Tenant.query.filter_by(public_pay_slug=slug).first()
-    if not tenant:
+    if not tenant or not modules.is_enabled(tenant, 'whish_payments'):
         return jsonify({"error": "not found"}), 404
 
     body = request.get_json(silent=True) or {}
@@ -6874,6 +6919,9 @@ def public_pay_view(view_token):
     }
     if not link:
         return jsonify(invalid_response), 200
+    link_tenant = db.session.get(Tenant, link.tenant_id)
+    if not link_tenant or not modules.is_enabled(link_tenant, 'whish_payments'):
+        return jsonify(invalid_response), 200
     if link.status == 'stale' or link.status == 'expired':
         return jsonify(invalid_response), 200
     if link.status == 'pending' and link.expires_at < datetime.utcnow():
@@ -6896,6 +6944,9 @@ def public_pay_view(view_token):
 def public_pay_checkout(view_token):
     link = CustomerPaymentLink.query.filter_by(view_token=view_token).first()
     if not link:
+        return jsonify({"msg": "Payment link not found."}), 404
+    link_tenant = db.session.get(Tenant, link.tenant_id)
+    if not link_tenant or not modules.is_enabled(link_tenant, 'whish_payments'):
         return jsonify({"msg": "Payment link not found."}), 404
     if link.status != 'pending' or link.expires_at < datetime.utcnow():
         return jsonify({"msg": "This payment link is no longer valid."}), 409
@@ -7007,6 +7058,7 @@ def customer_whish_failure():
 @app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/resend', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def resend_customer_payment_link(customer_id, payment_id):
     """Generate a fresh CustomerPaymentLink for an existing pending Payment.
     Leaves any prior link for that Payment alone -- the old link is left to
@@ -7022,8 +7074,6 @@ def resend_customer_payment_link(customer_id, payment_id):
         return jsonify({"msg": "This payment is already paid -- nothing to send a link for."}), 409
 
     tenant = current_tenant()
-    if not plans.limits(tenant.plan)["whish_customer_payments"]:
-        return jsonify({"msg": "Tenant-facing Whish customer payments require an upgraded plan."}), 402
     whish_settings = tenant_query(TenantWhishSettings).filter_by(enabled=True).first()
     if not whish_settings:
         return jsonify({"msg": "Whish customer payments are not configured for this business yet."}), 402
@@ -7049,6 +7099,7 @@ def resend_customer_payment_link(customer_id, payment_id):
 @app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/email', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whish_payments')
 def email_customer_payment_link(customer_id, payment_id):
     """Send a payment link to a staff-typed, ad-hoc email address -- this
     codebase has no persisted Customer.email column and isn't adding one
@@ -7079,6 +7130,7 @@ def email_customer_payment_link(customer_id, payment_id):
 
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
 @jwt_required()
+@require_module('whatsapp')
 def subscribe_waba():
     try:
         settings = tenant_query(WhatsAppSettings).first()
@@ -7109,6 +7161,7 @@ def _parse_meta_error(resp):
 
 @app.route('/api/whatsapp/templates', methods=['GET'])
 @jwt_required()
+@require_module('whatsapp')
 def get_whatsapp_templates():
     templates = tenant_query(WhatsAppTemplate).order_by(WhatsAppTemplate.created_at.desc()).all()
     return jsonify({'templates': [t.to_dict() for t in templates]}), 200
@@ -7117,6 +7170,7 @@ def get_whatsapp_templates():
 @app.route('/api/whatsapp/templates/sync', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def sync_whatsapp_templates():
     settings = tenant_query(WhatsAppSettings).first()
     if not settings or settings.mode != 'api':
@@ -7188,6 +7242,7 @@ def _validate_template_components(components):
 @app.route('/api/whatsapp/templates', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def create_whatsapp_template():
     settings = tenant_query(WhatsAppSettings).first()
     if not settings or settings.mode != 'api':
@@ -7235,6 +7290,7 @@ def create_whatsapp_template():
 @app.route('/api/whatsapp/templates/<int:template_id>', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def update_whatsapp_template(template_id):
     settings = tenant_query(WhatsAppSettings).first()
     if not settings or settings.mode != 'api':
@@ -7277,6 +7333,7 @@ def update_whatsapp_template(template_id):
 @app.route('/api/whatsapp/templates/<int:template_id>', methods=['DELETE'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def delete_whatsapp_template(template_id):
     settings = tenant_query(WhatsAppSettings).first()
     if not settings or settings.mode != 'api':
@@ -7304,6 +7361,7 @@ def delete_whatsapp_template(template_id):
 @app.route('/api/whatsapp/templates/upload-sample', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('whatsapp')
 def upload_whatsapp_template_sample():
     """Uploads a sample media file for a media (image/video/document) HEADER
     component via Meta's resumable-upload API, returning the 'handle' Meta
@@ -7562,6 +7620,8 @@ def send_whatsapp_message(customer, event_type, context=None):
         context = {}
 
     try:
+        if not modules.is_enabled(db.session.get(Tenant, customer.tenant_id), 'whatsapp'):
+            return {'success': False, 'status': 'Skipped', 'error': 'whatsapp module disabled'}
         if not getattr(customer, 'whatsapp_notifications_enabled', True):
             return {'success': False, 'status': 'Skipped', 'error': 'Customer has WhatsApp notifications disabled'}  # User disabled notifications
 
@@ -8232,6 +8292,7 @@ def submit_feedback():
 
 @app.route('/api/payment-reminders', methods=['POST'])
 @jwt_required()
+@require_module('whatsapp')
 def create_payment_reminder():
     data = request.json
     reminder = PaymentReminder(
@@ -8246,6 +8307,7 @@ def create_payment_reminder():
 
 @app.route('/api/customers/<int:customer_id>/send-whatsapp-reminder', methods=['POST'])
 @jwt_required()
+@require_module('whatsapp')
 def trigger_whatsapp_reminder(customer_id):
     customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
@@ -8269,6 +8331,7 @@ def trigger_whatsapp_reminder(customer_id):
 
 @app.route('/api/messages/bulk_send', methods=['POST'])
 @jwt_required()
+@require_module('whatsapp')
 def send_bulk_messages():
     # Only allow admin
     current_username = get_jwt_identity()
@@ -8510,6 +8573,10 @@ def whatsapp_webhook():
                             logging.warning(f"WhatsApp template status webhook: signature mismatch for tenant_id={tpl_settings.tenant_id}; rejecting.")
                             return jsonify({'error': 'Invalid signature'}), 401
 
+                        if not modules.is_enabled(db.session.get(Tenant, tpl_settings.tenant_id), 'whatsapp'):
+                            logging.info(f"WhatsApp template status webhook: whatsapp module disabled for tenant_id={tpl_settings.tenant_id}; skipping.")
+                            continue
+
                         tpl_name = val.get('message_template_name')
                         tpl_language = val.get('message_template_language')
                         tpl_new_status = val.get('event')
@@ -8553,6 +8620,14 @@ def whatsapp_webhook():
                     if not hmac.compare_digest(expected_sig, provided_sig):
                         logging.warning(f"WhatsApp webhook: signature mismatch for tenant_id={settings.tenant_id}; rejecting.")
                         return jsonify({'error': 'Invalid signature'}), 401
+
+                    # Module gate: a tenant without the whatsapp module gets nothing
+                    # processed, but Meta still receives 200 (it retries otherwise).
+                    _wh_tenant = db.session.get(Tenant, settings.tenant_id)
+                    if not modules.is_enabled(_wh_tenant, 'whatsapp'):
+                        logging.info(f"WhatsApp webhook: whatsapp module disabled for tenant_id={settings.tenant_id}; skipping.")
+                        continue
+                    _ai_cs_on = modules.is_enabled(_wh_tenant, 'ai_cs')
 
                     if len(matches) > 1:
                         logging.warning(f"WhatsApp webhook: {len(matches)} settings rows share phone_number_id={incoming_pnid} "
@@ -8724,7 +8799,7 @@ def whatsapp_webhook():
                             if cs_settings is None or cs_settings.is_active:
                                 cs_agent_active = True
 
-                        ai_will_run = bool(cs_agent_active and getattr(settings, 'auto_reply_enabled', True))
+                        ai_will_run = bool(cs_agent_active and _ai_cs_on and getattr(settings, 'auto_reply_enabled', True))
                         ai_paused = False
                         if inbox_conv is not None:
                             try:
@@ -10210,6 +10285,7 @@ def collect_reseller_payment(reseller_id):
 @app.route('/api/upstream-providers', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def get_upstream_providers():
     providers = tenant_query(UpstreamProvider).order_by(UpstreamProvider.name).all()
     result = []
@@ -10222,6 +10298,7 @@ def get_upstream_providers():
 @app.route('/api/upstream-providers', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def create_upstream_provider():
     data = request.json
     try:
@@ -10244,6 +10321,7 @@ def create_upstream_provider():
 @app.route('/api/upstream-providers/<int:provider_id>', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def update_upstream_provider(provider_id):
     data = request.json
     provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
@@ -10273,6 +10351,7 @@ def update_upstream_provider(provider_id):
 @app.route('/api/upstream-providers/<int:provider_id>', methods=['DELETE'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def delete_upstream_provider(provider_id):
     try:
         provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
@@ -10294,6 +10373,7 @@ def delete_upstream_provider(provider_id):
 @app.route('/api/upstream-providers/<int:provider_id>/history', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def get_upstream_provider_history(provider_id):
     provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
     if not provider:
@@ -10305,6 +10385,7 @@ def get_upstream_provider_history(provider_id):
 @app.route('/api/upstream-providers/<int:provider_id>/topup', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def topup_upstream_provider(provider_id):
     """Manual prepaid-credit top-up -- decreases balance, the same direction the
     real portal's own balance figure moves when the tenant pays the upstream."""
@@ -10334,6 +10415,7 @@ def topup_upstream_provider(provider_id):
 @app.route('/api/upstream-providers/<int:provider_id>/renewal-cost', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('upstream_sync')
 def record_upstream_renewal_cost(provider_id):
     """Manual record of what a customer's renewal cost upstream -- how the
     tenant tracks real per-customer cost until portal automation exists."""
@@ -10379,6 +10461,7 @@ def record_upstream_renewal_cost(provider_id):
 # other scheduler jobs -- see the comment there for why.
 @app.route('/api/customers/<int:customer_id>/upstream-status-sync', methods=['POST'])
 @jwt_required()
+@require_module('upstream_sync')
 def sync_customer_upstream_status(customer_id):
     customer = tenant_query(Customer).filter_by(id=customer_id).first()
     if not customer:
@@ -10457,6 +10540,7 @@ def _resolve_parent_device_id(raw_parent_id, device_id=None):
 @app.route('/api/network-devices', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def get_network_devices():
     devices = tenant_query(NetworkDevice).order_by(NetworkDevice.name).all()
     return jsonify([d.to_dict() for d in devices]), 200
@@ -10464,6 +10548,7 @@ def get_network_devices():
 @app.route('/api/network-devices', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def create_network_device():
     data = request.json
     try:
@@ -10512,6 +10597,7 @@ def create_network_device():
 @app.route('/api/network-devices/<int:device_id>', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def update_network_device(device_id):
     data = request.json
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
@@ -10571,6 +10657,7 @@ def update_network_device(device_id):
 @app.route('/api/network-devices/<int:device_id>', methods=['DELETE'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def delete_network_device(device_id):
     try:
         device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
@@ -10598,6 +10685,7 @@ def delete_network_device(device_id):
 @app.route('/api/network-devices/<int:device_id>/check-now', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def check_network_device_now(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
@@ -10613,6 +10701,7 @@ def check_network_device_now(device_id):
 @app.route('/api/network-devices/<int:device_id>/test-connection', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def test_network_device_connection(device_id):
     """Ask the device to prove it is reachable and the credential works.
 
@@ -10633,6 +10722,7 @@ def test_network_device_connection(device_id):
 @app.route('/api/network-devices/<int:device_id>/interface-labels', methods=['PATCH'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def set_network_device_interface_label(device_id):
     data = request.json
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
@@ -11261,6 +11351,8 @@ def agent_poll_job():
     the legitimate agent's own rate (one poll every DEFAULT_POLL_SECONDS=2s,
     i.e. 30/min).
     """
+    if not modules.is_enabled(db.session.get(Tenant, g.network_agent.tenant_id), 'network'):
+        return modules.disabled_response('network')
     agent = g.network_agent
     agent.last_seen_at = datetime.utcnow()
     version = (request.headers.get('X-Agent-Version') or '')[:20]
@@ -11460,6 +11552,8 @@ def _stamp_device_status_from_agent(job, status):
 @limiter.limit("120 per minute")
 @agent_token_required()
 def agent_post_result(job_id):
+    if not modules.is_enabled(db.session.get(Tenant, g.network_agent.tenant_id), 'network'):
+        return modules.disabled_response('network')
     agent = g.network_agent
     agent.last_seen_at = datetime.utcnow()
     job = NetworkAgentJob.query.filter_by(
@@ -11909,6 +12003,7 @@ def _with_interface_labels(job, payload):
 @app.route('/api/network-jobs/<int:job_id>', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_network_job(job_id):
     job = tenant_query(NetworkAgentJob).filter_by(id=job_id).first()
     if not job:
@@ -11927,6 +12022,7 @@ def get_network_job(job_id):
 @app.route('/api/network-agents', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def list_network_agents():
     agents = tenant_query(NetworkAgent).order_by(NetworkAgent.name).all()
     return jsonify([a.to_dict() for a in agents]), 200
@@ -11935,6 +12031,7 @@ def list_network_agents():
 @app.route('/api/network-agents', methods=['POST'])
 @jwt_required()
 @admin_required()
+@require_module('network')
 def create_network_agent():
     if tenant_query(NetworkAgent).first():
         return jsonify({'error': 'This tenant already has an agent. '
@@ -11956,6 +12053,7 @@ def create_network_agent():
 @app.route('/api/network-agents/<int:agent_id>/regenerate-token', methods=['POST'])
 @jwt_required()
 @admin_required()
+@require_module('network')
 def regenerate_network_agent_token(agent_id):
     agent = tenant_query(NetworkAgent).filter_by(id=agent_id).first()
     if not agent:
@@ -11972,6 +12070,7 @@ def regenerate_network_agent_token(agent_id):
 @app.route('/api/network-tree', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_network_tree():
     """The device skeleton plus each device's last known result -- no device is
     contacted here. Live data is refreshed per-device, on demand, via the
@@ -11986,6 +12085,7 @@ def get_network_tree():
 @app.route('/api/network-tree/olt/<int:device_id>/refresh', methods=['POST'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def refresh_olt_onus(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
@@ -12100,6 +12200,7 @@ def _propose_label_matches(onus, customers):
 @app.route('/api/network-tree/olt/<int:device_id>/label-matches', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def get_onu_label_matches(device_id):
     """Two-phase. Without job_id: start a walk and return the job. With
     job_id: compute proposals from that job's stored ONU list.
@@ -12175,6 +12276,7 @@ def get_onu_label_matches(device_id):
 @app.route('/api/network-tree/olt/<int:device_id>/label-matches/apply', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def apply_onu_label_matches(device_id):
     device = tenant_query(NetworkDevice).filter_by(id=device_id).first()
     if not device:
@@ -12278,6 +12380,7 @@ def _apply_cpe_locations(result, tenant_id=None):
 @app.route('/api/network-tree/olt/<int:device_id>/locate-customers', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def locate_customers(device_id):
     """Start a CPE-location walk. Writes nothing -- the apply step does that,
     so the agent (which may run the walk) never touches customer records."""
@@ -12296,6 +12399,7 @@ def locate_customers(device_id):
            methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def apply_customer_locations(device_id):
     """Second half of the two-call locate flow: authenticated as the logged-in
     admin (never the agent), this is the only path that writes a customer's
@@ -12468,6 +12572,7 @@ def _require_olt(device_id):
 @app.route('/api/network-map/olts', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_network_map_olts():
     olts = (tenant_query(NetworkDevice)
             .filter_by(device_type='vsol_olt')
@@ -12478,6 +12583,7 @@ def get_network_map_olts():
 @app.route('/api/network-map', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_network_map():
     device_id = request.args.get('olt_device_id', type=int)
     device, err = _require_olt(device_id)
@@ -12503,6 +12609,7 @@ def get_network_map():
 @app.route('/api/network-map/unplaced-onus', methods=['GET'])
 @jwt_required()
 @network_view_required()
+@require_module('network')
 def get_unplaced_onus():
     device_id = request.args.get('olt_device_id', type=int)
     device, err = _require_olt(device_id)
@@ -12733,6 +12840,7 @@ def _validate_node_payload(payload, device_id, node=None):
 @app.route('/api/network-map/nodes', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def create_network_node():
     payload = request.json or {}
     # Coerced the same way and for the same reason as parent_node_id (see
@@ -12757,6 +12865,7 @@ def create_network_node():
 @app.route('/api/network-map/nodes/<int:node_id>', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def update_network_node(node_id):
     node = tenant_query(NetworkNode).filter_by(id=node_id).first()
     if not node:
@@ -12774,6 +12883,7 @@ def update_network_node(node_id):
 @app.route('/api/network-map/nodes/<int:node_id>', methods=['DELETE'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def delete_network_node(node_id):
     node = tenant_query(NetworkNode).filter_by(id=node_id).first()
     if not node:
@@ -12808,6 +12918,7 @@ def _customer_network_context(customer_id):
 
 @app.route('/api/customers/<int:customer_id>/network-status', methods=['POST'])
 @jwt_required()
+@require_module('network')
 def get_customer_network_status(customer_id):
     """Queue the two reads that describe a customer's PPPoE state.
 
@@ -12900,6 +13011,7 @@ def _perform_customer_write(customer_id, action):
 @app.route('/api/customers/<int:customer_id>/network-suspend', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def suspend_customer_network(customer_id):
     return _perform_customer_write(customer_id, 'suspend')
 
@@ -12907,6 +13019,7 @@ def suspend_customer_network(customer_id):
 @app.route('/api/customers/<int:customer_id>/network-unsuspend', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@require_module('network')
 def unsuspend_customer_network(customer_id):
     return _perform_customer_write(customer_id, 'unsuspend')
 
@@ -13521,6 +13634,8 @@ def cs_agent_config():
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     if request.method == 'POST':
         data = request.get_json(silent=True) or {}
@@ -13585,6 +13700,8 @@ def cs_tool_lookup_customer():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
     
     phone = (
         request.args.get('phone') or 
@@ -13612,6 +13729,8 @@ def cs_tool_customer_status():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     customer_id = request.args.get('customer_id', type=int) or request.args.get('id', type=int)
     if not customer_id and request.is_json:
@@ -13635,6 +13754,11 @@ def cs_tool_network_diagnostic():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    _tenant = db.session.get(Tenant, tenant_id)
+    if not modules.is_enabled(_tenant, 'ai_cs'):
+        return modules.disabled_response('ai_cs')
+    if not modules.is_enabled(_tenant, 'network'):
+        return jsonify({"available": False, "message": "Network diagnostics are not available for this business. Offer to open a support ticket instead."}), 200
 
     data = (request.get_json(silent=True) or {}) if request.is_json else {}
     raw_id = data.get('customer_id') or request.args.get('customer_id') or request.args.get('id')
@@ -13662,6 +13786,11 @@ def cs_tool_send_payment_link():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    _tenant = db.session.get(Tenant, tenant_id)
+    if not modules.is_enabled(_tenant, 'ai_cs'):
+        return modules.disabled_response('ai_cs')
+    if not modules.is_enabled(_tenant, 'whish_payments'):
+        return jsonify({"available": False, "message": "Online payment links are not available for this business. Tell the customer how to pay at the office instead."}), 200
 
     data = (request.get_json(silent=True) or {}) if request.is_json else {}
     raw_id = data.get('customer_id') or request.args.get('customer_id') or request.args.get('id')
@@ -13684,6 +13813,8 @@ def cs_tool_escalate():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     data = (request.get_json(silent=True) or {}) if request.is_json else {}
     raw_id = data.get('customer_id') or request.args.get('customer_id') or request.args.get('id')
@@ -13714,6 +13845,8 @@ def cs_get_recent_tickets():
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     limit = min(int(request.args.get('limit', 15)), 50)
     tickets = SupportTicket.query.filter_by(tenant_id=tenant_id).order_by(SupportTicket.id.desc()).limit(limit).all()
@@ -13769,6 +13902,8 @@ def cs_agent_memory():
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     if request.method == 'POST':
         data = request.get_json(silent=True) or {}
@@ -13806,6 +13941,8 @@ def cs_agent_memory_recent_logs():
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     limit = min(int(request.args.get('limit', 50)), 100)
     logs = CSAgentMessageLog.query.filter_by(tenant_id=tenant_id).order_by(
@@ -13820,6 +13957,8 @@ def cs_agent_memory_update(entry_id):
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     data = request.get_json(silent=True) or {}
     if 'is_active' not in data:
@@ -13837,6 +13976,8 @@ def cs_agent_memory_delete(entry_id):
     tenant_id = _require_authenticated_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized"), 401
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
 
     ok = cs_agent_tools.delete_knowledge_entry(appmod, tenant_id, entry_id)
     if not ok:

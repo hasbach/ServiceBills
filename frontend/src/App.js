@@ -33,6 +33,7 @@ import {
     Map as NetworkMapIcon,
     SmartToy as SmartToyIcon,
 } from '@mui/icons-material';
+import { filterNavItems } from './utils/navFilter.js';
 import { AppContextProvider, useAppContext, apiService } from './context/AppContext.js';
 import DashboardView from './components/DashboardView.js';
 import SubscriptionsView from './components/SubscriptionsView.js';
@@ -77,18 +78,18 @@ const NAV_ITEMS = [
     { key: 'suppliers',          label: 'Suppliers',          icon: <ShoppingCartIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
     // Concept A/B (see docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
     // only one of these is ever relevant, gated by BusinessSettings.network_mode, not roles.
-    { key: 'upstream-providers',  label: 'Upstream Providers',  icon: <UpstreamProviderIcon />, group: 'main',    allowedRoles: ['admin', 'finance'], visibleWhen: (bs) => bs?.network_mode === 'upstream_bridge' },
-    { key: 'network-devices',    label: 'Network Devices',    icon: <NetworkDeviceIcon />,    group: 'main',    allowedRoles: ['admin', 'finance'] },
+    { key: 'upstream-providers',  label: 'Upstream Providers',  icon: <UpstreamProviderIcon />, group: 'main',    allowedRoles: ['admin', 'finance'], module: 'upstream_sync', visibleWhen: (bs) => bs?.network_mode === 'upstream_bridge' },
+    { key: 'network-devices',    label: 'Network Devices',    icon: <NetworkDeviceIcon />,    group: 'main',    allowedRoles: ['admin', 'finance'], module: 'network' },
     // 'employee'/'collector' get the tree read-only: they need to see which
     // ONU a customer sits behind and whether it's down. The write action on
     // the page (Match Labels) is hidden from them in NetworkTreeView.js and
     // refused by admin_or_finance_required() on the endpoints behind it.
-    { key: 'network-tree',       label: 'Network Tree',       icon: <NetworkTreeIcon />,      group: 'main',    allowedRoles: ['admin', 'finance', 'cashier', 'employee', 'collector'] },
+    { key: 'network-tree',       label: 'Network Tree',       icon: <NetworkTreeIcon />,      group: 'main',    allowedRoles: ['admin', 'finance', 'cashier', 'employee', 'collector'], module: 'network' },
     // Same roles as network-tree above: the map's read endpoints are also
     // network_view_required() (admin/finance/employee/collector), and writes
     // are admin_or_finance_required() -- enforced inside NetworkMapView.js
     // (canEdit) and the backend itself, not by this nav entry.
-    { key: 'network-map',        label: 'Network Map',        icon: <NetworkMapIcon />,       group: 'main',    allowedRoles: ['admin', 'finance', 'cashier', 'employee', 'collector'] },
+    { key: 'network-map',        label: 'Network Map',        icon: <NetworkMapIcon />,       group: 'main',    allowedRoles: ['admin', 'finance', 'cashier', 'employee', 'collector'], module: 'network' },
     { key: 'employees',          label: 'Payroll',            icon: <PayrollIcon />,             group: 'main',      allowedRoles: ['admin'] },
     { key: 'payments',           label: 'Payments',           icon: <PaymentIcon />,         group: 'main',      allowedRoles: ['admin', 'finance', 'cashier', 'collector'] },
     { key: 'receipts',           label: 'Receipts',           icon: <ReceiptIcon />,         group: 'main',      allowedRoles: ['admin', 'finance'] },
@@ -97,9 +98,9 @@ const NAV_ITEMS = [
     { key: 'enhanced-reports',   label: 'Enhanced Reports',   icon: <EnhancedReportIcon />,  group: 'analytics', allowedRoles: ['admin'] },
     { key: 'service',            label: 'Service Management', icon: <ServiceIcon />,         group: 'manage',    allowedRoles: ['admin', 'employee', 'technician'] },
     { key: 'subscription-plans', label: 'Subscription Plans', icon: <PlansIcon />,           group: 'manage',    allowedRoles: ['admin', 'finance'] },
-    { key: 'messaging',          label: 'Messaging',          icon: <MessageIcon />,         group: 'manage',    allowedRoles: ['admin'] },
+    { key: 'messaging',          label: 'Messaging',          icon: <MessageIcon />,         group: 'manage',    allowedRoles: ['admin'], module: 'whatsapp' },
     { key: 'settings',           label: 'Settings',           icon: <SettingsIcon />,        group: 'manage',    allowedRoles: ['admin'] },
-    { key: 'cs-agent-voice',     label: 'AI Voice Agent',     icon: <SmartToyIcon />,        group: 'manage',    allowedRoles: ['admin'] },
+    { key: 'cs-agent-voice',     label: 'AI Voice Agent',     icon: <SmartToyIcon />,        group: 'manage',    allowedRoles: ['admin'], module: 'ai_cs' },
     { key: 'billing',            label: 'Billing & Plan',     icon: <PaymentIcon />,         group: 'manage',    allowedRoles: ['admin'] },
 ];
 
@@ -129,7 +130,7 @@ const MainApp = ({
     customerStatus, setCustomerStatus,
     customerExpiryDay, setCustomerExpiryDay
 }) => {
-    const { user, logout } = useAppContext();
+    const { user, logout, modules, hasModule } = useAppContext();
     const theme = useTheme();
     const isMobile = useMediaQuery(theme.breakpoints.down('md'));
     const userRoles = (user?.role || '').split(',').map(r => r.trim());
@@ -163,7 +164,7 @@ const MainApp = ({
     const [inboxAttention, setInboxAttention] = useState(0);
 
     useEffect(() => {
-        if (!hasRole('admin')) return undefined;
+        if (!hasRole('admin') || !hasModule('whatsapp')) return undefined;
         let cancelled = false;
         const poll = () => apiService.fetchInboxSummary()
             .then(r => { if (!cancelled) setInboxAttention(r.data.needs_attention || 0); })
@@ -171,7 +172,7 @@ const MainApp = ({
         poll();
         const i = setInterval(poll, 20000);
         return () => { cancelled = true; clearInterval(i); };
-    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [modules]); // eslint-disable-line react-hooks/exhaustive-deps
 
     useEffect(() => {
         if (!('serviceWorker' in navigator)) return undefined;
@@ -192,10 +193,23 @@ const MainApp = ({
         setDrawerOpen(false);
     };
 
-    const navItems = NAV_ITEMS.filter(item =>
-        (!item.allowedRoles || item.allowedRoles.some(r => hasRole(r))) &&
-        (!item.visibleWhen || item.visibleWhen(businessSettings))
-    );
+    const navItems = filterNavItems(NAV_ITEMS, { hasRole, businessSettings, hasModule });
+
+    // A deep link (?view=network-tree) or push-notification target must not
+    // render a page whose module is off: once modules have loaded, fall back
+    // to the role's default view (not getDefaultView(), which re-reads ?view=).
+    useEffect(() => {
+        if (modules === null) return;
+        const gated = NAV_ITEMS.find(n => n.key === currentView && n.module);
+        if (gated && !hasModule(gated.module)) {
+            setCurrentView(
+                (hasRole('admin') || hasRole('finance')) ? 'dashboard'
+                : (hasRole('employee') || hasRole('technician')) ? 'service'
+                : hasRole('cashier') ? 'subscriptions'
+                : hasRole('collector') ? 'payments' : 'dashboard'
+            );
+        }
+    }, [modules, currentView]); // eslint-disable-line react-hooks/exhaustive-deps
     const currentLabel = navItems.find(n => n.key === currentView)?.label || 'Dashboard';
 
     // Per-tenant branding: resolve the logo (custom upload or app default) to an absolute URL.
@@ -316,6 +330,10 @@ const MainApp = ({
 
     // ── renderView ────────────────────────────────────────────────────────────
     const renderView = () => {
+        // Don't mount a gated page before modules load (or while the effect
+        // above redirects away) -- it would fetch and flash a load error.
+        const gatedView = NAV_ITEMS.find(n => n.key === currentView && n.module);
+        if (gatedView && !hasModule(gatedView.module)) return null;
         switch (currentView) {
             case 'dashboard': return <DashboardView />;
             case 'resellers': return <ResellerManagementView />;

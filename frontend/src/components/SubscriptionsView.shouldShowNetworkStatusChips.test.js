@@ -17,7 +17,7 @@
 // real render of the panel isn't exercised anywhere.
 jest.mock('../context/AppContext.js', () => ({
     apiService: {},
-    useAppContext: () => ({ setSnackbar: () => {}, user: null }),
+    useAppContext: () => ({ setSnackbar: () => {}, user: null, hasModule: () => true }),
 }));
 
 import { shouldShowNetworkStatusChips } from './SubscriptionsView';
@@ -36,6 +36,10 @@ describe('shouldShowNetworkStatusChips', () => {
 
     test('one job landed, the other still pending -- still does not show chips', () => {
         expect(shouldShowNetworkStatusChips({ pending: true, secret_status: 'enabled', active_session: null })).toBe(false);
+    });
+
+    test('network module off -- never shows chips, even for a finished status', () => {
+        expect(shouldShowNetworkStatusChips({ pending: false, secret_status: 'enabled', active_session: null }, false)).toBe(false);
     });
 
     test('both jobs landed -- shows chips', () => {

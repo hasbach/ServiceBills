@@ -9,7 +9,7 @@ from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity
 import media_convert
 import storage
 import whatsapp_inbox as wi
-from tenancy import tenant_query
+from tenancy import tenant_query, require_module
 
 PAGE_SIZE = 30
 THREAD_PAGE = 50
@@ -50,6 +50,7 @@ def register_inbox_routes(app, appmod):
 
     @app.route('/api/whatsapp/inbox/summary', methods=['GET'])
     @inbox_admin
+    @require_module('whatsapp')
     def inbox_summary():
         base = tenant_query(Conv)
         return jsonify({
@@ -61,6 +62,7 @@ def register_inbox_routes(app, appmod):
 
     @app.route('/api/whatsapp/inbox/conversations', methods=['GET'])
     @inbox_admin
+    @require_module('whatsapp')
     def inbox_conversations():
         flt = request.args.get('filter', 'attention')
         q = tenant_query(Conv)
@@ -84,6 +86,7 @@ def register_inbox_routes(app, appmod):
 
     @app.route('/api/whatsapp/inbox/conversations/<int:conv_id>/messages', methods=['GET'])
     @inbox_admin
+    @require_module('whatsapp')
     def inbox_messages(conv_id):
         conv = _conv_or_404(conv_id)
         q = tenant_query(Msg).filter_by(conversation_id=conv.id)
@@ -99,6 +102,7 @@ def register_inbox_routes(app, appmod):
 
     @app.route('/api/whatsapp/inbox/conversations/<int:conv_id>/read', methods=['POST'])
     @inbox_admin
+    @require_module('whatsapp')
     def inbox_read(conv_id):
         conv = _conv_or_404(conv_id)
         conv.unread_count = 0
@@ -107,6 +111,7 @@ def register_inbox_routes(app, appmod):
 
     @app.route('/api/whatsapp/inbox/conversations/<int:conv_id>/resolve', methods=['POST'])
     @inbox_admin
+    @require_module('whatsapp')
     def inbox_resolve(conv_id):
         conv = _conv_or_404(conv_id)
         wi.clear_attention(conv)
@@ -117,6 +122,7 @@ def register_inbox_routes(app, appmod):
 
     @app.route('/api/whatsapp/inbox/conversations/<int:conv_id>/pause', methods=['POST'])
     @inbox_admin
+    @require_module('whatsapp')
     def inbox_pause(conv_id):
         conv = _conv_or_404(conv_id)
         conv.ai_paused = True
@@ -127,6 +133,7 @@ def register_inbox_routes(app, appmod):
 
     @app.route('/api/whatsapp/inbox/conversations/<int:conv_id>/send', methods=['POST'])
     @inbox_admin
+    @require_module('whatsapp')
     def inbox_send(conv_id):
         conv = _conv_or_404(conv_id)
         user = appmod.User.query.filter_by(username=get_jwt_identity()).first()
@@ -153,6 +160,7 @@ def register_inbox_routes(app, appmod):
 
     @app.route('/api/whatsapp/inbox/media/<int:message_id>', methods=['GET'])
     @inbox_admin
+    @require_module('whatsapp')
     def inbox_media(message_id):
         msg = tenant_query(Msg).filter_by(id=message_id).first_or_404()
         use_playback = request.args.get('variant') == 'playback' and msg.media_playback_key

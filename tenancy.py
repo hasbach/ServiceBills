@@ -69,3 +69,20 @@ def tenant_required(fn):
         current_tenant_id()  # aborts 401 if missing
         return fn(*args, **kwargs)
     return wrapper
+
+
+def require_module(key):
+    """Decorator factory: 403 unless the current tenant has module `key`.
+
+    Stack it innermost (just above `def`), after @jwt_required() and any role
+    decorator, mirroring app.network_view_required()."""
+    def wrapper(fn):
+        @wraps(fn)
+        def decorator(*args, **kwargs):
+            verify_jwt_in_request()
+            import modules
+            if not modules.is_enabled(current_tenant(), key):
+                return modules.disabled_response(key)
+            return fn(*args, **kwargs)
+        return decorator
+    return wrapper

@@ -1,4 +1,5 @@
 // src/context/AppContext.js
+import { shouldNotifyModuleDisabled } from '../utils/moduleDisabled.js';
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import axios from 'axios';
 
@@ -38,6 +39,15 @@ api.interceptors.response.use(
         if (status === 402 && !url.includes('/billing')) {
             window.dispatchEvent(new CustomEvent('sb:upgrade-required', {
                 detail: { message: error.response?.data?.msg || error.response?.data?.message || 'Upgrade required to continue.' }
+            }));
+        }
+
+        // Feature module not enabled for this tenant (modules.py).
+        // Only for user-initiated writes: a GET is a passive page-load fetch and
+        // the view already hides itself when its module is off.
+        if (shouldNotifyModuleDisabled(error)) {
+            window.dispatchEvent(new CustomEvent('sb:module-disabled', {
+                detail: { module: error.response.data.module }
             }));
         }
 
@@ -104,6 +114,7 @@ const rawApiService = {
     adminReactivateTenant: (id) => api.post(`/admin/tenants/${id}/reactivate`),
     adminDeleteTenant: (id) => api.delete(`/admin/tenants/${id}`),
     adminSetPlan: (id, plan, extra = {}) => api.post(`/admin/tenants/${id}/set-plan`, { plan, ...extra }),
+    adminSetModules: (id, overrides) => api.post(`/admin/tenants/${id}/modules`, { overrides }),
     adminUpgradeRequests: () => api.get('/admin/upgrade-requests'),
 
     // User Management API methods
@@ -386,6 +397,32 @@ export const AppContextProvider = ({ children }) => {
         return () => window.removeEventListener('sb:upgrade-required', onUpgrade);
     }, []);
 
+    // Enabled feature modules for this tenant: null while loading, else array.
+    // Super-admins have no tenant (call fails) -> [].
+    const [modules, setModules] = useState(null);
+    const refreshModules = React.useCallback(() => {
+        if (!token) { setModules(null); return Promise.resolve(); }
+        // Super-admins have no tenant: /tenant/me would 401, and the 401
+        // interceptor above would log them straight back out.
+        if ((user?.role || '').split(',').includes('superadmin')) { setModules([]); return Promise.resolve(); }
+        return apiService.tenantMe()
+            .then(r => setModules(r.data?.modules || []))
+            .catch(() => setModules([]));
+    }, [token, user]);
+    useEffect(() => { refreshModules(); }, [refreshModules]);
+
+    useEffect(() => {
+        const onModuleDisabled = () => setSnackbar({
+            open: true,
+            message: "This feature isn't included in your plan.",
+            severity: 'warning',
+        });
+        window.addEventListener('sb:module-disabled', onModuleDisabled);
+        return () => window.removeEventListener('sb:module-disabled', onModuleDisabled);
+    }, []);
+
+    const hasModule = (key) => key === 'core' || key === 'office' || (Array.isArray(modules) && modules.includes(key));
+
     const login = async (credentials) => {
         const response = await apiService.login(credentials);
         setToken(response.data.access_token);
@@ -405,6 +442,9 @@ export const AppContextProvider = ({ children }) => {
         token,
         user,
         isAuthenticated,
+        modules,
+        hasModule,
+        refreshModules,
         login,
         logout
     };

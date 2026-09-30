@@ -54,6 +54,7 @@ def test_tenant_whish_settings_is_tenant_isolated(app, client):
 
 def test_get_tenant_whish_settings_returns_defaults_when_unconfigured(app, client):
     hdr = make_tenant(client, "Biz TWS Get", "tws_get_admin")
+    _pro(app, "Biz TWS Get")
     r = client.get("/api/tenant-whish-settings", headers=hdr)
     assert r.status_code == 200
     assert r.get_json()["settings"]["enabled"] is False
@@ -64,7 +65,7 @@ def test_save_tenant_whish_settings_rejected_on_free_plan(app, client):
     hdr = make_tenant(client, "Biz TWS Free", "tws_free_admin")
     r = client.post("/api/tenant-whish-settings", headers=hdr,
                      json={"enabled": True, "whish_channel": "c1", "whish_secret": "s1"})
-    assert r.status_code == 402
+    assert r.status_code == 403 and r.get_json()["module"] == "whish_payments"
 
 
 def test_save_tenant_whish_settings_succeeds_on_pro_plan(app, client):
@@ -238,6 +239,13 @@ def test_customer_payment_link_unaffected_by_mutation_when_not_pending(app, clie
         appmod.db.session.commit()
         link = appmod.db.session.get(appmod.CustomerPaymentLink, link_id)
         assert link.status == 'succeeded'  # untouched
+
+
+def _pro(app, tenant_name):
+    """Give a tenant the pro bundle (includes the whish_payments module)."""
+    with app.app_context():
+        appmod.Tenant.query.filter_by(name=tenant_name).first().plan = 'pro'
+        appmod.db.session.commit()
 
 
 def _enable_whish_for_tenant(app, tenant_name, currency='USD'):
@@ -699,6 +707,7 @@ def test_resend_rejects_when_whish_not_enabled(app, client):
     hdr = make_tenant(client, "Biz Resend2", "resend2_admin")
     with app.app_context():
         tenant = appmod.Tenant.query.filter_by(name="Biz Resend2").first()
+        tenant.plan = 'pro'  # module on; this test is about whish not being *configured* (still 402)
         plan = appmod.SubscriptionPlan(tenant_id=tenant.id, name="P", price=10.0, billing_cycle="monthly", currency="USD")
         appmod.db.session.add(plan)
         appmod.db.session.commit()
@@ -730,6 +739,7 @@ def test_resend_rejects_for_already_paid_payment(app, client):
 
 def test_resend_tenant_isolation(app, client):
     hdr_a = make_tenant(client, "Biz ResendIsoA", "resendisoa_admin")
+    _pro(app, "Biz ResendIsoA")
     hdr_b = make_tenant(client, "Biz ResendIsoB", "resendisob_admin")
     tenant_b_id, customer_b_id = _enable_whish_for_tenant(app, "Biz ResendIsoB")
     r = client.post("/api/payments", headers=hdr_b, json={
@@ -804,6 +814,7 @@ def test_customer_whish_payments_report_filters_by_status(app, client):
 
 def test_customer_whish_payments_report_tenant_isolated(app, client):
     hdr_a = make_tenant(client, "Biz ReportIsoA", "reportisoa_admin")
+    _pro(app, "Biz ReportIsoA")
     make_tenant(client, "Biz ReportIsoB", "reportisob_admin")
     tenant_b_id, customer_b_id = _enable_whish_for_tenant(app, "Biz ReportIsoB")
     # Tenant A's staff attempting to create a payment for tenant B's customer

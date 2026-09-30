@@ -188,9 +188,19 @@ password = "device password"`}
 );
 
 const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) => {
-    const { apiService } = useAppContext();
+    const { apiService, hasModule, modules } = useAppContext();
     const theme = useTheme();
-    const [tab, setTab] = useState(0);
+    const [tab, setTab] = useState('business');
+    const SETTINGS_TABS = [
+        { key: 'business', label: 'Business Details', icon: <BusinessIcon sx={{ fontSize: 18 }} /> },
+        { key: 'wa-notifications', label: 'WhatsApp Notifications', icon: <WhatsAppIcon sx={{ fontSize: 18 }} />, module: 'whatsapp' },
+        { key: 'wa-templates', label: 'WhatsApp Templates', icon: <WhatsAppIcon sx={{ fontSize: 18 }} />, module: 'whatsapp' },
+        { key: 'whish', label: 'Whish Payments', icon: <PaymentsIcon sx={{ fontSize: 18 }} />, module: 'whish_payments' },
+        { key: 'expense-categories', label: 'Expense Categories', icon: <MessageIcon sx={{ fontSize: 18 }} /> },
+        { key: 'users', label: 'User Management', icon: <PeopleIcon sx={{ fontSize: 18 }} /> },
+        { key: 'sectors', label: 'Sectors', icon: <LocationOnIcon sx={{ fontSize: 18 }} /> },
+    ].filter(t => !t.module || hasModule(t.module));
+    const activeTab = SETTINGS_TABS.some(t => t.key === tab) ? tab : 'business';
 
     // ── Business form state ───────────────────────────────────────────────────
     const [bizForm, setBizForm] = useState({
@@ -262,8 +272,8 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     }, [apiService]);
 
     useEffect(() => {
-        if (bizForm.network_access_mode === 'agent') fetchAgents();
-    }, [bizForm.network_access_mode, fetchAgents]);
+        if (bizForm.network_access_mode === 'agent' && hasModule('network')) fetchAgents();
+    }, [bizForm.network_access_mode, fetchAgents, modules]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // The token dialog is the ONLY place the plaintext token is ever held.
     // It lives in this one piece of state, cleared the moment the dialog
@@ -556,12 +566,14 @@ Read-Host -Prompt "Press Enter to exit"
 
     const [approvedTemplates, setApprovedTemplates] = useState([]);
     useEffect(() => {
+        if (!hasModule('whatsapp')) return;
         apiService.fetchWhatsAppTemplates()
             .then(res => setApprovedTemplates((res.data.templates || []).filter(t => t.status === 'APPROVED')))
             .catch(() => {}); // Settings page still works with free-text fallback if this fails
-    }, [apiService]);
+    }, [apiService, modules]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const fetchWASettings = useCallback(async () => {
+        if (!hasModule('whatsapp')) { setWaFetching(false); return; }
         setWaFetching(true);
         try {
             const res = await apiService.fetchWhatsAppSettings();
@@ -571,7 +583,8 @@ Read-Host -Prompt "Press Enter to exit"
         } finally {
             setWaFetching(false);
         }
-    }, [apiService]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [apiService, modules]);
 
     useEffect(() => { fetchWASettings(); }, [fetchWASettings]);
 
@@ -607,12 +620,8 @@ Read-Host -Prompt "Press Enter to exit"
 
     const waField = (key) => ({ value: waForm[key], onChange: (e) => setWaForm(f => ({ ...f, [key]: e.target.value })) });
 
-    // ── Tenant plan (for the Pro-gated Whish Payments tab below) ────────────────
-    const [tenant, setTenant] = useState(null);
-    useEffect(() => {
-        apiService.tenantMe().then((r) => setTenant(r.data)).catch(() => setTenant({ plan: 'free' }));
-    }, [apiService]);
-    const isPro = tenant?.plan === 'pro';
+    // ── Whish Payments is a feature module (was the Pro plan flag) ──────────────
+    const isPro = hasModule('whish_payments');
 
     // ── Tenant Whish (customer payments) settings state ─────────────────────────
     const DEFAULT_TWS = { enabled: false, whish_channel: '', whish_secret: '', display_name_override: '', configured: false };
@@ -625,6 +634,7 @@ Read-Host -Prompt "Press Enter to exit"
     const [twsCredsEditing, setTwsCredsEditing] = useState(false);
 
     const fetchTwsSettings = useCallback(async () => {
+        if (!hasModule('whish_payments')) { setTwsFetching(false); return; }
         setTwsFetching(true);
         try {
             const res = await apiService.tenantWhishSettings();
@@ -635,7 +645,7 @@ Read-Host -Prompt "Press Enter to exit"
             setTwsFetching(false);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [apiService]);
+    }, [apiService, modules]);
 
     useEffect(() => { fetchTwsSettings(); }, [fetchTwsSettings]);
 
@@ -726,19 +736,13 @@ Read-Host -Prompt "Press Enter to exit"
 
             {/* Tabs */}
             <Paper elevation={0} sx={{ borderRadius: '16px', mb: 3, overflow: 'hidden', border: `1px solid ${alpha(theme.palette.divider, 0.1)}` }}>
-                <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ px: 2, '& .MuiTab-root': { textTransform: 'none', fontWeight: 600 } }}>
-                    <Tab icon={<BusinessIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Business Details" />
-                    <Tab icon={<WhatsAppIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="WhatsApp Notifications" />
-                    <Tab icon={<WhatsAppIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="WhatsApp Templates" />
-                    <Tab icon={<PaymentsIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Whish Payments" />
-                    <Tab icon={<MessageIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Expense Categories" />
-                    <Tab icon={<PeopleIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="User Management" />
-                    <Tab icon={<LocationOnIcon sx={{ fontSize: 18 }} />} iconPosition="start" label="Sectors" />
+                <Tabs value={activeTab} onChange={(_, v) => setTab(v)} sx={{ px: 2, '& .MuiTab-root': { textTransform: 'none', fontWeight: 600 } }}>
+                    {SETTINGS_TABS.map(t => <Tab key={t.key} value={t.key} icon={t.icon} iconPosition="start" label={t.label} />)}
                 </Tabs>
             </Paper>
 
             {/* ── Tab 0: Business Details ── */}
-            {tab === 0 && (
+            {activeTab === 'business' && (
                 <Section icon={<BusinessIcon />} title="Business Details" subtitle="Your company information shown on receipts" color={theme.palette.primary.main}>
                     <form onSubmit={handleBizSubmit}>
                         <Grid container spacing={3}>
@@ -901,7 +905,7 @@ Read-Host -Prompt "Press Enter to exit"
             )}
 
             {/* ── Tab 1: WhatsApp ── */}
-            {tab === 1 && (
+            {activeTab === 'wa-notifications' && (
                 <Box>
                     {waFetching ? (
                         <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}><CircularProgress /></Box>
@@ -1247,17 +1251,17 @@ Read-Host -Prompt "Press Enter to exit"
             )}
 
             {/* ── Tab 2: WhatsApp Templates ── */}
-            {tab === 2 && <WhatsAppTemplatesManager />}
+            {activeTab === 'wa-templates' && <WhatsAppTemplatesManager />}
 
             {/* ── Tab 3: Whish Payments (tenant-facing customer payments) ── */}
-            {tab === 3 && (
+            {activeTab === 'whish' && (
                 <Box>
-                    {twsFetching || !tenant ? (
+                    {twsFetching || modules === null ? (
                         <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}><CircularProgress /></Box>
                     ) : !isPro ? (
                         <Section icon={<PaymentsIcon />} title="Whish Payments" subtitle="Let your customers pay you directly via Whish" color={theme.palette.warning.main}>
                             <Alert severity="warning" icon={<LockIcon />} sx={{ borderRadius: '12px' }}>
-                                This feature requires the <strong>Pro</strong> plan. Upgrade from the Billing page to let your
+                                This feature isn't included in your plan. Get it enabled to let your
                                 customers pay their invoices directly via Whish, using your own Whish merchant account.
                             </Alert>
                         </Section>
@@ -1421,19 +1425,19 @@ Read-Host -Prompt "Press Enter to exit"
             </Dialog>
 
             {/* ── Tab 4: Expense Categories ── */}
-            {tab === 4 && (
+            {activeTab === 'expense-categories' && (
                 <Section icon={<MessageIcon />} title="Expense Categories" subtitle="Manage the categories used to classify expenses" color={theme.palette.warning.main}>
                     <ExpenseCategoryManager />
                 </Section>
             )}
 
             {/* ── Tab 5: User Management ── */}
-            {tab === 5 && (
+            {activeTab === 'users' && (
                 <UserManagement />
             )}
 
             {/* Tab 6: Sectors */}
-            {tab === 6 && (
+            {activeTab === 'sectors' && (
                 <SectorManager />
             )}
 

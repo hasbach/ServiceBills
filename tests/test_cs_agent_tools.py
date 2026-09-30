@@ -7,7 +7,18 @@ and multi-tenant boundary isolation.
 from datetime import datetime, timedelta
 import pytest
 import app as appmod
-from tests.conftest import auth_headers
+from tests import conftest
+
+
+def auth_headers(client, username="admin", password="pw", role="admin"):
+    """conftest.auth_headers + the ai_cs module (free-plan tenants lack it and
+    every /api/cs-agent/* route is gated on it)."""
+    hdr = conftest.auth_headers(client, username, password, role=role)
+    with appmod.app.app_context():
+        u = appmod.User.query.filter_by(username=username).first()
+        appmod.db.session.get(appmod.Tenant, u.tenant_id).module_overrides = {"ai_cs": True}
+        appmod.db.session.commit()
+    return hdr
 
 
 def _setup_customer(app, tenant_id, name="Georges Khoury", phone="70123456", balance=-25.0):
@@ -218,6 +229,9 @@ def test_send_payment_link(app, client):
     headers = auth_headers(client, "admin_pay", "pw123")
     with app.app_context():
         tenant = appmod.Tenant.query.order_by(appmod.Tenant.id.desc()).first()
+        # the tool needs the whish_payments module too (not part of the free plan)
+        tenant.module_overrides = {"ai_cs": True, "whish_payments": True}
+        appmod.db.session.commit()
         cust_id, _ = _setup_customer(app, tenant.id, "Rami Zein", "76123456", balance=-40.0)
 
     res = client.post(

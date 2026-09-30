@@ -76,8 +76,8 @@ import pollNetworkJob from './pollNetworkJob';
 // 2-second rounds (see fetchNetworkStatus below) -- so gating on `pending`
 // too, not just on the result being non-null, is what stops a still-checking
 // poll from being rendered as a finished "Not connected" answer.
-export function shouldShowNetworkStatusChips(mikrotikStatus) {
-    return !!mikrotikStatus && !mikrotikStatus.pending;
+export function shouldShowNetworkStatusChips(mikrotikStatus, hasNetworkModule = true) {
+    return hasNetworkModule && !!mikrotikStatus && !mikrotikStatus.pending;
 }
 
 // --- NEW: Toolbar for bulk actions ---
@@ -172,7 +172,7 @@ const GridCustomerCard = React.memo(function GridCustomerCard({
                                     <Button size="small" variant="outlined" startIcon={isExpanded ? <VisibilityOffIcon /> : <VisibilityIcon />} onClick={() => actions.fetchCustomerPayments(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>{isExpanded ? 'Hide' : 'Payments'}</Button>
                                     <Button size="small" variant="outlined" color="info" startIcon={<EditIcon />} onClick={() => actions.openEditCustomerDialog(customer)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Edit</Button>
                                     <Button size="small" variant="outlined" color="success" startIcon={<RefreshIcon />} onClick={() => actions.renew(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Renew</Button>
-                                    <Button size="small" variant="outlined" color="primary" startIcon={<ChatIcon />} onClick={() => actions.handleSendWAReminder(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>WA Reminder</Button>
+                                    {actions.hasWhatsApp && <Button size="small" variant="outlined" color="primary" startIcon={<ChatIcon />} onClick={() => actions.handleSendWAReminder(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>WA Reminder</Button>}
                                     {customer.is_subscription_active ? (
                                         <Button size="small" variant="outlined" color="warning" startIcon={<CancelIcon />} onClick={() => actions.cancel(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Cancel</Button>
                                     ) : (
@@ -317,11 +317,13 @@ const ListCustomerRow = React.memo(function ListCustomerRow({
                             <RefreshIcon fontSize="small" />
                         </IconButton>
                     </Tooltip>
+                    {actions.hasWhatsApp && (
                     <Tooltip title="WA Reminder">
                         <IconButton size="small" color="primary" onClick={() => actions.handleSendWAReminder(customer.id)}>
                             <ChatIcon fontSize="small" />
                         </IconButton>
                     </Tooltip>
+                    )}
                     {customer.is_subscription_active ? (
                         <Tooltip title="Cancel">
                             <IconButton size="small" color="warning" onClick={() => actions.cancel(customer.id)}>
@@ -489,7 +491,7 @@ const SubscriptionsView = ({
     setCustomerExpiryDay
 }) => {
     const theme = useTheme();
-    const { apiService, user } = useAppContext();
+    const { apiService, user, hasModule } = useAppContext();
     // 'employee'/'collector' (and anyone else without admin/finance) get a
     // read-only view of Subscriptions: status only, no balance, no header
     // stats, no action buttons -- enforced here for the UI and separately
@@ -689,7 +691,7 @@ const SubscriptionsView = ({
     // only trigger for a fresh live check available to 'employee'; Edit's
     // own "Refresh Upstream Status" panel still exists for admin/finance.
     const renderUpstreamStatusChip = (customer) => {
-        if (businessSettings?.network_mode !== 'upstream_bridge' || !customer.upstream_provider_id || !customer.upstream_username) {
+        if (!hasModule('upstream_sync') || businessSettings?.network_mode !== 'upstream_bridge' || !customer.upstream_provider_id || !customer.upstream_username) {
             return null;
         }
         const isSyncing = syncingCustomerIds.has(customer.id);
@@ -1382,6 +1384,7 @@ const SubscriptionsView = ({
 
     // Stable across renders so the memoized cards/rows don't re-render just
     // because the parent did; each method calls the latest handler.
+    const hasWhatsApp = hasModule('whatsapp');
     const latestHandlersRef = React.useRef(null);
     latestHandlersRef.current = {
         fetchCustomerPayments, openEditCustomerDialog, handleSubscriptionAction,
@@ -1391,6 +1394,7 @@ const SubscriptionsView = ({
     const cardActions = React.useMemo(() => {
         const h = () => latestHandlersRef.current;
         return {
+            hasWhatsApp,
             fetchCustomerPayments: (...a) => h().fetchCustomerPayments(...a),
             openEditCustomerDialog: (...a) => h().openEditCustomerDialog(...a),
             handleSendWAReminder: (...a) => h().handleSendWAReminder(...a),
@@ -1403,7 +1407,7 @@ const SubscriptionsView = ({
             cancel: (id) => h().handleSubscriptionAction(apiService.cancelSubscription, id, "Cancel subscription?"),
             activate: (id) => h().handleSubscriptionAction(apiService.activateSubscription, id, "Activate subscription?"),
         };
-    }, [apiService]);
+    }, [apiService, hasWhatsApp]);
     // --- End of NEW Selection Logic ---
 
     // Memoize search input handler to prevent lag
@@ -1805,7 +1809,7 @@ const SubscriptionsView = ({
                         <Grid item xs={12}><TextField fullWidth multiline minRows={2} label="Notes (Optional)" value={editingCustomer?.notes || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, notes: e.target.value })} inputProps={{ maxLength: 2000 }} helperText="Shown on the subscription card" /></Grid>
                         {!isCashierOnly && <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Account Balance ($)" value={editingCustomer?.balance !== undefined ? editingCustomer.balance : 0} helperText="Negative value = Customer owes money. 0 = Paid." onChange={(e) => setEditingCustomer({ ...editingCustomer, balance: parseFloat(e.target.value) || 0 })} /></Grid>}
 
-                        {!isCashierOnly && businessSettings?.network_mode === 'local_mikrotik' && editingCustomer?.network_device_id && editingCustomer?.pppoe_username && (
+                        {!isCashierOnly && hasModule('network') && businessSettings?.network_mode === 'local_mikrotik' && editingCustomer?.network_device_id && editingCustomer?.pppoe_username && (
                             <Grid item xs={12}>
                                 <Box sx={{ p: 2, borderRadius: '12px', border: `1px solid ${alpha(theme.palette.divider, 0.15)}`, bgcolor: '#f8fafc' }}>
                                     <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
@@ -1814,7 +1818,7 @@ const SubscriptionsView = ({
                                             {mikrotikStatusLoading ? <CircularProgress size={16} /> : 'Refresh'}
                                         </Button>
                                     </Box>
-                                    {shouldShowNetworkStatusChips(mikrotikStatus) ? (
+                                    {shouldShowNetworkStatusChips(mikrotikStatus, hasModule('network')) ? (
                                         <Box sx={{ mt: 1, display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
                                             <Chip
                                                 size="small"
@@ -1843,7 +1847,7 @@ const SubscriptionsView = ({
                                 </Box>
                             </Grid>
                         )}
-                        {!isCashierOnly && businessSettings?.network_mode === 'upstream_bridge' && editingCustomer?.upstream_provider_id && editingCustomer?.upstream_username && (
+                        {!isCashierOnly && hasModule('upstream_sync') && businessSettings?.network_mode === 'upstream_bridge' && editingCustomer?.upstream_provider_id && editingCustomer?.upstream_username && (
                             <Grid item xs={12}>
                                 <Box sx={{ p: 2, borderRadius: '12px', border: `1px solid ${alpha(theme.palette.divider, 0.15)}`, bgcolor: '#f8fafc' }}>
                                     <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>

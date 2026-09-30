@@ -4,7 +4,7 @@ Single source of truth mapping each plan to its Stripe Price ID (dormant --
 see docs/superpowers/specs/2026-08-26-whish-self-serve-billing-design.md for
 why Stripe is not used) and its Whish self-serve prices, plus enforced
 limits. max_customers=None means unlimited; whatsapp_api gates Meta Cloud
-API mode.
+API mode (Whish customer payments are the whish_payments module, not a limit). modules is the bundle of paid modules the plan includes (see modules.py).
 """
 import os
 
@@ -15,7 +15,7 @@ PLANS = {
         "whish_price_yearly": None,
         "max_customers": 50,
         "whatsapp_api": False,
-        "whish_customer_payments": False,
+        "modules": ("whatsapp", "network", "upstream_sync"),
     },
     "pro": {
         "stripe_price": os.environ.get("STRIPE_PRICE_PRO"),
@@ -23,7 +23,7 @@ PLANS = {
         "whish_price_yearly": 1000.0,
         "max_customers": None,
         "whatsapp_api": True,
-        "whish_customer_payments": True,
+        "modules": ("whatsapp", "ai_cs", "network", "upstream_sync", "whish_payments"),
     },
 }
 

@@ -600,7 +600,7 @@ const PaymentListRow = React.memo(function PaymentListRow({
 });
 
 const PaymentsView = () => {
-    const { user, apiService, setSnackbar } = useAppContext();
+    const { user, apiService, setSnackbar, hasModule, modules } = useAppContext();
     const parsedRoles = user?.role ? user.role.split(',').map(r => r.trim().toLowerCase()) : [];
     // On this page an office 'cashier' has exactly a collector's rights
     // (collect, never confirm receipt -- see mark_payment_as_paid), so fold
@@ -648,10 +648,11 @@ const PaymentsView = () => {
     // Fetch tenant-Whish (customer payments) settings once -- gates the
     // "Send payment link" button below.
     useEffect(() => {
+        if (!hasModule('whish_payments')) { setTwsEnabled(false); return; }
         apiService.tenantWhishSettings().then(res => {
             setTwsEnabled(!!res.data?.settings?.enabled);
         }).catch(() => {});
-    }, [apiService]);
+    }, [apiService, modules]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // Send-payment-link dialog: shown after a successful resend, offering
     // WhatsApp / copy-link / email delivery for the fresh link.
