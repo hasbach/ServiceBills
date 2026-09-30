@@ -57,6 +57,8 @@ def test_setup_with_file(onprem, client):
     assert client.get("/api/license", headers=hdr).get_json()["state"] == "valid"
     assert client.get("/api/setup/status").get_json()["setup_required"] is False
     assert client.get("/api/system/info").get_json()["setup_required"] is False
+    bs = appmod.BusinessSettings.query.filter_by(tenant_id=appmod.Tenant.query.first().id).first()
+    assert bs is not None and bs.business_name == _body()["business_name"]
 
 
 def test_second_setup_rejected(onprem, client):

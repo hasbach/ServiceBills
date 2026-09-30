@@ -369,6 +369,11 @@ def register(app, appmod):
         try:
             tenant, _user = appmod._create_tenant_with_admin(
                 vals["business_name"].strip(), vals["username"], vals["password"], plan="pro")
+            # Seed the business profile so the header/receipts show the real name
+            # instead of the "Default Business" placeholder.
+            db.session.add(appmod.BusinessSettings(
+                tenant_id=tenant.id, business_name=vals["business_name"].strip()[:200],
+                address="", mobile=vals["owner_phone"].strip()[:20]))
             store_license(text, from_server=data.get("mode") != "file", commit=False)
             # a concurrent setup may have created a tenant since our first check
             if appmod.Tenant.query.filter(appmod.Tenant.id != tenant.id).first() is not None:
