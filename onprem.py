@@ -129,7 +129,7 @@ def current_state():
     return st
 
 
-def store_license(text, from_server=False):
+def store_license(text, from_server=False, commit=True):
     from app import db
     payload = lic.verify(text, public_key())
     if payload.get("machine_id") != _machine_id():
@@ -144,6 +144,10 @@ def store_license(text, from_server=False):
             raise lic.LicenseError("revoked")
     row.license_text = text
     row.revoked = False
+    if not commit:  # caller owns the transaction; state is recomputed after its commit
+        db.session.flush()
+        invalidate()
+        return None
     db.session.commit()
     invalidate()
     return current_state()
@@ -228,6 +232,60 @@ def license_body():
             "machine_id": _machine_id()}
 
 
+def _setup_required():
+    if not is_onprem():
+        return False
+    from app import Tenant
+    return Tenant.query.first() is None
+
+
+def _setup_required_guard():
+    if not is_onprem():
+        return None
+    p = request.path
+    if not p.startswith("/api/") or p.startswith("/api/setup") or p.startswith("/api/system/info"):
+        return None
+    if _setup_required():
+        return jsonify({"setup_required": True}), 409
+
+
+def _fetch_license_text(data, business_name, owner_phone):
+    """Returns (text, error_response). Exactly one is None."""
+    mode = data.get("mode")
+    if mode == "file":
+        text = data.get("license_file")
+        if not isinstance(text, str) or not text.strip():
+            return None, (jsonify(msg="license_file required"), 400)
+        return text, None
+    if mode == "trial":
+        path, body = "trial", {"business_name": business_name, "owner_phone": owner_phone,
+                               "machine_id": _machine_id()}
+    elif mode == "activate":
+        key = data.get("license_key")
+        if not isinstance(key, str) or not key.strip():
+            return None, (jsonify(msg="license_key required"), 400)
+        path, body = "activate", {"license_key": key, "machine_id": _machine_id()}
+    else:
+        return None, (jsonify(msg="invalid mode"), 400)
+    try:
+        resp = requests.post(f"{_cfg('LICENSE_SERVER_URL')}/api/licenses/{path}", json=body, timeout=15)
+    except requests.RequestException:
+        return None, (jsonify(msg="No internet connection \u2014 the trial needs internet. "
+                                  "You can upload a license file instead."), 502)
+    try:
+        j = resp.json() or {}
+    except Exception:
+        j = {}
+    if resp.status_code in (200, 201) and isinstance(j.get("license"), str):
+        return j["license"], None
+    code = j.get("error") or "activation_failed"
+    if resp.status_code == 409 and code == "trial_already_used":
+        return None, (jsonify(msg="trial_already_used"), 409)
+    if 400 <= resp.status_code < 500:
+        return None, (jsonify(msg=code), 400)
+    return None, (jsonify(msg="License server error"), 502)
+
+
 def system_info():
     onprem = is_onprem()
     license_info = None
@@ -243,7 +301,7 @@ def system_info():
     return {
         "deployment_mode": "onprem" if onprem else "saas",
         "app_version": _cfg("APP_VERSION"),
-        "setup_required": False,
+        "setup_required": _setup_required(),
         "license": license_info,
     }
 
@@ -253,7 +311,8 @@ def register(app, appmod):
     # Insert at the front so the guard runs before _block_suspended_tenants.
     funcs = app.before_request_funcs.setdefault(None, [])
     funcs.insert(0, _deployment_mode_guard)
-    funcs.insert(1, _readonly_guard)
+    funcs.insert(1, _setup_required_guard)
+    funcs.insert(2, _readonly_guard)
     modules.license_provider = _license_provider
 
     if is_onprem() and not Config.MACHINE_ID:
@@ -262,6 +321,42 @@ def register(app, appmod):
     @app.route("/api/system/info", methods=["GET"])
     def api_system_info():
         return jsonify(system_info())
+
+    @app.route("/api/setup/status", methods=["GET"])
+    def api_setup_status():
+        return jsonify({"setup_required": _setup_required(), "machine_id_present": bool(_machine_id())})
+
+    @app.route("/api/setup", methods=["POST"])
+    def api_setup():
+        db = appmod.db
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            data = {}
+        if not _setup_required():
+            return jsonify(msg="Setup already completed"), 409
+        vals = {k: data.get(k) for k in ("business_name", "username", "password", "owner_phone")}
+        if not all(isinstance(v, str) and v.strip() for v in vals.values()):
+            return jsonify(msg="business_name, username, password and owner_phone are required"), 400
+        if appmod.User.query.filter_by(username=vals["username"]).first():
+            return jsonify(msg="Username already exists"), 400
+        text, err = _fetch_license_text(data, vals["business_name"].strip(), vals["owner_phone"].strip())
+        if err:
+            return err
+        try:
+            appmod._create_tenant_with_admin(vals["business_name"].strip(), vals["username"],
+                                             vals["password"], plan="pro")
+            store_license(text, from_server=data.get("mode") != "file", commit=False)
+            db.session.commit()
+        except lic.LicenseError as e:
+            db.session.rollback()
+            msg = str(e) if str(e) in ("machine_mismatch", "revoked") else "invalid_license"
+            return jsonify(msg=msg), 400
+        except Exception:
+            db.session.rollback()
+            log.exception("setup failed")
+            return jsonify(msg="Setup failed"), 500
+        invalidate()
+        return jsonify(msg="ok", license=license_body()), 201
 
     @app.route("/api/license", methods=["GET"])
     @jwt_required()

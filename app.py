@@ -2296,6 +2296,26 @@ def has_pending_reseller_charge(customer_id, billing_date, tenant_id):
     return existing_charge is not None
 
 
+def _create_tenant_with_admin(business_name, username, password, email=None, plan="free"):
+    """Create a tenant (unique slug), seed its defaults and an admin user. Flushes, never commits."""
+    slug = re.sub(r'[^a-z0-9]+', '-', business_name.lower()).strip('-')[:80] or 'tenant'
+    base = slug
+    i = 1
+    while Tenant.query.filter_by(slug=slug).first():
+        i += 1
+        slug = f"{base}-{i}"
+    tenant = Tenant(name=business_name, slug=slug, plan=plan)
+    db.session.add(tenant)
+    db.session.flush()  # assign tenant.id before creating the user
+    seed_default_expense_categories(tenant.id)
+
+    new_user = User(username=username, role='admin', tenant_id=tenant.id, email=email)
+    new_user.set_password(password)
+    db.session.add(new_user)
+    db.session.flush()
+    return tenant, new_user
+
+
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
@@ -2311,20 +2331,7 @@ def register():
         return jsonify({"msg": "Email already in use"}), 409
 
     # Each registration provisions a new tenant (business); the registrant is its admin.
-    slug = re.sub(r'[^a-z0-9]+', '-', business_name.lower()).strip('-')[:80] or 'tenant'
-    base = slug
-    i = 1
-    while Tenant.query.filter_by(slug=slug).first():
-        i += 1
-        slug = f"{base}-{i}"
-    tenant = Tenant(name=business_name, slug=slug)
-    db.session.add(tenant)
-    db.session.flush()  # assign tenant.id before creating the user
-    seed_default_expense_categories(tenant.id)
-
-    new_user = User(username=username, role='admin', tenant_id=tenant.id, email=email)
-    new_user.set_password(password)
-    db.session.add(new_user)
+    tenant, new_user = _create_tenant_with_admin(business_name, username, password, email=email)
     db.session.commit()
 
     # Send an email-verification link (best-effort; failure doesn't block signup).
