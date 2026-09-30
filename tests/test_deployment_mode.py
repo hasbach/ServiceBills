@@ -30,7 +30,7 @@ def test_saas_blocks_onprem_families(client, path):
 
 def test_saas_does_not_block_licenses_prefix(client):
     # /api/licenses/* is the SaaS license server (Task 3) -- must not be caught by the /api/license guard
-    assert client.post("/api/licenses/trial", json={}).status_code != 404 or True
+    assert client.post("/api/licenses/trial", json={}).status_code != 404
 
 
 def test_onprem_still_serves_login(onprem, client):

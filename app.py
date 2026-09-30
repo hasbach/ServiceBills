@@ -194,6 +194,25 @@ def health_check():
 
 
 # Database Models (unchanged)
+class OnpremLicense(db.Model):
+    __tablename__ = "onprem_license"
+    id = db.Column(db.String(36), primary_key=True)            # uuid4 = license_id
+    license_key = db.Column(db.String(24), unique=True, nullable=False, index=True)  # SB-XXXX-XXXX-XXXX
+    business_name = db.Column(db.String(200), nullable=False)
+    owner_phone = db.Column(db.String(40), nullable=True)
+    machine_id = db.Column(db.String(128), nullable=True, index=True)
+    trial = db.Column(db.Boolean, nullable=False, default=False)
+    base_term = db.Column(db.String(16), nullable=False)       # monthly|yearly|lifetime|trial
+    base_expires_at = db.Column(db.String(10), nullable=False)  # ISO date
+    modules = db.Column(db.JSON, nullable=True)                 # {key: {term, expires_at}}
+    revoked = db.Column(db.Boolean, nullable=False, default=False)
+    notes = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    activated_at = db.Column(db.DateTime, nullable=True)
+    last_refresh_at = db.Column(db.DateTime, nullable=True)
+    last_app_version = db.Column(db.String(40), nullable=True)
+
+
 class Tenant(db.Model):
     __tablename__ = "tenant"
     id = db.Column(db.Integer, primary_key=True)
@@ -8946,6 +8965,9 @@ whatsapp_inbox_routes.register_inbox_routes(app, sys.modules[__name__])
 
 import onprem
 onprem.register(app, sys.modules[__name__])
+
+import license_server_routes
+license_server_routes.register(app, sys.modules[__name__])
 
 @app.route('/api/reports/revenue', methods=['GET'])
 @jwt_required()
