@@ -18,13 +18,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install PowerShell modules
-        shell: pwsh
+        shell: powershell
         run: |
+          # Windows PowerShell 5.1 (the shell customers run) needs the NuGet provider first.
+          Install-PackageProvider NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
           Install-Module Pester -RequiredVersion 5.6.1 -Force -Scope CurrentUser -SkipPublisherCheck
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
 
       - name: Pester
-        shell: pwsh
+        shell: powershell
         run: |
           Import-Module Pester -RequiredVersion 5.6.1
           # Tests dot-source ..\scripts\*.ps1 relative to their own folder (onprem/tests -> onprem/scripts).
@@ -35,7 +37,7 @@ jobs:
           Invoke-Pester -Configuration $cfg
 
       - name: PSScriptAnalyzer
-        shell: pwsh
+        shell: powershell
         run: |
           $findings = Invoke-ScriptAnalyzer -Path onprem/scripts -Recurse -Severity Warning,Error
           if ($findings) {

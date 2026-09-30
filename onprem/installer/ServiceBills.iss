@@ -56,8 +56,8 @@ Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" sta
 const
   DockerUrl = 'https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe';
   DockerTermsUrl = 'https://www.docker.com/legal/docker-subscription-service-agreement/';
-  MinDiskBytes = 21474836480;   { 20 GB }
-  MinRamBytes = 7516192768;     { 7 GB: an 8 GB PC reports slightly less than 8 GB usable }
+  MinDiskMB = 20480;   { 20 GB }
+  MinRamMB = 7168;     { 7 GB: an 8 GB PC reports slightly less than 8 GB usable }
 
 type
   TMemoryStatusEx = record
@@ -74,8 +74,6 @@ type
 
 function GlobalMemoryStatusEx(var lpBuffer: TMemoryStatusEx): Boolean;
   external 'GlobalMemoryStatusEx@kernel32.dll stdcall';
-function PostMessage(hWnd: HWND; Msg: UINT; wParam: LongInt; lParam: LongInt): Boolean;
-  external 'PostMessageW@user32.dll stdcall';
 
 var
   DockerPage: TWizardPage;
@@ -110,7 +108,7 @@ end;
 function InitializeSetup: Boolean;
 var
   Mem: TMemoryStatusEx;
-  FreeB, TotalB: Int64;
+  FreeMB, TotalMB: Cardinal;
   Drive: String;
   ResultCode: Integer;
 begin
@@ -119,7 +117,7 @@ begin
   { 1. RAM: warn only. }
   Mem.dwLength := SizeOf(Mem);
   if GlobalMemoryStatusEx(Mem) then
-    if Mem.ullTotalPhys < MinRamBytes then
+    if (Mem.ullTotalPhys div 1048576) < MinRamMB then
       if MsgBox('This PC has less than 8 GB of memory. ServiceBills may run slowly.' + #13#10#13#10 +
                 'Do you want to continue anyway?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDNO then
       begin
@@ -129,8 +127,8 @@ begin
 
   { 2. Free disk space on the system drive: block. }
   Drive := ExtractFileDrive(ExpandConstant('{sys}')) + '\';
-  if GetSpaceOnDisk64(Drive, FreeB, TotalB) then
-    if FreeB < MinDiskBytes then
+  if GetSpaceOnDisk(Drive, True, FreeMB, TotalMB) then
+    if FreeMB < MinDiskMB then
     begin
       MsgBox('ServiceBills needs at least 20 GB of free disk space on drive ' + Drive + '.' + #13#10 +
              'Please free up some space and run this Setup again.', mbError, MB_OK);
@@ -433,9 +431,10 @@ begin
   begin
     DeleteData := False;
     if not UninstallSilent then
-      if MsgBox('Also delete all ServiceBills data (customers, payments, backups)? This cannot be undone.',
+      if MsgBox('Also delete all ServiceBills data (customers, payments, and backups in the default Documents folder)? ' +
+                'Backups you saved elsewhere, such as OneDrive, are kept. This cannot be undone.',
                 mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-        if MsgBox('Are you sure? All customers, payments and backups will be permanently deleted.',
+        if MsgBox('Are you sure? All customers and payments will be permanently deleted.',
                   mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
           DeleteData := True;
 
