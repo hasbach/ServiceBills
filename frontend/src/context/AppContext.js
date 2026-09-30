@@ -41,6 +41,13 @@ api.interceptors.response.use(
             }));
         }
 
+        // Feature module not enabled for this tenant (modules.py).
+        if (status === 403 && error.response?.data?.module) {
+            window.dispatchEvent(new CustomEvent('sb:module-disabled', {
+                detail: { module: error.response.data.module }
+            }));
+        }
+
         return Promise.reject(error);
     }
 );
@@ -386,6 +393,29 @@ export const AppContextProvider = ({ children }) => {
         return () => window.removeEventListener('sb:upgrade-required', onUpgrade);
     }, []);
 
+    // Enabled feature modules for this tenant: null while loading, else array.
+    // Super-admins have no tenant (call fails) -> [].
+    const [modules, setModules] = useState(null);
+    const refreshModules = React.useCallback(() => {
+        if (!token) { setModules(null); return Promise.resolve(); }
+        return apiService.tenantMe()
+            .then(r => setModules(r.data?.modules || []))
+            .catch(() => setModules([]));
+    }, [token]);
+    useEffect(() => { refreshModules(); }, [refreshModules]);
+
+    useEffect(() => {
+        const onModuleDisabled = () => setSnackbar({
+            open: true,
+            message: "This feature isn't included in your plan.",
+            severity: 'warning',
+        });
+        window.addEventListener('sb:module-disabled', onModuleDisabled);
+        return () => window.removeEventListener('sb:module-disabled', onModuleDisabled);
+    }, []);
+
+    const hasModule = (key) => key === 'core' || key === 'office' || (Array.isArray(modules) && modules.includes(key));
+
     const login = async (credentials) => {
         const response = await apiService.login(credentials);
         setToken(response.data.access_token);
@@ -405,6 +435,9 @@ export const AppContextProvider = ({ children }) => {
         token,
         user,
         isAuthenticated,
+        modules,
+        hasModule,
+        refreshModules,
         login,
         logout
     };
