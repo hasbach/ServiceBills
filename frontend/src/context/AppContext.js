@@ -1,4 +1,5 @@
 // src/context/AppContext.js
+import { shouldNotifyModuleDisabled } from '../utils/moduleDisabled.js';
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import axios from 'axios';
 
@@ -42,7 +43,9 @@ api.interceptors.response.use(
         }
 
         // Feature module not enabled for this tenant (modules.py).
-        if (status === 403 && error.response?.data?.module) {
+        // Only for user-initiated writes: a GET is a passive page-load fetch and
+        // the view already hides itself when its module is off.
+        if (shouldNotifyModuleDisabled(error)) {
             window.dispatchEvent(new CustomEvent('sb:module-disabled', {
                 detail: { module: error.response.data.module }
             }));

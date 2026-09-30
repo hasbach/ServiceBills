@@ -164,7 +164,7 @@ const MainApp = ({
     const [inboxAttention, setInboxAttention] = useState(0);
 
     useEffect(() => {
-        if (!hasRole('admin')) return undefined;
+        if (!hasRole('admin') || !hasModule('whatsapp')) return undefined;
         let cancelled = false;
         const poll = () => apiService.fetchInboxSummary()
             .then(r => { if (!cancelled) setInboxAttention(r.data.needs_attention || 0); })
@@ -172,7 +172,7 @@ const MainApp = ({
         poll();
         const i = setInterval(poll, 20000);
         return () => { cancelled = true; clearInterval(i); };
-    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [modules]); // eslint-disable-line react-hooks/exhaustive-deps
 
     useEffect(() => {
         if (!('serviceWorker' in navigator)) return undefined;
@@ -209,7 +209,7 @@ const MainApp = ({
                 : hasRole('collector') ? 'payments' : 'dashboard'
             );
         }
-    }); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [modules, currentView]); // eslint-disable-line react-hooks/exhaustive-deps
     const currentLabel = navItems.find(n => n.key === currentView)?.label || 'Dashboard';
 
     // Per-tenant branding: resolve the logo (custom upload or app default) to an absolute URL.

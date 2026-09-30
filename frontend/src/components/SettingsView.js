@@ -272,8 +272,8 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar }) =>
     }, [apiService]);
 
     useEffect(() => {
-        if (bizForm.network_access_mode === 'agent') fetchAgents();
-    }, [bizForm.network_access_mode, fetchAgents]);
+        if (bizForm.network_access_mode === 'agent' && hasModule('network')) fetchAgents();
+    }, [bizForm.network_access_mode, fetchAgents, modules]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // The token dialog is the ONLY place the plaintext token is ever held.
     // It lives in this one piece of state, cleared the moment the dialog
@@ -566,12 +566,14 @@ Read-Host -Prompt "Press Enter to exit"
 
     const [approvedTemplates, setApprovedTemplates] = useState([]);
     useEffect(() => {
+        if (!hasModule('whatsapp')) return;
         apiService.fetchWhatsAppTemplates()
             .then(res => setApprovedTemplates((res.data.templates || []).filter(t => t.status === 'APPROVED')))
             .catch(() => {}); // Settings page still works with free-text fallback if this fails
-    }, [apiService]);
+    }, [apiService, modules]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const fetchWASettings = useCallback(async () => {
+        if (!hasModule('whatsapp')) { setWaFetching(false); return; }
         setWaFetching(true);
         try {
             const res = await apiService.fetchWhatsAppSettings();
@@ -581,7 +583,8 @@ Read-Host -Prompt "Press Enter to exit"
         } finally {
             setWaFetching(false);
         }
-    }, [apiService]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [apiService, modules]);
 
     useEffect(() => { fetchWASettings(); }, [fetchWASettings]);
 
@@ -631,6 +634,7 @@ Read-Host -Prompt "Press Enter to exit"
     const [twsCredsEditing, setTwsCredsEditing] = useState(false);
 
     const fetchTwsSettings = useCallback(async () => {
+        if (!hasModule('whish_payments')) { setTwsFetching(false); return; }
         setTwsFetching(true);
         try {
             const res = await apiService.tenantWhishSettings();
@@ -641,7 +645,7 @@ Read-Host -Prompt "Press Enter to exit"
             setTwsFetching(false);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [apiService]);
+    }, [apiService, modules]);
 
     useEffect(() => { fetchTwsSettings(); }, [fetchTwsSettings]);
 
@@ -1257,7 +1261,7 @@ Read-Host -Prompt "Press Enter to exit"
                     ) : !isPro ? (
                         <Section icon={<PaymentsIcon />} title="Whish Payments" subtitle="Let your customers pay you directly via Whish" color={theme.palette.warning.main}>
                             <Alert severity="warning" icon={<LockIcon />} sx={{ borderRadius: '12px' }}>
-                                This feature requires the <strong>Pro</strong> plan. Upgrade from the Billing page to let your
+                                This feature isn't included in your plan. Get it enabled to let your
                                 customers pay their invoices directly via Whish, using your own Whish merchant account.
                             </Alert>
                         </Section>
