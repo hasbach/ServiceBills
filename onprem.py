@@ -292,7 +292,10 @@ def _setup_required_guard():
     if not is_onprem():
         return None
     p = request.path
-    if not p.startswith("/api/") or p.startswith("/api/setup") or p.startswith("/api/system/info"):
+    # /api/health must answer before setup too: Docker's healthcheck and the
+    # installer's wait loop poll it on a brand-new, not-yet-set-up install.
+    if (not p.startswith("/api/") or p.startswith("/api/setup") or p.startswith("/api/system/info")
+            or p == "/api/health"):
         return None
     if _setup_required():
         return jsonify({"setup_required": True}), 409

@@ -163,3 +163,9 @@ def test_placeholder_tenant_from_migration_is_adopted(onprem, client):
     assert tenants[0].plan == "pro"
     assert appmod.User.query.filter_by(username="boss").first().tenant_id == tenants[0].id
     assert client.get("/api/setup/status").get_json()["setup_required"] is False
+
+
+def test_health_answers_before_setup(onprem, client):
+    # Docker's healthcheck + the installer poll this on a fresh install.
+    assert client.get("/api/setup/status").get_json()["setup_required"] is True
+    assert client.get("/api/health").status_code == 200
