@@ -1318,6 +1318,9 @@ class BusinessSettings(db.Model):
     mobile = db.Column(db.String(20), nullable=False)
     email = db.Column(db.String(100), nullable=True)
     website = db.Column(db.String(200), nullable=True)
+    # On-prem only: the externally reachable base URL of this install, used for
+    # the WhatsApp webhook display and customer-facing payment links.
+    public_url = db.Column(db.String(300), nullable=True)
     # Which of the 3 network-integration shapes this tenant uses (see
     # docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
     # 'none' (default, no network integration), 'upstream_bridge' (subreseller
@@ -1364,6 +1367,7 @@ class BusinessSettings(db.Model):
             'mobile': self.mobile,
             'email': self.email,
             'website': self.website,
+            'public_url': self.public_url,
             'network_mode': self.network_mode or 'none',
             'network_access_mode': self.network_access_mode or 'direct',
             'upstream_sync_automation_enabled': bool(self.upstream_sync_automation_enabled),
@@ -6413,6 +6417,29 @@ def get_monthly_revenue():
 
     return jsonify(result)
 
+def _public_base_url(tenant_id=None):
+    """Base URL for customer-facing links. On-prem installs use the tenant's
+    configured BusinessSettings.public_url (first tenant when tenant_id is
+    None); everything else falls back to Config.APP_BASE_URL."""
+    if onprem.is_onprem():
+        q = BusinessSettings.query
+        if tenant_id is not None:
+            q = q.filter_by(tenant_id=tenant_id)
+        else:
+            q = q.order_by(BusinessSettings.tenant_id, BusinessSettings.id)
+        bs = q.first()
+        if bs and bs.public_url:
+            return bs.public_url
+    return Config.APP_BASE_URL
+
+
+def _whish_base_url_kwargs(tenant_id):
+    """Extra create_payment kwargs: only override the callback base URL when
+    it differs from the default, so SaaS behaviour is byte-for-byte unchanged."""
+    base = _public_base_url(tenant_id)
+    return {} if base == Config.APP_BASE_URL else {'base_url': base}
+
+
 @app.route('/api/business-settings', methods=['POST'])
 @jwt_required()
 def save_business_settings():
@@ -6432,6 +6459,13 @@ def save_business_settings():
                 return jsonify({'error': f"Invalid network_access_mode "
                                          f"'{_requested_network_access_mode}'. "
                                          f"Must be 'direct' or 'agent'."}), 400
+
+        _public_url_provided = 'public_url' in request.form
+        _public_url_value = None
+        if _public_url_provided:
+            _public_url_value = (request.form.get('public_url') or '').strip().rstrip('/') or None
+            if _public_url_value and not _public_url_value.startswith(('https://', 'http://')):
+                return jsonify({'error': "public_url must start with https:// or http://"}), 400
 
         # Fetch existing settings or create new
         settings = tenant_query(BusinessSettings).first()
@@ -6465,6 +6499,8 @@ def save_business_settings():
         settings.mobile = request.form.get('mobile', settings.mobile)
         settings.email = request.form.get('email', settings.email)
         settings.website = request.form.get('website', settings.website)
+        if _public_url_provided:
+            settings.public_url = _public_url_value
         settings.network_mode = request.form.get('network_mode', settings.network_mode)
         settings.network_access_mode = request.form.get(
             'network_access_mode', settings.network_access_mode)
@@ -6573,10 +6609,11 @@ def list_exchange_rates():
 @require_module('whatsapp')
 def get_whatsapp_settings():
     settings = tenant_query(WhatsAppSettings).first()
+    webhook_url = _public_base_url(current_tenant_id()) + "/api/whatsapp/webhook"
     if settings:
-        return jsonify({'settings': settings.to_dict()}), 200
+        return jsonify({'settings': settings.to_dict(), 'webhook_url': webhook_url}), 200
     # Return safe defaults if not configured yet
-    return jsonify({'settings': {
+    return jsonify({'webhook_url': webhook_url, 'settings': {
         'mode': 'deeplink', 'enabled': False,
         'phone_number_id': '', 'business_account_id': '', 'app_id': '',
         'app_secret': '', 'access_token': '', 'api_version': 'v19.0',
@@ -6727,7 +6764,7 @@ def get_public_pay_link():
     slug = tenant.public_pay_slug
     return jsonify({
         'slug': slug,
-        'url': f"{Config.APP_BASE_URL}/pay-business?slug={slug}" if slug else None,
+        'url': f"{_public_base_url(tenant.id)}/pay-business?slug={slug}" if slug else None,
     }), 200
 
 
@@ -6749,7 +6786,7 @@ def regenerate_public_pay_link():
     db.session.commit()
     return jsonify({
         'slug': tenant.public_pay_slug,
-        'url': f"{Config.APP_BASE_URL}/pay-business?slug={tenant.public_pay_slug}",
+        'url': f"{_public_base_url(tenant.id)}/pay-business?slug={tenant.public_pay_slug}",
     }), 200
 
 
@@ -6928,6 +6965,7 @@ def public_tenant_pay_checkout(slug):
             # docstring for why this parameter exists at all.
             success_path='/api/pay-attempt/success',
             failure_path='/api/pay-attempt/failure',
+            **_whish_base_url_kwargs(tenant.id),
         )
     except whish_billing.WhishAPIError as e:
         logging.error(f"Whish checkout failed for CustomerWhishPaymentAttempt {attempt.id}: {e}")
@@ -6953,7 +6991,7 @@ def customer_whish_attempt_success():
         logging.warning(f"Customer-Whish attempt success callback rejected: order={external_id}")
         tenant = db.session.get(Tenant, attempt.tenant_id) if attempt else None
         slug = tenant.public_pay_slug if tenant else 'invalid'
-        return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={slug}&status=error")
+        return redirect(f"{_public_base_url(attempt.tenant_id if attempt else None)}/pay-business?slug={slug}&status=error")
 
     # TBD: exact query-param name Whish's real success callback uses for the
     # transaction number -- same unresolved-fact caveat as Task 9's callback
@@ -6977,7 +7015,7 @@ def customer_whish_attempt_success():
         logging.warning(f"payment_paid WhatsApp notification failed after self-service Whish success (attempt {attempt.id}): {e}")
 
     tenant = db.session.get(Tenant, attempt.tenant_id)
-    return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={tenant.public_pay_slug}&status=success")
+    return redirect(f"{_public_base_url(tenant.id)}/pay-business?slug={tenant.public_pay_slug}&status=success")
 
 
 @app.route('/api/pay-attempt/failure', methods=['GET'])
@@ -6991,7 +7029,7 @@ def customer_whish_attempt_failure():
         db.session.commit()
     tenant = db.session.get(Tenant, attempt.tenant_id) if attempt else None
     slug = tenant.public_pay_slug if tenant else 'invalid'
-    return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={slug}&status=failed")
+    return redirect(f"{_public_base_url(attempt.tenant_id if attempt else None)}/pay-business?slug={slug}&status=failed")
 
 
 @app.route('/api/pay/<view_token>', methods=['GET'])
@@ -7073,6 +7111,7 @@ def public_pay_checkout(view_token):
             # for why this parameter exists at all.
             success_path='/api/customer-whish/success',
             failure_path='/api/customer-whish/failure',
+            **_whish_base_url_kwargs(link.tenant_id),
         )
     except whish_billing.WhishAPIError as e:
         logging.error(f"Whish checkout failed for CustomerPaymentLink {link.id}: {e}")
@@ -7099,7 +7138,7 @@ def customer_whish_success():
             or not secrets.compare_digest(link.callback_token, token)
             or link.expires_at < datetime.utcnow()):
         logging.warning(f"Customer-Whish success callback rejected: order={external_id}")
-        return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token if link else 'invalid'}&status=error")
+        return redirect(f"{_public_base_url(link.tenant_id if link else None)}/pay?token={link.view_token if link else 'invalid'}&status=error")
 
     payment = db.session.get(Payment, link.payment_id)
     customer = db.session.get(Customer, link.customer_id)
@@ -7131,7 +7170,7 @@ def customer_whish_success():
     except Exception as e:
         logging.warning(f"payment_paid WhatsApp notification failed after Whish success (link {link.id}): {e}")
 
-    return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token}&status=success")
+    return redirect(f"{_public_base_url(link.tenant_id)}/pay?token={link.view_token}&status=success")
 
 
 @app.route('/api/customer-whish/failure', methods=['GET'])
@@ -7143,7 +7182,7 @@ def customer_whish_failure():
     if link and link.status == 'pending' and secrets.compare_digest(link.callback_token, token):
         link.status = 'failed'
         db.session.commit()
-    return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token if link else 'invalid'}&status=failed")
+    return redirect(f"{_public_base_url(link.tenant_id if link else None)}/pay?token={link.view_token if link else 'invalid'}&status=failed")
 
 
 @app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/resend', methods=['POST'])
@@ -7183,7 +7222,7 @@ def resend_customer_payment_link(customer_id, payment_id):
     # Query-string token, not a path segment -- see PublicPaymentView.js's
     # own note (Task 10) for why /pay/<token> breaks this build's relative
     # asset paths (needed for the Electron packaging).
-    pay_url = f"{Config.APP_BASE_URL}/pay?token={link.view_token}"
+    pay_url = f"{_public_base_url(tenant.id)}/pay?token={link.view_token}"
     return jsonify({"view_token": link.view_token, "pay_url": pay_url}), 200
 
 

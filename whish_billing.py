@@ -40,7 +40,7 @@ def _headers():
 
 
 def create_payment(external_id, amount, currency, callback_token, requestee, target, email, invoice,
-                    success_path='/api/billing/whish/success', failure_path='/api/billing/whish/failure'):
+                    success_path='/api/billing/whish/success', failure_path='/api/billing/whish/failure', base_url=None):
     """Create a one-time Whish payment and return the collectUrl to redirect
     the customer's browser to. Raises WhishAPIError on any failure -- never
     returns a falsy/partial result, matching billing.py's raise-based
@@ -56,8 +56,9 @@ def create_payment(external_id, amount, currency, callback_token, requestee, tar
     whatever URL it was given verbatim, and a payment meant for a tenant's
     customer must never redirect through platform billing's success handler
     (or vice versa)."""
-    success_url = f"{Config.APP_BASE_URL}{success_path}?order={external_id}&token={callback_token}"
-    failure_url = f"{Config.APP_BASE_URL}{failure_path}?order={external_id}&token={callback_token}"
+    base = base_url or Config.APP_BASE_URL
+    success_url = f"{base}{success_path}?order={external_id}&token={callback_token}"
+    failure_url = f"{base}{failure_path}?order={external_id}&token={callback_token}"
     payload = {
         "externalId": external_id,
         "successCallbackUrl": success_url,
