@@ -2578,8 +2578,35 @@ def admin_list_tenants():
         d = t.to_dict()
         d["customers"] = Customer.query.filter_by(tenant_id=t.id).count()
         d["users"] = User.query.filter_by(tenant_id=t.id).count()
+        d["module_overrides"] = t.module_overrides or {}
         result.append(d)
     return jsonify(result), 200
+
+
+@app.route('/api/admin/tenants/<int:tid>/modules', methods=['POST'])
+@superadmin_required
+def admin_set_modules(tid):
+    t = db.session.get(Tenant, tid)
+    if not t:
+        return jsonify({"msg": "Tenant not found"}), 404
+    incoming = (request.get_json(silent=True) or {}).get("overrides")
+    if not isinstance(incoming, dict):
+        return jsonify({"msg": "overrides must be an object"}), 400
+    current = dict(t.module_overrides or {})
+    for key, val in incoming.items():
+        if key in modules.ALWAYS_ON:
+            return jsonify({"msg": f"{key} is always on"}), 400
+        if key not in modules.PAID:
+            return jsonify({"msg": f"Unknown module: {key}"}), 400
+        if val is None:
+            current.pop(key, None)
+        elif isinstance(val, bool):
+            current[key] = val
+        else:
+            return jsonify({"msg": f"{key}: expected true, false or null"}), 400
+    t.module_overrides = current or None
+    db.session.commit()
+    return jsonify({"tenant": {**t.to_dict(), "module_overrides": t.module_overrides or {}}}), 200
 
 
 @app.route('/api/admin/tenants/<int:tid>/suspend', methods=['POST'])
