@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import hashlib
 import hmac
 import json
@@ -126,3 +127,24 @@ def test_webhook_with_ai_cs_runs_ai(app, client, monkeypatch):
     r = _signed_post(client, payload, "sekret")
     assert r.status_code == 200
     assert calls == [1]
+
+
+def test_send_whatsapp_message_skipped_when_module_off(app, client, monkeypatch):
+    make_tenant(client, "Wa Send", "wasend_admin")
+    _set_overrides(app, "wa-send", {"whatsapp": False})
+    calls = []
+    monkeypatch.setattr(appmod.requests, "post", lambda *a, **k: calls.append(a) or None)
+    with app.app_context():
+        t = appmod.Tenant.query.filter_by(slug="wa-send").first()
+        appmod.db.session.add(appmod.WhatsAppSettings(
+            tenant_id=t.id, enabled=True, mode="api", access_token="x", phone_number_id="1"))
+        plan = appmod.SubscriptionPlan(tenant_id=t.id, name="P", price=10.0, billing_cycle="monthly", currency="USD")
+        appmod.db.session.add(plan)
+        appmod.db.session.commit()
+        c = appmod.Customer(tenant_id=t.id, name="C", phone="70111222", address="a", subscription_plan_id=plan.id,
+                               subscription_expiry_date=datetime.utcnow() + timedelta(days=30))
+        appmod.db.session.add(c)
+        appmod.db.session.commit()
+        res = appmod.send_whatsapp_message(c, "payment_paid", context={"amount": 1})
+    assert res == {'success': False, 'status': 'Skipped', 'error': 'whatsapp module disabled'}
+    assert calls == []

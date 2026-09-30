@@ -1998,6 +1998,8 @@ def _maybe_create_customer_payment_link(payment, customer):
     at construction) -- confirmed at every one of this task's 10 call sites,
     not assumed."""
     try:
+        if not modules.is_enabled(db.session.get(Tenant, customer.tenant_id), 'whish_payments'):
+            return None
         whish_settings = TenantWhishSettings.query.filter_by(tenant_id=customer.tenant_id, enabled=True).first()
         if not whish_settings:
             return None
@@ -5173,8 +5175,8 @@ def get_unpaid_payments():
 
 @app.route('/api/reports/customer-whish-payments', methods=['GET'])
 @jwt_required()
-@require_module('whish_payments')
 def customer_whish_payments_report():
+    has_links = modules.is_enabled(db.session.get(Tenant, current_tenant_id()), 'whish_payments')
     query = tenant_query(CustomerPaymentLink).join(Customer)
     status = request.args.get('status')
     start_date_str = request.args.get('start_date')
@@ -5192,7 +5194,9 @@ def customer_whish_payments_report():
     query = query.order_by(CustomerPaymentLink.created_at.desc())
 
     rows = []
-    if status != 'manual_transfer':
+    # Tenants without whish_payments keep their manual-transfer history but
+    # never see payment-link rows.
+    if has_links and status != 'manual_transfer':
         for link in query.all():
             d = link.to_dict()
             d['customer_name'] = link.customer.name
@@ -7616,6 +7620,8 @@ def send_whatsapp_message(customer, event_type, context=None):
         context = {}
 
     try:
+        if not modules.is_enabled(db.session.get(Tenant, customer.tenant_id), 'whatsapp'):
+            return {'success': False, 'status': 'Skipped', 'error': 'whatsapp module disabled'}
         if not getattr(customer, 'whatsapp_notifications_enabled', True):
             return {'success': False, 'status': 'Skipped', 'error': 'Customer has WhatsApp notifications disabled'}  # User disabled notifications
 
@@ -13748,9 +13754,10 @@ def cs_tool_network_diagnostic():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
-    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+    _tenant = db.session.get(Tenant, tenant_id)
+    if not modules.is_enabled(_tenant, 'ai_cs'):
         return modules.disabled_response('ai_cs')
-    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'network'):
+    if not modules.is_enabled(_tenant, 'network'):
         return jsonify({"available": False, "message": "Network diagnostics are not available for this business. Offer to open a support ticket instead."}), 200
 
     data = (request.get_json(silent=True) or {}) if request.is_json else {}
@@ -13779,9 +13786,10 @@ def cs_tool_send_payment_link():
     tenant_id, is_jwt = cs_agent_tools.resolve_tenant_id(appmod)
     if not tenant_id:
         return jsonify(error="Unauthorized or tenant_id required"), 401
-    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+    _tenant = db.session.get(Tenant, tenant_id)
+    if not modules.is_enabled(_tenant, 'ai_cs'):
         return modules.disabled_response('ai_cs')
-    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'whish_payments'):
+    if not modules.is_enabled(_tenant, 'whish_payments'):
         return jsonify({"available": False, "message": "Online payment links are not available for this business. Tell the customer how to pay at the office instead."}), 200
 
     data = (request.get_json(silent=True) or {}) if request.is_json else {}
