@@ -101,3 +101,75 @@ def test_system_info_reports_license(onprem, client):
     _admin(client)
     j = client.get("/api/system/info").get_json()
     assert j["deployment_mode"] == "onprem" and j["license"]["reason"] == "no_license"
+
+
+def test_last_seen_bump_does_not_commit_callers_session(onprem, client):
+    app, priv = onprem
+    hdr, _ = _admin(client)
+    client.post("/api/license", headers=hdr, json={"license_file": _text(priv)})
+    import onprem as op
+    row = appmod.db.session.get(appmod.InstalledLicense, 1)
+    row.last_seen_at = datetime.utcnow() - timedelta(hours=1)
+    appmod.db.session.commit()
+    op.invalidate()
+    appmod.db.session.add(appmod.Tenant(name="Ghost", slug="ghost", plan="pro"))
+    assert op.current_state().state == "valid"
+    appmod.db.session.rollback()
+    assert appmod.Tenant.query.filter_by(slug="ghost").count() == 0
+    assert appmod.db.session.get(appmod.InstalledLicense, 1).last_seen_at > datetime.utcnow() - timedelta(minutes=5)
+
+
+def test_revocation_is_sticky_for_same_license_file(onprem, client):
+    app, priv = onprem
+    hdr, _ = _admin(client)
+    text = _text(priv)
+    client.post("/api/license", headers=hdr, json={"license_file": text})
+    row = appmod.db.session.get(appmod.InstalledLicense, 1)
+    row.revoked = True
+    appmod.db.session.commit()
+    import onprem as op
+    op.invalidate()
+    r = client.post("/api/license", headers=hdr, json={"license_file": text})
+    assert r.status_code == 400 and r.get_json() == {"msg": "revoked"}
+    assert op.current_state().reason == "revoked"
+    r = client.post("/api/license", headers=hdr, json={"license_file": _text(priv, license_id="L2")})
+    assert r.status_code == 200 and r.get_json()["state"] == "valid"
+
+
+def test_server_issued_license_clears_revocation(onprem, client):
+    app, priv = onprem
+    hdr, _ = _admin(client)
+    text = _text(priv)
+    import onprem as op
+    op.store_license(text)
+    appmod.db.session.get(appmod.InstalledLicense, 1).revoked = True
+    appmod.db.session.commit()
+    assert op.store_license(text, from_server=True).state == "valid"
+
+
+def test_non_string_license_fields_400(onprem, client):
+    hdr, _ = _admin(client)
+    for body in ({"license_file": 123}, {"license_file": {"a": 1}}, {"license_key": 5}, {"license_key": {"x": 1}}):
+        r = client.post("/api/license", headers=hdr, json=body)
+        assert r.status_code == 400 and r.get_json() == {"msg": "invalid_license"}
+
+
+def test_readonly_allowlist_exact_and_writes_blocked(onprem, client):
+    app, priv = onprem
+    hdr, _ = _admin(client)
+    r = client.post("/api/license", headers=hdr, json={"license_file": _text(priv)})
+    assert r.status_code == 200
+    import onprem as op
+    appmod.db.session.get(appmod.InstalledLicense, 1).revoked = True
+    appmod.db.session.commit()
+    op.invalidate()
+    for m in (client.put, client.delete):
+        r = m("/api/subscription_plans/1", headers=hdr, json={})
+        assert r.status_code == 403 and r.get_json() == {"license_readonly": True, "reason": "revoked"}
+    r = client.post("/api/licensex", headers=hdr, json={})
+    assert r.status_code == 403 and r.get_json().get("license_readonly") is True
+
+
+def test_readonly_hook_skipped_without_tenant(onprem, client):
+    r = client.post("/api/subscription_plans", json={"name": "P"})
+    assert "license_readonly" not in (r.get_json(silent=True) or {})

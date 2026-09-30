@@ -88,9 +88,21 @@ def _row(create=False):
     return row
 
 
+def _bump_last_seen(ts):
+    """Write last_seen_at on an independent connection, never touching db.session."""
+    from app import db, InstalledLicense
+    try:
+        t = InstalledLicense.__table__
+        with db.engine.begin() as conn:
+            conn.execute(t.update().where(t.c.id == 1).values(last_seen_at=ts))
+    except Exception as e:
+        log.warning("could not update license last_seen_at: %s", e)
+
+
 def _compute_state():
     from app import db
-    row = _row()
+    with db.session.no_autoflush:  # never flush pending objects of the calling request
+        row = _row()
     if row is None or not row.license_text:
         return lic.evaluate(None, date.today(), _machine_id())
     try:
@@ -103,8 +115,7 @@ def _compute_state():
         return lic.LicenseState("readonly", "clock_rollback", payload, set(),
                                 base.get("expires_at"), [])
     if row.last_seen_at is None or now - row.last_seen_at > timedelta(minutes=1):
-        row.last_seen_at = max(now, row.last_seen_at) if row.last_seen_at else now
-        db.session.commit()
+        _bump_last_seen(max(now, row.last_seen_at) if row.last_seen_at else now)
     return lic.evaluate(payload, date.today(), _machine_id(),
                         release_date=_cfg("APP_RELEASE_DATE"), revoked=bool(row.revoked))
 
@@ -118,12 +129,19 @@ def current_state():
     return st
 
 
-def store_license(text):
+def store_license(text, from_server=False):
     from app import db
     payload = lic.verify(text, public_key())
     if payload.get("machine_id") != _machine_id():
         raise lic.LicenseError("machine_mismatch")
     row = _row(create=True)
+    if row.revoked and not from_server and row.license_text:
+        try:
+            old = lic.verify(row.license_text, public_key())
+        except lic.LicenseError:
+            old = {}
+        if old.get("license_id") == payload.get("license_id"):
+            raise lic.LicenseError("revoked")
     row.license_text = text
     row.revoked = False
     db.session.commit()
@@ -146,7 +164,7 @@ def refresh_license():
                       "app_version": _cfg("APP_VERSION")},
                 timeout=15)
             if resp.status_code == 200:
-                store_license(resp.json()["license"])
+                store_license(resp.json()["license"], from_server=True)
                 row = _row()
                 row.last_refresh_error = None
                 row.last_refresh_at = datetime.utcnow()
@@ -183,7 +201,7 @@ def _readonly_guard():
     if not is_onprem() or request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     p = request.path
-    if not p.startswith("/api/") or any(p.startswith(a) for a in READONLY_ALLOW):
+    if not p.startswith("/api/") or any(p == a or p.startswith(a + "/") for a in READONLY_ALLOW):
         return None
     from app import Tenant
     if Tenant.query.first() is None:  # setup phase
@@ -255,7 +273,12 @@ def register(app, appmod):
     @jwt_required()
     @appmod.admin_required()
     def api_license_set():
-        data = request.get_json(silent=True) or {}
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            data = {}
+        for k in ("license_file", "license_key"):
+            if k in data and data[k] is not None and not isinstance(data[k], str):
+                return jsonify(msg="invalid_license"), 400
         try:
             if data.get("license_file"):
                 store_license(data["license_file"])
@@ -273,11 +296,11 @@ def register(app, appmod):
                     except Exception:
                         code = "activation_failed"
                     return jsonify(msg=code), 400
-                store_license(resp.json()["license"])
+                store_license(resp.json()["license"], from_server=True)
             else:
                 return jsonify(msg="license_key or license_file required"), 400
         except lic.LicenseError as e:
-            msg = "machine_mismatch" if str(e) == "machine_mismatch" else "invalid_license"
+            msg = str(e) if str(e) in ("machine_mismatch", "revoked") else "invalid_license"
             return jsonify(msg=msg), 400
         return jsonify(license_body())
 
