@@ -243,6 +243,19 @@ const rawApiService = {
         return response.data; // Returns the data object directly
     },
     addCustomer: (customerData) => api.post(`/customers`, customerData),
+    // Customer import wizard (docs/superpowers/specs/2026-09-30-customer-import-wizard-design.md).
+    downloadImportTemplate: () => api.get('/customers/import/template', { responseType: 'blob' }),
+    validateCustomerImport: (file) => {
+        const fd = new FormData();
+        fd.append('file', file);
+        return api.post('/customers/import/validate', fd);
+    },
+    commitCustomerImport: (file, newPlans) => {
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('new_plans', JSON.stringify(newPlans || []));
+        return api.post('/customers/import/commit', fd);
+    },
     updateCustomer: (customerId, customerData) => api.put(`/customers/${customerId}`, customerData),
     // --- FIX: Ensure all API calls consistently return response.data ---
     fetchSubscriptionPlans: async () => {
