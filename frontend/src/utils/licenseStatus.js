@@ -33,3 +33,19 @@ export const expiryWarnings = (license, today = new Date()) => {
         daysLeft: Math.max(0, Math.ceil((new Date(w.expires_at) - today) / DAY_MS)),
     }));
 };
+
+// Result of the last on-prem update, as a dismissible notice (or null).
+export const updateNotice = (update, dismissedKey) => {
+    const last = update && update.last_update;
+    if (!last) return null;
+    const key = `${last.status}:${last.target}:${last.at}`;
+    if (key === dismissedKey) return null;
+    if (last.status === 'ok' && last.target === update.current) {
+        return { severity: 'success', text: `ServiceBills was updated to v${update.current}.`, key };
+    }
+    if (last.status === 'failed') {
+        const msg = last.message ? ` ${last.message}` : '';
+        return { severity: 'error', text: `Update to v${last.target} failed — still running v${update.current}.${msg}`, key };
+    }
+    return null;
+};
