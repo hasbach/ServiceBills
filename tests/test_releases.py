@@ -25,6 +25,10 @@ def test_publish_wrong_secret_401(client, secret):
     assert _pub(client, "1.0.0", headers={}).status_code == 401
 
 
+def test_publish_non_ascii_secret_401_not_500(client, secret):
+    assert _pub(client, "1.0.0", headers={"X-Release-Secret": "s3crét"}).status_code == 401
+
+
 @pytest.mark.parametrize("kw", [{"version": "1.2"}, {"version": "1.2.x"},
                                 {"version": "1.0.0", "min_upgrade_from": "2"},
                                 {"version": "1.0.0", "release_date": "nope"},

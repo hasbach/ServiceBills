@@ -31,7 +31,9 @@ def register(app, appmod):
         secret = _cfg("RELEASE_PUBLISH_SECRET")
         if not secret:
             return jsonify({"error": "release publishing not configured"}), 503
-        if not hmac.compare_digest(request.headers.get("X-Release-Secret", ""), secret):
+        supplied = request.headers.get("X-Release-Secret", "")
+        # Compare as UTF-8 bytes: str compare_digest raises TypeError on non-ASCII input.
+        if not hmac.compare_digest(supplied.encode("utf-8"), secret.encode("utf-8")):
             return jsonify({"error": "Unauthorized"}), 401
         d = request.get_json(silent=True)
         d = d if isinstance(d, dict) else {}
