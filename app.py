@@ -228,6 +228,7 @@ class InstalledLicense(db.Model):
     last_seen_at = db.Column(db.DateTime, nullable=True)
     last_refresh_at = db.Column(db.DateTime, nullable=True)
     last_refresh_error = db.Column(db.String(500), nullable=True)
+    revision = db.Column(db.Integer, nullable=False, default=0, server_default='0')
 
 
 class Tenant(db.Model):

@@ -2,12 +2,13 @@
 license state, read-only enforcement and /api/license endpoints.
 
 Operational requirements for on-prem deployments:
-  * Run with WEB_CONCURRENCY=1. The license state cache (and its invalidation after
-    setup / activation / refresh) is per-process, so several workers could disagree
-    for up to CACHE_SECONDS.
+  * The license state cache is per-process, but each entry is tagged with the
+    InstalledLicense.revision it was computed from, so workers notice changes made
+    by other workers on the next call.
   * Every container (app, scheduler, ...) must run with the identical TZ setting:
     expiry is evaluated against the local calendar date (date.today()).
 """
+import json
 import logging
 import os
 import time
@@ -32,7 +33,7 @@ READONLY_ALLOW = ("/api/login", "/api/logout", "/api/setup", "/api/license", "/a
 CACHE_SECONDS = 60
 
 _pubkey_cache = None
-_state_cache = None  # (timestamp, LicenseState)
+_state_cache = None  # (timestamp, revision, LicenseState)
 
 
 def _cfg(key):
@@ -89,7 +90,7 @@ def _row(create=False):
     from app import db, InstalledLicense
     row = db.session.get(InstalledLicense, 1)
     if row is None and create:
-        row = InstalledLicense(id=1, revoked=False)
+        row = InstalledLicense(id=1, revoked=False, revision=0)
         db.session.add(row)
     return row
 
@@ -132,14 +133,25 @@ def _compute_state():
                         release_date=_cfg("APP_RELEASE_DATE"), revoked=bool(row.revoked))
 
 
+def _db_revision():
+    """Current revision of the license row (-1 when there is none). One cheap query;
+    lets every worker notice a license change made by another worker."""
+    from app import db, InstalledLicense
+    with db.session.no_autoflush:
+        rev = db.session.query(InstalledLicense.revision).filter_by(id=1).scalar()
+    return -1 if rev is None else rev
+
+
 def current_state():
     global _state_cache
     if not _machine_id():  # never licensed without a machine identity
         return lic.LicenseState("readonly", "machine_mismatch")
-    if _state_cache and time.time() - _state_cache[0] < CACHE_SECONDS:
-        return _state_cache[1]
+    rev = _db_revision()
+    c = _state_cache
+    if c and time.time() - c[0] < CACHE_SECONDS and c[1] == rev:
+        return c[2]
     st = _compute_state()
-    _state_cache = (time.time(), st)
+    _state_cache = (time.time(), rev, st)
     return st
 
 
@@ -158,6 +170,7 @@ def store_license(text, from_server=False, commit=True):
             raise lic.LicenseError("revoked")
     row.license_text = text
     row.revoked = False
+    row.revision = (row.revision or 0) + 1
     if from_server:
         # A license fresh from the server proves the server's clock: forgive an
         # earlier local clock jump by letting last_seen_at move backward, here only.
@@ -194,6 +207,7 @@ def refresh_license():
                     (403, "revoked"), (409, "license_in_use"), (404, "unknown_license")):
                 # revoked, moved to another computer (unbind), or deleted server-side
                 row.revoked = True
+                row.revision = (row.revision or 0) + 1
                 row.last_refresh_error = None
                 row.last_refresh_at = datetime.utcnow()
             else:
@@ -306,6 +320,23 @@ def _fetch_license_text(data, business_name, owner_phone):
     return None, (jsonify(msg="License server error"), 502)
 
 
+def update_status():
+    """Installer/updater status from the host-mounted state.json, or None."""
+    path = _cfg("ONPREM_STATE_FILE") or os.environ.get("ONPREM_STATE_FILE")
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+    except (OSError, ValueError) as e:
+        log.debug("cannot read update state file %s: %s", path, e)
+        return None
+    return {"current": data.get("current"), "previous": data.get("previous"),
+            "last_update": data.get("last_update")}
+
+
 def system_info():
     onprem = is_onprem()
     license_info = None
@@ -318,12 +349,15 @@ def system_info():
             license_info = {"state": st.state, "reason": st.reason,
                             "base_expires_at": st.base_expires_at,
                             "trial": bool((st.payload or {}).get("trial"))}
-    return {
+    info = {
         "deployment_mode": "onprem" if onprem else "saas",
         "app_version": _cfg("APP_VERSION"),
         "setup_required": _setup_required(),
         "license": license_info,
     }
+    if onprem:
+        info["update"] = update_status()
+    return info
 
 
 def register(app, appmod):
