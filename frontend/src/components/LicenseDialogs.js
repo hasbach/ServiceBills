@@ -165,13 +165,13 @@ export const EditLicenseDialog = ({ lic, onClose, onSubmit }) => {
     const submit = async () => {
         const body = { business_name: f.business_name.trim(), owner_phone: f.owner_phone.trim(), notes: f.notes };
         if (f.base_expires_at && f.base_expires_at !== toDate(lic.base_expires_at)) {
-            body.base_expires_at = `${f.base_expires_at}T00:00:00Z`;
+            body.base_expires_at = f.base_expires_at;
         }
         const modules = {};
         Object.entries(lic.modules || {}).forEach(([k, v]) => {
             if (removed[k]) modules[k] = null;
             else if (mods[k] && mods[k] !== toDate(v.expires_at)) {
-                modules[k] = { term: v.term, expires_at: `${mods[k]}T00:00:00Z` };
+                modules[k] = { term: v.term, expires_at: mods[k] };
             }
         });
         if (Object.keys(modules).length) body.modules = modules;
