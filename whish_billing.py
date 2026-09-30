@@ -28,8 +28,9 @@ class WhishAPIError(Exception):
     a network error, or a well-formed response with status=false."""
 
 
-def _headers():
-    site_netloc = urllib.parse.urlparse(Config.APP_BASE_URL).netloc or Config.APP_BASE_URL
+def _headers(base=None):
+    base = base or Config.APP_BASE_URL
+    site_netloc = urllib.parse.urlparse(base).netloc or base
     return {
         "Content-Type": "application/json",
         "channel": Config.WHISH_CHANNEL or "",
@@ -40,7 +41,7 @@ def _headers():
 
 
 def create_payment(external_id, amount, currency, callback_token, requestee, target, email, invoice,
-                    success_path='/api/billing/whish/success', failure_path='/api/billing/whish/failure'):
+                    success_path='/api/billing/whish/success', failure_path='/api/billing/whish/failure', base_url=None):
     """Create a one-time Whish payment and return the collectUrl to redirect
     the customer's browser to. Raises WhishAPIError on any failure -- never
     returns a falsy/partial result, matching billing.py's raise-based
@@ -56,8 +57,9 @@ def create_payment(external_id, amount, currency, callback_token, requestee, tar
     whatever URL it was given verbatim, and a payment meant for a tenant's
     customer must never redirect through platform billing's success handler
     (or vice versa)."""
-    success_url = f"{Config.APP_BASE_URL}{success_path}?order={external_id}&token={callback_token}"
-    failure_url = f"{Config.APP_BASE_URL}{failure_path}?order={external_id}&token={callback_token}"
+    base = base_url or Config.APP_BASE_URL
+    success_url = f"{base}{success_path}?order={external_id}&token={callback_token}"
+    failure_url = f"{base}{failure_path}?order={external_id}&token={callback_token}"
     payload = {
         "externalId": external_id,
         "successCallbackUrl": success_url,
@@ -66,8 +68,8 @@ def create_payment(external_id, amount, currency, callback_token, requestee, tar
         # from the callback URLs above (see the reference plugin). This app has
         # no separate thank-you page -- point both at the Billing page directly,
         # since the callback routes above already 302 there once processed.
-        "successRedirectUrl": f"{Config.APP_BASE_URL}/billing?status=success",
-        "failureRedirectUrl": f"{Config.APP_BASE_URL}/billing?status=failed",
+        "successRedirectUrl": f"{base}/billing?status=success",
+        "failureRedirectUrl": f"{base}/billing?status=failed",
         "amount": amount,
         "invoice": invoice,
         "currency": currency,
@@ -76,7 +78,7 @@ def create_payment(external_id, amount, currency, callback_token, requestee, tar
         "email": email,
     }
     try:
-        resp = requests.post(WHISH_CREATE_URL, json=payload, headers=_headers(), timeout=15)
+        resp = requests.post(WHISH_CREATE_URL, json=payload, headers=_headers(base), timeout=15)
     except requests.exceptions.RequestException as e:
         raise WhishAPIError(f"Whish request failed: {e}") from e
 

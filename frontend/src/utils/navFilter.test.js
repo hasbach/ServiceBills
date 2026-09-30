@@ -17,3 +17,11 @@ test('still applies roles and visibleWhen', () => {
     const got = filterNavItems(items, { hasRole, businessSettings: {}, hasModule: () => true });
     expect(got.map(i => i.key)).toEqual(['dashboard', 'network-tree']);
 });
+
+test('saasOnly items are hidden on-prem only', () => {
+    const its = [{ key: 'billing', saasOnly: true }, { key: 'x' }];
+    const base = { hasRole: () => true, businessSettings: {}, hasModule: () => true };
+    expect(filterNavItems(its, { ...base, isOnprem: true }).map(i => i.key)).toEqual(['x']);
+    expect(filterNavItems(its, { ...base, isOnprem: false }).map(i => i.key)).toEqual(['billing', 'x']);
+    expect(filterNavItems(its, base).map(i => i.key)).toEqual(['billing', 'x']);
+});

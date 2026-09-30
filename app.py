@@ -40,6 +40,8 @@ from sqlalchemy import and_, func, extract
 from werkzeug.utils import secure_filename
 import atexit
 import click
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
 from flask import send_from_directory
 from sqlalchemy.exc import IntegrityError
 from dateutil.relativedelta import relativedelta # REQUIRED: pip install python-dateutil
@@ -88,6 +90,10 @@ app = Flask(__name__, static_folder='build', static_url_path='/_assets')
 
 from config import Config
 app.config.from_object(Config)
+if os.environ.get("TRUST_PROXY") == "1":
+    # Behind exactly one reverse proxy (Render): key rate limits on the real client IP.
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
 
 # Error tracking (Phase 2). Dormant/no-op if SENTRY_DSN is unset -- same optional-
@@ -194,6 +200,36 @@ def health_check():
 
 
 # Database Models (unchanged)
+class OnpremLicense(db.Model):
+    __tablename__ = "onprem_license"
+    id = db.Column(db.String(36), primary_key=True)            # uuid4 = license_id
+    license_key = db.Column(db.String(24), unique=True, nullable=False, index=True)  # SB-XXXX-XXXX-XXXX
+    business_name = db.Column(db.String(200), nullable=False)
+    owner_phone = db.Column(db.String(40), nullable=True)
+    machine_id = db.Column(db.String(128), nullable=True, index=True)
+    trial = db.Column(db.Boolean, nullable=False, default=False)
+    base_term = db.Column(db.String(16), nullable=False)       # monthly|yearly|lifetime|trial
+    base_expires_at = db.Column(db.String(10), nullable=False)  # ISO date
+    modules = db.Column(db.JSON, nullable=True)                 # {key: {term, expires_at}}
+    revoked = db.Column(db.Boolean, nullable=False, default=False)
+    notes = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    activated_at = db.Column(db.DateTime, nullable=True)
+    last_refresh_at = db.Column(db.DateTime, nullable=True)
+    last_app_version = db.Column(db.String(40), nullable=True)
+
+
+class InstalledLicense(db.Model):
+    """On-prem only: the single (id=1) installed license row."""
+    __tablename__ = "installed_license"
+    id = db.Column(db.Integer, primary_key=True)
+    license_text = db.Column(db.Text, nullable=True)
+    revoked = db.Column(db.Boolean, nullable=False, default=False)
+    last_seen_at = db.Column(db.DateTime, nullable=True)
+    last_refresh_at = db.Column(db.DateTime, nullable=True)
+    last_refresh_error = db.Column(db.String(500), nullable=True)
+
+
 class Tenant(db.Model):
     __tablename__ = "tenant"
     id = db.Column(db.Integer, primary_key=True)
@@ -1286,6 +1322,9 @@ class BusinessSettings(db.Model):
     mobile = db.Column(db.String(20), nullable=False)
     email = db.Column(db.String(100), nullable=True)
     website = db.Column(db.String(200), nullable=True)
+    # On-prem only: the externally reachable base URL of this install, used for
+    # the WhatsApp webhook display and customer-facing payment links.
+    public_url = db.Column(db.String(300), nullable=True)
     # Which of the 3 network-integration shapes this tenant uses (see
     # docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
     # 'none' (default, no network integration), 'upstream_bridge' (subreseller
@@ -1332,6 +1371,7 @@ class BusinessSettings(db.Model):
             'mobile': self.mobile,
             'email': self.email,
             'website': self.website,
+            'public_url': self.public_url,
             'network_mode': self.network_mode or 'none',
             'network_access_mode': self.network_access_mode or 'direct',
             'upstream_sync_automation_enabled': bool(self.upstream_sync_automation_enabled),
@@ -2266,6 +2306,26 @@ def has_pending_reseller_charge(customer_id, billing_date, tenant_id):
     return existing_charge is not None
 
 
+def _create_tenant_with_admin(business_name, username, password, email=None, plan="free"):
+    """Create a tenant (unique slug), seed its defaults and an admin user. Flushes, never commits."""
+    slug = re.sub(r'[^a-z0-9]+', '-', business_name.lower()).strip('-')[:80] or 'tenant'
+    base = slug
+    i = 1
+    while Tenant.query.filter_by(slug=slug).first():
+        i += 1
+        slug = f"{base}-{i}"
+    tenant = Tenant(name=business_name, slug=slug, plan=plan)
+    db.session.add(tenant)
+    db.session.flush()  # assign tenant.id before creating the user
+    seed_default_expense_categories(tenant.id)
+
+    new_user = User(username=username, role='admin', tenant_id=tenant.id, email=email)
+    new_user.set_password(password)
+    db.session.add(new_user)
+    db.session.flush()
+    return tenant, new_user
+
+
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
@@ -2281,20 +2341,7 @@ def register():
         return jsonify({"msg": "Email already in use"}), 409
 
     # Each registration provisions a new tenant (business); the registrant is its admin.
-    slug = re.sub(r'[^a-z0-9]+', '-', business_name.lower()).strip('-')[:80] or 'tenant'
-    base = slug
-    i = 1
-    while Tenant.query.filter_by(slug=slug).first():
-        i += 1
-        slug = f"{base}-{i}"
-    tenant = Tenant(name=business_name, slug=slug)
-    db.session.add(tenant)
-    db.session.flush()  # assign tenant.id before creating the user
-    seed_default_expense_categories(tenant.id)
-
-    new_user = User(username=username, role='admin', tenant_id=tenant.id, email=email)
-    new_user.set_password(password)
-    db.session.add(new_user)
+    tenant, new_user = _create_tenant_with_admin(business_name, username, password, email=email)
     db.session.commit()
 
     # Send an email-verification link (best-effort; failure doesn't block signup).
@@ -3681,6 +3728,58 @@ _SCHEDULED_JOBS = {
     "check_pro_plan_expirations": check_pro_plan_expirations_with_context,
     "refresh_agent_mode_network_status": refresh_agent_mode_network_status_with_context,
 }
+
+
+def _refresh_license_with_context():
+    """Daily on-prem license refresh; a no-op outside on-prem mode."""
+    with app.app_context():
+        if onprem.is_onprem():
+            onprem.refresh_license()
+
+
+_SCHEDULED_JOBS["refresh_license"] = _refresh_license_with_context
+
+# Timetable for the built-in scheduler (`flask run-scheduler`). Must match the
+# cron lines in .github/workflows/scheduled-jobs.yml (a test enforces this).
+SCHEDULE = {
+    "generate_missing_payments": "0 2 * * *",
+    "generate_missing_salary_charges": "10 2 * * *",
+    "recalculate_all_estimated_profits": "20 2 * * *",
+    "send_daily_whatsapp_keepalive": "30 2 * * *",
+    "auto_sync_upstream_status": "40 2 * * *",
+    "check_pro_plan_expirations": "50 2 * * *",
+    "refresh_agent_mode_network_status": "*/15 * * * *",
+}
+ONPREM_EXTRA_SCHEDULE = {"refresh_license": "0 3 * * *"}
+
+
+def onprem_schedule():
+    """SCHEDULE minus SaaS-only billing jobs, plus on-prem extras."""
+    s = {k: v for k, v in SCHEDULE.items() if k != "check_pro_plan_expirations"}
+    s.update(ONPREM_EXTRA_SCHEDULE)
+    return s
+
+
+@app.cli.command("run-scheduler")
+def run_scheduler_command():
+    """Run the built-in blocking scheduler (on-prem installs only)."""
+    if not onprem.is_onprem():
+        raise click.ClickException("run-scheduler is for DEPLOYMENT_MODE=onprem")
+    tz = os.environ.get("TZ")
+    sched = BlockingScheduler(timezone=tz) if tz else BlockingScheduler()
+    for name, expr in onprem_schedule().items():
+        sched.add_job(
+            _run_scheduled_job, CronTrigger.from_crontab(expr, timezone=tz) if tz else CronTrigger.from_crontab(expr),
+            args=[name, _SCHEDULED_JOBS[name]], id=name, name=name,
+            max_instances=1, coalesce=True, misfire_grace_time=3600)
+        logging.info(f"run-scheduler: registered {name} at '{expr}'")
+    sched.add_job(
+        _run_scheduled_job, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=60),
+        args=["refresh_license", _SCHEDULED_JOBS["refresh_license"]],
+        id="refresh_license_startup", name="refresh_license_startup")
+    logging.info("run-scheduler: registered refresh_license startup run in 60s")
+    sched.start()
 
 
 @app.cli.command("run-scheduled-job")
@@ -6322,6 +6421,29 @@ def get_monthly_revenue():
 
     return jsonify(result)
 
+def _public_base_url(tenant_id=None):
+    """Base URL for customer-facing links. On-prem installs use the tenant's
+    configured BusinessSettings.public_url (first tenant when tenant_id is
+    None); everything else falls back to Config.APP_BASE_URL."""
+    if onprem.is_onprem():
+        q = BusinessSettings.query
+        if tenant_id is not None:
+            q = q.filter_by(tenant_id=tenant_id)
+        else:
+            q = q.order_by(BusinessSettings.tenant_id, BusinessSettings.id)
+        bs = q.first()
+        if bs and bs.public_url:
+            return bs.public_url
+    return Config.APP_BASE_URL
+
+
+def _whish_base_url_kwargs(tenant_id):
+    """Extra create_payment kwargs: only override the callback base URL when
+    it differs from the default, so SaaS behaviour is byte-for-byte unchanged."""
+    base = _public_base_url(tenant_id)
+    return {} if base == Config.APP_BASE_URL else {'base_url': base}
+
+
 @app.route('/api/business-settings', methods=['POST'])
 @jwt_required()
 def save_business_settings():
@@ -6341,6 +6463,13 @@ def save_business_settings():
                 return jsonify({'error': f"Invalid network_access_mode "
                                          f"'{_requested_network_access_mode}'. "
                                          f"Must be 'direct' or 'agent'."}), 400
+
+        _public_url_provided = 'public_url' in request.form
+        _public_url_value = None
+        if _public_url_provided:
+            _public_url_value = (request.form.get('public_url') or '').strip().rstrip('/') or None
+            if _public_url_value and not _public_url_value.startswith(('https://', 'http://')):
+                return jsonify({'error': "public_url must start with https:// or http://"}), 400
 
         # Fetch existing settings or create new
         settings = tenant_query(BusinessSettings).first()
@@ -6374,6 +6503,8 @@ def save_business_settings():
         settings.mobile = request.form.get('mobile', settings.mobile)
         settings.email = request.form.get('email', settings.email)
         settings.website = request.form.get('website', settings.website)
+        if _public_url_provided:
+            settings.public_url = _public_url_value
         settings.network_mode = request.form.get('network_mode', settings.network_mode)
         settings.network_access_mode = request.form.get(
             'network_access_mode', settings.network_access_mode)
@@ -6482,10 +6613,11 @@ def list_exchange_rates():
 @require_module('whatsapp')
 def get_whatsapp_settings():
     settings = tenant_query(WhatsAppSettings).first()
+    webhook_url = _public_base_url(current_tenant_id()) + "/api/whatsapp/webhook"
     if settings:
-        return jsonify({'settings': settings.to_dict()}), 200
+        return jsonify({'settings': settings.to_dict(), 'webhook_url': webhook_url}), 200
     # Return safe defaults if not configured yet
-    return jsonify({'settings': {
+    return jsonify({'webhook_url': webhook_url, 'settings': {
         'mode': 'deeplink', 'enabled': False,
         'phone_number_id': '', 'business_account_id': '', 'app_id': '',
         'app_secret': '', 'access_token': '', 'api_version': 'v19.0',
@@ -6636,7 +6768,7 @@ def get_public_pay_link():
     slug = tenant.public_pay_slug
     return jsonify({
         'slug': slug,
-        'url': f"{Config.APP_BASE_URL}/pay-business?slug={slug}" if slug else None,
+        'url': f"{_public_base_url(tenant.id)}/pay-business?slug={slug}" if slug else None,
     }), 200
 
 
@@ -6658,7 +6790,7 @@ def regenerate_public_pay_link():
     db.session.commit()
     return jsonify({
         'slug': tenant.public_pay_slug,
-        'url': f"{Config.APP_BASE_URL}/pay-business?slug={tenant.public_pay_slug}",
+        'url': f"{_public_base_url(tenant.id)}/pay-business?slug={tenant.public_pay_slug}",
     }), 200
 
 
@@ -6837,6 +6969,7 @@ def public_tenant_pay_checkout(slug):
             # docstring for why this parameter exists at all.
             success_path='/api/pay-attempt/success',
             failure_path='/api/pay-attempt/failure',
+            **_whish_base_url_kwargs(tenant.id),
         )
     except whish_billing.WhishAPIError as e:
         logging.error(f"Whish checkout failed for CustomerWhishPaymentAttempt {attempt.id}: {e}")
@@ -6862,7 +6995,7 @@ def customer_whish_attempt_success():
         logging.warning(f"Customer-Whish attempt success callback rejected: order={external_id}")
         tenant = db.session.get(Tenant, attempt.tenant_id) if attempt else None
         slug = tenant.public_pay_slug if tenant else 'invalid'
-        return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={slug}&status=error")
+        return redirect(f"{_public_base_url(attempt.tenant_id if attempt else None)}/pay-business?slug={slug}&status=error")
 
     # TBD: exact query-param name Whish's real success callback uses for the
     # transaction number -- same unresolved-fact caveat as Task 9's callback
@@ -6886,7 +7019,7 @@ def customer_whish_attempt_success():
         logging.warning(f"payment_paid WhatsApp notification failed after self-service Whish success (attempt {attempt.id}): {e}")
 
     tenant = db.session.get(Tenant, attempt.tenant_id)
-    return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={tenant.public_pay_slug}&status=success")
+    return redirect(f"{_public_base_url(tenant.id)}/pay-business?slug={tenant.public_pay_slug}&status=success")
 
 
 @app.route('/api/pay-attempt/failure', methods=['GET'])
@@ -6900,7 +7033,7 @@ def customer_whish_attempt_failure():
         db.session.commit()
     tenant = db.session.get(Tenant, attempt.tenant_id) if attempt else None
     slug = tenant.public_pay_slug if tenant else 'invalid'
-    return redirect(f"{Config.APP_BASE_URL}/pay-business?slug={slug}&status=failed")
+    return redirect(f"{_public_base_url(attempt.tenant_id if attempt else None)}/pay-business?slug={slug}&status=failed")
 
 
 @app.route('/api/pay/<view_token>', methods=['GET'])
@@ -6982,6 +7115,7 @@ def public_pay_checkout(view_token):
             # for why this parameter exists at all.
             success_path='/api/customer-whish/success',
             failure_path='/api/customer-whish/failure',
+            **_whish_base_url_kwargs(link.tenant_id),
         )
     except whish_billing.WhishAPIError as e:
         logging.error(f"Whish checkout failed for CustomerPaymentLink {link.id}: {e}")
@@ -7008,7 +7142,7 @@ def customer_whish_success():
             or not secrets.compare_digest(link.callback_token, token)
             or link.expires_at < datetime.utcnow()):
         logging.warning(f"Customer-Whish success callback rejected: order={external_id}")
-        return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token if link else 'invalid'}&status=error")
+        return redirect(f"{_public_base_url(link.tenant_id if link else None)}/pay?token={link.view_token if link else 'invalid'}&status=error")
 
     payment = db.session.get(Payment, link.payment_id)
     customer = db.session.get(Customer, link.customer_id)
@@ -7040,7 +7174,7 @@ def customer_whish_success():
     except Exception as e:
         logging.warning(f"payment_paid WhatsApp notification failed after Whish success (link {link.id}): {e}")
 
-    return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token}&status=success")
+    return redirect(f"{_public_base_url(link.tenant_id)}/pay?token={link.view_token}&status=success")
 
 
 @app.route('/api/customer-whish/failure', methods=['GET'])
@@ -7052,7 +7186,7 @@ def customer_whish_failure():
     if link and link.status == 'pending' and secrets.compare_digest(link.callback_token, token):
         link.status = 'failed'
         db.session.commit()
-    return redirect(f"{Config.APP_BASE_URL}/pay?token={link.view_token if link else 'invalid'}&status=failed")
+    return redirect(f"{_public_base_url(link.tenant_id if link else None)}/pay?token={link.view_token if link else 'invalid'}&status=failed")
 
 
 @app.route('/api/customers/<int:customer_id>/payments/<int:payment_id>/whish-link/resend', methods=['POST'])
@@ -7092,7 +7226,7 @@ def resend_customer_payment_link(customer_id, payment_id):
     # Query-string token, not a path segment -- see PublicPaymentView.js's
     # own note (Task 10) for why /pay/<token> breaks this build's relative
     # asset paths (needed for the Electron packaging).
-    pay_url = f"{Config.APP_BASE_URL}/pay?token={link.view_token}"
+    pay_url = f"{_public_base_url(tenant.id)}/pay?token={link.view_token}"
     return jsonify({"view_token": link.view_token, "pay_url": pay_url}), 200
 
 
@@ -8943,6 +9077,12 @@ def whatsapp_webhook():
 
 import whatsapp_inbox_routes
 whatsapp_inbox_routes.register_inbox_routes(app, sys.modules[__name__])
+
+import onprem
+onprem.register(app, sys.modules[__name__])
+
+import license_server_routes
+license_server_routes.register(app, sys.modules[__name__])
 
 @app.route('/api/reports/revenue', methods=['GET'])
 @jwt_required()

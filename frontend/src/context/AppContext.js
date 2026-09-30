@@ -51,6 +51,26 @@ api.interceptors.response.use(
             }));
         }
 
+        // On-prem: license expired -> server is view-only for writes.
+        if (status === 403 && error.response?.data?.license_readonly) {
+            window.dispatchEvent(new CustomEvent('sb:license-readonly', {
+                detail: { reason: error.response.data.reason }
+            }));
+        }
+
+        // On-prem: first-run setup not finished -> back to the setup wizard.
+        if (status === 409 && error.response?.data?.setup_required) {
+            // Drop any stale session first so the wizard (not the login loop) shows.
+            try {
+                localStorage.removeItem('token');
+                localStorage.removeItem('user');
+            } catch { /* storage unavailable */ }
+            window.dispatchEvent(new CustomEvent('sb:setup-required'));
+            if (window.location.pathname !== '/') {
+                window.location.assign('/');
+            }
+        }
+
         return Promise.reject(error);
     }
 );
@@ -114,6 +134,11 @@ const rawApiService = {
     adminReactivateTenant: (id) => api.post(`/admin/tenants/${id}/reactivate`),
     adminDeleteTenant: (id) => api.delete(`/admin/tenants/${id}`),
     adminSetPlan: (id, plan, extra = {}) => api.post(`/admin/tenants/${id}/set-plan`, { plan, ...extra }),
+    adminLicenses: () => api.get('/admin/licenses'),
+    adminCreateLicense: (body) => api.post('/admin/licenses', body),
+    adminUpdateLicense: (id, body) => api.patch(`/admin/licenses/${id}`, body),
+    adminRenewLicense: (id, scope, term) => api.post(`/admin/licenses/${id}/renew`, term ? { scope, term } : { scope }),
+    adminLicenseFile: (id) => api.get(`/admin/licenses/${id}/file`, { responseType: 'text' }),
     adminSetModules: (id, overrides) => api.post(`/admin/tenants/${id}/modules`, { overrides }),
     adminUpgradeRequests: () => api.get('/admin/upgrade-requests'),
 
@@ -347,6 +372,15 @@ const rawApiService = {
     setPushTopics: (endpoint, topics) => api.put('/push-subscription/topics', { endpoint, topics }),
     unsubscribePush: (endpoint) => api.post('/push-unsubscribe', { endpoint }),
     sendTestPush: (endpoint) => api.post('/push-test', { endpoint }),
+
+    // On-prem edition: system info, first-run setup, license
+    systemInfo: () => api.get('/system/info'),
+    setupStatus: () => api.get('/setup/status'),
+    runSetup: (body) => api.post('/setup', body),
+    getLicense: () => api.get('/license'),
+    activateLicense: (license_key) => api.post('/license', { license_key }),
+    uploadLicenseFile: (license_file) => api.post('/license', { license_file }),
+    refreshLicense: () => api.post('/license/refresh'),
 };
 
 export const apiService = Object.fromEntries(
@@ -421,6 +455,53 @@ export const AppContextProvider = ({ children }) => {
         return () => window.removeEventListener('sb:module-disabled', onModuleDisabled);
     }, []);
 
+    // Deployment info (no auth). null while loading (or if the request failed,
+    // in which case the app behaves as SaaS).
+    const [systemInfo, setSystemInfo] = useState(null);
+    const [systemInfoLoaded, setSystemInfoLoaded] = useState(false);
+    const refreshSystemInfo = React.useCallback(() =>
+        apiService.systemInfo()
+            .then(r => setSystemInfo(r.data || null))
+            .catch(() => setSystemInfo(null))
+            .finally(() => setSystemInfoLoaded(true)),
+    []);
+    useEffect(() => { refreshSystemInfo(); }, [refreshSystemInfo]);
+    useEffect(() => { if (token) refreshSystemInfo(); }, [token, refreshSystemInfo]);
+    const isOnprem = systemInfo?.deployment_mode === 'onprem';
+    const readOnly = isOnprem && systemInfo?.license?.state === 'readonly';
+
+    useEffect(() => {
+        const onReadonly = () => {
+            setSnackbar({
+                open: true,
+                message: 'ServiceBills is in view-only mode — enter a license in Settings → License.',
+                severity: 'warning',
+            });
+            refreshSystemInfo();
+        };
+        window.addEventListener('sb:license-readonly', onReadonly);
+        return () => window.removeEventListener('sb:license-readonly', onReadonly);
+    }, [refreshSystemInfo]);
+
+    // A stale session hit 409 setup_required: forget it and show the wizard.
+    useEffect(() => {
+        const onSetup = () => {
+            setToken(null);
+            setUser(null);
+            refreshSystemInfo();
+        };
+        window.addEventListener('sb:setup-required', onSetup);
+        return () => window.removeEventListener('sb:setup-required', onSetup);
+    }, [refreshSystemInfo]);
+
+    // While the app stays open in read-only mode, re-check the license every
+    // 5 minutes so an expiry (or a renewal) mid-session is reflected.
+    useEffect(() => {
+        if (!isOnprem) return undefined;
+        const id = setInterval(refreshSystemInfo, 5 * 60 * 1000);
+        return () => clearInterval(id);
+    }, [isOnprem, refreshSystemInfo]);
+
     const hasModule = (key) => key === 'core' || key === 'office' || (Array.isArray(modules) && modules.includes(key));
 
     const login = async (credentials) => {
@@ -445,6 +526,11 @@ export const AppContextProvider = ({ children }) => {
         modules,
         hasModule,
         refreshModules,
+        systemInfo,
+        systemInfoLoaded,
+        isOnprem,
+        readOnly,
+        refreshSystemInfo,
         login,
         logout
     };

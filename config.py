@@ -68,3 +68,11 @@ class Config:
     ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID", "")
     ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
     ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "")
+
+    # --- Deployment mode / on-prem ---
+    DEPLOYMENT_MODE = os.environ.get("DEPLOYMENT_MODE", "saas").strip().lower()
+    MACHINE_ID = os.environ.get("MACHINE_ID")
+    LICENSE_SERVER_URL = os.environ.get("LICENSE_SERVER_URL", "https://servicebills.onrender.com").rstrip("/")
+    LICENSE_SIGNING_KEY = os.environ.get("LICENSE_SIGNING_KEY")
+    APP_VERSION = os.environ.get("APP_VERSION", "dev")
+    APP_RELEASE_DATE = os.environ.get("APP_RELEASE_DATE") or None

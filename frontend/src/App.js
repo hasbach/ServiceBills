@@ -44,6 +44,8 @@ import SettingsView from './components/SettingsView.js';
 import SubscriptionPlansView from './components/SubscriptionPlansView.js';
 import ReceiptsView from './components/ReceiptsView.js';
 import LoginView from './components/LoginView.js';
+import SetupWizardView from './components/SetupWizardView.js';
+import LicenseBanner from './components/LicenseBanner.js';
 import RegisterView from './components/RegisterView.js';
 import VerifyEmailView from './components/VerifyEmailView.js';
 import ForgotPasswordView from './components/ForgotPasswordView.js';
@@ -101,7 +103,7 @@ const NAV_ITEMS = [
     { key: 'messaging',          label: 'Messaging',          icon: <MessageIcon />,         group: 'manage',    allowedRoles: ['admin'], module: 'whatsapp' },
     { key: 'settings',           label: 'Settings',           icon: <SettingsIcon />,        group: 'manage',    allowedRoles: ['admin'] },
     { key: 'cs-agent-voice',     label: 'AI Voice Agent',     icon: <SmartToyIcon />,        group: 'manage',    allowedRoles: ['admin'], module: 'ai_cs' },
-    { key: 'billing',            label: 'Billing & Plan',     icon: <PaymentIcon />,         group: 'manage',    allowedRoles: ['admin'] },
+    { key: 'billing',            label: 'Billing & Plan',     icon: <PaymentIcon />,         group: 'manage',    allowedRoles: ['admin'], saasOnly: true },
 ];
 
 const GROUP_LABELS = { main: 'Main', analytics: 'Analytics', manage: 'Management' };
@@ -130,7 +132,8 @@ const MainApp = ({
     customerStatus, setCustomerStatus,
     customerExpiryDay, setCustomerExpiryDay
 }) => {
-    const { user, logout, modules, hasModule } = useAppContext();
+    const { user, logout, modules, hasModule, isOnprem, systemInfo } = useAppContext();
+    const [settingsTab, setSettingsTab] = useState(null);
     const theme = useTheme();
     const isMobile = useMediaQuery(theme.breakpoints.down('md'));
     const userRoles = (user?.role || '').split(',').map(r => r.trim());
@@ -193,7 +196,7 @@ const MainApp = ({
         setDrawerOpen(false);
     };
 
-    const navItems = filterNavItems(NAV_ITEMS, { hasRole, businessSettings, hasModule });
+    const navItems = filterNavItems(NAV_ITEMS, { hasRole, businessSettings, hasModule, isOnprem });
 
     // A deep link (?view=network-tree) or push-notification target must not
     // render a page whose module is off: once modules have loaded, fall back
@@ -352,7 +355,7 @@ const MainApp = ({
             case 'enhanced-reports': return <EnhancedReportsView />;
             case 'subscription-plans': return <SubscriptionPlansView subscriptionPlans={subscriptionPlans} refetchSubscriptionPlans={refetchSubscriptionPlans} setSnackbar={setSnackbar} />;
             case 'messaging': return hasRole('admin') ? <MessagingView openConversationId={inboxOpenId} /> : <Typography>Access Denied</Typography>;
-            case 'settings': return hasRole('admin') ? <SettingsView businessSettings={businessSettings} setBusinessSettings={setBusinessSettings} setSnackbar={setSnackbar} /> : <Typography>Access Denied</Typography>;
+            case 'settings': return hasRole('admin') ? <SettingsView initialTab={settingsTab} businessSettings={businessSettings} setBusinessSettings={setBusinessSettings} setSnackbar={setSnackbar} /> : <Typography>Access Denied</Typography>;
             case 'cs-agent-voice': return hasRole('admin') ? <CSAgentVoiceTest /> : <Typography>Access Denied</Typography>;
             case 'billing': return hasRole('admin') ? <BillingView /> : <Typography>Access Denied</Typography>;
             default:
@@ -398,6 +401,10 @@ const MainApp = ({
                 </Toolbar>
             </AppBar>
 
+            {isOnprem && (
+                <LicenseBanner onEnterLicense={() => { setSettingsTab('license'); navigate('settings'); }} />
+            )}
+
             {/* ── Desktop Nav ── */}
             {!isMobile && <DesktopNav />}
 
@@ -408,6 +415,12 @@ const MainApp = ({
             <Box sx={{ px: { xs: 1, sm: 2, md: 3 }, py: { xs: 1.5, sm: 2, md: 3 } }}>
                 {renderView()}
             </Box>
+
+            {isOnprem && systemInfo?.app_version && (
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', textAlign: 'center', pb: 2 }}>
+                    ServiceBills v{systemInfo.app_version}
+                </Typography>
+            )}
 
             {/* ── Back to Top (mobile) ── */}
             {isMobile && (
@@ -431,7 +444,7 @@ const MainApp = ({
 
 // This component now decides whether to show the Login/Register screens or the MainApp
 const AppContent = () => {
-    const { isAuthenticated, setSnackbar, user } = useAppContext();
+    const { isAuthenticated, setSnackbar, user, systemInfo, systemInfoLoaded } = useAppContext();
     const location = useLocation();
     const isSuperadmin = (user?.role || '') === 'superadmin';
 
@@ -581,7 +594,25 @@ const AppContent = () => {
     if (location.pathname === '/pay') return <PublicPaymentView />;
     if (location.pathname === '/pay-business') return <PublicTenantPayView />;
 
+    // First-run setup wins over a stale token left from a previous install.
+    if (systemInfoLoaded && systemInfo?.setup_required) {
+        return <SetupWizardView />;
+    }
+
     if (!isAuthenticated) {
+        // Don't flash the SaaS landing page over an on-prem install (or vice
+        // versa) while deployment info loads. If the request fails, systemInfo
+        // stays null and we fall through to SaaS behaviour.
+        if (!systemInfoLoaded) {
+            return (
+                <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
+                    <CircularProgress />
+                </Box>
+            );
+        }
+        if (systemInfo?.deployment_mode === 'onprem') {
+            return systemInfo.setup_required ? <SetupWizardView /> : <LoginView />;
+        }
         if (location.pathname === '/register') return <RegisterView />;
         if (location.pathname === '/login') return <LoginView />;
         return <LandingView />; // public landing at '/' (and any other path)
