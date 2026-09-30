@@ -25,7 +25,9 @@ log = logging.getLogger(__name__)
 
 # Route families that exist only in the SaaS deployment.
 ONPREM_BLOCKED = ("/api/register", "/api/admin/", "/api/billing/", "/api/stripe/",
-                  "/api/licenses/", "/api/internal/")
+                  "/api/licenses/", "/api/internal/", "/api/updates/")
+# Exact-match SaaS-only paths (a prefix match would be too broad for SPA routes).
+ONPREM_BLOCKED_EXACT = ("/download",)
 
 # Writes to these prefixes stay allowed while the license is read-only.
 READONLY_ALLOW = ("/api/login", "/api/logout", "/api/setup", "/api/license", "/api/system/info",
@@ -57,7 +59,7 @@ def _saas_blocked(path):
 def _deployment_mode_guard():
     p = request.path
     if is_onprem():
-        if any(p == x.rstrip("/") or p.startswith(x) for x in ONPREM_BLOCKED):
+        if p in ONPREM_BLOCKED_EXACT or any(p == x.rstrip("/") or p.startswith(x) for x in ONPREM_BLOCKED):
             return jsonify({"error": "not found"}), 404
     elif _saas_blocked(p):
         return jsonify({"error": "not found"}), 404

@@ -63,6 +63,10 @@ class Config:
     SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
     MAIL_FROM = os.environ.get("MAIL_FROM", "noreply@servicesbills.net")
 
+    # --- On-prem releases (SaaS side) ---
+    RELEASE_PUBLISH_SECRET = os.environ.get("RELEASE_PUBLISH_SECRET")
+    INSTALLER_URL = os.environ.get("INSTALLER_URL")
+
     # --- Customer Service AI Agent ---
     CS_AGENT_SECRET = os.environ.get("CS_AGENT_SECRET", "")
     ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID", "")

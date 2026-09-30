@@ -18,7 +18,8 @@ def test_system_info_saas(client):
 @pytest.mark.parametrize("path,method", [("/api/register", "post"), ("/api/admin/tenants", "get"),
                                          ("/api/billing/whish/checkout", "post"),
                                          ("/api/licenses/trial", "post"),
-                                         ("/api/internal/scheduled-jobs/x", "post")])
+                                         ("/api/internal/scheduled-jobs/x", "post"),
+                                         ("/api/updates/latest", "get"), ("/download", "get")])
 def test_onprem_blocks_saas_families(onprem, client, path, method):
     assert getattr(client, method)(path, json={}).status_code == 404
 
