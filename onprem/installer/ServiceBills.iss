@@ -29,6 +29,8 @@ MinVersion=10.0.19045
 OutputBaseFilename=ServiceBills-Setup
 WizardStyle=modern
 UninstallDisplayName=ServiceBills
+SetupIconFile=assets\servicebills.ico
+UninstallDisplayIcon={app}\servicebills.ico
 Compression=lzma2
 SolidCompression=yes
 
@@ -36,17 +38,18 @@ SolidCompression=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
+Source: "assets\servicebills.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docker-compose.yml"; DestDir: "{app}\setup-src"; Flags: ignoreversion
 Source: "..\env.template"; DestDir: "{app}\setup-src"; Flags: ignoreversion
 Source: "..\scripts\*"; DestDir: "{app}\setup-src\scripts"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{commondesktop}\ServiceBills"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" start.ps1"; WorkingDir: "{app}"
-Name: "{group}\ServiceBills"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" start.ps1"; WorkingDir: "{app}"
-Name: "{group}\Backup now"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" backup.ps1"; WorkingDir: "{app}"
-Name: "{group}\Restore backup"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" restore.ps1"; WorkingDir: "{app}"
-Name: "{group}\Check for updates"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" update.ps1"; WorkingDir: "{app}"
-Name: "{group}\Stop ServiceBills"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" stop.ps1"; WorkingDir: "{app}"
+Name: "{commondesktop}\ServiceBills"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" start.ps1"; WorkingDir: "{app}"; IconFilename: "{app}\servicebills.ico"
+Name: "{group}\ServiceBills"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" start.ps1"; WorkingDir: "{app}"; IconFilename: "{app}\servicebills.ico"
+Name: "{group}\Backup now"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" backup.ps1"; WorkingDir: "{app}"; IconFilename: "{app}\servicebills.ico"
+Name: "{group}\Restore backup"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" restore.ps1"; WorkingDir: "{app}"; IconFilename: "{app}\servicebills.ico"
+Name: "{group}\Check for updates"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" update.ps1"; WorkingDir: "{app}"; IconFilename: "{app}\servicebills.ico"
+Name: "{group}\Stop ServiceBills"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\scripts\run-hidden.vbs"" stop.ps1"; WorkingDir: "{app}"; IconFilename: "{app}\servicebills.ico"
 Name: "{group}\Uninstall ServiceBills"; Filename: "{uninstallexe}"
 
 [Run]
