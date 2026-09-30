@@ -489,6 +489,16 @@ def test_commit_returns_report_of_skipped_rows_only(client, no_whatsapp):
     assert 'name is required' in data_rows[0][-1].value
 
 
+def test_error_report_keeps_equals_values_as_text():
+    # Called directly: an uploaded formula cell has no cached value, so the
+    # reader (data_only=True) would see it as blank before it got here.
+    raw_rows = [{'_row': 2, 'name': '', 'phone': '2', 'notes': '=HYPERLINK("x")'}]
+    result = {'rows': [{'row': 2, 'import': False, 'messages': ['name is required.']}]}
+    ws = load_workbook(io.BytesIO(ci.build_error_report(raw_rows, result)))['Customers']
+    cell = ws.cell(row=2, column=ci.HEADERS.index('notes') + 1)
+    assert cell.value == '=HYPERLINK("x")' and cell.data_type == 's'
+
+
 def test_commit_without_skips_has_no_report(client, no_whatsapp):
     h = make_tenant(client, 'Biz', 'c_noreport')
     _plan(client, h)

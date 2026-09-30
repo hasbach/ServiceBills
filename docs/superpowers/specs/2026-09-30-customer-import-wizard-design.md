@@ -40,7 +40,17 @@ Result: the scheduler's next charge lands exactly on `expiry_date`, the same
 invariant `add_customer` produces. There is therefore **no start_date column**
 in the template. A customer whose expiry is already in the past and who is
 `active=yes` will be billed from their expiry on the next scheduler run —
-the normal overdue behaviour — and the preview flags such rows as a warning.
+the normal overdue behaviour — and the preview warns with the number of
+cycles and the total that will be charged. An active row whose expiry is more
+than a year in the past, or any row more than 5 years ahead, is an error
+(typo guard: otherwise one run would bill every cycle since then).
+
+**Known limitation (shared with Add Customer and the scheduler):** month
+arithmetic clamps, so an expiry on the 29th–31st whose previous month is
+shorter gets its first charge 1–3 days early (anchor Feb 28 + 1 month =
+Mar 28, not Mar 31), and the billing day then stays on the earlier date.
+Fixing that means changing how `generate_missing_payments` steps cycles,
+which is out of scope here.
 
 ## Template (`GET /api/customers/import/template`)
 
@@ -119,7 +129,8 @@ missing a required column, zero data rows, more than 5,000 data rows, file
 ## Commit (`POST /api/customers/import/commit`)
 
 Multipart: `file` (the same workbook) + `new_plans` (JSON string):
-`[{"name": "Fiber 50M", "price": 25, "billing_cycle": "monthly", "currency": "USD", "cost": 0}]`.
+`[{"name": "Fiber 50M", "price": 25, "billing_cycle": "monthly", "currency": "USD", "cost": 0}]`
+(the wizard asks for price, cost, cycle and currency).
 
 Server re-runs validation with the plan definitions (never trusts client
 rows), then in **one transaction**:
@@ -146,15 +157,16 @@ Response: `{"imported": 110, "skipped": 10, "plans_created": 1, "sectors_created
 
 ## Error report
 
-Built client-side is not possible without an xlsx lib, so:
-`POST /api/customers/import/error_report` (multipart `file` + `new_plans`)
-re-validates and returns an .xlsx with only the non-imported rows, in the
-template's column order, plus a final `errors` column. Frontend downloads it
-as a blob.
+When the commit skips any rows, its response also carries `skipped_report`:
+a base64 .xlsx of exactly the rows *this commit* did not import (template
+column order plus a final `errors` column; values starting with `=` are kept
+as text). It is built from the commit's own validation pass — a separate
+post-commit request would re-validate and flag every just-imported row as a
+duplicate. The wizard decodes it into the "Download skipped rows" file.
 
 ## Auth & limits
 
-All four endpoints: `@jwt_required()` + `admin_required()`. Template is
+All three endpoints (template, validate, commit): `@jwt_required()` + `admin_required()`. Template is
 tenant-scoped via `tenant_query`. Request size guard 5 MB on uploads.
 
 ## Code layout
@@ -164,14 +176,14 @@ tenant-scoped via `tenant_query`. Request size guard 5 MB on uploads.
   pattern (registered from app.py with `sys.modules[__name__]`), so app.py
   only gains two lines. Functions: `build_template(appmod)`,
   `read_workbook(file_storage)`, `validate_rows(appmod, raw_rows, new_plans)`,
-  `commit_import(appmod, validated, new_plans)`, `build_error_report(...)`,
+  `commit_import(appmod, validated, new_plans)`, `build_error_report(...)` (used by commit),
   `register_customer_import_routes(app, appmod)`.
 - `requirements.txt` — add `openpyxl`.
 - `frontend/src/components/CustomerImportWizard.js` — MUI Dialog + Stepper
   (pattern of SetupWizardView.js): 1 Download template · 2 Upload · 3 Review
   (status filter chips, row table, new-plan form) · 4 Done (summary + error
   report download).
-- `frontend/src/context/AppContext.js` — four `apiService` methods.
+- `frontend/src/context/AppContext.js` — three `apiService` methods.
 - `frontend/src/components/SubscriptionsView.js` — "Import" button next to
   Export, admin only, opens the wizard, refreshes the list on success.
 
