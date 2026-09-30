@@ -46,6 +46,7 @@ const SetupWizardView = () => {
 
     const submit = async () => {
         setError('');
+        if (mode === 'trial' && !form.owner_phone.trim()) { setError('A phone number is required for the free trial.'); return; }
         if (mode === 'activate' && !licenseKey.trim()) { setError('Enter your license key.'); return; }
         if (mode === 'file' && !licenseFile) { setError('Choose your license file.'); return; }
         const body = {

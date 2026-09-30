@@ -60,7 +60,15 @@ api.interceptors.response.use(
 
         // On-prem: first-run setup not finished -> back to the setup wizard.
         if (status === 409 && error.response?.data?.setup_required) {
-            window.location.assign('/');
+            // Drop any stale session first so the wizard (not the login loop) shows.
+            try {
+                localStorage.removeItem('token');
+                localStorage.removeItem('user');
+            } catch { /* storage unavailable */ }
+            window.dispatchEvent(new CustomEvent('sb:setup-required'));
+            if (window.location.pathname !== '/') {
+                window.location.assign('/');
+            }
         }
 
         return Promise.reject(error);
@@ -474,6 +482,25 @@ export const AppContextProvider = ({ children }) => {
         window.addEventListener('sb:license-readonly', onReadonly);
         return () => window.removeEventListener('sb:license-readonly', onReadonly);
     }, [refreshSystemInfo]);
+
+    // A stale session hit 409 setup_required: forget it and show the wizard.
+    useEffect(() => {
+        const onSetup = () => {
+            setToken(null);
+            setUser(null);
+            refreshSystemInfo();
+        };
+        window.addEventListener('sb:setup-required', onSetup);
+        return () => window.removeEventListener('sb:setup-required', onSetup);
+    }, [refreshSystemInfo]);
+
+    // While the app stays open in read-only mode, re-check the license every
+    // 5 minutes so an expiry (or a renewal) mid-session is reflected.
+    useEffect(() => {
+        if (!isOnprem) return undefined;
+        const id = setInterval(refreshSystemInfo, 5 * 60 * 1000);
+        return () => clearInterval(id);
+    }, [isOnprem, refreshSystemInfo]);
 
     const hasModule = (key) => key === 'core' || key === 'office' || (Array.isArray(modules) && modules.includes(key));
 

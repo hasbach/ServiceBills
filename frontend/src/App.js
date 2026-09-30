@@ -594,6 +594,11 @@ const AppContent = () => {
     if (location.pathname === '/pay') return <PublicPaymentView />;
     if (location.pathname === '/pay-business') return <PublicTenantPayView />;
 
+    // First-run setup wins over a stale token left from a previous install.
+    if (systemInfoLoaded && systemInfo?.setup_required) {
+        return <SetupWizardView />;
+    }
+
     if (!isAuthenticated) {
         // Don't flash the SaaS landing page over an on-prem install (or vice
         // versa) while deployment info loads. If the request fails, systemInfo

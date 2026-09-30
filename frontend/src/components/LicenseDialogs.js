@@ -155,6 +155,7 @@ export const EditLicenseDialog = ({ lic, onClose, onSubmit }) => {
         setF({
             business_name: lic.business_name || '', owner_phone: lic.owner_phone || '',
             notes: lic.notes || '', base_expires_at: toDate(lic.base_expires_at),
+            machine_id: lic.machine_id || '',
         });
         const m = {};
         Object.entries(lic.modules || {}).forEach(([k, v]) => { m[k] = toDate(v.expires_at); });
@@ -164,6 +165,8 @@ export const EditLicenseDialog = ({ lic, onClose, onSubmit }) => {
 
     const submit = async () => {
         const body = { business_name: f.business_name.trim(), owner_phone: f.owner_phone.trim(), notes: f.notes };
+        const mid = (f.machine_id || '').trim();
+        if (mid && mid !== (lic.machine_id || '')) body.machine_id = mid;   // empty = leave unchanged
         if (f.base_expires_at && f.base_expires_at !== toDate(lic.base_expires_at)) {
             body.base_expires_at = f.base_expires_at;
         }
@@ -190,6 +193,9 @@ export const EditLicenseDialog = ({ lic, onClose, onSubmit }) => {
                                onChange={(e) => setF({ ...f, business_name: e.target.value })} fullWidth />
                     <TextField label="Owner phone" value={f.owner_phone || ''}
                                onChange={(e) => setF({ ...f, owner_phone: e.target.value })} fullWidth />
+                    <TextField label="Machine ID" value={f.machine_id || ''}
+                               onChange={(e) => setF({ ...f, machine_id: e.target.value })} fullWidth
+                               helperText="The ID shown in the customer's License tab. Leave empty to keep it unchanged (use Unbind machine to clear)." />
                     <TextField label="Notes" value={f.notes || ''}
                                onChange={(e) => setF({ ...f, notes: e.target.value })} fullWidth multiline />
                     <TextField label="ServiceBills expires on" type="date" value={f.base_expires_at || ''}
