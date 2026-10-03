@@ -1431,6 +1431,10 @@ class WhatsAppSettings(db.Model):
         default='Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!')
     deeplink_msg_payment_link = db.Column(db.Text, nullable=True,
         default='Hi {customer_name}, here is your payment link: {pay_url}')
+    deeplink_msg_payment_reminder = db.Column(db.Text, nullable=True,
+        default='Dear {customer_name}, this is a friendly reminder that your subscription payment is due. Balance: ${balance}. Thank you!')
+    deeplink_msg_current_balance = db.Column(db.Text, nullable=True,
+        default='Dear {customer_name}, your current balance is ${balance}. Expiry date: {expiry_date}. Thank you!')
     forwarding_mobile = db.Column(db.String(50), nullable=True)
     webhook_verify_token = db.Column(db.String(100), nullable=True, default='delta_net_whatsapp_secret')
     auto_reply_enabled = db.Column(db.Boolean, default=True)
@@ -1472,6 +1476,8 @@ class WhatsAppSettings(db.Model):
             'deeplink_msg_payment': self.deeplink_msg_payment or 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
             'deeplink_msg_renewal': self.deeplink_msg_renewal or 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
             'deeplink_msg_payment_link': self.deeplink_msg_payment_link or 'Hi {customer_name}, here is your payment link: {pay_url}',
+            'deeplink_msg_payment_reminder': self.deeplink_msg_payment_reminder or 'Dear {customer_name}, this is a friendly reminder that your subscription payment is due. Balance: ${balance}. Thank you!',
+            'deeplink_msg_current_balance': self.deeplink_msg_current_balance or 'Dear {customer_name}, your current balance is ${balance}. Expiry date: {expiry_date}. Thank you!',
             'forwarding_mobile': self.forwarding_mobile or '',
             'webhook_verify_token': self.webhook_verify_token or 'delta_net_whatsapp_secret',
             'auto_reply_enabled': True if self.auto_reply_enabled is None else self.auto_reply_enabled,
@@ -6655,6 +6661,8 @@ def get_whatsapp_settings():
         'deeplink_msg_payment': 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
         'deeplink_msg_renewal': 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
         'deeplink_msg_payment_link': 'Hi {customer_name}, here is your payment link: {pay_url}',
+        'deeplink_msg_payment_reminder': 'Dear {customer_name}, this is a friendly reminder that your subscription payment is due. Balance: ${balance}. Thank you!',
+        'deeplink_msg_current_balance': 'Dear {customer_name}, your current balance is ${balance}. Expiry date: {expiry_date}. Thank you!',
         'forwarding_mobile': '', 'webhook_verify_token': 'delta_net_whatsapp_secret',
         'auto_reply_enabled': True,
         'auto_reply_message': "your message will be redirected to customer services team, they will respond in minutes, thank you.\n\nسيتم تحويل رسالتك الى قسم خدمة الزبائن, يقومون بالرد خلال دقائق, شكرا لكم",
@@ -6684,6 +6692,8 @@ def get_whatsapp_deeplink_settings():
         'deeplink_msg_payment': full.get('deeplink_msg_payment') or 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
         'deeplink_msg_renewal': full.get('deeplink_msg_renewal') or 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
         'deeplink_msg_payment_link': full.get('deeplink_msg_payment_link') or 'Hi {customer_name}, here is your payment link: {pay_url}',
+        'deeplink_msg_payment_reminder': full.get('deeplink_msg_payment_reminder') or 'Dear {customer_name}, this is a friendly reminder that your subscription payment is due. Balance: ${balance}. Thank you!',
+        'deeplink_msg_current_balance': full.get('deeplink_msg_current_balance') or 'Dear {customer_name}, your current balance is ${balance}. Expiry date: {expiry_date}. Thank you!',
     }}), 200
 
 @app.route('/api/whatsapp-settings', methods=['POST'])
@@ -6706,6 +6716,7 @@ def save_whatsapp_settings():
                   'template_forward_alert', 'template_bulk_outage', 'template_bulk_maintenance', 'template_bulk_feature', 'template_bulk_offer',
                   'template_payment_link',
                   'template_language','deeplink_msg_payment','deeplink_msg_renewal', 'deeplink_msg_payment_link',
+                  'deeplink_msg_payment_reminder', 'deeplink_msg_current_balance',
                   'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message',
                   'template_forward_keepalive']
         for f in fields:

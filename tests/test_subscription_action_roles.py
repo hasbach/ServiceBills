@@ -260,6 +260,27 @@ def test_cashier_reads_whatsapp_deeplink_settings_without_secrets(client):
     assert client.get("/api/whatsapp-settings/deeplink", headers=employee_hdr).status_code == 403
 
 
+def test_reminder_and_balance_deeplink_texts_are_editable(client):
+    """The Subscriptions page reminder dialog builds its wa.me text from these
+    two settings; unset, they fall back to the texts it used to hardcode."""
+    admin_hdr = make_tenant(client, "Biz WA3", "wa3_admin")
+    cashier_hdr = _create_user(client, admin_hdr, "wa3_cashier", "cashier")
+    client.post("/api/whatsapp-settings", headers=admin_hdr, json={"mode": "deeplink", "enabled": True})
+
+    s = client.get("/api/whatsapp-settings/deeplink", headers=cashier_hdr).get_json()["settings"]
+    assert "{balance}" in s["deeplink_msg_payment_reminder"]
+    assert "{balance}" in s["deeplink_msg_current_balance"] and "{expiry_date}" in s["deeplink_msg_current_balance"]
+
+    client.post("/api/whatsapp-settings", headers=admin_hdr, json={
+        "deeplink_msg_payment_reminder": "Pay ${balance} please, {customer_name}",
+        "deeplink_msg_current_balance": "You owe ${balance} until {expiry_date}"})
+    s = client.get("/api/whatsapp-settings/deeplink", headers=cashier_hdr).get_json()["settings"]
+    assert s["deeplink_msg_payment_reminder"] == "Pay ${balance} please, {customer_name}"
+    assert s["deeplink_msg_current_balance"] == "You owe ${balance} until {expiry_date}"
+    full = client.get("/api/whatsapp-settings", headers=admin_hdr).get_json()["settings"]
+    assert full["deeplink_msg_payment_reminder"] == "Pay ${balance} please, {customer_name}"
+
+
 def test_cashier_collect_sends_api_template(client, monkeypatch):
     admin_hdr = make_tenant(client, "Biz WA2", "wa2_admin")
     cashier_hdr = _create_user(client, admin_hdr, "wa2_cashier", "cashier")
