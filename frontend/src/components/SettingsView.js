@@ -64,6 +64,10 @@ const DEFAULT_WA = {
     deeplink_msg_payment: 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!',
     // eslint-disable-next-line no-template-curly-in-string
     deeplink_msg_renewal: 'Dear {customer_name}, your subscription has been renewed until {expiry_date}. Thank you!',
+    // eslint-disable-next-line no-template-curly-in-string
+    deeplink_msg_payment_reminder: 'Dear {customer_name}, this is a friendly reminder that your subscription payment is due. Balance: ${balance}. Thank you!',
+    // eslint-disable-next-line no-template-curly-in-string
+    deeplink_msg_current_balance: 'Dear {customer_name}, your current balance is ${balance}. Expiry date: {expiry_date}. Thank you!',
 };
 
 // ── Section wrapper ──────────────────────────────────────────────────────────
@@ -954,7 +958,7 @@ Read-Host -Prompt "Press Enter to exit"
 
                             {/* Deep Link Message Templates */}
                             <Collapse in={waForm.mode === 'deeplink'}>
-                                <Section icon={<MessageIcon />} title="Message Templates — Deep Link" subtitle="Use {customer_name}, {amount}, {expiry_date} as placeholders" color="#25D366">
+                                <Section icon={<MessageIcon />} title="Message Templates — Deep Link" subtitle="Use {customer_name}, {amount}, {balance}, {expiry_date} as placeholders" color="#25D366">
                                     <Grid container spacing={2}>
                                         <Grid item xs={12}>
                                             <TextField fullWidth multiline rows={3} label="Payment Received Message"
@@ -966,6 +970,18 @@ Read-Host -Prompt "Press Enter to exit"
                                             <TextField fullWidth multiline rows={3} label="Subscription Renewed Message"
                                                 {...waField('deeplink_msg_renewal')}
                                                 helperText="Placeholders: {customer_name}, {expiry_date}"
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                        </Grid>
+                                        <Grid item xs={12}>
+                                            <TextField fullWidth multiline rows={3} label="Payment Reminder Message"
+                                                {...waField('deeplink_msg_payment_reminder')}
+                                                helperText="Sent from the Subscriptions page reminder dialog. Placeholders: {customer_name}, {balance}, {expiry_date}"
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                        </Grid>
+                                        <Grid item xs={12}>
+                                            <TextField fullWidth multiline rows={3} label="Current Balance Message"
+                                                {...waField('deeplink_msg_current_balance')}
+                                                helperText="Sent from the Subscriptions page reminder dialog. Placeholders: {customer_name}, {balance}, {expiry_date}"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                     </Grid>

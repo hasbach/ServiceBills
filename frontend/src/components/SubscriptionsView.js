@@ -971,12 +971,15 @@ const SubscriptionsView = ({
             if (waSettings.enabled && waSettings.mode === 'deeplink') {
                 const phone = (cust.phone || '').replace(/\D/g, '');
                 if (phone) {
-                    let msg = '';
-                    if (templateType === 'current_balance') {
-                        msg = `Dear ${cust.name}, your current balance is $${parseFloat(cust.balance || 0).toFixed(2)}. Expiry date: ${cust.subscription_expiry_date || 'N/A'}. Thank you!`;
-                    } else {
-                        msg = `Dear ${cust.name}, this is a friendly reminder that your subscription payment is due. Balance: $${parseFloat(cust.balance || 0).toFixed(2)}. Thank you!`;
-                    }
+                    const template = templateType === 'current_balance'
+                        // eslint-disable-next-line no-template-curly-in-string
+                        ? (waSettings.deeplink_msg_current_balance || 'Dear {customer_name}, your current balance is ${balance}. Expiry date: {expiry_date}. Thank you!')
+                        // eslint-disable-next-line no-template-curly-in-string
+                        : (waSettings.deeplink_msg_payment_reminder || 'Dear {customer_name}, this is a friendly reminder that your subscription payment is due. Balance: ${balance}. Thank you!');
+                    const msg = template
+                        .replaceAll('{customer_name}', cust.name || '')
+                        .replaceAll('{balance}', parseFloat(cust.balance || 0).toFixed(2))
+                        .replaceAll('{expiry_date}', cust.subscription_expiry_date || 'N/A');
                     const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
                     try {
                         window.open(waUrl, '_blank', 'noopener,noreferrer');
