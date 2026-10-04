@@ -332,6 +332,10 @@ class ResellerPayment(db.Model):
             'amount': float(self.amount),
             'type': self.type,
             'date': self.date.strftime('%Y-%m-%d %H:%M:%S'),
+            # Reseller-level entries (no customer: add_credit/apply_discount/
+            # collect_payment) are stamped with utcnow; customer billing
+            # entries carry the cycle's calendar date instead.
+            'date_is_utc': self.customer_id is None,
             'description': self.description
         }
 
@@ -9831,6 +9835,13 @@ def delete_expense(expense_id):
             employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
             if employee:
                 employee.balance += expense.amount  # Undo the earlier deduction
+
+        # A credit purchase added its amount to the supplier's balance owed; take it back off.
+        if expense.is_credit and expense.supplier_id:
+            supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
+            if supplier:
+                _note_balance_reason(supplier, f"Credit purchase deleted: {expense.description}" if expense.description else 'Credit purchase deleted')
+                supplier.balance -= expense.amount
 
         db.session.delete(expense)
         db.session.commit()

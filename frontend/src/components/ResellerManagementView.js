@@ -298,7 +298,11 @@ const ResellerManagementView = () => {
                                 <TableBody>
                                     {historyData.map(row => (
                                         <TableRow key={row.id}>
-                                            <TableCell>{new Date(row.date).toLocaleString()}</TableCell>
+                                            <TableCell sx={{ whiteSpace: 'nowrap' }}>
+                                                {row.date_is_utc
+                                                    ? new Date(row.date.replace(' ', 'T') + 'Z').toLocaleString()
+                                                    : row.date.slice(0, 10)}
+                                            </TableCell>
                                             <TableCell>
                                                 <Chip size="small" label={row.type.replace('_', ' ')} color={row.type === 'credit_added' ? 'info' : row.type === 'discount_applied' ? 'warning' : 'success'} />
                                             </TableCell>

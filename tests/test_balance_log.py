@@ -116,3 +116,40 @@ def test_balance_log_is_tenant_scoped(app, client):
     sid = _supplier(client, a)
     client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": 10})
     assert client.get(f"/api/suppliers/{sid}/balance-log", headers=b).status_code == 404
+
+
+def test_deleting_credit_purchase_reverts_supplier_balance(app, client):
+    a = make_tenant(client, "Biz A", "alice")
+    sid = _supplier(client, a)
+    client.post("/api/expense_categories", headers=a, json={"name": "Stock"})
+    eid = client.post("/api/expenses", headers=a, json={
+        "category": "Stock", "amount": 40, "description": "Cables", "date": "2026-10-01",
+        "is_credit": True, "supplier_id": sid}).get_json()["id"]
+    assert client.delete(f"/api/expenses/{eid}", headers=a).status_code == 200
+
+    supplier = next(s for s in client.get("/api/suppliers", headers=a).get_json() if s["id"] == sid)
+    assert supplier["balance"] == 0
+    delete, _create = _supplier_log(client, a, sid)
+    assert (delete["balance_before"], delete["balance_after"]) == (40, 0)
+    assert delete["reason"] == "Credit purchase deleted: Cables"
+
+
+def test_cash_expense_delete_leaves_supplier_alone(app, client):
+    a = make_tenant(client, "Biz A", "alice")
+    sid = _supplier(client, a)
+    client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": 10})
+    client.post("/api/expense_categories", headers=a, json={"name": "Stock"})
+    eid = client.post("/api/expenses", headers=a, json={
+        "category": "Stock", "amount": 40, "description": "Paid cash", "date": "2026-10-01",
+        "is_credit": False, "supplier_id": sid}).get_json()["id"]
+    client.delete(f"/api/expenses/{eid}", headers=a)
+    supplier = next(s for s in client.get("/api/suppliers", headers=a).get_json() if s["id"] == sid)
+    assert supplier["balance"] == 10
+
+
+def test_reseller_history_marks_utc_dates(app, client):
+    a = make_tenant(client, "Biz A", "alice")
+    rid = _reseller(client, a)
+    client.post(f"/api/resellers/{rid}/add_credit", headers=a, json={"amount": 5})
+    (row,) = client.get(f"/api/resellers/{rid}/history", headers=a).get_json()
+    assert row["date_is_utc"] is True
