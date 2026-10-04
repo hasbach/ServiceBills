@@ -332,6 +332,10 @@ class ResellerPayment(db.Model):
             'amount': float(self.amount),
             'type': self.type,
             'date': self.date.strftime('%Y-%m-%d %H:%M:%S'),
+            # Reseller-level entries (no customer: add_credit/apply_discount/
+            # collect_payment) are stamped with utcnow; customer billing
+            # entries carry the cycle's calendar date instead.
+            'date_is_utc': self.customer_id is None,
             'description': self.description
         }
 
@@ -978,6 +982,41 @@ class SupplierPayment(db.Model):
             'payment_date': self.payment_date.strftime('%Y-%m-%d %H:%M:%S'),
             'payment_method': self.payment_method,
             'reference_note': self.reference_note
+        }
+
+class BalanceLog(db.Model):
+    """One row per change of a Reseller's or Supplier's balance: what it was,
+    what it became, and why. Written automatically by the
+    _log_balance_changes before_flush listener, so every code path that moves
+    a balance (payments, credits, renewals, manual edits, ...) is covered
+    without each call site having to remember. Exactly one of reseller_id /
+    supplier_id is set."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    reseller_id = db.Column(db.Integer, db.ForeignKey('reseller.id'), nullable=True, index=True)
+    supplier_id = db.Column(db.Integer, db.ForeignKey('supplier.id'), nullable=True, index=True)
+    balance_before = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    balance_after = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    reason = db.Column(db.String(300), nullable=True)
+    changed_by = db.Column(db.String(100), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    reseller = db.relationship('Reseller', backref=db.backref('balance_logs', lazy=True, cascade='all, delete-orphan'))
+    supplier = db.relationship('Supplier', backref=db.backref('balance_logs', lazy=True, cascade='all, delete-orphan'))
+
+    def to_dict(self):
+        before, after = float(self.balance_before), float(self.balance_after)
+        return {
+            'id': self.id,
+            'reseller_id': self.reseller_id,
+            'supplier_id': self.supplier_id,
+            'balance_before': before,
+            'balance_after': after,
+            'change': round(after - before, 4),
+            'reason': self.reason,
+            'changed_by': self.changed_by,
+            # UTC, marked as such so the browser shows local time.
+            'date': self.created_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
         }
 
 class ExpenseCategory(db.Model):
@@ -1985,7 +2024,7 @@ TENANT_OWNED_MODELS = (
     UpstreamProvider, UpstreamProviderPayment,
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
-    WhatsAppConversation, WhatsAppMessage,
+    WhatsAppConversation, WhatsAppMessage, BalanceLog,
 )
 
 from sqlalchemy import event as _sa_event
@@ -2031,6 +2070,94 @@ def _stale_customer_payment_links_on_payment_mutation(session, flush_context, in
         for link in links:
             if link.status == 'pending':
                 link.status = 'stale'
+
+
+_RESELLER_ENTRY_LABELS = {
+    'credit_added': 'Credit added',
+    'payment_received': 'Payment received',
+    'payment_collected': 'Payment collected',
+    'discount_applied': 'Discount applied',
+}
+
+
+def _note_balance_reason(obj, reason):
+    """Tell _log_balance_changes why obj's balance is about to move. Needed
+    where the reason can't be read off the flush itself -- e.g. supplier
+    paths, where an autoflushing query often separates the ledger row from
+    the balance change."""
+    obj.__dict__['_balance_reason'] = reason
+
+
+def _balance_change_reason(session, obj):
+    """Why obj's balance moved in this flush. An explicit _note_balance_reason
+    wins; otherwise, for a reseller, it's read off the ResellerPayment rows
+    the same flush adds (every reseller billing path adds its ledger row right
+    next to the balance change). Anything else is a direct edit (Edit dialog
+    / Set Fixed Credit)."""
+    noted = obj.__dict__.pop('_balance_reason', None)
+    if noted:
+        return noted[:300]
+    if isinstance(obj, Reseller):
+        parts = []
+        for p in session.new:
+            if isinstance(p, ResellerPayment) and (p.reseller is obj or (obj.id is not None and p.reseller_id == obj.id)):
+                label = _RESELLER_ENTRY_LABELS.get(p.type, p.type)
+                same = (p.description or '').strip().lower() in ('', label.lower())
+                parts.append(label if same else f"{label}: {p.description}")
+        if parts:
+            # A bulk action (e.g. renewing many of one reseller's customers)
+            # can put several entries in one flush.
+            if len(parts) == 1:
+                return parts[0][:300]
+            more = '; ...' if len(parts) > 3 else ''
+            return f"{len(parts)} entries: {'; '.join(parts[:3])}{more}"[:300]
+    if obj in session.new:
+        return 'Opening balance'
+    return 'Balance edited manually'
+
+
+@_sa_event.listens_for(db.session, "before_flush")
+def _log_balance_changes(session, flush_context, instances):
+    """Write a BalanceLog row (before -> after, with the reason) for every
+    Reseller/Supplier whose balance this flush changes."""
+    candidates = [o for o in list(session.new) + list(session.dirty) if isinstance(o, (Reseller, Supplier))]
+    if not candidates:
+        return
+    try:
+        who = get_jwt_identity()
+    except Exception:
+        who = None  # scheduler / webhook / no JWT in context
+    for obj in candidates:
+        if obj in session.new:
+            before = 0.0
+        else:
+            hist = db.inspect(obj).attrs.balance.history
+            if not hist.has_changes():
+                continue
+            if hist.deleted:
+                before = hist.deleted[0]
+            else:
+                # Assigned without ever being loaded (e.g. after an expire):
+                # the old value is still the one in the database.
+                with session.no_autoflush:
+                    before = session.execute(
+                        db.select(type(obj).balance).where(type(obj).id == obj.id)).scalar()
+        before = float(before or 0)
+        after = float(obj.balance or 0)
+        if abs(after - before) < 1e-9:
+            continue
+        log = BalanceLog(
+            tenant_id=obj.tenant_id if obj.tenant_id is not None else current_tenant_id(),
+            balance_before=before,
+            balance_after=after,
+            reason=_balance_change_reason(session, obj),
+            changed_by=str(who)[:100] if who else None,
+        )
+        if isinstance(obj, Reseller):
+            log.reseller = obj
+        else:
+            log.supplier = obj
+        session.add(log)
 
 
 def _maybe_create_customer_payment_link(payment, customer):
@@ -2879,7 +3006,7 @@ _TENANT_DELETE_ORDER = [
     # and only fails against production Postgres.
     NetworkWriteAudit,
     UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
-    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment,
+    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment, BalanceLog,
     # WhatsAppMessage holds an FK to whatsapp_conversation, and
     # WhatsAppConversation holds an FK to customer, so both must be deleted
     # before Customer -- message before conversation -- or a tenant delete
@@ -9613,6 +9740,7 @@ def add_expense():
         if new_expense.is_credit and new_expense.supplier_id:
             supplier = tenant_query(Supplier).filter_by(id=new_expense.supplier_id).first()
             if supplier:
+                _note_balance_reason(supplier, f"Credit purchase: {new_expense.description}" if new_expense.description else 'Credit purchase')
                 supplier.balance += new_expense.amount
 
         # A payroll expense IS the payment: reduce what's owed to the employee,
@@ -9656,32 +9784,37 @@ def update_expense(expense_id):
             new_is_credit = False
             new_supplier_id = None
 
-        # Revert whatever balance effect this expense previously had.
-        if expense.is_credit and expense.supplier_id:
-            old_supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
-            if old_supplier:
-                old_supplier.balance -= expense.amount  # Revert old expense amount
-        if expense.employee_id:
-            old_employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
-            if old_employee:
-                old_employee.balance += expense.amount  # Undo the earlier deduction
+        # No autoflush in between, so a same-supplier edit lands as one
+        # balance-log row (net change) instead of a revert row + an apply row.
+        with db.session.no_autoflush:
+            # Revert whatever balance effect this expense previously had.
+            if expense.is_credit and expense.supplier_id:
+                old_supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
+                if old_supplier:
+                    _note_balance_reason(old_supplier, f"Credit purchase edited: {expense.description}" if expense.description else 'Credit purchase edited')
+                    old_supplier.balance -= expense.amount  # Revert old expense amount
+            if expense.employee_id:
+                old_employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
+                if old_employee:
+                    old_employee.balance += expense.amount  # Undo the earlier deduction
 
-        expense.amount = new_amount
-        expense.is_credit = new_is_credit
-        expense.supplier_id = new_supplier_id if new_is_credit else None
-        expense.employee_id = new_employee_id
-        expense.description = data.get('description', expense.description)
-        expense.date = datetime.strptime(data.get('date', expense.date.strftime('%Y-%m-%d')), '%Y-%m-%d')
+            expense.amount = new_amount
+            expense.is_credit = new_is_credit
+            expense.supplier_id = new_supplier_id if new_is_credit else None
+            expense.employee_id = new_employee_id
+            expense.description = data.get('description', expense.description)
+            expense.date = datetime.strptime(data.get('date', expense.date.strftime('%Y-%m-%d')), '%Y-%m-%d')
 
-        # Re-apply the balance effect for the (possibly changed) new state.
-        if expense.is_credit and expense.supplier_id:
-            new_supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
-            if new_supplier:
-                new_supplier.balance += expense.amount  # Apply new expense amount
-        if expense.employee_id:
-            new_employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
-            if new_employee:
-                new_employee.balance -= expense.amount
+            # Re-apply the balance effect for the (possibly changed) new state.
+            if expense.is_credit and expense.supplier_id:
+                new_supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
+                if new_supplier:
+                    _note_balance_reason(new_supplier, f"Credit purchase edited: {expense.description}" if expense.description else 'Credit purchase edited')
+                    new_supplier.balance += expense.amount  # Apply new expense amount
+            if expense.employee_id:
+                new_employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
+                if new_employee:
+                    new_employee.balance -= expense.amount
 
         db.session.commit()
         return jsonify(expense.to_dict()), 200
@@ -9702,6 +9835,13 @@ def delete_expense(expense_id):
             employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
             if employee:
                 employee.balance += expense.amount  # Undo the earlier deduction
+
+        # A credit purchase added its amount to the supplier's balance owed; take it back off.
+        if expense.is_credit and expense.supplier_id:
+            supplier = tenant_query(Supplier).filter_by(id=expense.supplier_id).first()
+            if supplier:
+                _note_balance_reason(supplier, f"Credit purchase deleted: {expense.description}" if expense.description else 'Credit purchase deleted')
+                supplier.balance -= expense.amount
 
         db.session.delete(expense)
         db.session.commit()
@@ -10250,6 +10390,16 @@ def get_reseller_history(reseller_id):
     payments = tenant_query(ResellerPayment).filter_by(reseller_id=reseller_id).order_by(ResellerPayment.date.desc()).all()
     result = [p.to_dict() for p in payments]
     return jsonify(result), 200
+
+@app.route('/api/resellers/<int:reseller_id>/balance-log', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_reseller_balance_log(reseller_id):
+    if not tenant_query(Reseller).filter_by(id=reseller_id).first():
+        return jsonify({'message': 'Reseller not found'}), 404
+    logs = tenant_query(BalanceLog).filter_by(reseller_id=reseller_id).order_by(
+        BalanceLog.created_at.desc(), BalanceLog.id.desc()).all()
+    return jsonify([l.to_dict() for l in logs]), 200
 
 @app.route('/api/customer-form-options', methods=['GET'])
 @jwt_required()
@@ -13292,6 +13442,9 @@ def record_supplier_payment(supplier_id):
 
     try:
         # Reduce the balance
+        method, note = data.get('payment_method', ''), data.get('reference_note', '')
+        label = f"Payment recorded ({method})" if method else 'Payment recorded'
+        _note_balance_reason(supplier, f"{label}: {note}" if note else label)
         supplier.balance -= amount
         
         new_payment = SupplierPayment(
@@ -13342,6 +13495,7 @@ def update_supplier_payment(supplier_id, payment_id):
             except ValueError as ve:
                 return jsonify({'error': str(ve)}), 400
             # Paying reduced the balance by the old amount; undo that, apply the new one.
+            _note_balance_reason(supplier, f"Payment edited: {float(payment.amount):.2f} -> {new_amount:.2f}")
             supplier.balance = float(supplier.balance or 0) + float(payment.amount) - new_amount
             payment.amount = new_amount
         if data.get('payment_date'):
@@ -13373,6 +13527,7 @@ def delete_supplier_payment(supplier_id, payment_id):
         return jsonify({'message': 'Payment not found!'}), 404
     supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
     try:
+        _note_balance_reason(supplier, f"Payment deleted ({float(payment.amount):.2f})")
         supplier.balance = float(supplier.balance or 0) + float(payment.amount)
         db.session.delete(payment)
         db.session.commit()
@@ -13425,6 +13580,17 @@ def get_supplier_history(supplier_id):
     }), 200
 
 
+@app.route('/api/suppliers/<int:supplier_id>/balance-log', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_supplier_balance_log(supplier_id):
+    if not tenant_query(Supplier).filter_by(id=supplier_id).first():
+        return jsonify({'message': 'Supplier not found!'}), 404
+    logs = tenant_query(BalanceLog).filter_by(supplier_id=supplier_id).order_by(
+        BalanceLog.created_at.desc(), BalanceLog.id.desc()).all()
+    return jsonify([l.to_dict() for l in logs]), 200
+
+
 @app.route('/api/suppliers/<int:supplier_id>/fix-balance', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
@@ -13437,6 +13603,7 @@ def fix_supplier_balance(supplier_id):
     if 'balance' not in data:
         return jsonify({'error': 'New balance is required'}), 400
 
+    _note_balance_reason(supplier, 'Fixed credit balance set')
     supplier.balance = float(data['balance'])
     db.session.commit()
     return jsonify({'message': 'Supplier balance fixed successfully!', 'supplier': supplier.to_dict()}), 200

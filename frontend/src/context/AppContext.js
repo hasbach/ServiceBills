@@ -158,6 +158,7 @@ const rawApiService = {
     applyResellerDiscount: (id, data) => api.post(`/resellers/${id}/apply_discount`, data),
     collectResellerPayment: (id, data) => api.post(`/resellers/${id}/collect_payment`, data),
     getResellerHistory: (id) => api.get(`/resellers/${id}/history`),
+    getResellerBalanceLog: (id) => api.get(`/resellers/${id}/balance-log`),
 
     // Upstream Provider API methods (Concept A -- bridged RADIUS subresellers;
     // see docs/superpowers/specs/2026-08-12-network-enforcement-design.md)
@@ -220,6 +221,7 @@ const rawApiService = {
     recordSupplierPayment: (id, data) => api.post(`/suppliers/${id}/payments`, data),
     fetchSupplierHistory: (id) => api.get(`/suppliers/${id}/history`),
     fixSupplierBalance: (id, data) => api.put(`/suppliers/${id}/fix-balance`, data),
+    getSupplierBalanceLog: (id) => api.get(`/suppliers/${id}/balance-log`),
     updateSupplierPayment: (supplierId, paymentId, data) => api.put(`/suppliers/${supplierId}/payments/${paymentId}`, data),
     deleteSupplierPayment: (supplierId, paymentId) => api.delete(`/suppliers/${supplierId}/payments/${paymentId}`),
 
