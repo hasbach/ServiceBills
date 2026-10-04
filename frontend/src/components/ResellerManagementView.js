@@ -3,7 +3,7 @@ import {
     Box, Typography, Button, TextField, Dialog, DialogTitle,
     DialogContent, DialogActions, Grid, Paper, TableContainer,
     Table, TableHead, TableRow, TableCell, TableBody, MenuItem,
-    IconButton, Tooltip, Chip, CircularProgress
+    IconButton, Tooltip, Chip, CircularProgress, Tabs, Tab
 } from '@mui/material';
 import {
     Add as AddIcon,
@@ -15,6 +15,7 @@ import {
     History as HistoryIcon
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
+import BalanceLogTable from './BalanceLogTable';
 
 const ResellerManagementView = () => {
     const { setSnackbar } = useAppContext();
@@ -33,8 +34,12 @@ const ResellerManagementView = () => {
     const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
     const [historyData, setHistoryData] = useState([]);
     const [historyLoading, setHistoryLoading] = useState(false);
+    const [historyResellerId, setHistoryResellerId] = useState(null);
+    const [historyTab, setHistoryTab] = useState(0);
 
     const openHistoryDialog = async (id) => {
+        setHistoryResellerId(id);
+        setHistoryTab(0);
         setHistoryDialogOpen(true);
         setHistoryLoading(true);
         try {
@@ -268,8 +273,14 @@ const ResellerManagementView = () => {
 
             <Dialog open={historyDialogOpen} onClose={() => setHistoryDialogOpen(false)} maxWidth="md" fullWidth>
                 <DialogTitle sx={{ fontWeight: 700 }}>Reseller Financial History</DialogTitle>
+                <Tabs value={historyTab} onChange={(e, v) => setHistoryTab(v)} sx={{ px: 3, borderBottom: 1, borderColor: 'divider' }}>
+                    <Tab label="Transactions" />
+                    <Tab label="Balance log" />
+                </Tabs>
                 <DialogContent dividers>
-                    {historyLoading ? (
+                    {historyTab === 1 ? (
+                        <BalanceLogTable key={historyResellerId} load={() => apiService.getResellerBalanceLog(historyResellerId)} />
+                    ) : historyLoading ? (
                         <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress /></Box>
                     ) : historyData.length === 0 ? (
                         <Typography sx={{ textAlign: 'center', color: 'text.secondary', p: 4 }}>No history records found.</Typography>

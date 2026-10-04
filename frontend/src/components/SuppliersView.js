@@ -3,7 +3,7 @@ import {
     Box, Typography, Paper, Button, CircularProgress,
     Dialog, DialogTitle, DialogContent, DialogActions, TextField,
     Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
-    IconButton, Tooltip, Chip, alpha, useTheme
+    IconButton, Tooltip, Chip, alpha, useTheme, Tabs, Tab
 } from '@mui/material';
 import {
     Add as AddIcon,
@@ -14,6 +14,7 @@ import {
     History as HistoryIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext';
+import BalanceLogTable from './BalanceLogTable';
 
 function SuppliersView() {
     const theme = useTheme();
@@ -28,6 +29,7 @@ function SuppliersView() {
     const [supplierDialog, setSupplierDialog] = useState({ open: false, data: null });
     const [paymentDialog, setPaymentDialog] = useState({ open: false, supplierId: null, amount: '' });
     const [historyDialog, setHistoryDialog] = useState({ open: false, supplier: null, history: [] });
+    const [historyTab, setHistoryTab] = useState(0);
     const [fixBalanceInput, setFixBalanceInput] = useState('');
     const [historyLoading, setHistoryLoading] = useState(false);
 
@@ -87,6 +89,7 @@ function SuppliersView() {
     };
     const handleOpenHistory = async (supplier) => {
         setHistoryDialog({ open: true, supplier, history: [] });
+        if (historyDialog.supplier?.id !== supplier.id) setHistoryTab(0);
         setFixBalanceInput(supplier.balance);
         setHistoryLoading(true);
         try {
@@ -280,7 +283,20 @@ function SuppliersView() {
                         </Box>
                     )}
 
-                    {historyLoading ? (
+                    <Tabs value={historyTab} onChange={(e, v) => setHistoryTab(v)} sx={{ mb: 1, borderBottom: 1, borderColor: 'divider' }}>
+                        <Tab label="Transactions" />
+                        <Tab label="Balance log" />
+                    </Tabs>
+
+                    {historyTab === 1 ? (
+                        historyDialog.supplier && (
+                            <BalanceLogTable
+                                // Re-mounts (refetches) whenever the balance changes from this dialog.
+                                key={`${historyDialog.supplier.id}:${historyDialog.supplier.balance}:${historyDialog.history.length}`}
+                                load={() => apiService.getSupplierBalanceLog(historyDialog.supplier.id)}
+                            />
+                        )
+                    ) : historyLoading ? (
                         <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}><CircularProgress /></Box>
                     ) : (
                         <TableContainer>
