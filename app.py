@@ -323,6 +323,9 @@ class ResellerPayment(db.Model):
     type = db.Column(db.String(50), nullable=False) # 'credit_added', 'payment_received', 'discount_applied'
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     description = db.Column(db.String(200))
+    # How the money moved: None/'cash' or 'whish' (the business's Whish account).
+    # Splits the Daily Cash flow into its cash and Whish columns.
+    paid_via = db.Column(db.String(10), nullable=True)
 
     def to_dict(self):
         return {
@@ -336,7 +339,8 @@ class ResellerPayment(db.Model):
             # collect_payment) are stamped with utcnow; customer billing
             # entries carry the cycle's calendar date instead.
             'date_is_utc': self.customer_id is None,
-            'description': self.description
+            'description': self.description,
+            'paid_via': self.paid_via or 'cash'
         }
 
 class UpstreamProvider(db.Model):
@@ -376,6 +380,9 @@ class UpstreamProviderPayment(db.Model):
     type = db.Column(db.String(50), nullable=False)  # 'balance_topup', 'renewal_cost', 'manual_adjustment'
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     description = db.Column(db.String(200))
+    # How the money moved: None/'cash' or 'whish' (the business's Whish account).
+    # Splits the Daily Cash flow into its cash and Whish columns.
+    paid_via = db.Column(db.String(10), nullable=True)
 
     def to_dict(self):
         return {
@@ -385,7 +392,8 @@ class UpstreamProviderPayment(db.Model):
             'amount': float(self.amount),
             'type': self.type,
             'date': self.date.strftime('%Y-%m-%d %H:%M:%S'),
-            'description': self.description
+            'description': self.description,
+            'paid_via': self.paid_via or 'cash'
         }
 
 class NetworkDevice(db.Model):
@@ -971,6 +979,9 @@ class SupplierPayment(db.Model):
     payment_date = db.Column(db.DateTime, default=datetime.utcnow)
     payment_method = db.Column(db.String(50), nullable=True)
     reference_note = db.Column(db.Text, nullable=True)
+    # How the money moved: None/'cash' or 'whish' (the business's Whish account).
+    # Splits the Daily Cash flow into its cash and Whish columns.
+    paid_via = db.Column(db.String(10), nullable=True)
 
     supplier = db.relationship('Supplier', backref='payments', lazy=True)
 
@@ -981,7 +992,8 @@ class SupplierPayment(db.Model):
             'amount': float(self.amount),
             'payment_date': self.payment_date.strftime('%Y-%m-%d %H:%M:%S'),
             'payment_method': self.payment_method,
-            'reference_note': self.reference_note
+            'reference_note': self.reference_note,
+            'paid_via': self.paid_via or 'cash'
         }
 
 class BalanceLog(db.Model):
@@ -1075,6 +1087,9 @@ class Expense(db.Model):
     amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     description = db.Column(db.String(200), nullable=False)
     date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    # How the money moved: None/'cash' or 'whish' (the business's Whish account).
+    # Splits the Daily Cash flow into its cash and Whish columns.
+    paid_via = db.Column(db.String(10), nullable=True)
 
     supplier = db.relationship('Supplier', backref='expenses', lazy=True)
     employee = db.relationship('Employee', backref='expense_payments', lazy=True)
@@ -1091,7 +1106,8 @@ class Expense(db.Model):
             'is_credit': self.is_credit,
             'amount': float(self.amount),
             'description': self.description,
-            'date': self.date.strftime('%Y-%m-%d')
+            'date': self.date.strftime('%Y-%m-%d'),
+            'paid_via': self.paid_via or 'cash'
         }
 
 # --- Payroll: Employee is a party you owe money to, exactly like Supplier.
@@ -1419,6 +1435,8 @@ class BusinessSettings(db.Model):
     # (the report then shows only the day's in/out/net).
     cash_opening_date = db.Column(db.Date, nullable=True)
     cash_opening_amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
+    # Whish account balance at the start of the same cash_opening_date.
+    whish_opening_amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -2434,6 +2452,21 @@ if not os.path.exists(app.config['UPLOAD_FOLDER']):
 
 # --- NEW HELPER FUNCTION ---
 _MONEY_EPS = 0.005
+
+
+PAID_VIA_VALUES = ('cash', 'whish')
+
+
+def _paid_via(data, current=None):
+    """'paid_via' from a request body: None for cash (the default, stored as
+    NULL like every row before this field existed) or 'whish'. Keeps
+    `current` when the field is absent. Raises ValueError on anything else."""
+    if 'paid_via' not in (data or {}):
+        return current
+    value = (data.get('paid_via') or 'cash').strip().lower()
+    if value not in PAID_VIA_VALUES:
+        raise ValueError("paid_via must be 'cash' or 'whish'.")
+    return None if value == 'cash' else value
 
 
 def _open_bills(customer, uncollected_only=False):
@@ -10133,7 +10166,8 @@ def add_expense():
             # A payroll expense is a real cash payment, never a credit purchase.
             is_credit=data.get('is_credit', False) if not employee else False,
             supplier_id=supplier_id if not employee else None,
-            employee_id=employee_id
+            employee_id=employee_id,
+            paid_via=_paid_via(data),
         )
         db.session.add(new_expense)
 
@@ -10204,6 +10238,7 @@ def update_expense(expense_id):
             expense.supplier_id = new_supplier_id if new_is_credit else None
             expense.employee_id = new_employee_id
             expense.description = data.get('description', expense.description)
+            expense.paid_via = _paid_via(data, expense.paid_via)
             expense.date = datetime.strptime(data.get('date', expense.date.strftime('%Y-%m-%d')), '%Y-%m-%d')
 
             # Re-apply the balance effect for the (possibly changed) new state.
@@ -10445,21 +10480,26 @@ def get_collector_progress():
 
 _CASH_IN_CATEGORIES = ('Customer payments', 'Reseller collections')
 _CASH_OUT_CATEGORIES = ('Expenses', 'Payroll', 'Supplier payments', 'Upstream top-ups', 'Customer refunds')
+_WHISH_VIA = ('whish', 'whish_transfer')
 
 
 def _cash_flow_entries(win_start, win_end, offset):
-    """Every cash movement whose raw timestamp falls in [win_start, win_end)
+    """Every money movement whose raw timestamp falls in [win_start, win_end)
     (naive UTC, deliberately a day wider than needed on each side), as
-    (direction, category, local_date, amount, time_str, description).
+    (channel, direction, category, local_date, amount, time_str, description)
+    with channel 'cash' or 'whish'.
 
     Two kinds of timestamp live in these tables: real instants (utcnow,
     collected_at, ...) and calendar dates typed into a form (an expense's
     "Date" field -> midnight, no zone). A midnight value is taken as the
     calendar date it names; anything else is a UTC instant, shifted by the
     viewer's `offset` (local midnight - UTC midnight) to get its local day.
-    Customer-payment rules match get_daily_cash_report's collector groups:
-    a bill auto-settled from existing credit, Whish, gratis and reverted
-    payments are not cash."""
+
+    Customer payments: Whish (payment link or a transfer to the business's
+    Whish account) goes to the whish channel; cash follows
+    get_daily_cash_report's collector rules. A bill settled from existing
+    credit, gratis and reverted payments are not money moving at all.
+    Everything else follows its own paid_via (NULL = cash)."""
     def is_calendar(dt):
         return dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0
 
@@ -10473,13 +10513,16 @@ def _cash_flow_entries(win_start, win_end, offset):
             return dt.strftime('%Y-%m-%d')
         return (dt + offset).strftime('%Y-%m-%d %H:%M')
 
+    def channel(paid_via):
+        return 'whish' if paid_via == 'whish' else 'cash'
+
     out = []
     when = func.coalesce(Payment.collected_at, Payment.paid_at)
     payments = tenant_query(Payment).filter(
         Payment.paid == True,
-        Payment.collected_via.is_(None),
         Payment.is_gratis == False,
         Payment.reverted_at.is_(None),
+        Payment.settled_from_credit.isnot(True),
         when >= win_start, when < win_end,
     ).options(db.joinedload(Payment.customer)).all()
     for p in payments:
@@ -10487,97 +10530,123 @@ def _cash_flow_entries(win_start, win_end, offset):
         amount = p.amount * float(p.fx_rate_to_reporting)
         name = p.customer.name if p.customer else 'Unknown customer'
         if p.is_refund:
-            out.append(('out', 'Customer refunds', local_day(t), amount, stamp(t), f"Refund to {name}"))
-        elif p.collected_by_id or p.received_by_id or p.pre_payment:
-            out.append(('in', 'Customer payments', local_day(t), amount, stamp(t), name))
+            out.append(('cash', 'out', 'Customer refunds', local_day(t), amount, stamp(t), f"Refund to {name}"))
+        elif p.collected_via in _WHISH_VIA:
+            how = 'payment link' if p.collected_via == 'whish' else 'transfer'
+            out.append(('whish', 'in', 'Customer payments', local_day(t), amount, stamp(t), f"{name} (Whish {how})"))
+        elif p.collected_via is None and (p.collected_by_id or p.received_by_id or p.pre_payment):
+            out.append(('cash', 'in', 'Customer payments', local_day(t), amount, stamp(t), name))
 
     for rp in tenant_query(ResellerPayment).filter(
             ResellerPayment.type == 'payment_received',
             ResellerPayment.date >= win_start, ResellerPayment.date < win_end).all():
         name = rp.reseller.name if rp.reseller else 'Unknown reseller'
-        out.append(('in', 'Reseller collections', local_day(rp.date), float(rp.amount), stamp(rp.date), name))
+        out.append((channel(rp.paid_via), 'in', 'Reseller collections', local_day(rp.date), float(rp.amount),
+                    stamp(rp.date), name))
 
     for e in tenant_query(Expense).filter(
             Expense.is_credit == False, Expense.date >= win_start, Expense.date < win_end).all():
         cat = 'Payroll' if e.employee_id else 'Expenses'
         label = e.category.name if e.category else 'Expense'
         desc = f"{label}: {e.description}" if e.description else label
-        out.append(('out', cat, local_day(e.date, True), float(e.amount), stamp(e.date, True), desc))
+        out.append((channel(e.paid_via), 'out', cat, local_day(e.date, True), float(e.amount),
+                    stamp(e.date, True), desc))
 
     for sp in tenant_query(SupplierPayment).filter(
             SupplierPayment.payment_date >= win_start, SupplierPayment.payment_date < win_end).all():
         name = sp.supplier.name if sp.supplier else 'Unknown supplier'
         desc = f"{name}: {sp.reference_note}" if sp.reference_note else name
-        out.append(('out', 'Supplier payments', local_day(sp.payment_date, True), float(sp.amount),
-                    stamp(sp.payment_date, True), desc))
+        out.append((channel(sp.paid_via), 'out', 'Supplier payments', local_day(sp.payment_date, True),
+                    float(sp.amount), stamp(sp.payment_date, True), desc))
 
     # Legacy payroll rows from before payroll moved onto Expense (see get_expenses).
     for sal in tenant_query(SalaryPayment).filter(
             SalaryPayment.payment_date >= win_start, SalaryPayment.payment_date < win_end).all():
         name = sal.employee.name if sal.employee else 'Unknown employee'
-        out.append(('out', 'Payroll', local_day(sal.payment_date, True), float(sal.amount),
+        out.append(('cash', 'out', 'Payroll', local_day(sal.payment_date, True), float(sal.amount),
                     stamp(sal.payment_date, True), name))
 
     for up in tenant_query(UpstreamProviderPayment).filter(
             UpstreamProviderPayment.type == 'balance_topup',
             UpstreamProviderPayment.date >= win_start, UpstreamProviderPayment.date < win_end).all():
         name = up.upstream_provider.name if up.upstream_provider else 'Upstream'
-        out.append(('out', 'Upstream top-ups', local_day(up.date), float(up.amount), stamp(up.date), name))
+        out.append((channel(up.paid_via), 'out', 'Upstream top-ups', local_day(up.date), float(up.amount),
+                    stamp(up.date), name))
     return out
 
 
 def _cash_flow_for_day(day, day_start_utc, settings):
-    """In / out / net for local calendar day `day`, plus the running cash on
-    hand when an opening balance is set and `day` is on or after it."""
+    """In / out / net for local calendar day `day`, per channel (cash, Whish)
+    and in total, plus the running balance of each once an opening balance is
+    set and `day` is on or after its date.
+
+    Keys: cash_in/cash_out/net (cash only, unchanged from before Whish was
+    added), whish_in/whish_out/whish_net, total_in/total_out/total_net, and
+    cash_/whish_/total_ start and end (None when not tracked)."""
     offset = datetime.combine(day, datetime.min.time()) - day_start_utc
     opening_date = settings.cash_opening_date if settings else None
-    opening_amount = settings.cash_opening_amount if settings else None
-    has_opening = opening_date is not None and opening_amount is not None
+    opening_cash = settings.cash_opening_amount if settings else None
+    has_opening = opening_date is not None and opening_cash is not None
+    opening_whish = float((settings.whish_opening_amount if settings else None) or 0)
     first = min(opening_date, day) if has_opening else day
     # One day of slack on each side covers the local/UTC shift either way.
     win_start = datetime.combine(first - timedelta(days=1), datetime.min.time())
     win_end = datetime.combine(day + timedelta(days=2), datetime.min.time())
 
-    sections = {'in': {c: [] for c in _CASH_IN_CATEGORIES}, 'out': {c: [] for c in _CASH_OUT_CATEGORIES}}
-    before = 0.0  # net since the opening date, up to (not including) `day`
-    for direction, cat, ld, amount, t, desc in _cash_flow_entries(win_start, win_end, offset):
+    sections = {(ch, d): {c: [] for c in (_CASH_IN_CATEGORIES if d == 'in' else _CASH_OUT_CATEGORIES)}
+                for ch in ('cash', 'whish') for d in ('in', 'out')}
+    before = {'cash': 0.0, 'whish': 0.0}  # net since the opening date, up to (not including) `day`
+    for ch, direction, cat, ld, amount, t, desc in _cash_flow_entries(win_start, win_end, offset):
         if ld == day:
-            sections[direction][cat].append({'time': t, 'description': desc, 'amount': round(amount, 4)})
+            sections[(ch, direction)][cat].append({'time': t, 'description': desc, 'amount': round(amount, 4)})
         elif has_opening and opening_date <= ld < day:
-            before += amount if direction == 'in' else -amount
+            before[ch] += amount if direction == 'in' else -amount
 
-    def summarize(direction):
+    def summarize(ch, direction):
         items = []
-        for cat, entries in sections[direction].items():
+        for cat, entries in sections[(ch, direction)].items():
             if entries:
                 entries.sort(key=lambda x: x['time'])
                 items.append({'category': cat, 'count': len(entries),
                               'total': round(sum(x['amount'] for x in entries), 4), 'entries': entries})
         return {'total': round(sum(i['total'] for i in items), 4), 'items': items}
 
-    cash_in, cash_out = summarize('in'), summarize('out')
+    cash_in, cash_out = summarize('cash', 'in'), summarize('cash', 'out')
+    whish_in, whish_out = summarize('whish', 'in'), summarize('whish', 'out')
     net = round(cash_in['total'] - cash_out['total'], 4)
-    cash_start = cash_end = None
-    if has_opening and day >= opening_date:
-        cash_start = round(float(opening_amount) + before, 4)
-        cash_end = round(cash_start + net, 4)
-    return {
+    whish_net = round(whish_in['total'] - whish_out['total'], 4)
+    result = {
         'day': day.isoformat(),
-        'cash_in': cash_in,
-        'cash_out': cash_out,
-        'net': net,
-        'opening': ({'date': opening_date.isoformat(), 'amount': float(opening_amount)} if has_opening else None),
-        'cash_start': cash_start,
-        'cash_end': cash_end,
+        'cash_in': cash_in, 'cash_out': cash_out, 'net': net,
+        'whish_in': whish_in, 'whish_out': whish_out, 'whish_net': whish_net,
+        'total_in': round(cash_in['total'] + whish_in['total'], 4),
+        'total_out': round(cash_out['total'] + whish_out['total'], 4),
+        'total_net': round(net + whish_net, 4),
+        'opening': ({'date': opening_date.isoformat(), 'amount': float(opening_cash),
+                     'whish_amount': opening_whish} if has_opening else None),
+        'cash_start': None, 'cash_end': None,
+        'whish_start': None, 'whish_end': None,
+        'total_start': None, 'total_end': None,
     }
+    if has_opening and day >= opening_date:
+        cash_start = round(float(opening_cash) + before['cash'], 4)
+        whish_start = round(opening_whish + before['whish'], 4)
+        result.update({
+            'cash_start': cash_start, 'cash_end': round(cash_start + net, 4),
+            'whish_start': whish_start, 'whish_end': round(whish_start + whish_net, 4),
+            'total_start': round(cash_start + whish_start, 4),
+            'total_end': round(cash_start + whish_start + net + whish_net, 4),
+        })
+    return result
 
 
 @app.route('/api/reports/cash-opening', methods=['PUT'])
 @jwt_required()
 @admin_or_finance_required()
 def set_cash_opening():
-    """Set (or clear, with date null) the opening cash on hand the Daily Cash
-    report's running balance starts from."""
+    """Set (or clear, with date null) the opening balances -- cash in the box
+    and money in the Whish account at the start of `date` -- the Daily Cash
+    report's running balances start from."""
     data = request.json or {}
     settings = tenant_query(BusinessSettings).first()
     if not settings:
@@ -10587,14 +10656,17 @@ def set_cash_opening():
     if not data.get('date'):
         settings.cash_opening_date = None
         settings.cash_opening_amount = None
+        settings.whish_opening_amount = None
     else:
         try:
             settings.cash_opening_date = datetime.strptime(data['date'], '%Y-%m-%d').date()
             settings.cash_opening_amount = float(data.get('amount'))
+            whish = data.get('whish_amount')
+            settings.whish_opening_amount = float(whish) if whish not in (None, '') else 0.0
         except (TypeError, ValueError):
-            return jsonify({'error': 'Use date YYYY-MM-DD and a numeric amount.'}), 400
+            return jsonify({'error': 'Use date YYYY-MM-DD and numeric amounts.'}), 400
     db.session.commit()
-    return jsonify({'message': 'Opening cash saved.'}), 200
+    return jsonify({'message': 'Opening balances saved.'}), 200
 
 
 @app.route('/api/reports/daily-cash', methods=['GET'])
@@ -11135,7 +11207,8 @@ def collect_reseller_payment(reseller_id):
             reseller_id=reseller.id,
             amount=amount,
             type='payment_received',
-            description=data.get('description', 'Payment received')
+            description=data.get('description', 'Payment received'),
+            paid_via=_paid_via(data)
         )
         db.session.add(new_payment)
         db.session.commit()
@@ -11292,6 +11365,7 @@ def topup_upstream_provider(provider_id):
             upstream_provider_id=provider.id,
             amount=amount,
             type='balance_topup',
+            paid_via=_paid_via(data),
             description=data.get('description', 'Manual balance top-up')
         ))
         db.session.commit()
@@ -14013,7 +14087,8 @@ def record_supplier_payment(supplier_id):
             supplier_id=supplier.id,
             amount=amount,
             payment_method=data.get('payment_method', ''),
-            reference_note=data.get('reference_note', '')
+            reference_note=data.get('reference_note', ''),
+            paid_via=_paid_via(data),
         )
         if 'payment_date' in data and data['payment_date']:
             new_payment.payment_date = datetime.strptime(data['payment_date'], '%Y-%m-%d')
@@ -14069,6 +14144,7 @@ def update_supplier_payment(supplier_id, payment_id):
             payment.payment_method = data['payment_method'] or ''
         if 'reference_note' in data:
             payment.reference_note = data['reference_note'] or ''
+        payment.paid_via = _paid_via(data, payment.paid_via)
         db.session.commit()
         return jsonify({'message': 'Payment updated.', 'supplier': supplier.to_dict(), 'payment': payment.to_dict()}), 200
     except Exception as e:
@@ -14436,7 +14512,8 @@ def record_employee_payment(employee_id):
             description=note or default_description,
             date=payment_date,
             is_credit=False,
-            is_advance=is_advance
+            is_advance=is_advance,
+            paid_via=_paid_via(data),
         )
         db.session.add(new_expense)
 

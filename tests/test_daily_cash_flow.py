@@ -114,7 +114,7 @@ def test_running_cash_on_hand(app, client):
     assert r.status_code == 200
 
     flow = _flow(client, a, _utc_range(DAY))
-    assert flow["opening"] == {"date": "2026-10-04", "amount": 100}
+    assert flow["opening"] == {"date": "2026-10-04", "amount": 100, "whish_amount": 0}
     assert flow["cash_start"] == 70   # 100 - 30 spent on the 4th
     assert flow["cash_end"] == 115    # + 45 in today
     on_opening_day = _flow(client, a, _utc_range("2026-10-04"))
@@ -163,3 +163,69 @@ def test_cash_opening_validation_and_roles(app, client):
     tok = client.post("/api/login", json={"username": "coll5", "password": "pw"}).get_json()["access_token"]
     assert client.put("/api/reports/cash-opening", headers={"Authorization": f"Bearer {tok}"},
                       json={"date": "2026-10-05", "amount": 1}).status_code == 403
+
+
+def test_whish_channel_and_totals(app, client):
+    """Whish money is reported next to cash, never mixed into it, and the
+    totals and running balances combine both."""
+    a = make_tenant(client, "Biz A", "flow6")
+    tid = _tenant_id("flow6")
+    plan = _make_plan(client, a, price=45)
+    cust = _make_customer(client, a, plan)
+    with flask_app.app_context():
+        cat = _cat(tid)
+        sup = Supplier(tenant_id=tid, name="Sup")
+        prov = UpstreamProvider(tenant_id=tid, name="Up")
+        db.session.add_all([sup, prov])
+        db.session.flush()
+        noon = D + timedelta(hours=12)
+        db.session.add_all([
+            # in: cash 45, Whish link 30, Whish transfer 20
+            Payment(tenant_id=tid, customer_id=cust, amount=45, currency='USD', fx_rate_to_reporting=1,
+                    paid=True, paid_at=noon, pre_payment=True),
+            Payment(tenant_id=tid, customer_id=cust, amount=30, currency='USD', fx_rate_to_reporting=1,
+                    paid=True, paid_at=noon, collected_via='whish'),
+            Payment(tenant_id=tid, customer_id=cust, amount=20, currency='USD', fx_rate_to_reporting=1,
+                    paid=True, paid_at=noon, collected_via='whish_transfer', received_by_id=None),
+            # a bill settled from credit moves no money in either channel
+            Payment(tenant_id=tid, customer_id=cust, amount=99, currency='USD', fx_rate_to_reporting=1,
+                    paid=True, paid_at=noon, settled_from_credit=True),
+            # out: cash expense 15, Whish expense 7, Whish supplier payment 10, Whish top-up 5
+            Expense(tenant_id=tid, category_id=cat.id, amount=15, description="Rent", date=D),
+            Expense(tenant_id=tid, category_id=cat.id, amount=7, description="Online", date=D, paid_via='whish'),
+            SupplierPayment(tenant_id=tid, supplier_id=sup.id, amount=10, payment_date=D, paid_via='whish'),
+            UpstreamProviderPayment(tenant_id=tid, upstream_provider_id=prov.id, amount=5,
+                                    type='balance_topup', date=noon, paid_via='whish'),
+        ])
+        db.session.commit()
+    client.put("/api/reports/cash-opening", headers=a, json={"date": DAY, "amount": 100, "whish_amount": 40})
+
+    flow = _flow(client, a, _utc_range(DAY))
+    assert flow["cash_in"]["total"] == 45 and flow["cash_out"]["total"] == 15
+    assert flow["whish_in"]["total"] == 50 and flow["whish_out"]["total"] == 22
+    assert _totals(flow["whish_out"]) == {"Expenses": 7, "Supplier payments": 10, "Upstream top-ups": 5}
+    assert (flow["total_in"], flow["total_out"], flow["total_net"]) == (95, 37, 58)
+    assert (flow["cash_start"], flow["cash_end"]) == (100, 130)
+    assert (flow["whish_start"], flow["whish_end"]) == (40, 68)
+    assert (flow["total_start"], flow["total_end"]) == (140, 198)
+    assert flow["opening"]["whish_amount"] == 40
+
+
+def test_paid_via_is_accepted_and_validated(app, client):
+    a = make_tenant(client, "Biz A", "flow7")
+    client.post("/api/expense_categories", headers=a, json={"name": "Stock"})
+    r = client.post("/api/expenses", headers=a, json={"category": "Stock", "amount": 9, "description": "x",
+                                                      "date": DAY, "paid_via": "whish"})
+    assert r.status_code == 201 and r.get_json()["paid_via"] == "whish"
+    eid = r.get_json()["id"]
+    assert client.put(f"/api/expenses/{eid}", headers=a, json={"paid_via": "cash"}).get_json()["paid_via"] == "cash"
+    assert client.post("/api/expenses", headers=a, json={"category": "Stock", "amount": 9, "description": "x",
+                                                         "date": DAY, "paid_via": "bitcoin"}).status_code == 400
+    sid = client.post("/api/suppliers", headers=a, json={"name": "S"}).get_json()["id"]
+    r = client.post(f"/api/suppliers/{sid}/payments", headers=a, json={"amount": 5, "paid_via": "whish"})
+    assert r.get_json()["payment"]["paid_via"] == "whish"
+    rid = client.post("/api/resellers", headers=a, json={"name": "R", "phone": "1", "type": "type1",
+                                                         "balance": 50}).get_json()["reseller"]["id"]
+    client.post(f"/api/resellers/{rid}/collect_payment", headers=a, json={"amount": 20, "paid_via": "whish"})
+    flow = _flow(client, a, _utc_range(datetime.utcnow().strftime("%Y-%m-%d")))
+    assert _totals(flow["whish_in"]) == {"Reseller collections": 20}
