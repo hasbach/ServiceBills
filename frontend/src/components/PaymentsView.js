@@ -1454,15 +1454,14 @@ const handlePrint = () => {
     const cardHandlers = React.useMemo(() => ({
         getStatusColor,
         getPaymentTypeColor,
-        // Through the ref-backed wrapper: it reads the current `payments`
-        // (for the customer's other collected cards), not the first render's.
+        // Through the ref-backed wrapper: reads latest closures/state, not render 0's.
         openMarkPaidDialog: rowActions.openMarkPaidDialog,
-        openMarkGratisDialog,
-        openRevertDialog,
-        openMethodDialog,
-        handlePrepareReceipt,
-        handleDeletePayment,
-        buildWhatsAppLink,
+        openMarkGratisDialog: rowActions.openMarkGratisDialog,
+        openRevertDialog: rowActions.openRevertDialog,
+        openMethodDialog: rowActions.openMethodDialog,
+        handlePrepareReceipt: rowActions.handlePrepareReceipt,
+        handleDeletePayment: rowActions.handleDeletePayment,
+        buildWhatsAppLink: rowActions.buildWhatsAppLink,
         waSettings,
         userRoles,
         twsEnabled,

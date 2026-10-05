@@ -186,7 +186,7 @@ const GridCustomerCard = React.memo(function GridCustomerCard({
                             <>
                                 <Divider sx={{ my: 2, opacity: 0.6 }} />
                                 <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                                    <Button size="small" variant="outlined" startIcon={isExpanded ? <VisibilityOffIcon /> : <VisibilityIcon />} onClick={() => actions.fetchCustomerPayments(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>{isExpanded ? 'Hide' : 'Payments'}</Button>
+                                    <Button size="small" variant="outlined" startIcon={isExpanded ? <VisibilityOffIcon /> : <VisibilityIcon />} onClick={() => actions.fetchCustomerPayments(customer.id, customer)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Payments</Button>
                                     <Button size="small" variant="outlined" color="info" startIcon={<EditIcon />} onClick={() => actions.openEditCustomerDialog(customer)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Edit</Button>
                                     <Button size="small" variant="outlined" color="success" startIcon={<RefreshIcon />} onClick={() => actions.renew(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>Renew</Button>
                                     {actions.hasWhatsApp && <Button size="small" variant="outlined" color="primary" startIcon={<ChatIcon />} onClick={() => actions.handleSendWAReminder(customer.id)} sx={{ borderRadius: '8px', textTransform: 'none', fontWeight: 600 }}>WA Reminder</Button>}

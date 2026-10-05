@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Box, TextField, Button, Typography, CircularProgress, InputAdornment, FormControl, FormControlLabel, Switch, InputLabel, Select, MenuItem } from '@mui/material';
 import { useAppContext } from '../context/AppContext.js';
+import PaidViaSelect from './PaidViaSelect';
 
 function ExpenseForm({ expense, onSave, onCancel }) {
     const { apiService, setSnackbar } = useAppContext();
@@ -14,7 +15,8 @@ function ExpenseForm({ expense, onSave, onCancel }) {
     date: new Date().toISOString().split('T')[0],
     is_credit: false,
     supplier_id: '',
-    employee_id: ''
+    employee_id: '',
+    paid_via: 'cash'
   });
   const [loading, setLoading] = useState(false);
 
@@ -47,7 +49,8 @@ function ExpenseForm({ expense, onSave, onCancel }) {
         date: expense.date || new Date().toISOString().split('T')[0],
         is_credit: expense.is_credit || false,
         supplier_id: expense.supplier_id || '',
-        employee_id: expense.employee_id || ''
+        employee_id: expense.employee_id || '',
+        paid_via: expense.paid_via || 'cash'
       });
     } else {
       setFormData({ // Reset for new expense
@@ -57,7 +60,8 @@ function ExpenseForm({ expense, onSave, onCancel }) {
         date: new Date().toISOString().split('T')[0],
         is_credit: false,
         supplier_id: '',
-        employee_id: ''
+        employee_id: '',
+        paid_via: 'cash'
       });
     }
   }, [expense]);
@@ -204,6 +208,11 @@ function ExpenseForm({ expense, onSave, onCancel }) {
         label="Purchase on Credit?"
         sx={{ mt: 1, display: 'block' }}
       />}
+
+      {/* A credit purchase isn't paid yet, so it has no "paid by". */}
+      {!formData.is_credit && (
+        <PaidViaSelect value={formData.paid_via} onChange={(v) => setFormData(prev => ({ ...prev, paid_via: v }))} />
+      )}
 
       {formData.is_credit && (
         <FormControl fullWidth margin="normal" required size="small">
