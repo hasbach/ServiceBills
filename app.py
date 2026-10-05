@@ -1404,6 +1404,11 @@ class BusinessSettings(db.Model):
     # path (always convert-and-sum) rather than a flag-gated branch.
     multi_currency_enabled = db.Column(db.Boolean, nullable=False, default=False)
     reporting_currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
+    # Cash on hand at the START of cash_opening_date -- the anchor the Daily
+    # Cash report's running balance counts forward from. Both null = not set
+    # (the report then shows only the day's in/out/net).
+    cash_opening_date = db.Column(db.Date, nullable=True)
+    cash_opening_amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -10042,6 +10047,160 @@ def get_collector_progress():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+_CASH_IN_CATEGORIES = ('Customer payments', 'Reseller collections')
+_CASH_OUT_CATEGORIES = ('Expenses', 'Payroll', 'Supplier payments', 'Upstream top-ups', 'Customer refunds')
+
+
+def _cash_flow_entries(win_start, win_end, offset):
+    """Every cash movement whose raw timestamp falls in [win_start, win_end)
+    (naive UTC, deliberately a day wider than needed on each side), as
+    (direction, category, local_date, amount, time_str, description).
+
+    Two kinds of timestamp live in these tables: real instants (utcnow,
+    collected_at, ...) and calendar dates typed into a form (an expense's
+    "Date" field -> midnight, no zone). A midnight value is taken as the
+    calendar date it names; anything else is a UTC instant, shifted by the
+    viewer's `offset` (local midnight - UTC midnight) to get its local day.
+    Customer-payment rules match get_daily_cash_report's collector groups:
+    a bill auto-settled from existing credit, Whish, gratis and reverted
+    payments are not cash."""
+    def is_calendar(dt):
+        return dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0
+
+    def local_day(dt, calendar=False):
+        if calendar and is_calendar(dt):
+            return dt.date()
+        return (dt + offset).date()
+
+    def stamp(dt, calendar=False):
+        if calendar and is_calendar(dt):
+            return dt.strftime('%Y-%m-%d')
+        return (dt + offset).strftime('%Y-%m-%d %H:%M')
+
+    out = []
+    when = func.coalesce(Payment.collected_at, Payment.paid_at)
+    payments = tenant_query(Payment).filter(
+        Payment.paid == True,
+        Payment.collected_via.is_(None),
+        Payment.is_gratis == False,
+        Payment.reverted_at.is_(None),
+        when >= win_start, when < win_end,
+    ).options(db.joinedload(Payment.customer)).all()
+    for p in payments:
+        t = p.collected_at or p.paid_at
+        amount = p.amount * float(p.fx_rate_to_reporting)
+        name = p.customer.name if p.customer else 'Unknown customer'
+        if p.is_refund:
+            out.append(('out', 'Customer refunds', local_day(t), amount, stamp(t), f"Refund to {name}"))
+        elif p.collected_by_id or p.received_by_id or p.pre_payment:
+            out.append(('in', 'Customer payments', local_day(t), amount, stamp(t), name))
+
+    for rp in tenant_query(ResellerPayment).filter(
+            ResellerPayment.type == 'payment_received',
+            ResellerPayment.date >= win_start, ResellerPayment.date < win_end).all():
+        name = rp.reseller.name if rp.reseller else 'Unknown reseller'
+        out.append(('in', 'Reseller collections', local_day(rp.date), float(rp.amount), stamp(rp.date), name))
+
+    for e in tenant_query(Expense).filter(
+            Expense.is_credit == False, Expense.date >= win_start, Expense.date < win_end).all():
+        cat = 'Payroll' if e.employee_id else 'Expenses'
+        label = e.category.name if e.category else 'Expense'
+        desc = f"{label}: {e.description}" if e.description else label
+        out.append(('out', cat, local_day(e.date, True), float(e.amount), stamp(e.date, True), desc))
+
+    for sp in tenant_query(SupplierPayment).filter(
+            SupplierPayment.payment_date >= win_start, SupplierPayment.payment_date < win_end).all():
+        name = sp.supplier.name if sp.supplier else 'Unknown supplier'
+        desc = f"{name}: {sp.reference_note}" if sp.reference_note else name
+        out.append(('out', 'Supplier payments', local_day(sp.payment_date, True), float(sp.amount),
+                    stamp(sp.payment_date, True), desc))
+
+    # Legacy payroll rows from before payroll moved onto Expense (see get_expenses).
+    for sal in tenant_query(SalaryPayment).filter(
+            SalaryPayment.payment_date >= win_start, SalaryPayment.payment_date < win_end).all():
+        name = sal.employee.name if sal.employee else 'Unknown employee'
+        out.append(('out', 'Payroll', local_day(sal.payment_date, True), float(sal.amount),
+                    stamp(sal.payment_date, True), name))
+
+    for up in tenant_query(UpstreamProviderPayment).filter(
+            UpstreamProviderPayment.type == 'balance_topup',
+            UpstreamProviderPayment.date >= win_start, UpstreamProviderPayment.date < win_end).all():
+        name = up.upstream_provider.name if up.upstream_provider else 'Upstream'
+        out.append(('out', 'Upstream top-ups', local_day(up.date), float(up.amount), stamp(up.date), name))
+    return out
+
+
+def _cash_flow_for_day(day, day_start_utc, settings):
+    """In / out / net for local calendar day `day`, plus the running cash on
+    hand when an opening balance is set and `day` is on or after it."""
+    offset = datetime.combine(day, datetime.min.time()) - day_start_utc
+    opening_date = settings.cash_opening_date if settings else None
+    opening_amount = settings.cash_opening_amount if settings else None
+    has_opening = opening_date is not None and opening_amount is not None
+    first = min(opening_date, day) if has_opening else day
+    # One day of slack on each side covers the local/UTC shift either way.
+    win_start = datetime.combine(first - timedelta(days=1), datetime.min.time())
+    win_end = datetime.combine(day + timedelta(days=2), datetime.min.time())
+
+    sections = {'in': {c: [] for c in _CASH_IN_CATEGORIES}, 'out': {c: [] for c in _CASH_OUT_CATEGORIES}}
+    before = 0.0  # net since the opening date, up to (not including) `day`
+    for direction, cat, ld, amount, t, desc in _cash_flow_entries(win_start, win_end, offset):
+        if ld == day:
+            sections[direction][cat].append({'time': t, 'description': desc, 'amount': round(amount, 4)})
+        elif has_opening and opening_date <= ld < day:
+            before += amount if direction == 'in' else -amount
+
+    def summarize(direction):
+        items = []
+        for cat, entries in sections[direction].items():
+            if entries:
+                entries.sort(key=lambda x: x['time'])
+                items.append({'category': cat, 'count': len(entries),
+                              'total': round(sum(x['amount'] for x in entries), 4), 'entries': entries})
+        return {'total': round(sum(i['total'] for i in items), 4), 'items': items}
+
+    cash_in, cash_out = summarize('in'), summarize('out')
+    net = round(cash_in['total'] - cash_out['total'], 4)
+    cash_start = cash_end = None
+    if has_opening and day >= opening_date:
+        cash_start = round(float(opening_amount) + before, 4)
+        cash_end = round(cash_start + net, 4)
+    return {
+        'day': day.isoformat(),
+        'cash_in': cash_in,
+        'cash_out': cash_out,
+        'net': net,
+        'opening': ({'date': opening_date.isoformat(), 'amount': float(opening_amount)} if has_opening else None),
+        'cash_start': cash_start,
+        'cash_end': cash_end,
+    }
+
+
+@app.route('/api/reports/cash-opening', methods=['PUT'])
+@jwt_required()
+@admin_or_finance_required()
+def set_cash_opening():
+    """Set (or clear, with date null) the opening cash on hand the Daily Cash
+    report's running balance starts from."""
+    data = request.json or {}
+    settings = tenant_query(BusinessSettings).first()
+    if not settings:
+        # Same defaults update_business_settings uses for a tenant that never saved Settings.
+        settings = BusinessSettings(business_name="Default Business", address="", mobile="")
+        db.session.add(settings)
+    if not data.get('date'):
+        settings.cash_opening_date = None
+        settings.cash_opening_amount = None
+    else:
+        try:
+            settings.cash_opening_date = datetime.strptime(data['date'], '%Y-%m-%d').date()
+            settings.cash_opening_amount = float(data.get('amount'))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Use date YYYY-MM-DD and a numeric amount.'}), 400
+    db.session.commit()
+    return jsonify({'message': 'Opening cash saved.'}), 200
+
+
 @app.route('/api/reports/daily-cash', methods=['GET'])
 @jwt_required()
 def get_daily_cash_report():
@@ -10138,12 +10297,18 @@ def get_daily_cash_report():
         settings = tenant_query(BusinessSettings).first()
         reporting_currency = settings.reporting_currency if settings else 'USD'
 
+        # The local calendar day this report is for. The caller sends local
+        # midnight as a UTC instant, so +12h lands mid-day for any zone
+        # within +/-12h of UTC.
+        day = (start_date + timedelta(hours=12)).date()
+
         return jsonify({
             'date_start': start_date_str,
             'date_end': end_date_str,
             'grand_total': grand_total,
             'reporting_currency': reporting_currency,
             'groups': group_list,
+            'cash_flow': _cash_flow_for_day(day, start_date, settings),
         }), 200
 
     except Exception as e:

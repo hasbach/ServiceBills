@@ -25,6 +25,7 @@ import {
 } from '@mui/material';
 import { KeyboardArrowDown as KeyboardArrowDownIcon, KeyboardArrowUp as KeyboardArrowUpIcon } from '@mui/icons-material';
 import { localDayRange } from './dailyCashDateRange';
+import DailyCashFlowSection from './DailyCashFlowSection';
 import { DatePicker } from '@mui/x-date-pickers/DatePicker';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
 import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
@@ -376,10 +377,18 @@ const EnhancedReportsView = () => {
     if (!reportData || reportType !== 'daily-cash' || !Array.isArray(reportData.groups)) return null;
 
     return (
+      <>
+      {reportData.cash_flow && (
+        <DailyCashFlowSection
+          flow={reportData.cash_flow}
+          currency={reportData.reporting_currency}
+          onOpeningSaved={fetchReportData}
+        />
+      )}
       <Grid item xs={12}>
         <Paper sx={{ p: 2 }}>
           <Typography variant="h6" gutterBottom>
-            Daily Cash Report
+            Customer Cash by Collector
           </Typography>
           <Typography variant="h5" sx={{ mb: 2 }}>
             Grand Total: {reportData.grand_total.toFixed(2)} {reportData.reporting_currency}
@@ -450,6 +459,7 @@ const EnhancedReportsView = () => {
           )}
         </Paper>
       </Grid>
+      </>
     );
   };
 
