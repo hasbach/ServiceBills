@@ -66,6 +66,7 @@ import {
     Email as EmailIcon
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
+import CreditReviewDialog from './CreditReviewDialog';
 import { escapeHtml } from '../utils/escapeHtml.js';
 
 
@@ -624,6 +625,10 @@ const PaymentsView = () => {
     // Chosen when collecting (not when confirming receipt): cash or a direct Whish transfer.
     const [markPaidMethod, setMarkPaidMethod] = useState('cash');
     const [markPaidReference, setMarkPaidReference] = useState('');
+    // Confirming one collected card can confirm the customer's other collected cards too.
+    const [confirmAllCollected, setConfirmAllCollected] = useState(true);
+    const [creditReviewOpen, setCreditReviewOpen] = useState(false);
+    const [creditReviewCount, setCreditReviewCount] = useState(0);
     // Mark-as-Gratis dialog
     const [markGratisDialog, setMarkGratisDialog] = useState({ open: false, paymentId: null, outstanding: 0, customerName: '' });
     const [markGratisNote, setMarkGratisNote] = useState('');
@@ -934,9 +939,27 @@ const PaymentsView = () => {
         }
     };
 
+    // --- Lost-credit review (admin/finance) ---
+    const canReviewCredit = userRoles.includes('admin') || userRoles.includes('finance');
+    const refreshCreditReviewCount = useCallback(async () => {
+        try {
+            const res = await apiService.getCreditReview();
+            setCreditReviewCount(res.data.count || 0);
+        } catch (e) { /* the button just stays hidden */ }
+    }, [apiService]);
+    useEffect(() => { if (canReviewCredit) refreshCreditReviewCount(); }, [canReviewCredit, refreshCreditReviewCount]);
+
     // --- Open the mark-as-paid dialog ---
     const openMarkPaidDialog = (payment) => {
-        setMarkPaidDialog({ open: true, paymentId: payment.id, outstanding: payment.amount, customerName: payment.customer_name, collectedAmount: payment.collected_amount, collecting: !payment.collected });
+        const otherCollected = payments.filter(p => p.customer_id === payment.customer_id && p.id !== payment.id
+            && p.collected && !p.paid && !p.pre_payment);
+        setMarkPaidDialog({
+            open: true, paymentId: payment.id, outstanding: payment.amount, customerName: payment.customer_name,
+            collectedAmount: payment.collected_amount, collecting: !payment.collected, customerId: payment.customer_id,
+            otherCollectedTotal: otherCollected.reduce((t, p) => t + (p.collected_amount ?? p.amount), 0),
+            otherCollectedCount: otherCollected.length,
+        });
+        setConfirmAllCollected(true);
         setMarkPaidMethod('cash');
         setMarkPaidReference('');
         const defaultAmount = (payment.collected && payment.collected_amount) ? payment.collected_amount : payment.amount;
@@ -954,6 +977,7 @@ const PaymentsView = () => {
             return;
         }
         setMarkPaidSubmitting(true);
+        const dialog = markPaidDialog;
         setMarkPaidDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' });
 
         const targetPayment = payments.find(p => p.id === paymentId);
@@ -982,8 +1006,25 @@ const PaymentsView = () => {
         }
 
         try {
-            const response = await apiService.markPaymentAsPaid(paymentId, payload);
+            let response;
+            if (!dialog.collecting && confirmAllCollected && dialog.otherCollectedCount > 0) {
+                // Confirm every collected card of this customer in one go.
+                response = await apiService.confirmCollectedPayments(dialog.customerId);
+            } else if (amountReceived > currentOutstandingAmount + 0.004 && dialog.customerId) {
+                // More than this card: the rest goes to the customer's other bills (then credit).
+                response = await apiService.receiveCustomerPayment(dialog.customerId, {
+                    amount: amountReceived,
+                    action,
+                    first_payment_id: paymentId,
+                    ...(action === 'collect' ? { method: markPaidMethod } : {}),
+                    ...(action === 'collect' && markPaidMethod === 'whish_transfer' && markPaidReference.trim()
+                        ? { reference: markPaidReference.trim() } : {}),
+                });
+            } else {
+                response = await apiService.markPaymentAsPaid(paymentId, payload);
+            }
             setSnackbar({ open: true, message: response.data.message, severity: 'success' });
+            if (canReviewCredit) refreshCreditReviewCount();
 
             fetchPayments();
             if (filters.customer_id) {
@@ -1031,7 +1072,7 @@ const PaymentsView = () => {
 
         } catch (error) {
             console.error("Error marking payment paid:", error);
-            setSnackbar({ open: true, message: 'Failed to mark payment as paid. ' + (error.response?.data?.error || error.message), severity: 'error' });
+            setSnackbar({ open: true, message: 'Failed to mark payment as paid. ' + (error.response?.data?.message || error.response?.data?.error || error.message), severity: 'error' });
         } finally {
             setMarkPaidSubmitting(false);
         }
@@ -1413,7 +1454,9 @@ const handlePrint = () => {
     const cardHandlers = React.useMemo(() => ({
         getStatusColor,
         getPaymentTypeColor,
-        openMarkPaidDialog,
+        // Through the ref-backed wrapper: it reads the current `payments`
+        // (for the customer's other collected cards), not the first render's.
+        openMarkPaidDialog: rowActions.openMarkPaidDialog,
         openMarkGratisDialog,
         openRevertDialog,
         openMethodDialog,
@@ -1471,6 +1514,12 @@ const handlePrint = () => {
                             </Typography>
                         </Box>
                         <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, gap: { xs: 1, sm: 2 }, width: { xs: '100%', sm: 'auto' } }}>
+                            {canReviewCredit && creditReviewCount > 0 && (
+                                <Button variant="contained" color="warning" onClick={() => setCreditReviewOpen(true)}
+                                    sx={{ borderRadius: '16px', textTransform: 'none', fontWeight: 600, px: { xs: 2, sm: 3 }, py: { xs: 1, sm: 1.5 }, width: { xs: '100%', sm: 'auto' } }}>
+                                    Credit check ({creditReviewCount})
+                                </Button>
+                            )}
                             <Button
                                 variant="contained"
                                 startIcon={<ScheduleSendIcon />}
@@ -1922,6 +1971,9 @@ const handlePrint = () => {
             </Dialog>
 
             {/* Mark as Paid Dialog */}
+            <CreditReviewDialog open={creditReviewOpen} onClose={() => setCreditReviewOpen(false)}
+                onChanged={() => { refreshCreditReviewCount(); fetchPayments(); }} />
+
             <Dialog open={markPaidDialog.open} onClose={() => setMarkPaidDialog({ open: false, paymentId: null, outstanding: 0, customerName: '' })} maxWidth="xs" fullWidth>
                 <DialogTitle sx={{ fontWeight: 700 }}>Update Payment Status</DialogTitle>
                 <DialogContent>
@@ -1937,8 +1989,21 @@ const handlePrint = () => {
                         value={markPaidAmount}
                         onChange={(e) => setMarkPaidAmount(e.target.value)}
                         InputProps={{ inputProps: { min: 0.01, step: 0.01 } }}
-                        helperText={parseFloat(markPaidAmount) < markPaidDialog.outstanding ? 'Partial payment — balance will be updated' : 'Full payment'}
+                        disabled={!markPaidDialog.collecting && confirmAllCollected && markPaidDialog.otherCollectedCount > 0}
+                        helperText={(() => {
+                            const v = parseFloat(markPaidAmount);
+                            const extra = v - (markPaidDialog.outstanding || 0);
+                            if (v < markPaidDialog.outstanding) return 'Partial payment — balance will be updated';
+                            if (extra > 0.004) return `Full payment — the extra $${extra.toFixed(2)} goes to this customer's other unpaid bills`
+                                + (markPaidDialog.collecting ? '' : ', then credit');
+                            return 'Full payment';
+                        })()}
                     />
+                    {!markPaidDialog.collecting && markPaidDialog.otherCollectedCount > 0 && (
+                        <FormControlLabel sx={{ mt: 1 }}
+                            control={<Checkbox checked={confirmAllCollected} onChange={(e) => setConfirmAllCollected(e.target.checked)} />}
+                            label={`Also confirm this customer's other ${markPaidDialog.otherCollectedCount} collected payment(s) ($${markPaidDialog.otherCollectedTotal.toFixed(2)})`} />
+                    )}
                     {markPaidDialog.collecting && (
                         <>
                             <TextField select fullWidth sx={{ mt: 2 }} label="Paid by" value={markPaidMethod}

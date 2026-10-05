@@ -38,7 +38,9 @@ import {
     Tooltip,
     IconButton,
     Switch,
-    FormControlLabel
+    FormControlLabel,
+    Tabs,
+    Tab
 } from '@mui/material';
 import {
     Add as AddIcon,
@@ -71,6 +73,19 @@ import { formatStamp } from './formatStamp';
 import { mergeNetworkStatus } from './mergeNetworkStatus';
 import pollNetworkJob from './pollNetworkJob';
 import CustomerImportWizard from './CustomerImportWizard';
+import ReceivePaymentDialog from './ReceivePaymentDialog';
+import BalanceLogTable from './BalanceLogTable';
+
+// Status of one Payment row, shared by the expanded grid row and the Payments History dialog.
+const renderPaymentStatusChip = (p) => {
+    if (p.is_refund) return <Chip label="Refund" size="small" variant="outlined" />;
+    if (p.pre_payment) return <Chip label="Credit received" size="small" color="info" variant="outlined" />;
+    if (p.paid && p.is_gratis) return <Chip label="Gratis" size="small" variant="outlined" />;
+    if (p.paid && p.settled_from_credit) return <Chip label="Paid from credit" size="small" color="success" variant="outlined" />;
+    if (p.paid) return <Chip label="Paid" size="small" color="success" variant="outlined" />;
+    if (p.collected) return <Chip label={`Collected $${(p.collected_amount ?? p.amount).toFixed(2)}`} size="small" color="warning" variant="outlined" />;
+    return <Chip label="Unpaid" size="small" color="error" variant="outlined" />;
+};
 
 // Whether the Network Status panel should show the finished-state chips.
 // mergeNetworkStatus's `pending` flag stays true until BOTH the secret_status
@@ -198,7 +213,7 @@ const GridCustomerCard = React.memo(function GridCustomerCard({
                                                     <TableRow key={p.id}>
                                                         <TableCell>{new Date(p.date).toLocaleDateString()}</TableCell>
                                                         <TableCell sx={{ fontWeight: 600 }}>${p.amount.toFixed(2)}</TableCell>
-                                                        <TableCell><Chip label={p.paid ? 'Paid' : 'Unpaid'} size="small" color={p.paid ? 'success' : 'error'} variant="outlined" /></TableCell>
+                                                        <TableCell>{renderPaymentStatusChip(p)}</TableCell>
                                                         <TableCell>{actions.renderPaymentAction(p)}</TableCell>
                                                     </TableRow>
                                                 )) : <TableRow><TableCell colSpan={4} sx={{ textAlign: 'center', py: 3 }}><Typography variant="body2" color="text.secondary">No payments found</Typography></TableCell></TableRow>}
@@ -534,6 +549,10 @@ const SubscriptionsView = ({
     });
     const [expandedCustomerId, setExpandedCustomerId] = useState(null);
     const [paymentsModalCustomer, setPaymentsModalCustomer] = useState(null);
+    const [paymentsModalTab, setPaymentsModalTab] = useState(0); // 0 bills, 1 statement
+    const [receiveOpen, setReceiveOpen] = useState(false);
+    const [confirmingCollected, setConfirmingCollected] = useState(false);
+    const [statementVersion, setStatementVersion] = useState(0);
     const [payments, setPayments] = useState([]);
     const [loadingPayments, setLoadingPayments] = useState(false);
     const [waReminderDialog, setWaReminderDialog] = useState({ open: false, customer: null });
@@ -869,6 +888,62 @@ const SubscriptionsView = ({
             setCollectSubmitting(false);
         }
     }, [collectDialog, collectSubmitting, apiService, setSnackbar, expandedCustomerId, paymentsModalCustomer, fetchCustomerPayments, payments, customers, waSettings]);
+
+    // --- Customer-level receive / confirm (Payments History dialog) ---
+    const isOpenBill = (p) => !p.paid && !p.pre_payment && !p.is_refund;
+    const modalOwed = payments.filter(isOpenBill).reduce((t, p) => t + p.amount, 0);
+    const modalOwedUncollected = payments.filter(p => isOpenBill(p) && !p.collected).reduce((t, p) => t + p.amount, 0);
+    const modalCollectedPending = payments.filter(p => isOpenBill(p) && p.collected)
+        .reduce((t, p) => t + (p.collected_amount ?? p.amount), 0);
+
+    const closePaymentsModal = () => { setPaymentsModalCustomer(null); setPayments([]); setPaymentsModalTab(0); };
+
+    const refreshPaymentsModal = () => {
+        if (paymentsModalCustomer) fetchCustomerPayments(paymentsModalCustomer.id, paymentsModalCustomer);
+        setStatementVersion(v => v + 1);
+        refetchCustomers();
+    };
+
+    const openPaymentWhatsApp = (customer, amount, message) => {
+        const phone = (customer?.phone || '').replace(/\D/g, '');
+        if (!(waSettings.enabled && waSettings.mode === 'deeplink' && phone)) return false;
+        const msg = (waSettings.deeplink_msg_payment || 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!')
+            .replace('{customer_name}', customer.name || '')
+            .replace('{amount}', amount.toFixed(2));
+        const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+        try { window.open(waUrl, '_blank', 'noopener,noreferrer'); } catch (e) { /* popup blocked: snackbar link below */ }
+        setSnackbar({
+            open: true, severity: 'success', message: `${message} — WhatsApp link ready`,
+            action: (
+                <Button color="inherit" size="small" onClick={() => window.open(waUrl, '_blank', 'noopener,noreferrer')} sx={{ fontWeight: 700, textDecoration: 'underline' }}>
+                    Open WhatsApp
+                </Button>
+            )
+        });
+        return true;
+    };
+
+    const handleReceiveDone = (data, amount) => {
+        setReceiveOpen(false);
+        if (!openPaymentWhatsApp(paymentsModalCustomer, amount, data.message)) {
+            setSnackbar({ open: true, message: data.message, severity: 'success' });
+        }
+        refreshPaymentsModal();
+    };
+
+    const handleConfirmCollected = async () => {
+        if (!paymentsModalCustomer || confirmingCollected) return;
+        setConfirmingCollected(true);
+        try {
+            const res = await apiService.confirmCollectedPayments(paymentsModalCustomer.id);
+            setSnackbar({ open: true, message: res.data.message, severity: 'success' });
+            refreshPaymentsModal();
+        } catch (error) {
+            setSnackbar({ open: true, message: error.response?.data?.message || 'Failed to confirm.', severity: 'error' });
+        } finally {
+            setConfirmingCollected(false);
+        }
+    };
 
     const renderPaymentAction = (p) => {
         if (p.paid) return null;
@@ -1917,10 +1992,38 @@ const SubscriptionsView = ({
                 </DialogActions>
             </Dialog>
 
-            <Dialog open={Boolean(paymentsModalCustomer)} onClose={() => { setPaymentsModalCustomer(null); setPayments([]); }} maxWidth="md" fullWidth>
+            <Dialog open={Boolean(paymentsModalCustomer)} onClose={closePaymentsModal} maxWidth="md" fullWidth>
                 <DialogTitle sx={{ fontWeight: 700 }}>Payments History - {paymentsModalCustomer?.name}</DialogTitle>
+                <Box sx={{ px: 3, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
+                    <Typography variant="body2" color="text.secondary">
+                        Owed: <strong>${modalOwed.toFixed(2)}</strong>
+                        {modalCollectedPending > 0 && <> · Collected, awaiting confirmation: <strong>${modalCollectedPending.toFixed(2)}</strong></>}
+                    </Typography>
+                    <Box sx={{ display: 'flex', gap: 1 }}>
+                        {canManageSubscriptions && modalCollectedPending > 0 && (
+                            <Button size="small" variant="outlined" color="success" onClick={handleConfirmCollected} disabled={confirmingCollected}
+                                startIcon={confirmingCollected ? <CircularProgress size={14} color="inherit" /> : <CheckCircleIcon />}>
+                                Confirm collected
+                            </Button>
+                        )}
+                        {(canManageSubscriptions || (isCashierOnly && modalOwedUncollected > 0)) && (
+                            <Button size="small" variant="contained" color="success" onClick={() => setReceiveOpen(true)}>
+                                {canManageSubscriptions ? 'Receive payment' : 'Collect payment'}
+                            </Button>
+                        )}
+                    </Box>
+                </Box>
+                <Tabs value={paymentsModalTab} onChange={(e, v) => setPaymentsModalTab(v)} sx={{ px: 3, borderBottom: 1, borderColor: 'divider' }}>
+                    <Tab label="Bills" />
+                    <Tab label="Statement" />
+                </Tabs>
                 <DialogContent>
-                    {loadingPayments ? (
+                    {paymentsModalTab === 1 ? (
+                        paymentsModalCustomer && (
+                            <BalanceLogTable key={`${paymentsModalCustomer.id}:${statementVersion}`} increaseIsGood
+                                load={() => apiService.getCustomerBalanceLog(paymentsModalCustomer.id)} />
+                        )
+                    ) : loadingPayments ? (
                         <Box sx={{ display: 'flex', justifyContent: 'center', my: 4 }}>
                             <CircularProgress size={32} />
                         </Box>
@@ -1940,7 +2043,7 @@ const SubscriptionsView = ({
                                         <TableRow key={p.id}>
                                             <TableCell>{new Date(p.date).toLocaleDateString()}</TableCell>
                                             <TableCell sx={{ fontWeight: 600 }}>${p.amount.toFixed(2)}</TableCell>
-                                            <TableCell><Chip label={p.paid ? 'Paid' : 'Unpaid'} size="small" color={p.paid ? 'success' : 'error'} variant="outlined" /></TableCell>
+                                            <TableCell>{renderPaymentStatusChip(p)}</TableCell>
                                             <TableCell>{renderPaymentAction(p)}</TableCell>
                                         </TableRow>
                                     )) : (
@@ -1952,9 +2055,18 @@ const SubscriptionsView = ({
                     )}
                 </DialogContent>
                 <DialogActions>
-                    <Button onClick={() => { setPaymentsModalCustomer(null); setPayments([]); }}>Close</Button>
+                    <Button onClick={closePaymentsModal}>Close</Button>
                 </DialogActions>
             </Dialog>
+
+            <ReceivePaymentDialog
+                open={receiveOpen}
+                onClose={() => setReceiveOpen(false)}
+                onDone={handleReceiveDone}
+                customer={paymentsModalCustomer}
+                owed={canManageSubscriptions ? modalOwed : modalOwedUncollected}
+                mode={canManageSubscriptions ? 'pay' : 'collect'}
+            />
 
             {/* Cashier: collect a payment */}
             <Dialog open={collectDialog.open} onClose={() => !collectSubmitting && closeCollectDialog()} maxWidth="xs" fullWidth>

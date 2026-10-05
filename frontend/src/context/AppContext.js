@@ -270,6 +270,12 @@ const rawApiService = {
     fetchPayments: (customerId, status, startDate, endDate, searchQuery, collectedBy, collectedDate, sort_by = 'billed_date', sort_desc = 'true', paidDateStart, paidDateEnd) => api.get(`/payments`, { params: { customer_id: customerId, status: status, start_date: startDate, end_date: endDate, search_query: searchQuery, collected_by: collectedBy, collected_date: collectedDate, sort_by: sort_by, sort_desc: sort_desc, paid_date_start: paidDateStart, paid_date_end: paidDateEnd } }),
     deletePayment: (paymentId) => api.delete(`/payments/${paymentId}`),
     markPaymentAsPaid: (paymentId, data = {}) => api.put(`/payments/${paymentId}/mark_paid`, data),
+    // One amount across a customer's bills (oldest first) -- action 'pay' or 'collect'.
+    receiveCustomerPayment: (customerId, data) => api.post(`/customers/${customerId}/receive-payment`, data),
+    confirmCollectedPayments: (customerId) => api.post(`/customers/${customerId}/confirm-collected`),
+    getCustomerBalanceLog: (customerId) => api.get(`/customers/${customerId}/balance-log`),
+    getCreditReview: () => api.get('/customers/credit-review'),
+    resolveCreditReview: (customerId, action) => api.post(`/customers/${customerId}/credit-review`, { action }),
     markPaymentGratis: (paymentId, note) => api.put(`/payments/${paymentId}/mark_gratis`, { note }),
     revertPayment: (paymentId, reason) => api.put(`/payments/${paymentId}/revert`, { reason }),
     setPaymentMethod: (paymentId, method, reference) => api.put(`/payments/${paymentId}/method`, { method, reference }),
