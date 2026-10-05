@@ -985,16 +985,17 @@ class SupplierPayment(db.Model):
         }
 
 class BalanceLog(db.Model):
-    """One row per change of a Reseller's or Supplier's balance: what it was,
-    what it became, and why. Written automatically by the
+    """One row per change of a Reseller's, Supplier's or Customer's balance:
+    what it was, what it became, and why. Written automatically by the
     _log_balance_changes before_flush listener, so every code path that moves
     a balance (payments, credits, renewals, manual edits, ...) is covered
     without each call site having to remember. Exactly one of reseller_id /
-    supplier_id is set."""
+    supplier_id / customer_id is set."""
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     reseller_id = db.Column(db.Integer, db.ForeignKey('reseller.id'), nullable=True, index=True)
     supplier_id = db.Column(db.Integer, db.ForeignKey('supplier.id'), nullable=True, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=True, index=True)
     balance_before = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     balance_after = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
     reason = db.Column(db.String(300), nullable=True)
@@ -1003,6 +1004,7 @@ class BalanceLog(db.Model):
 
     reseller = db.relationship('Reseller', backref=db.backref('balance_logs', lazy=True, cascade='all, delete-orphan'))
     supplier = db.relationship('Supplier', backref=db.backref('balance_logs', lazy=True, cascade='all, delete-orphan'))
+    customer = db.relationship('Customer', backref=db.backref('balance_logs', lazy=True, cascade='all, delete-orphan'))
 
     def to_dict(self):
         before, after = float(self.balance_before), float(self.balance_after)
@@ -1010,6 +1012,7 @@ class BalanceLog(db.Model):
             'id': self.id,
             'reseller_id': self.reseller_id,
             'supplier_id': self.supplier_id,
+            'customer_id': self.customer_id,
             'balance_before': before,
             'balance_after': after,
             'change': round(after - before, 4),
@@ -1257,6 +1260,13 @@ class Payment(db.Model):
     # payment-link gateway -- not cash, so the daily cash report skips it too.
     collected_via = db.Column(db.String(20), nullable=True)  # None | 'whish' | 'whish_transfer'
     whish_transaction_number = db.Column(db.String(64), nullable=True)
+    # Paid out of credit the customer already had (no money changed hands) by
+    # apply_customer_balance_to_unpaid_payments -- see
+    # docs/superpowers/specs/2026-10-05-receive-payment-and-statement-design.md.
+    settled_from_credit = db.Column(db.Boolean, nullable=False, default=False, server_default=db.false())
+    # Lost-credit review of rows the pre-fix settlement auto-paid (and wrongly
+    # took off the balance a second time): None | 'restored' | 'dismissed'.
+    credit_review = db.Column(db.String(10), nullable=True)
     addon_purchases = db.relationship('AddonPurchase', backref='payment', lazy=True)
 
     collected_by = db.relationship('User', foreign_keys=[collected_by_id])
@@ -2093,29 +2103,87 @@ def _note_balance_reason(obj, reason):
     obj.__dict__['_balance_reason'] = reason
 
 
-def _balance_change_reason(session, obj):
+def _customer_entry_label(p, change):
+    """How one Payment row in this flush moved its customer's balance."""
+    when = p.date.strftime('%Y-%m-%d') if p.date else ''
+    if change == 'deleted':
+        return f"Bill deleted ({when})"
+    if change == 'new':
+        if p.is_refund:
+            return 'Refund'
+        if p.pre_payment and p.paid:
+            return 'Payment received via Whish (credit)' if p.collected_via == 'whish' else 'Payment received (credit)'
+        if not p.paid:
+            return f"Bill: {p.reason} ({when})" if p.reason else f"Subscription bill ({when})"
+        return 'Payment received'
+    # dirty: only rows whose paid state flipped moved the balance
+    paid_hist = db.inspect(p).attrs.paid.history
+    if not paid_hist.has_changes():
+        return None
+    if not p.paid:
+        return f"Payment reverted (bill of {when})"
+    if p.is_gratis:
+        return f"Bill forgiven (gratis, {when})"
+    if p.settled_from_credit:
+        return f"Bill of {when} settled from credit"
+    if p.collected_via == 'whish':
+        return f"Paid via Whish (bill of {when})"
+    return f"Payment received for bill of {when}"
+
+
+def _ledger_index(session):
+    """Reason parts per balance owner, from the ledger rows this flush adds,
+    changes or removes, accumulated across every flush of the transaction in
+    session.info: an autoflush (any query) often writes the ledger row one
+    flush before the balance change it explains. Consumed per owner when its
+    balance change is logged; dropped on commit/rollback. One pass per flush,
+    so a scheduler flush touching thousands of customers stays linear."""
+    index = session.info.setdefault('_ledger_pending', {})
+
+    def add(key, label):
+        if label:
+            index.setdefault(key, []).append(label)
+
+    for p in session.new:
+        if isinstance(p, ResellerPayment):
+            label = _RESELLER_ENTRY_LABELS.get(p.type, p.type)
+            same = (p.description or '').strip().lower() in ('', label.lower())
+            text = label if same else f"{label}: {p.description}"
+            add(('r', p.reseller_id), text)
+            if p.reseller is not None:
+                add(('r', id(p.reseller)), text)
+        elif isinstance(p, Payment):
+            key = ('c', p.customer_id) if p.customer_id is not None else ('c', id(p.customer))
+            add(key, _customer_entry_label(p, 'new'))
+    for p in session.dirty:
+        if isinstance(p, Payment):
+            add(('c', p.customer_id), _customer_entry_label(p, 'dirty'))
+    for p in session.deleted:
+        if isinstance(p, Payment) and not p.paid:
+            add(('c', p.customer_id), _customer_entry_label(p, 'deleted'))
+    return index
+
+
+def _balance_change_reason(session, obj, index):
     """Why obj's balance moved in this flush. An explicit _note_balance_reason
-    wins; otherwise, for a reseller, it's read off the ResellerPayment rows
-    the same flush adds (every reseller billing path adds its ledger row right
-    next to the balance change). Anything else is a direct edit (Edit dialog
-    / Set Fixed Credit)."""
+    wins; otherwise it's read off the ledger rows (ResellerPayment / Payment)
+    the same flush adds or changes -- every reseller and customer billing path
+    writes its ledger row right next to the balance change. Anything else is a
+    direct edit (Edit dialog / Set Fixed Credit)."""
+    parts = []
+    if isinstance(obj, (Reseller, Customer)):
+        kind = 'r' if isinstance(obj, Reseller) else 'c'
+        parts = index.pop((kind, obj.id), []) + index.pop((kind, id(obj)), [])
     noted = obj.__dict__.pop('_balance_reason', None)
     if noted:
         return noted[:300]
-    if isinstance(obj, Reseller):
-        parts = []
-        for p in session.new:
-            if isinstance(p, ResellerPayment) and (p.reseller is obj or (obj.id is not None and p.reseller_id == obj.id)):
-                label = _RESELLER_ENTRY_LABELS.get(p.type, p.type)
-                same = (p.description or '').strip().lower() in ('', label.lower())
-                parts.append(label if same else f"{label}: {p.description}")
-        if parts:
-            # A bulk action (e.g. renewing many of one reseller's customers)
-            # can put several entries in one flush.
-            if len(parts) == 1:
-                return parts[0][:300]
-            more = '; ...' if len(parts) > 3 else ''
-            return f"{len(parts)} entries: {'; '.join(parts[:3])}{more}"[:300]
+    if parts:
+        # A bulk action (e.g. renewing many of one reseller's customers)
+        # can put several entries in one flush.
+        if len(parts) == 1:
+            return parts[0][:300]
+        more = '; ...' if len(parts) > 3 else ''
+        return f"{len(parts)} entries: {'; '.join(parts[:3])}{more}"[:300]
     if obj in session.new:
         return 'Opening balance'
     return 'Balance edited manually'
@@ -2124,14 +2192,12 @@ def _balance_change_reason(session, obj):
 @_sa_event.listens_for(db.session, "before_flush")
 def _log_balance_changes(session, flush_context, instances):
     """Write a BalanceLog row (before -> after, with the reason) for every
-    Reseller/Supplier whose balance this flush changes."""
-    candidates = [o for o in list(session.new) + list(session.dirty) if isinstance(o, (Reseller, Supplier))]
+    Reseller/Supplier/Customer whose balance this flush changes."""
+    index = _ledger_index(session)
+    candidates = [o for o in list(session.new) + list(session.dirty) if isinstance(o, (Reseller, Supplier, Customer))]
     if not candidates:
         return
-    try:
-        who = get_jwt_identity()
-    except Exception:
-        who = None  # scheduler / webhook / no JWT in context
+    who = False
     for obj in candidates:
         if obj in session.new:
             before = 0.0
@@ -2151,18 +2217,31 @@ def _log_balance_changes(session, flush_context, instances):
         after = float(obj.balance or 0)
         if abs(after - before) < 1e-9:
             continue
+        if who is False:
+            try:
+                who = get_jwt_identity()
+            except Exception:
+                who = None  # scheduler / webhook / no JWT in context
         log = BalanceLog(
             tenant_id=obj.tenant_id if obj.tenant_id is not None else current_tenant_id(),
             balance_before=before,
             balance_after=after,
-            reason=_balance_change_reason(session, obj),
+            reason=_balance_change_reason(session, obj, index),
             changed_by=str(who)[:100] if who else None,
         )
         if isinstance(obj, Reseller):
             log.reseller = obj
-        else:
+        elif isinstance(obj, Supplier):
             log.supplier = obj
+        else:
+            log.customer = obj
         session.add(log)
+
+
+@_sa_event.listens_for(db.session, "after_commit")
+@_sa_event.listens_for(db.session, "after_rollback")
+def _drop_pending_ledger(session):
+    session.info.pop('_ledger_pending', None)
 
 
 def _maybe_create_customer_payment_link(payment, customer):
@@ -2354,75 +2433,79 @@ if not os.path.exists(app.config['UPLOAD_FOLDER']):
 
 
 # --- NEW HELPER FUNCTION ---
+_MONEY_EPS = 0.005
+
+
+def _open_bills(customer, uncollected_only=False):
+    """The customer's unpaid bills, oldest first (prepayment and refund rows
+    are never bills). Scoped by the customer's own tenant so it works from a
+    request or the context-less scheduler."""
+    q = Payment.query.filter_by(tenant_id=customer.tenant_id, customer_id=customer.id, paid=False).filter(
+        Payment.pre_payment.isnot(True), Payment.is_refund.isnot(True))
+    if uncollected_only:
+        q = q.filter(Payment.collected.isnot(True))
+    return q.order_by(Payment.date.asc(), Payment.id.asc()).all()
+
+
+def _split_bill(bill, portion, customer):
+    """Shrink `bill` to `portion` and add an unpaid row for the rest (same
+    currency, locked FX rate, date and reason). Returns the new row. The
+    balance is NOT touched: the original bill already debited the full
+    amount, and the two rows together still sum to it."""
+    remainder = Payment(
+        tenant_id=bill.tenant_id or customer.tenant_id,
+        customer_id=bill.customer_id,
+        amount=round(float(bill.amount) - portion, 4),
+        currency=bill.currency,
+        fx_rate_to_reporting=bill.fx_rate_to_reporting,
+        reason=bill.reason,
+        paid=False,
+        date=bill.date,
+        pre_payment=bill.pre_payment,
+    )
+    bill.amount = portion
+    db.session.add(remainder)
+    _maybe_create_customer_payment_link(remainder, customer)
+    return remainder
+
+
 def apply_customer_balance_to_unpaid_payments(customer):
-    """
-    Applies a customer's positive balance to their outstanding unpaid payments.
-    Matches the logic of mark_payment_as_paid for partial payments.
-    Assumes the customer object is part of the current DB session.
-    """
-    
-    # Only run if the customer has credit
-    if customer.balance <= 0:
+    """Settle the customer's unpaid bills out of credit they already have.
+
+    Customer.balance is the NET position: every path that creates an unpaid
+    bill debits it in the same transaction, and paying a bill credits it back.
+    So money received but not yet matched to a bill is
+    balance + sum(unpaid bills) -- NOT balance alone. (Treating balance alone
+    as the credit was the bug this replaces: credit 25 + bill 25 left the bill
+    unpaid at balance 0, and credit 50 + bill 25 paid it but took the balance
+    to 0 instead of 25. See
+    docs/superpowers/specs/2026-10-05-receive-payment-and-statement-design.md.)
+
+    Settles oldest bills first, splitting the last one if the credit covers
+    only part of it, and marks them settled_from_credit. Bills a collector is
+    already holding cash for (collected, unconfirmed) are left to that
+    collection. The balance itself never changes here. Caller commits."""
+    bills = _open_bills(customer)
+    if not bills:
         return
-
-    logging.info(f"Reconciling balance for customer {customer.id}. Current balance: {customer.balance}")
-
-    # Get all outstanding bills, oldest first. Scope by the customer's own tenant so
-    # this helper is correct whether called from a request or the (context-less) scheduler.
-    unpaid_payments = Payment.query.filter_by(
-        tenant_id=customer.tenant_id,
-        customer_id=customer.id,
-        paid=False
-    ).order_by(Payment.date.asc()).all()
-
-    for payment in unpaid_payments:
-        if customer.balance <= 0:
-            break  # Stop if credit runs out
-
-        amount_due = payment.amount
-        
-        if customer.balance >= amount_due:
-            # Full payment from balance
-            payment.paid = True
-            payment.paid_at = datetime.utcnow()
-            # The balance is "spent" to pay this, so it decreases.
-            # The payment.amount remains unchanged for revenue tracking.
-            customer.balance -= amount_due
-            logging.info(f"Auto-paid payment {payment.id} (Amount: {amount_due}) for customer {customer.id} using balance. New balance: {customer.balance}")
-            
-        else:
-            # Partial payment from balance
-            # Customer has some credit (e.g., $10), but not enough for the bill (e.g., $30)
-            
-            amount_paid_from_balance = customer.balance
-            remaining_amount_due = amount_due - amount_paid_from_balance
-
-            # Create a new payment record for the remaining amount if greater than 0
-            if remaining_amount_due > 0:
-                remaining_payment = Payment(
-                    tenant_id=customer.tenant_id,
-                    customer_id=customer.id,
-                    amount=remaining_amount_due,
-                    paid=False,
-                    date=payment.date,
-                    pre_payment=payment.pre_payment
-                )
-                db.session.add(remaining_payment)
-                _maybe_create_customer_payment_link(remaining_payment, customer)
-
-            # Mark original payment as paid
-            # (This is the established logic from mark_payment_as_paid)
-            payment.amount = amount_paid_from_balance
-            payment.paid = True
-            payment.paid_at = datetime.utcnow()
-            
-            # All credit is used up
-            customer.balance = 0
-            
-            logging.info(f"Partially auto-paid payment {payment.id} (Amount: {amount_due}) for customer {customer.id} using {amount_paid_from_balance} from balance. New payment created for remaining {remaining_amount_due}. New balance: 0")
-
-    # Note: The caller is responsible for db.session.commit()
-# --- END HELPER FUNCTION ---
+    credit = float(customer.balance or 0) + sum(float(b.amount) for b in bills)
+    if credit <= _MONEY_EPS:
+        return
+    now = datetime.utcnow()
+    for bill in bills:
+        if credit <= _MONEY_EPS:
+            break
+        if bill.collected:
+            continue
+        amount = float(bill.amount)
+        if credit + _MONEY_EPS < amount:
+            _split_bill(bill, round(credit, 4), customer)
+            amount = float(bill.amount)
+        bill.paid = True
+        bill.paid_at = now
+        bill.settled_from_credit = True
+        credit -= amount
+        logging.info(f"Settled bill {bill.id} ({amount}) for customer {customer.id} from existing credit.")
 
 
 
@@ -5265,6 +5348,8 @@ def get_payments():
             'reason': p.reason,
             'is_gratis': p.is_gratis,
             'gratis_note': p.gratis_note,
+            'is_refund': p.is_refund,
+            'settled_from_credit': bool(p.settled_from_credit),
             'reverted_at': p.reverted_at.strftime('%Y-%m-%d %H:%M:%S') if p.reverted_at else None,
             'reverted_by': p.reverted_by.username if p.reverted_by else None,
             'revert_reason': p.revert_reason,
@@ -5405,7 +5490,10 @@ def get_total_sales():
         Payment.is_gratis == False,
         # Prepayments count as revenue -- see
         # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-        Payment.is_refund == False
+        Payment.is_refund == False,
+        # A bill paid from existing credit isn't new money: the prepayment that
+        # created the credit was already counted.
+        Payment.settled_from_credit.isnot(True),
     ).group_by('month').all()
 
     return jsonify([{
@@ -5770,6 +5858,310 @@ def mark_payment_as_paid(payment_id):
 
 
 PAYMENT_METHODS_STAFF_SETTABLE = ('cash', 'whish_transfer')
+
+
+# --- Customer-level money handling: one amount across many bills -------------
+# See docs/superpowers/specs/2026-10-05-receive-payment-and-statement-design.md.
+
+def _bills_starting_with(bills, first_payment_id):
+    """`bills` (oldest first) with the one the user clicked moved to the front."""
+    if not first_payment_id:
+        return bills
+    first = [b for b in bills if b.id == first_payment_id]
+    return first + [b for b in bills if b.id != first_payment_id]
+
+
+def _apply_method(row, method, reference):
+    if method == 'whish_transfer':
+        row.collected_via = 'whish_transfer'
+        row.whish_transaction_number = reference
+    elif row.collected_via == 'whish_transfer':
+        row.collected_via = None
+        row.whish_transaction_number = None
+
+
+def _confirm_bill(bill, customer, user, portion=None):
+    """Confirm money received for `bill` -- all of it, or `portion` of it
+    (splitting off an unpaid remainder, exactly like a partial Confirm
+    Receipt). Credits the balance by what was received. Returns that."""
+    amount = float(bill.amount)
+    if portion is not None and portion + _MONEY_EPS < amount:
+        _split_bill(bill, round(portion, 4), customer)
+        amount = float(bill.amount)
+    customer.balance = float(customer.balance or 0) + amount
+    bill.paid = True
+    bill.paid_at = datetime.utcnow()
+    bill.received_by_id = user.id
+    return amount
+
+
+def _receive_customer_payment(customer, amount, user, method, reference, first_payment_id):
+    """Admin/finance received `amount` from the customer: pay their bills
+    oldest first (the clicked one first), split the last partly covered one,
+    and keep anything left over as credit (a paid prepayment row). Returns
+    (bills_paid, credit_added). Raises fx.FxRateMissingError before touching
+    anything if credit would be left and no exchange rate is on file."""
+    bills = _bills_starting_with(_open_bills(customer), first_payment_id)
+    credit = round(amount - sum(float(b.amount) for b in bills), 4)
+    credit = credit if credit > _MONEY_EPS else 0.0
+    # Resolve the credit row's currency/FX up front: get_tenant_settings may
+    # commit (to create a missing settings row), which must not happen with
+    # half the bills already marked paid.
+    credit_fx = _credit_currency_and_rate(customer) if credit else None
+
+    remaining = amount
+    paid_count = 0
+    # No autoflush mid-way: the whole receipt lands as one flush, so the
+    # customer statement shows one row for it, not one per bill.
+    with db.session.no_autoflush:
+        for bill in bills:
+            if remaining <= _MONEY_EPS:
+                break
+            received = _confirm_bill(bill, customer, user, portion=min(remaining, float(bill.amount)))
+            _apply_method(bill, method, reference)
+            remaining -= received
+            paid_count += 1
+        if credit:
+            currency, rate = credit_fx
+            now = datetime.utcnow()
+            row = Payment(customer_id=customer.id, amount=credit, currency=currency, fx_rate_to_reporting=rate,
+                          reason='Payment received (credit)', date=now, paid=True, paid_at=now,
+                          pre_payment=True, received_by_id=user.id)
+            _apply_method(row, method, reference)
+            db.session.add(row)
+            customer.balance = float(customer.balance or 0) + credit
+    db.session.flush()
+    # Settlement queries open bills from the database, so it runs after the flush.
+    apply_customer_balance_to_unpaid_payments(customer)
+    return paid_count, credit
+
+
+def _credit_currency_and_rate(customer):
+    """Currency and locked FX rate for a credit (prepayment) row, the same way
+    add_payment locks them."""
+    settings = get_tenant_settings(BusinessSettings, business_name="Default Business", address="", mobile="")
+    plan = tenant_query(SubscriptionPlan).filter_by(id=customer.subscription_plan_id).first()
+    currency = plan.currency if plan else 'USD'
+    rate = fx.get_rate(current_tenant_id(), currency, settings.reporting_currency, as_of=datetime.utcnow())
+    return currency, rate
+
+
+def _collect_customer_payment(customer, amount, user, method, reference, first_payment_id):
+    """A collector took `amount` from the customer: mark their uncollected
+    bills collected oldest first (the clicked one first); the last one may be
+    collected in part. No split and no balance change until it's confirmed --
+    same as collecting a single card. Returns how many bills it touched."""
+    now = datetime.utcnow()
+    remaining = amount
+    count = 0
+    for bill in _bills_starting_with(_open_bills(customer, uncollected_only=True), first_payment_id):
+        if remaining <= _MONEY_EPS:
+            break
+        take = min(remaining, float(bill.amount))
+        bill.collected = True
+        bill.collected_amount = round(take, 4)
+        bill.collected_at = now
+        bill.collected_by_id = user.id
+        _apply_method(bill, method, reference)
+        remaining -= take
+        count += 1
+    return count
+
+
+def _customer_money_request(customer_id):
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
+    user = User.query.filter_by(username=get_jwt_identity()).first()
+    return customer, user
+
+
+@app.route('/api/customers/<int:customer_id>/receive-payment', methods=['POST'])
+@jwt_required()
+def receive_customer_payment(customer_id):
+    """One amount for the whole customer instead of card by card.
+    action 'pay' (admin/finance) confirms it straight away; 'collect'
+    (collector/cashier too) records it as collected, awaiting confirmation."""
+    customer, user = _customer_money_request(customer_id)
+    if not customer:
+        return jsonify({'message': 'Customer not found!'}), 404
+    data = request.json or {}
+    roles = _jwt_roles()
+    is_admin_or_finance = 'admin' in roles or 'finance' in roles
+    action = data.get('action', 'pay')
+    if action not in ('pay', 'collect'):
+        return jsonify({'message': "action must be 'pay' or 'collect'."}), 400
+    if action == 'pay' and not is_admin_or_finance:
+        return jsonify({'message': 'Only finance or admin can confirm money as received.'}), 403
+    if action == 'collect' and not (is_admin_or_finance or 'collector' in roles or 'cashier' in roles):
+        return jsonify({'message': 'Unauthorized to collect payments.'}), 403
+    try:
+        amount = _parse_positive_amount(data.get('amount'))
+    except ValueError as ve:
+        return jsonify({'message': str(ve)}), 400
+    method = (data.get('method') or 'cash').strip().lower()
+    if method not in PAYMENT_METHODS_STAFF_SETTABLE:
+        return jsonify({'message': "method must be 'cash' or 'whish_transfer'."}), 400
+    reference = (data.get('reference') or '').strip()[:64] or None
+    first_payment_id = data.get('first_payment_id')
+
+    try:
+        if action == 'collect':
+            owed = sum(float(b.amount) for b in _open_bills(customer, uncollected_only=True))
+            if amount > owed + _MONEY_EPS:
+                return jsonify({'message': f'That is more than this customer owes (${owed:.2f}). '
+                                           f'Collect up to that amount; record any extra at the office.'}), 400
+            count = _collect_customer_payment(customer, amount, user, method, reference, first_payment_id)
+            db.session.commit()
+            unconfirmed = db.session.query(func.coalesce(func.sum(Payment.collected_amount), 0.0)).filter_by(
+                customer_id=customer.id, collected=True, paid=False).scalar()
+            send_whatsapp_message(customer, event_type='payment_paid',
+                                  context={'amount': amount, 'balance': float(customer.balance) + float(unconfirmed)})
+            return jsonify({'message': f'Collected ${amount:.2f} across {count} bill(s); awaiting confirmation.',
+                            'bills': count, 'customer_new_balance': float(customer.balance)}), 200
+
+        method_label = ' (Whish transfer)' if method == 'whish_transfer' else ''
+        _note_balance_reason(customer, f"Payment received ${amount:.2f}{method_label}")
+        try:
+            count, credit = _receive_customer_payment(customer, amount, user, method, reference, first_payment_id)
+        except fx.FxRateMissingError:
+            db.session.rollback()
+            return jsonify({'message': 'No exchange rate on file for this customer\'s currency; '
+                                       'enter one under Settings -> Exchange Rates first.'}), 400
+        db.session.commit()
+        mikrotik = _maybe_restore_mikrotik_access(customer)
+        msg = f'Received ${amount:.2f}: {count} bill(s) paid'
+        if credit:
+            msg += f', ${credit:.2f} kept as credit'
+        return jsonify({'message': msg + '.', 'bills': count, 'credit_added': credit,
+                        'amount_received_in_this_transaction': amount,
+                        'customer_new_balance': float(customer.balance), 'mikrotik': mikrotik}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/customers/<int:customer_id>/confirm-collected', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def confirm_collected_payments(customer_id):
+    """Confirm every collected-but-unconfirmed bill of this customer at once:
+    in full when the collected amount covers it, otherwise in part (the rest
+    stays a new unpaid bill) -- the same thing Confirm Receipt does per card."""
+    customer, user = _customer_money_request(customer_id)
+    if not customer:
+        return jsonify({'message': 'Customer not found!'}), 404
+    bills = [b for b in _open_bills(customer) if b.collected]
+    if not bills:
+        return jsonify({'message': 'Nothing collected is waiting for confirmation.'}), 400
+    try:
+        total = 0.0
+        _note_balance_reason(customer, f"Collected payments confirmed (${sum(float(b.collected_amount or b.amount) for b in bills):.2f})")
+        with db.session.no_autoflush:  # one statement row for the whole confirmation
+            for bill in bills:
+                total += _confirm_bill(bill, customer, user, portion=float(bill.collected_amount or bill.amount))
+        db.session.flush()
+        apply_customer_balance_to_unpaid_payments(customer)
+        db.session.commit()
+        mikrotik = _maybe_restore_mikrotik_access(customer)
+        return jsonify({'message': f'Confirmed ${total:.2f} across {len(bills)} bill(s).', 'bills': len(bills),
+                        'amount_received_in_this_transaction': total,
+                        'customer_new_balance': float(customer.balance), 'mikrotik': mikrotik}), 200
+    except Exception as e:
+        db.session.rollback()
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/customers/<int:customer_id>/balance-log', methods=['GET'])
+@jwt_required()
+@subscription_desk_required()
+def get_customer_balance_log(customer_id):
+    if not tenant_query(Customer).filter_by(id=customer_id).first():
+        return jsonify({'message': 'Customer not found!'}), 404
+    logs = tenant_query(BalanceLog).filter_by(customer_id=customer_id).order_by(
+        BalanceLog.created_at.desc(), BalanceLog.id.desc()).all()
+    return jsonify([l.to_dict() for l in logs]), 200
+
+
+def _lost_credit_rows_query():
+    """Bills the pre-fix settlement paid automatically -- each of which also
+    took its amount off the balance a second time. Paid, a real bill, no staff
+    member / collector / Whish behind it, not settled by the fixed code, not
+    reverted, and not reviewed yet. received_by_id has been set by every staff
+    "paid" path since the first commit, so this pattern means auto-settled."""
+    return tenant_query(Payment).filter(
+        Payment.paid == True,
+        Payment.pre_payment.isnot(True),
+        Payment.is_gratis == False,
+        Payment.is_refund == False,
+        Payment.reverted_at.is_(None),
+        Payment.received_by_id.is_(None),
+        Payment.collected_by_id.is_(None),
+        Payment.collected_via.is_(None),
+        Payment.settled_from_credit == False,
+        Payment.credit_review.is_(None),
+        # The old settlement always stamped paid_at and never touched
+        # `collected`; moving a customer under a reseller closes their bills
+        # with collected=True / collected_amount=0 and nobody recorded --
+        # that's a debt transfer, not lost credit.
+        Payment.paid_at.isnot(None),
+        Payment.collected.isnot(True),
+    )
+
+
+@app.route('/api/customers/credit-review', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_credit_review():
+    rows = _lost_credit_rows_query().options(db.joinedload(Payment.customer)).order_by(
+        Payment.customer_id, Payment.date).all()
+    by_customer = {}
+    for p in rows:
+        c = by_customer.setdefault(p.customer_id, {
+            'customer_id': p.customer_id,
+            'customer_name': p.customer.name if p.customer else 'Unknown',
+            'balance': float(p.customer.balance or 0) if p.customer else 0.0,
+            'suggested_credit': 0.0,
+            'bills': [],
+        })
+        c['suggested_credit'] = round(c['suggested_credit'] + float(p.amount), 4)
+        c['bills'].append({'id': p.id, 'amount': float(p.amount), 'date': p.date.strftime('%Y-%m-%d'),
+                           'settled_at': p.paid_at.strftime('%Y-%m-%d') if p.paid_at else None})
+    customers = sorted(by_customer.values(), key=lambda c: -c['suggested_credit'])
+    return jsonify({'customers': customers, 'count': len(customers)}), 200
+
+
+@app.route('/api/customers/<int:customer_id>/credit-review', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def resolve_credit_review(customer_id):
+    """restore: give back what the old settlement took twice; dismiss: mark
+    reviewed with no change (e.g. the balance was already fixed by hand)."""
+    customer = tenant_query(Customer).filter_by(id=customer_id).first()
+    if not customer:
+        return jsonify({'message': 'Customer not found!'}), 404
+    action = (request.json or {}).get('action')
+    if action not in ('restore', 'dismiss'):
+        return jsonify({'message': "action must be 'restore' or 'dismiss'."}), 400
+    rows = _lost_credit_rows_query().filter(Payment.customer_id == customer_id).all()
+    if not rows:
+        return jsonify({'message': 'Nothing to review for this customer.'}), 400
+    total = round(sum(float(p.amount) for p in rows), 4)
+    try:
+        for p in rows:
+            p.credit_review = 'restored' if action == 'restore' else 'dismissed'
+        if action == 'restore':
+            _note_balance_reason(customer, f"Correction: credit lost to auto-settlement restored (${total:.2f})")
+            customer.balance = float(customer.balance or 0) + total
+            db.session.flush()
+            apply_customer_balance_to_unpaid_payments(customer)
+        db.session.commit()
+        return jsonify({'message': (f'Restored ${total:.2f} to {customer.name}.' if action == 'restore'
+                                    else f'Marked {customer.name} as reviewed.'),
+                        'customer_new_balance': float(customer.balance)}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
 
 
 @app.route('/api/payments/<int:payment_id>/method', methods=['PUT'])
@@ -6538,7 +6930,10 @@ def get_monthly_revenue():
         Payment.is_gratis == False,
         # Prepayments count as revenue -- see
         # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-        Payment.is_refund == False
+        Payment.is_refund == False,
+        # A bill paid from existing credit isn't new money: the prepayment that
+        # created the credit was already counted.
+        Payment.settled_from_credit.isnot(True),
     ).group_by('month').all()
 
     # Get expenses (exclude credit purchases)
@@ -8087,7 +8482,7 @@ def get_dashboard_metrics():
 
     # Prepayments count as revenue -- see
     # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-    revenue_query = tenant_query(Payment).filter_by(paid=True)
+    revenue_query = tenant_query(Payment).filter_by(paid=True).filter(Payment.settled_from_credit.isnot(True))  # credit already counted
     if start_date:
         revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
     if end_date:
@@ -9265,7 +9660,8 @@ def get_revenue_report():
         end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if end_date_str else None
 
         # Revenue = when the payment was actually paid, not when it was billed/due.
-        query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False, Payment.is_refund == False).options(
+        query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False, Payment.is_refund == False,
+                                             Payment.settled_from_credit.isnot(True)).options(  # credit already counted
             db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
         )
         if start_date:
@@ -10349,6 +10745,7 @@ def get_financial_report():
             Payment.paid == True,
             Payment.is_gratis == False,
             Payment.is_refund == False,
+            Payment.settled_from_credit.isnot(True),  # the prepayment behind it was already counted
             func.coalesce(Payment.paid_at, Payment.date) >= start_date,
             func.coalesce(Payment.paid_at, Payment.date) <= end_date
         ).group_by('month').all()

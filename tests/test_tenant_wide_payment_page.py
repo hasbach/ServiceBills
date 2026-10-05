@@ -292,12 +292,14 @@ def test_success_no_debt_entire_amount_is_prepayment(client, app):
         assert float(customer.balance) == 15.0
 
 
-def test_success_never_partially_marks_a_single_payment(client, app):
+def test_success_leftover_credit_settles_part_of_the_next_bill(client, app):
     # Two unpaid Payments of 40.0 each; attempt.amount == 50.0 -> the older
-    # one is paid in full (40.0 applied), the remaining 10.0 becomes a
-    # prepayment -- the second unpaid Payment is left untouched, never
-    # partially reduced. Mirrors apply_customer_balance_to_unpaid_payments's
-    # existing all-or-nothing-per-row behavior (app.py:1358).
+    # one is paid in full by the Whish payment, the remaining 10.0 is recorded
+    # as a prepayment, and that credit then settles 10.0 of the second bill
+    # (split: 10.0 paid from credit + a 30.0 unpaid remainder), so the open
+    # cards add up to what the balance says is owed. (This used to leave the
+    # second bill untouched at 40.0 next to a -30.0 balance -- see
+    # docs/superpowers/specs/2026-10-05-receive-payment-and-statement-design.md.)
     _make_branded_tenant(app, client, "Biz Success4")
     _enable_whish(app, "Biz Success4")
     customer_id = _add_customer(app, "Biz Success4", "Nadia", "70123456")
@@ -319,12 +321,13 @@ def test_success_never_partially_marks_a_single_payment(client, app):
         p1 = appmod.db.session.get(appmod.Payment, p1_id)
         p2 = appmod.db.session.get(appmod.Payment, p2_id)
         assert p1.paid is True
-        assert p2.paid is False  # left untouched, not partially reduced
+        assert p2.paid is True and p2.settled_from_credit is True and float(p2.amount) == 10.0
+        remainder = appmod.Payment.query.filter_by(customer_id=customer_id, paid=False).one()
+        assert float(remainder.amount) == 30.0
         prepayment = appmod.Payment.query.filter_by(customer_id=customer_id, pre_payment=True).first()
         assert float(prepayment.amount) == 10.0
         # -80 debt, 40 paid off + 10 prepayment credited = -80 + 50 = -30 --
-        # still owed on the untouched second Payment, exactly as p2 (still
-        # unpaid, still 40.0) implies.
+        # exactly the 30.0 remainder still open.
         customer = appmod.db.session.get(appmod.Customer, customer_id)
         assert float(customer.balance) == -30.0
 

@@ -398,7 +398,9 @@ def test_financial_report_opted_out_tenant_reports_usd(app, client):
     with app.app_context():
         expected = sum(
             float(p.amount) for p in appmod.Payment.query.filter_by(
-                customer_id=customer_id, paid=True, is_gratis=False, is_refund=False)
+                customer_id=customer_id, paid=True, is_gratis=False, is_refund=False,
+                # paid from the prepayment's credit -- that money is already counted
+                settled_from_credit=False)
         )
     assert body['totals']['income'] == pytest.approx(expected)
     assert expected >= 42.0

@@ -10,9 +10,11 @@ const money = (v) => `${v < 0 ? '-' : ''}$${Math.abs(v).toFixed(2)}`;
  * Every change of a reseller's / supplier's balance: what it was, what it
  * became, and why. `load` is a () => Promise<axios response> (e.g.
  * () => apiService.getSupplierBalanceLog(id)); re-mount with a new `key` to
- * refetch after an action changes the balance.
+ * refetch after an action changes the balance. `increaseIsGood`: a rising
+ * balance is money in (customers) rather than more owed (resellers,
+ * suppliers), which flips the change colour.
  */
-function BalanceLogTable({ load }) {
+function BalanceLogTable({ load, increaseIsGood = false }) {
     const [rows, setRows] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
@@ -57,7 +59,7 @@ function BalanceLogTable({ load }) {
                             <TableCell sx={{ whiteSpace: 'nowrap' }}>{new Date(r.date).toLocaleString()}</TableCell>
                             <TableCell>{r.reason}</TableCell>
                             <TableCell align="right">{money(r.balance_before)}</TableCell>
-                            <TableCell align="right" sx={{ fontWeight: 600, whiteSpace: 'nowrap', color: r.change > 0 ? 'error.main' : 'success.main' }}>
+                            <TableCell align="right" sx={{ fontWeight: 600, whiteSpace: 'nowrap', color: (r.change > 0) !== increaseIsGood ? 'error.main' : 'success.main' }}>
                                 {r.change > 0 ? '+' : ''}{money(r.change)}
                             </TableCell>
                             <TableCell align="right" sx={{ fontWeight: 700 }}>{money(r.balance_after)}</TableCell>
