@@ -1071,6 +1071,64 @@ def get_or_create_payroll_category(tenant_id):
     return category
 
 
+_MONEY_ACCOUNTS = ('cash', 'whish')
+
+
+class CashEntry(db.Model):
+    """A manual cash-in (money received that isn't a customer/reseller payment)
+    on the cash box or the Whish account. Feeds the Daily Cash flow."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    account = db.Column(db.String(10), nullable=False)  # 'cash' | 'whish'
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    reason = db.Column(db.String(200), nullable=False)
+    # Typed calendar date at midnight, same convention as Expense.date.
+    date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    created_by = db.relationship('User', foreign_keys=[created_by_id], lazy=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'account': self.account,
+            'amount': float(self.amount),
+            'reason': self.reason,
+            'date': self.date.strftime('%Y-%m-%d'),
+            'created_by': self.created_by.username if self.created_by else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AccountTransfer(db.Model):
+    """Money moved between the cash box and the Whish account. Not income or
+    expense: it moves each channel's balance but not the combined total."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    from_account = db.Column(db.String(10), nullable=False)
+    to_account = db.Column(db.String(10), nullable=False)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    note = db.Column(db.String(200), nullable=True)
+    date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    created_by = db.relationship('User', foreign_keys=[created_by_id], lazy=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'from_account': self.from_account,
+            'to_account': self.to_account,
+            'amount': float(self.amount),
+            'note': self.note,
+            'date': self.date.strftime('%Y-%m-%d'),
+            'created_by': self.created_by.username if self.created_by else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class Expense(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -10478,8 +10536,13 @@ def get_collector_progress():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-_CASH_IN_CATEGORIES = ('Customer payments', 'Reseller collections')
-_CASH_OUT_CATEGORIES = ('Expenses', 'Payroll', 'Supplier payments', 'Upstream top-ups', 'Customer refunds')
+_CASH_IN_CATEGORIES = ('Customer payments', 'Reseller collections', 'Manual cash-in',
+                       'Transfer from Cash', 'Transfer from Whish')
+_CASH_OUT_CATEGORIES = ('Expenses', 'Payroll', 'Supplier payments', 'Upstream top-ups', 'Customer refunds',
+                        'Transfer to Whish', 'Transfer to Cash')
+# Moves between the two accounts: shown per channel and in running balances,
+# left out of the combined in/out/net (they net to zero overall).
+_TRANSFER_CATEGORIES = ('Transfer from Cash', 'Transfer from Whish', 'Transfer to Whish', 'Transfer to Cash')
 _WHISH_VIA = ('whish', 'whish_transfer')
 
 
@@ -10566,6 +10629,17 @@ def _cash_flow_entries(win_start, win_end, offset):
         out.append(('cash', 'out', 'Payroll', local_day(sal.payment_date, True), float(sal.amount),
                     stamp(sal.payment_date, True), name))
 
+    for ce in tenant_query(CashEntry).filter(CashEntry.date >= win_start, CashEntry.date < win_end).all():
+        out.append((channel(ce.account), 'in', 'Manual cash-in', local_day(ce.date, True), float(ce.amount),
+                    stamp(ce.date, True), ce.reason))
+
+    for tr in tenant_query(AccountTransfer).filter(
+            AccountTransfer.date >= win_start, AccountTransfer.date < win_end).all():
+        src, dst = channel(tr.from_account), channel(tr.to_account)
+        ld, ts, amt = local_day(tr.date, True), stamp(tr.date, True), float(tr.amount)
+        out.append((src, 'out', f"Transfer to {dst.capitalize()}", ld, amt, ts, tr.note or ''))
+        out.append((dst, 'in', f"Transfer from {src.capitalize()}", ld, amt, ts, tr.note or ''))
+
     for up in tenant_query(UpstreamProviderPayment).filter(
             UpstreamProviderPayment.type == 'balance_topup',
             UpstreamProviderPayment.date >= win_start, UpstreamProviderPayment.date < win_end).all():
@@ -10611,17 +10685,22 @@ def _cash_flow_for_day(day, day_start_utc, settings):
                               'total': round(sum(x['amount'] for x in entries), 4), 'entries': entries})
         return {'total': round(sum(i['total'] for i in items), 4), 'items': items}
 
+    def transfer_total(direction):
+        return sum(i['total'] for ch in ('cash', 'whish') for i in summarize(ch, direction)['items']
+                   if i['category'] in _TRANSFER_CATEGORIES)
+
     cash_in, cash_out = summarize('cash', 'in'), summarize('cash', 'out')
     whish_in, whish_out = summarize('whish', 'in'), summarize('whish', 'out')
     net = round(cash_in['total'] - cash_out['total'], 4)
     whish_net = round(whish_in['total'] - whish_out['total'], 4)
+    total_in = round(cash_in['total'] + whish_in['total'] - transfer_total('in'), 4)
+    total_out = round(cash_out['total'] + whish_out['total'] - transfer_total('out'), 4)
     result = {
         'day': day.isoformat(),
         'cash_in': cash_in, 'cash_out': cash_out, 'net': net,
         'whish_in': whish_in, 'whish_out': whish_out, 'whish_net': whish_net,
-        'total_in': round(cash_in['total'] + whish_in['total'], 4),
-        'total_out': round(cash_out['total'] + whish_out['total'], 4),
-        'total_net': round(net + whish_net, 4),
+        'total_in': total_in, 'total_out': total_out,
+        'total_net': round(total_in - total_out, 4),
         'opening': ({'date': opening_date.isoformat(), 'amount': float(opening_cash),
                      'whish_amount': opening_whish} if has_opening else None),
         'cash_start': None, 'cash_end': None,
@@ -10638,6 +10717,120 @@ def _cash_flow_for_day(day, day_start_utc, settings):
             'total_end': round(cash_start + whish_start + net + whish_net, 4),
         })
     return result
+
+
+def _parse_money_form(data):
+    """(amount, date, error) shared by the cash-entry / transfer endpoints."""
+    try:
+        amount = float(data.get('amount'))
+    except (TypeError, ValueError):
+        return None, None, 'Amount must be a number.'
+    if not (0 < amount < float('inf')):
+        return None, None, 'Amount must be greater than zero.'
+    raw_date = data.get('date')
+    try:
+        date = (datetime.strptime(raw_date, '%Y-%m-%d') if raw_date
+                else datetime.combine(datetime.utcnow().date(), datetime.min.time()))
+    except (TypeError, ValueError):
+        return None, None, 'Use date YYYY-MM-DD.'
+    return amount, date, None
+
+
+def _dated_list(model):
+    query = tenant_query(model)
+    try:
+        if request.args.get('start_date'):
+            query = query.filter(model.date >= datetime.strptime(request.args['start_date'][:10], '%Y-%m-%d'))
+        if request.args.get('end_date'):  # inclusive of the whole end day
+            query = query.filter(model.date < datetime.strptime(request.args['end_date'][:10], '%Y-%m-%d')
+                                 + timedelta(days=1))
+    except ValueError:
+        return jsonify({'error': 'Use dates as YYYY-MM-DD.'}), 400
+    return jsonify([r.to_dict() for r in query.order_by(model.date.desc(), model.id.desc()).all()])
+
+
+@app.route('/api/cash-entries', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_cash_entries():
+    return _dated_list(CashEntry)
+
+
+@app.route('/api/cash-entries', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def add_cash_entry():
+    data = request.get_json(silent=True) or {}
+    account = data.get('account')
+    if account not in _MONEY_ACCOUNTS:
+        return jsonify({'error': "Account must be 'cash' or 'whish'."}), 400
+    reason = data.get('reason')
+    reason = reason.strip() if isinstance(reason, str) else ''
+    if not reason:
+        return jsonify({'error': 'A reason is required.'}), 400
+    amount, date, err = _parse_money_form(data)
+    if err:
+        return jsonify({'error': err}), 400
+    user = _current_user()
+    entry = new_for_tenant(CashEntry, account=account, amount=amount, reason=reason[:200], date=date,
+                      created_by_id=user.id if user else None)
+    db.session.add(entry)
+    db.session.commit()
+    return jsonify(entry.to_dict()), 201
+
+
+@app.route('/api/cash-entries/<int:entry_id>', methods=['DELETE'])
+@jwt_required()
+@admin_required()
+def delete_cash_entry(entry_id):
+    entry = tenant_query(CashEntry).filter_by(id=entry_id).first()
+    if not entry:
+        return jsonify({'message': 'Cash entry not found!'}), 404
+    db.session.delete(entry)
+    db.session.commit()
+    return jsonify({'message': 'Cash entry deleted.'}), 200
+
+
+@app.route('/api/account-transfers', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def get_account_transfers():
+    return _dated_list(AccountTransfer)
+
+
+@app.route('/api/account-transfers', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def add_account_transfer():
+    data = request.get_json(silent=True) or {}
+    from_account, to_account = data.get('from_account'), data.get('to_account')
+    if from_account not in _MONEY_ACCOUNTS or to_account not in _MONEY_ACCOUNTS:
+        return jsonify({'error': "Accounts must be 'cash' or 'whish'."}), 400
+    if from_account == to_account:
+        return jsonify({'error': 'From and to accounts must differ.'}), 400
+    amount, date, err = _parse_money_form(data)
+    if err:
+        return jsonify({'error': err}), 400
+    note = data.get('note')
+    note = note.strip()[:200] if isinstance(note, str) and note.strip() else None
+    user = _current_user()
+    transfer = new_for_tenant(AccountTransfer, from_account=from_account, to_account=to_account, amount=amount,
+                               note=note, date=date, created_by_id=user.id if user else None)
+    db.session.add(transfer)
+    db.session.commit()
+    return jsonify(transfer.to_dict()), 201
+
+
+@app.route('/api/account-transfers/<int:transfer_id>', methods=['DELETE'])
+@jwt_required()
+@admin_required()
+def delete_account_transfer(transfer_id):
+    transfer = tenant_query(AccountTransfer).filter_by(id=transfer_id).first()
+    if not transfer:
+        return jsonify({'message': 'Transfer not found!'}), 404
+    db.session.delete(transfer)
+    db.session.commit()
+    return jsonify({'message': 'Transfer deleted.'}), 200
 
 
 @app.route('/api/reports/cash-opening', methods=['PUT'])

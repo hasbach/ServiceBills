@@ -116,4 +116,17 @@ describe('DailyCashFlowSection', () => {
         expect(screen.getByLabelText(/Cash on hand at start of that day/i)).toBeInTheDocument();
         expect(screen.getByLabelText(/Whish balance at start of that day/i)).toBeInTheDocument();
     });
+    it('flags the combined breakdown when transfers are present', () => {
+        const withTransfer = {
+            ...mockFlow,
+            cash_out: { total: 70, items: [...mockFlow.cash_out.items,
+                { category: 'Transfer to Whish', count: 1, total: 40, entries: [] }] },
+            whish_in: { total: 90, items: [...mockFlow.whish_in.items,
+                { category: 'Transfer from Cash', count: 1, total: 40, entries: [] }] },
+        };
+        const { rerender } = render(<DailyCashFlowSection flow={mockFlow} currency="USD" />);
+        expect(screen.queryByText(/incl\. transfers/)).not.toBeInTheDocument();
+        rerender(<DailyCashFlowSection flow={withTransfer} currency="USD" />);
+        expect(screen.getAllByText(/incl\. transfers/)).toHaveLength(2);
+    });
 });
