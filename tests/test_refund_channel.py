@@ -6,11 +6,14 @@ from datetime import datetime
 from tests.conftest import make_tenant
 from app import app as flask_app, db, Payment, Customer
 from tests.test_daily_cash_report import _make_plan, _make_customer, _unpaid_payment_id
-from tests.test_daily_cash_flow import _flow, _utc_range, _tenant_id, _totals
+from tests.test_daily_cash_flow import _tenant_id, _totals
+from tests.test_day_close import _flow as _day_flow, _today as _business_today
 
 
-def _today():
-    return datetime.utcnow().strftime("%Y-%m-%d")
+def _todays_flow(client, hdr):
+    """Cash flow for the business's own today (Asia/Beirut), the day a refund
+    issued now lands on -- not the UTC date, which differs after local midnight."""
+    return _day_flow(client, hdr, _business_today())
 
 
 def _paid_row(tid, cust, amount, **kw):
@@ -45,7 +48,7 @@ def test_cash_refund_goes_out_of_cash(app, client):
     body = _refund(client, a, pid, amount=15)
     assert body["paid_via"] == "cash" and body["currency"] == "USD"
 
-    flow = _flow(client, a, _utc_range(_today()))
+    flow = _todays_flow(client, a)
     assert _totals(flow["cash_out"]).get("Customer refunds") == 15
     assert "Customer refunds" not in _totals(flow["whish_out"])
 
@@ -58,7 +61,7 @@ def test_whish_payment_refund_defaults_to_whish(app, client):
         pid = _paid_row(tid, cust, 20, collected_via=via)
         assert _refund(client, a, pid)["paid_via"] == "whish"
 
-    flow = _flow(client, a, _utc_range(_today()))
+    flow = _todays_flow(client, a)
     assert _totals(flow["whish_out"]).get("Customer refunds") == 40
     assert "Customer refunds" not in _totals(flow["cash_out"])
 
@@ -84,7 +87,7 @@ def test_refund_channel_can_be_overridden_and_is_validated(app, client):
     r = client.post(f"/api/payments/{cash_pid}/refund", headers=a, json={"reason": "x", "paid_via": "card"})
     assert r.status_code == 400
 
-    flow = _flow(client, a, _utc_range(_today()))
+    flow = _todays_flow(client, a)
     assert _totals(flow["cash_out"]).get("Customer refunds") == 20
     assert _totals(flow["whish_out"]).get("Customer refunds") == 30
 
@@ -102,7 +105,7 @@ def test_refund_copies_currency_and_fx(app, client):
         assert row.currency == "LBP"
         assert float(row.fx_rate_to_reporting) == 0.00001
 
-    flow = _flow(client, a, _utc_range(_today()))
+    flow = _todays_flow(client, a)
     assert _totals(flow["cash_out"])["Customer refunds"] == 4.5
 
 
@@ -130,7 +133,7 @@ def test_reverting_a_refund_credits_the_balance_back(app, client):
     assert client.delete(f"/api/payments/{refund_id}", headers=a).status_code == 200
     assert _balance(cust) == before
 
-    flow = _flow(client, a, _utc_range(_today()))
+    flow = _todays_flow(client, a)
     assert "Customer refunds" not in _totals(flow["cash_out"])
 
 
