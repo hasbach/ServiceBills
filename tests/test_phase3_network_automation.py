@@ -283,3 +283,30 @@ def test_concurrency_semaphore_returns_clear_error_when_exhausted():
         assert "too many" in result.lower() or "in progress" in result.lower()
     finally:
         sem.release()
+
+
+# --- Failed checks must not keep one transaction open for the whole run ------
+
+def test_auto_sync_failed_checks_end_their_transaction(app, client, monkeypatch):
+    """Regression (2026-10-06): the failure `continue` skipped the commit, so a
+    run of failing portal checks shared one transaction for hours and its read
+    locks blocked a deploy-time ALTER TABLE. Each check must start fresh."""
+    hdr = make_tenant(client, "Biz Leak", "leak_admin")
+    _setup_bridged_customer(client, hdr, upstream_username="leak1", name="A")
+    _setup_bridged_customer(client, hdr, upstream_username="leak2", name="B")
+    _setup_bridged_customer(client, hdr, upstream_username="leak3", name="C")
+
+    seen = []
+    def failing_get_status(provider, username):
+        seen.append(appmod.db.session().get_transaction())
+        return False, "portal down"
+    monkeypatch.setattr(appmod.upstream_portal, "get_subscriber_status", failing_get_status)
+
+    with app.app_context():
+        tenant = appmod.Tenant.query.filter_by(name="Biz Leak").first()
+        _enable_automation(app, tenant.id)
+        appmod.auto_sync_upstream_status_for_tenant(tenant.id)
+        assert not appmod.db.session().in_transaction()
+
+    assert len(seen) == 3
+    assert len({id(t) for t in seen}) == 3, "each customer's check must run in its own transaction"
