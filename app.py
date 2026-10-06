@@ -2261,6 +2261,8 @@ def _customer_entry_label(p, change):
     if not paid_hist.has_changes():
         return None
     if not p.paid:
+        if p.is_refund:
+            return f"Refund reverted ({when})"
         return f"Payment reverted (bill of {when})"
     if p.is_gratis:
         return f"Bill forgiven (gratis, {when})"
@@ -5513,6 +5515,7 @@ def get_payments():
             'id': p.id,
             'customer_id': p.customer_id,
             'amount': float(p.amount),
+            'currency': p.currency,
             'paid': p.paid,
             'date': p.date.strftime('%Y-%m-%d'),
             'paid_at': p.paid_at.strftime('%Y-%m-%d %H:%M:%S') if p.paid_at else None,
@@ -5528,6 +5531,7 @@ def get_payments():
             'is_gratis': p.is_gratis,
             'gratis_note': p.gratis_note,
             'is_refund': p.is_refund,
+            'refund_reason': p.refund_reason,
             'settled_from_credit': bool(p.settled_from_credit),
             'reverted_at': p.reverted_at.strftime('%Y-%m-%d %H:%M:%S') if p.reverted_at else None,
             'reverted_by': p.reverted_by.username if p.reverted_by else None,
@@ -5626,8 +5630,9 @@ def delete_payment(payment_id):
                 customer.balance += payment.amount
             else:
                 customer.balance -= payment.amount
-        else:
+        elif not getattr(payment, 'is_refund', False):
             # If the payment was unpaid, removing it means increasing the customer's balance (less owed)
+            # (an unpaid refund is a reverted one -- its balance effect is already undone)
             customer.balance += payment.amount
 
         _detach_payment_dependents(payment)
@@ -5738,6 +5743,7 @@ def customer_whish_payments_report():
         received_at = func.coalesce(Payment.collected_at, Payment.paid_at)
         transfers = tenant_query(Payment).filter(
             Payment.collected_via == 'whish_transfer',
+            Payment.is_refund.isnot(True),
             _payment_not_reverted(),
         ).options(db.joinedload(Payment.customer))
         if start_date:
@@ -5888,6 +5894,10 @@ def mark_payment_as_paid(payment_id):
     if not customer:
         db.session.rollback()
         return jsonify({'message': 'Customer not found for this payment!'}), 404
+
+    if payment.is_refund:
+        # Only refund_payment settles a refund; a reverted one stays voided.
+        return jsonify({'message': 'A refund cannot be marked paid -- issue a new refund instead.'}), 400
 
     try:
         action = data.get('action', 'pay') # 'collect' or 'pay'
@@ -6492,7 +6502,12 @@ def revert_payment(payment_id):
         # Settling a payment -- paid or gratis -- always credits the balance
         # (collecting cash and forgiving the debt both clear what was owed);
         # reverting always debits it back, regardless of which one it was.
-        customer.balance -= payment.amount
+        # A refund is the mirror image: issuing it debited the balance, so
+        # undoing it credits the amount back.
+        if payment.is_refund:
+            customer.balance += payment.amount
+        else:
+            customer.balance -= payment.amount
 
         payment.paid = False
         payment.paid_at = None
@@ -6502,8 +6517,9 @@ def revert_payment(payment_id):
         payment.collected_by_id = None
         payment.collected_amount = None
         # A staff-set Whish-transfer mark belongs to the collection being
-        # undone; gateway ('whish') history is left alone.
-        if payment.collected_via == 'whish_transfer':
+        # undone; gateway ('whish') history is left alone. A refund keeps its
+        # channel -- it records how the (now voided) payout was made.
+        if payment.collected_via == 'whish_transfer' and not payment.is_refund:
             payment.collected_via = None
             payment.whish_transaction_number = None
         payment.is_gratis = False
@@ -6564,6 +6580,15 @@ def refund_payment(payment_id):
     if closed:
         return closed
 
+    # How the money went back: cash, or a transfer to the customer's Whish.
+    # Defaults to however the original came in. Stored on collected_via like
+    # a staff-marked Whish transfer, so the cash flow books it on the right
+    # account.
+    try:
+        paid_via = _paid_via(data, 'whish' if payment.collected_via in _WHISH_VIA else None) or 'cash'
+    except ValueError as ve:
+        return jsonify({'message': str(ve)}), 400
+
     customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
     if not customer:
         return jsonify({'message': 'Customer not found for this payment!'}), 404
@@ -6574,6 +6599,9 @@ def refund_payment(payment_id):
             Payment,
             customer_id=customer.id,
             amount=refund_amount,
+            # Same currency and locked rate as the money being given back.
+            currency=payment.currency,
+            fx_rate_to_reporting=payment.fx_rate_to_reporting,
             reason=f'Refund for payment #{payment.id}',
             date=now,
             paid=True,
@@ -6583,6 +6611,7 @@ def refund_payment(payment_id):
             refund_reason=reason,
             refunded_by_id=current_user.id,
             refunded_at=now,
+            collected_via='whish_transfer' if paid_via == 'whish' else None,
         )
         db.session.add(refund)
 
@@ -6598,6 +6627,8 @@ def refund_payment(payment_id):
             'refund_payment_id': refund.id,
             'original_payment_id': payment.id,
             'amount': float(refund_amount),
+            'currency': refund.currency,
+            'paid_via': paid_via,
             'reason': reason,
             'customer_new_balance': float(customer.balance)
         }), 201
@@ -6650,6 +6681,9 @@ def bulk_mark_payments_paid():
             if not customer:
                 failed.append({'id': payment.id, 'error': 'Customer not found for this payment'})
                 continue
+            if payment.is_refund and not payment.paid:
+                failed.append({'id': payment.id, 'error': 'A refund cannot be marked paid'})
+                continue
             just_settled = not payment.paid
             if just_settled:
                 _mark_payment_fully_paid(payment, customer, current_user)
@@ -6697,7 +6731,7 @@ def bulk_delete_payments():
                     customer.balance += payment.amount
                 else:
                     customer.balance -= payment.amount
-            else:
+            elif not getattr(payment, 'is_refund', False):  # unpaid refund = reverted, nothing to undo
                 customer.balance += payment.amount
             _detach_payment_dependents(payment)
             db.session.delete(payment)
@@ -10856,7 +10890,8 @@ def _cash_flow_entries(win_start, win_end, settings):
 
     Customer payments: Whish (payment link or a transfer to the business's
     Whish account) goes to the whish channel; cash follows
-    get_daily_cash_report's collector rules. A bill settled from existing
+    get_daily_cash_report's collector rules. Refunds go out of whichever account
+    they were paid from (collected_via, set by refund_payment). A bill settled from existing
     credit, gratis and reverted payments are not money moving at all.
     Everything else follows its own paid_via (NULL = cash). Each DayClose adds
     an over/short adjustment per account on its day."""
@@ -10884,7 +10919,8 @@ def _cash_flow_entries(win_start, win_end, settings):
         name = p.customer.name if p.customer else 'Unknown customer'
         made = p.paid_at
         if p.is_refund:
-            out.append(('cash', 'out', 'Customer refunds', local_day(t), amount, stamp(t), f"Refund to {name}", made))
+            ch = 'whish' if p.collected_via in _WHISH_VIA else 'cash'
+            out.append((ch, 'out', 'Customer refunds', local_day(t), amount, stamp(t), f"Refund to {name}", made))
         elif p.collected_via in _WHISH_VIA:
             how = 'payment link' if p.collected_via == 'whish' else 'transfer'
             out.append(('whish', 'in', 'Customer payments', local_day(t), amount, stamp(t),

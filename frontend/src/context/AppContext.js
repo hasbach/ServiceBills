@@ -278,6 +278,7 @@ const rawApiService = {
     resolveCreditReview: (customerId, action) => api.post(`/customers/${customerId}/credit-review`, { action }),
     markPaymentGratis: (paymentId, note) => api.put(`/payments/${paymentId}/mark_gratis`, { note }),
     revertPayment: (paymentId, reason) => api.put(`/payments/${paymentId}/revert`, { reason }),
+    refundPayment: (paymentId, { amount, reason, paid_via }) => api.post(`/payments/${paymentId}/refund`, { amount, reason, paid_via }),
     setPaymentMethod: (paymentId, method, reference) => api.put(`/payments/${paymentId}/method`, { method, reference }),
     cancelSubscription: (customerId) => api.put(`/customers/${customerId}/cancel_subscription`),
     activateSubscription: (customerId) => api.put(`/customers/${customerId}/activate_subscription`),
