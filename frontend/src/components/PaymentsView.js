@@ -104,8 +104,9 @@ function PaymentTotalsBar({ totals, loading }) {
 }
 
 // Revenue helpers — kept outside component so they are never recreated.
-// A refund row gives money back, so it subtracts.
-const revenueAmount = (p) => (p.is_refund ? -1 : 1) * (parseFloat(p.amount) || 0);
+// A refund row gives money back, so it subtracts; a gratis (forgiven) bill is
+// marked paid but brought no money in, so it adds nothing.
+const revenueAmount = (p) => (p.is_gratis ? 0 : (p.is_refund ? -1 : 1) * (parseFloat(p.amount) || 0));
 
 const getTotalRevenue = (payments) => {
     if (!Array.isArray(payments)) return 0;
