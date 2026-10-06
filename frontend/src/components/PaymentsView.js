@@ -61,6 +61,7 @@ import {
     Phone as PhoneIcon,
     Undo as UndoIcon,
     SwapHoriz as MethodIcon,
+    MoneyOff as RefundIcon,
     ContentCopy as ContentCopyIcon,
     Link as LinkIcon,
     Email as EmailIcon
@@ -301,13 +302,26 @@ const PrintableReceipt = React.forwardRef(({ receiptData }, ref) => {
 const canChangeMethod = (payment) =>
     (payment.collected || payment.paid) && !payment.is_gratis && !payment.is_refund && payment.collected_via !== 'whish';
 
+// Money that actually came in can be (partly) given back -- see refund_payment in app.py.
+const canRefund = (payment) => payment.paid && !payment.is_gratis && !payment.is_refund;
+
+// How a refund is paid out by default: the same way the money came in.
+const defaultRefundVia = (payment) =>
+    (payment.collected_via === 'whish' || payment.collected_via === 'whish_transfer') ? 'whish' : 'cash';
+
+// A refund row's channel lives on collected_via (see refund_payment in app.py).
+const refundChipLabel = (payment) =>
+    `Refund · ${payment.collected_via === 'whish_transfer' ? 'Whish' : 'Cash'}`;
+
+const EMPTY_REFUND = { open: false, payment: null, amount: '', paidVia: 'cash', reason: '' };
+
 // _PaymentCard — module-level so React.memo actually memoizes between renders.
 // All event-handler props are passed in via cardHandlers (stable useMemo object).
 // ─────────────────────────────────────────────────────────────────────────────
 const PaymentCardItem = React.memo(({
     payment,
     getStatusColor, getPaymentTypeColor,
-    openMarkPaidDialog, openMarkGratisDialog, openRevertDialog, openMethodDialog, handlePrepareReceipt, handleDeletePayment,
+    openMarkPaidDialog, openMarkGratisDialog, openRevertDialog, openMethodDialog, openRefundDialog, handlePrepareReceipt, handleDeletePayment,
     buildWhatsAppLink, waSettings, userRoles,
     twsEnabled, handleSendPaymentLink, sendLinkLoading,
 }) => {
@@ -376,7 +390,11 @@ const PaymentCardItem = React.memo(({
                         <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 1 }}>
                             <Chip label={payment.paid ? 'Paid' : (payment.collected ? (payment.collected_amount ? `Collected ($${payment.collected_amount.toFixed(2)})` : 'Collected') : 'Unpaid')} size="small"
                                 sx={{ backgroundColor: alpha(getStatusColor(payment.paid), 0.1), color: getStatusColor(payment.paid), fontWeight: 600, fontSize: '0.75rem', border: `1px solid ${alpha(getStatusColor(payment.paid), 0.2)}` }} />
-                            {payment.collected_via === 'whish_transfer' && (
+                            {payment.is_refund && (
+                                <Chip label={refundChipLabel(payment)} size="small" title={payment.refund_reason || ''}
+                                    sx={{ backgroundColor: alpha('#8B5CF6', 0.08), color: '#8B5CF6', fontWeight: 700, fontSize: '0.75rem', border: `1px solid ${alpha('#8B5CF6', 0.25)}` }} />
+                            )}
+                            {payment.collected_via === 'whish_transfer' && !payment.is_refund && (
                                 <Chip label="Whish transfer" size="small" title={payment.whish_transaction_number ? `Ref: ${payment.whish_transaction_number}` : ''}
                                     sx={{ mr: 0.5, backgroundColor: alpha('#E11D48', 0.08), color: '#E11D48', fontWeight: 700, fontSize: '0.75rem', border: `1px solid ${alpha('#E11D48', 0.25)}` }} />
                             )}
@@ -455,6 +473,11 @@ const PaymentCardItem = React.memo(({
                                 Method
                             </Button>
                         )}
+                        {isAdminOrFinance && canRefund(payment) && (
+                            <Button size="small" variant="outlined" startIcon={<RefundIcon />} onClick={() => openRefundDialog(payment)} sx={{ borderColor: alpha('#8B5CF6', 0.3), color: '#8B5CF6', '&:hover': { borderColor: '#8B5CF6', backgroundColor: alpha('#8B5CF6', 0.05) } }}>
+                                Refund
+                            </Button>
+                        )}
                         {payment.paid && isAdminOrFinance && (
                             <Button size="small" variant="outlined" startIcon={<UndoIcon />} onClick={() => openRevertDialog(payment)} sx={{ borderColor: alpha('#F59E0B', 0.3), color: '#F59E0B', '&:hover': { borderColor: '#F59E0B', backgroundColor: alpha('#F59E0B', 0.05) } }}>
                                 Revert
@@ -527,7 +550,12 @@ const PaymentListRow = React.memo(function PaymentListRow({
                             sx={{ bgcolor: alpha(theme.palette.info.main, 0.1), color: theme.palette.info.main, fontWeight: 700, border: `1px solid ${alpha(theme.palette.info.main, 0.25)}` }}
                         />
                     )}
-                    {payment.collected_via === 'whish_transfer' && (
+                    {payment.is_refund && (
+                        <Chip label={refundChipLabel(payment)} size="small" title={payment.refund_reason || ''}
+                            sx={{ bgcolor: alpha('#8B5CF6', 0.08), color: '#8B5CF6', fontWeight: 700, border: `1px solid ${alpha('#8B5CF6', 0.25)}` }}
+                        />
+                    )}
+                    {payment.collected_via === 'whish_transfer' && !payment.is_refund && (
                         <Chip label="Whish transfer" size="small" title={payment.whish_transaction_number ? `Ref: ${payment.whish_transaction_number}` : ''}
                             sx={{ bgcolor: alpha('#E11D48', 0.08), color: '#E11D48', fontWeight: 700, border: `1px solid ${alpha('#E11D48', 0.25)}` }}
                         />
@@ -578,6 +606,13 @@ const PaymentListRow = React.memo(function PaymentListRow({
                     <Tooltip title="Change payment method (cash / Whish transfer)">
                         <IconButton size="small" sx={{ color: '#E11D48' }} onClick={() => actions.openMethodDialog(payment)}>
                             <MethodIcon fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                )}
+                {isAdminOrFinance && canRefund(payment) && (
+                    <Tooltip title="Refund">
+                        <IconButton size="small" sx={{ color: '#8B5CF6' }} onClick={() => actions.openRefundDialog(payment)}>
+                            <RefundIcon fontSize="small" />
                         </IconButton>
                     </Tooltip>
                 )}
@@ -639,6 +674,9 @@ const PaymentsView = () => {
     const [methodDialog, setMethodDialog] = useState({ open: false, payment: null, method: 'cash', reference: '' });
     const [methodSubmitting, setMethodSubmitting] = useState(false);
     const [revertReason, setRevertReason] = useState('');
+    // Refund dialog: amount (up to the original), payout channel and reason.
+    const [refundDialog, setRefundDialog] = useState(EMPTY_REFUND);
+    const [refundSubmitting, setRefundSubmitting] = useState(false);
     const [revertSubmitting, setRevertSubmitting] = useState(false);
     const [waSettings, setWaSettings] = useState({ enabled: false, mode: 'deeplink', deeplink_msg_payment: 'Dear {customer_name}, your payment of ${amount} has been received. Thank you!', deeplink_msg_payment_link: 'Hi {customer_name}, here is your payment link: {pay_url}' });
     const [twsEnabled, setTwsEnabled] = useState(false);
@@ -1412,6 +1450,48 @@ const handlePrint = () => {
     */
 
     const totalRevenue = React.useMemo(() => getTotalRevenue(payments), [payments]);
+    const openRefundDialog = (payment) => {
+        setRefundDialog({
+            open: true, payment,
+            amount: String(payment.amount ?? ''),
+            paidVia: defaultRefundVia(payment),
+            reason: '',
+        });
+    };
+
+    const closeRefundDialog = () => setRefundDialog(EMPTY_REFUND);
+
+    const refundAmountError = (() => {
+        if (!refundDialog.payment) return '';
+        const amt = parseFloat(refundDialog.amount);
+        if (!(amt > 0)) return 'Enter an amount above 0.';
+        if (amt > (parseFloat(refundDialog.payment.amount) || 0) + 1e-9) return 'Cannot exceed the original payment.';
+        return '';
+    })();
+
+    const handleRefundPayment = async () => {
+        if (refundSubmitting || !refundDialog.payment || refundAmountError || !refundDialog.reason.trim()) return;
+        setRefundSubmitting(true);
+        try {
+            const response = await apiService.refundPayment(refundDialog.payment.id, {
+                amount: parseFloat(refundDialog.amount),
+                reason: refundDialog.reason.trim(),
+                paid_via: refundDialog.paidVia,
+            });
+            setSnackbar({ open: true, message: `${response.data.message} Paid out via ${refundDialog.paidVia === 'whish' ? 'Whish' : 'cash'}.`, severity: 'success' });
+            closeRefundDialog();
+            fetchPayments();
+            if (filters.customer_id) {
+                fetchCustomerBalance(filters.customer_id);
+            }
+        } catch (error) {
+            console.error("Error issuing refund:", error);
+            setSnackbar({ open: true, message: 'Failed to issue refund. ' + (error.response?.data?.error || error.response?.data?.message || error.message), severity: 'error' });
+        } finally {
+            setRefundSubmitting(false);
+        }
+    };
+
     const currentMonthRevenue = React.useMemo(() => getCurrentMonthRevenue(payments), [payments]);
 
     const isAdminOrFinanceRole = userRoles.includes('admin') || userRoles.includes('finance');
@@ -1419,7 +1499,7 @@ const handlePrint = () => {
     const latestRowHandlersRef = useRef(null);
     latestRowHandlersRef.current = {
         handleSelectOne, openMarkPaidDialog, openMarkGratisDialog, handlePrepareReceipt,
-        buildWhatsAppLink, openRevertDialog, openMethodDialog, handleDeletePayment,
+        buildWhatsAppLink, openRevertDialog, openMethodDialog, openRefundDialog, handleDeletePayment,
     };
     const rowActions = React.useMemo(() => {
         const h = () => latestRowHandlersRef.current;
@@ -1431,6 +1511,7 @@ const handlePrint = () => {
             buildWhatsAppLink: (...a) => h().buildWhatsAppLink(...a),
             openRevertDialog: (...a) => h().openRevertDialog(...a),
             openMethodDialog: (...a) => h().openMethodDialog(...a),
+            openRefundDialog: (...a) => h().openRefundDialog(...a),
             handleDeletePayment: (...a) => h().handleDeletePayment(...a),
         };
     }, []);
@@ -1459,6 +1540,7 @@ const handlePrint = () => {
         openMarkGratisDialog: rowActions.openMarkGratisDialog,
         openRevertDialog: rowActions.openRevertDialog,
         openMethodDialog: rowActions.openMethodDialog,
+        openRefundDialog: rowActions.openRefundDialog,
         handlePrepareReceipt: rowActions.handlePrepareReceipt,
         handleDeletePayment: rowActions.handleDeletePayment,
         buildWhatsAppLink: rowActions.buildWhatsAppLink,
@@ -2120,6 +2202,59 @@ const handlePrint = () => {
                         disabled={revertSubmitting || !revertReason.trim()}
                     >
                         Confirm Revert
+                    </Button>
+                </DialogActions>
+            </Dialog>
+
+            <Dialog open={refundDialog.open} onClose={() => !refundSubmitting && closeRefundDialog()} maxWidth="xs" fullWidth>
+                <DialogTitle sx={{ fontWeight: 700 }}>Refund Payment</DialogTitle>
+                <DialogContent>
+                    {refundDialog.payment && (
+                        <Typography variant="body2" sx={{ mb: 2, color: 'text.secondary' }}>
+                            Customer: <strong>{refundDialog.payment.customer_name}</strong><br />
+                            Original payment: <strong>{(parseFloat(refundDialog.payment.amount) || 0).toFixed(2)} {refundDialog.payment.currency || 'USD'}</strong>
+                            {' '}({defaultRefundVia(refundDialog.payment) === 'whish' ? 'received via Whish' : 'received in cash'})<br />
+                            The refund is recorded in the same currency and debited from the customer's balance.
+                        </Typography>
+                    )}
+                    <TextField
+                        fullWidth
+                        type="number"
+                        label={`Refund amount (${refundDialog.payment?.currency || 'USD'})`}
+                        value={refundDialog.amount}
+                        onChange={(e) => setRefundDialog({ ...refundDialog, amount: e.target.value })}
+                        error={!!refundAmountError}
+                        helperText={refundAmountError || 'Defaults to the full amount; lower it for a partial refund.'}
+                        inputProps={{ min: 0, step: 'any' }}
+                        sx={{ mb: 2 }}
+                    />
+                    <TextField select fullWidth label="Paid out via" value={refundDialog.paidVia} sx={{ mb: 2 }}
+                        onChange={(e) => setRefundDialog({ ...refundDialog, paidVia: e.target.value })}
+                        helperText="Which account the money left -- the refund shows under this channel in the Daily Cash flow.">
+                        <MenuItem value="cash">Cash</MenuItem>
+                        <MenuItem value="whish">Whish (sent to the customer's Whish)</MenuItem>
+                    </TextField>
+                    <TextField
+                        fullWidth
+                        required
+                        label="Reason for refund"
+                        value={refundDialog.reason}
+                        onChange={(e) => setRefundDialog({ ...refundDialog, reason: e.target.value })}
+                        placeholder="e.g. service outage credit"
+                        multiline
+                        minRows={2}
+                    />
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={closeRefundDialog} disabled={refundSubmitting}>Cancel</Button>
+                    <Button
+                        variant="contained"
+                        sx={{ bgcolor: '#8B5CF6', '&:hover': { bgcolor: '#7C3AED' } }}
+                        startIcon={refundSubmitting ? <CircularProgress size={16} color="inherit" /> : <RefundIcon />}
+                        onClick={handleRefundPayment}
+                        disabled={refundSubmitting || !!refundAmountError || !refundDialog.reason.trim()}
+                    >
+                        Issue Refund
                     </Button>
                 </DialogActions>
             </Dialog>

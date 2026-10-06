@@ -154,3 +154,16 @@ def test_reverting_a_refund_on_a_closed_day_is_blocked(app, client):
 
     _blocked(client.put(f"/api/payments/{refund_id}/revert", headers=a, json={"reason": "late"}), day)
     assert _balance(cust) == before
+
+
+def test_payments_list_exposes_refund_fields_for_the_ui(app, client):
+    a = make_tenant(client, "Biz A", "rf7")
+    tid = _tenant_id("rf7")
+    cust = _make_customer(client, a, _make_plan(client, a, price=40))
+    pid = _paid_row(tid, cust, 900000, currency="LBP", fx_rate_to_reporting=0.00001, collected_via="whish")
+    refund_id = _refund(client, a, pid, amount=1000, reason="dup charge")["refund_payment_id"]
+
+    rows = client.get("/api/payments", headers=a, query_string={"customer_id": cust}).get_json()["payments"]
+    row = next(p for p in rows if p["id"] == refund_id)
+    assert (row["currency"], row["refund_reason"], row["collected_via"], row["is_refund"]) == \
+        ("LBP", "dup charge", "whish_transfer", True)
