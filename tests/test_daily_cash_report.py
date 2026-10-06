@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from tests.conftest import make_tenant
 from app import app as flask_app, db, Payment, Customer
@@ -43,7 +44,14 @@ def _day_range(day_str):
 
 
 def _today_range():
-    return _day_range(datetime.utcnow().strftime("%Y-%m-%d"))
+    """start_date/end_date for the business's own today (Asia/Beirut, the
+    default business timezone), as a browser there sends it. Not the UTC date:
+    the cash flow buckets by the business day, and the two differ between
+    local midnight and UTC midnight."""
+    tz = ZoneInfo("Asia/Beirut")
+    start = datetime.combine(datetime.now(tz).date(), datetime.min.time(), tz)
+    fmt = lambda d: d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return fmt(start), fmt(start + timedelta(days=1))
 
 
 def test_daily_cash_groups_by_field_collector_and_totals_correctly(app, client):

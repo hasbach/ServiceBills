@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from tests.conftest import make_tenant
 from app import (app as flask_app, db, User, Payment, Customer, Expense, ExpenseCategory,
                  SupplierPayment, Supplier, UpstreamProvider, UpstreamProviderPayment)
-from tests.test_daily_cash_report import _make_plan, _make_customer, _unpaid_payment_id
+from tests.test_daily_cash_report import _make_plan, _make_customer, _unpaid_payment_id, _today_range
 
 DAY = "2026-10-05"
 D = datetime(2026, 10, 5)
@@ -92,7 +92,7 @@ def test_reseller_collection_is_cash_in(app, client):
                                                          "balance": 100}).get_json()["reseller"]["id"]
     client.post(f"/api/resellers/{rid}/collect_payment", headers=a, json={"amount": 20})
     client.post(f"/api/resellers/{rid}/add_credit", headers=a, json={"amount": 7})  # not cash
-    flow = _flow(client, a, _utc_range(datetime.utcnow().strftime("%Y-%m-%d")))
+    flow = _flow(client, a, _today_range())
     assert _totals(flow["cash_in"]) == {"Reseller collections": 20}
 
 
@@ -227,7 +227,7 @@ def test_paid_via_is_accepted_and_validated(app, client):
     rid = client.post("/api/resellers", headers=a, json={"name": "R", "phone": "1", "type": "type1",
                                                          "balance": 50}).get_json()["reseller"]["id"]
     client.post(f"/api/resellers/{rid}/collect_payment", headers=a, json={"amount": 20, "paid_via": "whish"})
-    flow = _flow(client, a, _utc_range(datetime.utcnow().strftime("%Y-%m-%d")))
+    flow = _flow(client, a, _today_range())
     assert _totals(flow["whish_in"]) == {"Reseller collections": 20}
 
 
@@ -269,7 +269,7 @@ def test_reverted_then_repaid_today_shows_in_todays_reports(app, client):
     pay = _unpaid_payment_id(client, a, cust)
     _pay_revert_repay(client, a, pay)
 
-    rng = _utc_range(datetime.utcnow().strftime("%Y-%m-%d"))
+    rng = _today_range()
     assert _flow(client, a, rng)["cash_in"]["total"] == 30
     report = client.get("/api/reports/daily-cash", headers=a,
                         query_string={"start_date": rng[0], "end_date": rng[1]}).get_json()
@@ -284,5 +284,5 @@ def test_reverted_and_not_repaid_stays_out(app, client):
     client.put(f"/api/payments/{pay}/mark_paid", headers=a, json={"action": "pay"})
     client.put(f"/api/payments/{pay}/revert", headers=a, json={"reason": "oops"})
 
-    rng = _utc_range(datetime.utcnow().strftime("%Y-%m-%d"))
+    rng = _today_range()
     assert _flow(client, a, rng)["cash_in"]["total"] == 0
