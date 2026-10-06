@@ -20,12 +20,7 @@ import {
   FormControl,
   InputLabel,
   Alert,
-  Collapse,
-  IconButton,
 } from '@mui/material';
-import { KeyboardArrowDown as KeyboardArrowDownIcon, KeyboardArrowUp as KeyboardArrowUpIcon } from '@mui/icons-material';
-import { localDayRange } from './dailyCashDateRange';
-import DailyCashFlowSection from './DailyCashFlowSection';
 import { DatePicker } from '@mui/x-date-pickers/DatePicker';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
 import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
@@ -52,31 +47,21 @@ const EnhancedReportsView = () => {
   });
   const [endDate, setEndDate] = useState(new Date());
   const [reportType, setReportType] = useState('financial');
-  const [cashDate, setCashDate] = useState(new Date());
   const [reportData, setReportData] = useState(null);
   const [reportError, setReportError] = useState(null);
   const [overduePayments, setOverduePayments] = useState([]);
   const [customerMetrics, setCustomerMetrics] = useState(null);
-  const [expandedCashGroups, setExpandedCashGroups] = useState({});
 
   useEffect(() => {
     fetchReportData();
     fetchOverduePayments();
     fetchCustomerMetrics();
-  }, [startDate, endDate, reportType, cashDate]);
+  }, [startDate, endDate, reportType]);
 
   const fetchReportData = async () => {
     setReportData(null);
     setReportError(null);
     try {
-      if (reportType === 'daily-cash') {
-        const { startIso, endIso } = localDayRange(cashDate);
-        const response = await apiService.api.get('/reports/daily-cash', { params: { start_date: startIso, end_date: endIso } });
-        setExpandedCashGroups({});
-        setReportData(response.data);
-        return;
-      }
-
       if (reportType === 'financial') {
         const res = await apiService.fetchFinancialReport(startDate.toISOString(), endDate.toISOString());
         setReportData(res.data);
@@ -369,100 +354,6 @@ const EnhancedReportsView = () => {
     );
   };
 
-  const toggleCashGroupExpanded = (key) => {
-    setExpandedCashGroups((prev) => ({ ...prev, [key]: !prev[key] }));
-  };
-
-  const renderDailyCashReport = () => {
-    if (!reportData || reportType !== 'daily-cash' || !Array.isArray(reportData.groups)) return null;
-
-    return (
-      <>
-      {reportData.cash_flow && (
-        <DailyCashFlowSection
-          flow={reportData.cash_flow}
-          currency={reportData.reporting_currency}
-          onOpeningSaved={fetchReportData}
-        />
-      )}
-      <Grid item xs={12}>
-        <Paper sx={{ p: 2 }}>
-          <Typography variant="h6" gutterBottom>
-            Customer Cash by Collector
-          </Typography>
-          <Typography variant="h5" sx={{ mb: 2 }}>
-            Grand Total: {reportData.grand_total.toFixed(2)} {reportData.reporting_currency}
-          </Typography>
-          {reportData.groups.length === 0 ? (
-            <Typography color="text.secondary">No cash payments collected on this day.</Typography>
-          ) : (
-            <TableContainer>
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell />
-                    <TableCell>Collector</TableCell>
-                    <TableCell align="right">Payments</TableCell>
-                    <TableCell align="right">Total</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {reportData.groups.map((group) => {
-                    const key = group.is_office ? 'office' : group.collector_id;
-                    const isExpanded = !!expandedCashGroups[key];
-                    return (
-                      <React.Fragment key={key}>
-                        <TableRow>
-                          <TableCell>
-                            <IconButton size="small" onClick={() => toggleCashGroupExpanded(key)}>
-                              {isExpanded ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
-                            </IconButton>
-                          </TableCell>
-                          <TableCell>{group.collector_name}</TableCell>
-                          <TableCell align="right">{group.payment_count}</TableCell>
-                          <TableCell align="right">{group.total.toFixed(2)} {reportData.reporting_currency}</TableCell>
-                        </TableRow>
-                        <TableRow>
-                          <TableCell colSpan={4} sx={{ py: 0, border: 0 }}>
-                            <Collapse in={isExpanded} timeout="auto" unmountOnExit>
-                              <Table size="small">
-                                <TableHead>
-                                  <TableRow>
-                                    <TableCell>Customer</TableCell>
-                                    <TableCell align="right">Amount</TableCell>
-                                    <TableCell>Currency</TableCell>
-                                    <TableCell align="right">Reporting Amount</TableCell>
-                                    <TableCell>Time</TableCell>
-                                  </TableRow>
-                                </TableHead>
-                                <TableBody>
-                                  {group.payments.map((p) => (
-                                    <TableRow key={p.id}>
-                                      <TableCell>{p.customer_name}</TableCell>
-                                      <TableCell align="right">{p.amount.toFixed(2)}</TableCell>
-                                      <TableCell>{p.currency}</TableCell>
-                                      <TableCell align="right">{p.reporting_amount.toFixed(2)}</TableCell>
-                                      <TableCell>{p.time}</TableCell>
-                                    </TableRow>
-                                  ))}
-                                </TableBody>
-                              </Table>
-                            </Collapse>
-                          </TableCell>
-                        </TableRow>
-                      </React.Fragment>
-                    );
-                  })}
-                </TableBody>
-              </Table>
-            </TableContainer>
-          )}
-        </Paper>
-      </Grid>
-      </>
-    );
-  };
-
   return (
     <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
       <Grid container spacing={3}>
@@ -475,13 +366,7 @@ const EnhancedReportsView = () => {
                   <InputLabel>Report Type</InputLabel>
                   <Select
                     value={reportType}
-                    onChange={(e) => {
-                      const newType = e.target.value;
-                      setReportType(newType);
-                      if (newType === 'daily-cash') {
-                        setCashDate(new Date());
-                      }
-                    }}
+                    onChange={(e) => setReportType(e.target.value)}
                   >
                     <MenuItem value="financial">Financial Report</MenuItem>
                     <MenuItem value="revenue">Revenue Report</MenuItem>
@@ -489,32 +374,29 @@ const EnhancedReportsView = () => {
                     <MenuItem value="payments">Payment Report</MenuItem>
                     <MenuItem value="collector-progress">Collector Progress Report</MenuItem>
                     <MenuItem value="customer-whish-payments">Customer Whish Payments Report</MenuItem>
-                    <MenuItem value="daily-cash">Daily Cash Report</MenuItem>
                   </Select>
                 </FormControl>
               </Grid>
               <Grid item xs={12} md={3}>
                 <LocalizationProvider dateAdapter={AdapterDateFns}>
                   <DatePicker
-                    label={reportType === 'daily-cash' ? 'Date' : 'Start Date'}
-                    value={reportType === 'daily-cash' ? cashDate : startDate}
-                    onChange={reportType === 'daily-cash' ? setCashDate : setStartDate}
+                    label="Start Date"
+                    value={startDate}
+                    onChange={setStartDate}
                     renderInput={(params) => <TextField {...params} fullWidth />}
                   />
                 </LocalizationProvider>
               </Grid>
-              {reportType !== 'daily-cash' && (
-                <Grid item xs={12} md={3}>
-                  <LocalizationProvider dateAdapter={AdapterDateFns}>
-                    <DatePicker
-                      label="End Date"
-                      value={endDate}
-                      onChange={setEndDate}
-                      renderInput={(params) => <TextField {...params} fullWidth />}
-                    />
-                  </LocalizationProvider>
-                </Grid>
-              )}
+              <Grid item xs={12} md={3}>
+                <LocalizationProvider dateAdapter={AdapterDateFns}>
+                  <DatePicker
+                    label="End Date"
+                    value={endDate}
+                    onChange={setEndDate}
+                    renderInput={(params) => <TextField {...params} fullWidth />}
+                  />
+                </LocalizationProvider>
+              </Grid>
               <Grid item xs={12} md={3}>
                 <Button
                   variant="contained"
@@ -588,9 +470,6 @@ const EnhancedReportsView = () => {
             </Paper>
           </Grid>
         )}
-
-        {/* Daily Cash Report */}
-        {reportType === 'daily-cash' && renderDailyCashReport()}
 
         {/* Overdue Payments */}
         <Grid item xs={12}>

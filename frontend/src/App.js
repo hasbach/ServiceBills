@@ -20,12 +20,9 @@ import {
     TrendingUp as EnhancedReportIcon,
     Subscriptions as PlansIcon,
     Settings as SettingsIcon,
-    ShoppingCart as ShoppingCartIcon,
     Logout as LogoutIcon,
     ChevronRight as ChevronRightIcon,
     Campaign as MessageIcon,
-    Storefront as ResellerIcon,
-    Badge as PayrollIcon,
     KeyboardArrowUp as KeyboardArrowUpIcon,
     CloudQueue as UpstreamProviderIcon,
     NetworkCheck as NetworkDeviceIcon,
@@ -38,7 +35,6 @@ import { AppContextProvider, useAppContext, apiService } from './context/AppCont
 import DashboardView from './components/DashboardView.js';
 import SubscriptionsView from './components/SubscriptionsView.js';
 import PaymentsView from './components/PaymentsView.js';
-import ExpensesView from './components/ExpensesView.js';
 import ReportsView from './components/ReportsView.js';
 import SettingsView from './components/SettingsView.js';
 import SubscriptionPlansView from './components/SubscriptionPlansView.js';
@@ -56,11 +52,9 @@ import BillingView from './components/BillingView.js';
 import SuperAdminView from './components/SuperAdminView.js';
 import LandingView from './components/LandingView.js';
 import ServiceManagementView from './components/ServiceManagementView.js';
+import FinanceView from './components/FinanceView.js';
 import EnhancedReportsView from './components/EnhancedReportsView.js';
 import MessagingView from './components/MessagingView.js';
-import ResellerManagementView from './components/ResellerManagementView.js';
-import SuppliersView from './components/SuppliersView.js';
-import EmployeesView from './components/EmployeesView.js';
 import UpstreamProviderManagementView from './components/UpstreamProviderManagementView.js';
 import NetworkDeviceManagementView from './components/NetworkDeviceManagementView.js';
 import NetworkTreeView from './components/NetworkTreeView.js';
@@ -76,8 +70,7 @@ const NAV_ITEMS = [
     // nav entry. A combined role like "employee,collector" stays read-only
     // too, since that check only grants the full view for admin/finance.
     { key: 'subscriptions',      label: 'Subscriptions',      icon: <PeopleIcon />,          group: 'main',      allowedRoles: ['admin', 'finance', 'cashier', 'employee', 'collector'] },
-    { key: 'resellers',          label: 'Resellers',          icon: <ResellerIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
-    { key: 'suppliers',          label: 'Suppliers',          icon: <ShoppingCartIcon />,        group: 'main',      allowedRoles: ['admin', 'finance'] },
+    { key: 'finance',            label: 'Finance',            icon: <ExpenseIcon />,         group: 'main',      allowedRoles: ['admin', 'finance'] },
     // Concept A/B (see docs/superpowers/specs/2026-08-12-network-enforcement-design.md):
     // only one of these is ever relevant, gated by BusinessSettings.network_mode, not roles.
     { key: 'upstream-providers',  label: 'Upstream Providers',  icon: <UpstreamProviderIcon />, group: 'main',    allowedRoles: ['admin', 'finance'], module: 'upstream_sync', visibleWhen: (bs) => bs?.network_mode === 'upstream_bridge' },
@@ -92,10 +85,8 @@ const NAV_ITEMS = [
     // are admin_or_finance_required() -- enforced inside NetworkMapView.js
     // (canEdit) and the backend itself, not by this nav entry.
     { key: 'network-map',        label: 'Network Map',        icon: <NetworkMapIcon />,       group: 'main',    allowedRoles: ['admin', 'finance', 'cashier', 'employee', 'collector'], module: 'network' },
-    { key: 'employees',          label: 'Payroll',            icon: <PayrollIcon />,             group: 'main',      allowedRoles: ['admin'] },
     { key: 'payments',           label: 'Payments',           icon: <PaymentIcon />,         group: 'main',      allowedRoles: ['admin', 'finance', 'cashier', 'collector'] },
     { key: 'receipts',           label: 'Receipts',           icon: <ReceiptIcon />,         group: 'main',      allowedRoles: ['admin', 'finance'] },
-    { key: 'expenses',           label: 'Expenses',           icon: <ExpenseIcon />,         group: 'main',      allowedRoles: ['admin'] },
     { key: 'reports',            label: 'Reports',            icon: <ReportIcon />,          group: 'analytics', allowedRoles: ['admin'] },
     { key: 'enhanced-reports',   label: 'Enhanced Reports',   icon: <EnhancedReportIcon />,  group: 'analytics', allowedRoles: ['admin'] },
     { key: 'service',            label: 'Service Management', icon: <ServiceIcon />,         group: 'manage',    allowedRoles: ['admin', 'employee', 'technician'] },
@@ -117,6 +108,15 @@ const resolveLogoUrl = (logoUrl) => {
     if (logoUrl.startsWith('http') || logoUrl === DEFAULT_LOGO_PATH) return logoUrl;
     const apiBase = process.env.REACT_APP_API_URL ?? (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5000');
     return `${apiBase}${logoUrl}`;
+};
+
+// Legacy top-level views that now live as tabs inside Finance.
+const LEGACY_FINANCE_VIEWS = ['resellers', 'suppliers', 'employees', 'expenses'];
+// Maps a raw view key (+ optional ?tab= value) to { view, tab }.
+export const resolveView = (rawView, rawTab) => {
+    if (LEGACY_FINANCE_VIEWS.includes(rawView)) return { view: 'finance', tab: rawView };
+    if (rawView === 'cash-flow') return { view: 'finance', tab: 'cash-flow' };
+    return { view: rawView, tab: rawTab || null };
 };
 
 // ── Drawer width ─────────────────────────────────────────────────────────────
@@ -149,7 +149,7 @@ const MainApp = ({
         if (window.location.pathname.startsWith('/billing')) return 'billing';
         const urlParams = new URLSearchParams(window.location.search);
         const viewParam = urlParams.get('view');
-        if (viewParam) return viewParam;
+        if (viewParam) return resolveView(viewParam, urlParams.get('tab')).view;
 
         if (hasRole('admin') || hasRole('finance')) return 'dashboard';
         if (hasRole('employee') || hasRole('technician')) return 'service';
@@ -157,7 +157,18 @@ const MainApp = ({
         if (hasRole('collector')) return 'payments';
         return 'dashboard';
     };
-    const [currentView, setCurrentView] = useState(getDefaultView());
+    const [currentView, setCurrentViewRaw] = useState(getDefaultView());
+    const [financeTab, setFinanceTab] = useState(() => {
+        const p = new URLSearchParams(window.location.search);
+        const v = p.get('view');
+        return v ? resolveView(v, p.get('tab')).tab : null;
+    });
+    // Accepts legacy keys (resellers|suppliers|employees|expenses|cash-flow) too.
+    const setCurrentView = (key, tab) => {
+        const r = resolveView(key, tab);
+        if (r.view === 'finance') setFinanceTab(r.tab);
+        setCurrentViewRaw(r.view);
+    };
     const [drawerOpen, setDrawerOpen] = useState(false);
 
     const [inboxOpenId, setInboxOpenId] = useState(() => {
@@ -183,7 +194,7 @@ const MainApp = ({
             if (event.data?.type !== 'open-url') return;
             const url = new URL(event.data.url, window.location.origin);
             const view = url.searchParams.get('view');
-            if (view) setCurrentView(view);
+            if (view) setCurrentView(view, url.searchParams.get('tab'));
             if (event.data.conversationId) setInboxOpenId(Number(event.data.conversationId));
             window.history.replaceState(null, '', url.pathname + url.search);
         };
@@ -339,9 +350,7 @@ const MainApp = ({
         if (gatedView && !hasModule(gatedView.module)) return null;
         switch (currentView) {
             case 'dashboard': return <DashboardView />;
-            case 'resellers': return <ResellerManagementView />;
-            case 'suppliers': return <SuppliersView />;
-            case 'employees': return <EmployeesView />;
+            case 'finance': return <FinanceView key={financeTab || 'default'} initialTab={financeTab} />;
             case 'upstream-providers': return <UpstreamProviderManagementView />;
             case 'network-devices': return <NetworkDeviceManagementView />;
             case 'network-tree': return <NetworkTreeView />;
@@ -349,7 +358,6 @@ const MainApp = ({
             case 'subscriptions': return <SubscriptionsView customers={customers} pagination={pagination} subscriptionPlans={subscriptionPlans} businessSettings={businessSettings} refetchCustomers={refetchCustomers} setSnackbar={setSnackbar} currentPage={currentPage} setCurrentPage={setCurrentPage} itemsPerPage={itemsPerPage} setItemsPerPage={setItemsPerPage} searchQuery={searchQuery} setSearchQuery={setSearchQuery} customerSortBy={customerSortBy} setCustomerSortBy={setCustomerSortBy} customerResellerId={customerResellerId} setCustomerResellerId={setCustomerResellerId} customerStatus={customerStatus} setCustomerStatus={setCustomerStatus} customerExpiryDay={customerExpiryDay} setCustomerExpiryDay={setCustomerExpiryDay} />;
             case 'payments': return <PaymentsView />;
             case 'receipts': return <ReceiptsView />;
-            case 'expenses': return <ExpensesView />;
             case 'reports': return <ReportsView />;
             case 'service': return <ServiceManagementView />;
             case 'enhanced-reports': return <EnhancedReportsView />;
