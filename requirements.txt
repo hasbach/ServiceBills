@@ -28,3 +28,4 @@ psycogreen
 google-genai
 openpyxl
 Pillow
+tzdata

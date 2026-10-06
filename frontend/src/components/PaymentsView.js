@@ -1098,7 +1098,7 @@ const PaymentsView = () => {
             }
         } catch (error) {
             console.error("Error marking payment gratis:", error);
-            setSnackbar({ open: true, message: 'Failed to mark payment gratis. ' + (error.response?.data?.message || error.message), severity: 'error' });
+            setSnackbar({ open: true, message: 'Failed to mark payment gratis. ' + (error.response?.data?.error || error.response?.data?.message || error.message), severity: 'error' });
         } finally {
             setMarkGratisSubmitting(false);
         }
@@ -1123,7 +1123,7 @@ const PaymentsView = () => {
             setMethodDialog({ open: false, payment: null, method: 'cash', reference: '' });
             fetchPayments();
         } catch (error) {
-            setSnackbar({ open: true, message: error.response?.data?.message || 'Failed to change payment method.', severity: 'error' });
+            setSnackbar({ open: true, message: error.response?.data?.error || error.response?.data?.message || 'Failed to change payment method.', severity: 'error' });
         } finally {
             setMethodSubmitting(false);
         }
@@ -1152,7 +1152,7 @@ const PaymentsView = () => {
             }
         } catch (error) {
             console.error("Error reverting payment:", error);
-            setSnackbar({ open: true, message: 'Failed to revert payment. ' + (error.response?.data?.message || error.message), severity: 'error' });
+            setSnackbar({ open: true, message: 'Failed to revert payment. ' + (error.response?.data?.error || error.response?.data?.message || error.message), severity: 'error' });
         } finally {
             setRevertSubmitting(false);
         }
@@ -1194,7 +1194,7 @@ const PaymentsView = () => {
             fetchPayments();
             if (filters.customer_id) fetchCustomerBalance(filters.customer_id);
         } catch (error) {
-            setSnackbar({ open: true, message: 'Bulk delete failed: ' + (error.response?.data?.message || error.message), severity: 'error' });
+            setSnackbar({ open: true, message: 'Bulk delete failed: ' + (error.response?.data?.error || error.response?.data?.message || error.message), severity: 'error' });
         } finally {
             setBulkActionLoading(false);
         }
@@ -1217,7 +1217,7 @@ const PaymentsView = () => {
             fetchPayments();
             if (filters.customer_id) fetchCustomerBalance(filters.customer_id);
         } catch (error) {
-            setSnackbar({ open: true, message: 'Bulk mark paid failed: ' + (error.response?.data?.message || error.message), severity: 'error' });
+            setSnackbar({ open: true, message: 'Bulk mark paid failed: ' + (error.response?.data?.error || error.response?.data?.message || error.message), severity: 'error' });
         } finally {
             setBulkActionLoading(false);
         }
@@ -1251,7 +1251,7 @@ const PaymentsView = () => {
             setShowReceiptModal(true);
         } catch (error) {
             console.error("Error fetching receipt:", error);
-            setSnackbar({ open: true, message: 'Failed to fetch receipt. ' + (error.response?.data?.message || error.message), severity: 'error' });
+            setSnackbar({ open: true, message: 'Failed to fetch receipt. ' + (error.response?.data?.error || error.response?.data?.message || error.message), severity: 'error' });
         }
     };
 
@@ -1374,7 +1374,7 @@ const handlePrint = () => {
             setShowReceiptModal(true);
         } catch (error) {
             console.error("Error fetching receipt:", error);
-            setSnackbar({ open: true, message: 'Failed to fetch receipt. ' + (error.response?.data?.message || error.message), severity: 'error' });
+            setSnackbar({ open: true, message: 'Failed to fetch receipt. ' + (error.response?.data?.error || error.response?.data?.message || error.message), severity: 'error' });
         }
     };
 
@@ -1392,7 +1392,7 @@ const handlePrint = () => {
             setShowCombinedReceiptModal(true);
         } catch (error) {
             console.error("Error fetching unpaid statement:", error);
-            setSnackbar({ open: true, message: 'Failed to fetch unpaid statement. ' + (error.response?.data?.message || error.message), severity: 'error' });
+            setSnackbar({ open: true, message: 'Failed to fetch unpaid statement. ' + (error.response?.data?.error || error.response?.data?.message || error.message), severity: 'error' });
         }
     };
 

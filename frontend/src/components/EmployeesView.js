@@ -142,7 +142,7 @@ function EmployeesView() {
             setHistoryDialog({ ...historyDialog, employee: res.data.employee });
             loadEmployees();
         } catch (err) {
-            setSnackbar({ open: true, message: 'Error updating balance.', severity: 'error' });
+            setSnackbar({ open: true, message: err.response?.data?.error || 'Error updating balance.', severity: 'error' });
         }
     };
 
