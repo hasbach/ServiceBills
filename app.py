@@ -3928,6 +3928,14 @@ def auto_sync_upstream_status_for_tenant(tenant_id):
         except Exception as e:
             db.session.rollback()
             logging.error(f"Auto-sync error for customer {customer.id} (tenant {tenant_id}): {e}")
+        finally:
+            # End this customer's transaction on EVERY path. The `continue`
+            # branches above (no provider, failed portal check) used to skip
+            # the commit, so a run where many checks fail kept one transaction
+            # open for hours, holding read locks that blocked a deploy-time
+            # ALTER TABLE business_settings (2026-10-06 incident). No-op after
+            # the success-path commit.
+            db.session.rollback()
 
 
 def auto_sync_upstream_status_with_context():
