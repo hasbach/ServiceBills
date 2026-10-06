@@ -52,6 +52,12 @@ function DailyCashFlowSection({ flow, currency, onOpeningSaved }) {
     const totalOut = flow.total_out ?? ((cashOut.total || 0) + (whishOut.total || 0));
     const totalNet = flow.total_net ?? ((flow.net || 0) + (flow.whish_net || 0));
 
+    // Internal Cash<->Whish moves: excluded from the combined headline totals,
+    // but still counted in the per-account Cash/Whish breakdown under them.
+    const hasTransfers = [cashIn, cashOut, whishIn, whishOut].some(
+        (s) => (s.items || []).some((i) => (i.category || '').startsWith('Transfer ')));
+    const transferNote = hasTransfers ? ' (incl. transfers)' : '';
+
     const hasRunningTotal = flow.total_start !== null && flow.total_start !== undefined;
     const hasRunningCash = flow.cash_start !== null && flow.cash_start !== undefined;
     const hasRunningWhish = flow.whish_start !== null && flow.whish_start !== undefined;
@@ -70,14 +76,14 @@ function DailyCashFlowSection({ flow, currency, onOpeningSaved }) {
                 value: totalIn,
                 color: 'success.main',
                 sign: '+',
-                subtext: `Cash: ${fmt(cashIn.total)} · Whish: ${fmt(whishIn.total)}`,
+                subtext: `Cash: ${fmt(cashIn.total)} · Whish: ${fmt(whishIn.total)}${transferNote}`,
             },
             {
                 label: 'Total out',
                 value: totalOut,
                 color: 'error.main',
                 sign: '−',
-                subtext: `Cash: ${fmt(cashOut.total)} · Whish: ${fmt(whishOut.total)}`,
+                subtext: `Cash: ${fmt(cashOut.total)} · Whish: ${fmt(whishOut.total)}${transferNote}`,
             },
             hasRunningTotal
                 ? {
