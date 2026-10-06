@@ -1398,6 +1398,13 @@ class Payment(db.Model):
     refunded_by = db.relationship('User', foreign_keys=[refunded_by_id])
 
 
+def _signed_payment_amount():
+    """SQL: a payment's amount as revenue -- negative for a refund row, which
+    gives money back in the month it was paid out (the original payment keeps
+    its own month, so a closed month is never rewritten)."""
+    return db.case((Payment.is_refund.is_(True), -Payment.amount), else_=Payment.amount)
+
+
 def _payment_not_reverted():
     """SQL filter: the payment's current collection was not reverted.
     reverted_at is never cleared (it stays as the audit trail of the last
@@ -5553,29 +5560,35 @@ def _payment_totals(filtered_query):
       yet confirmed as paid;
     - uncollected: not collected and not paid;
     - unpaid: everything not yet paid (collected-awaiting + uncollected);
-    - paid: confirmed paid, excluding gratis (no money changed hands)."""
+    - paid: confirmed paid, excluding gratis (no money changed hands), net of
+      refunds -- a refund row subtracts its amount and isn't counted as a
+      payment. A reverted refund (unpaid) is in no bucket: it isn't a bill."""
     rate = func.coalesce(Payment.fx_rate_to_reporting, 1)
     due = Payment.amount * rate
     got = func.coalesce(Payment.collected_amount, Payment.amount) * rate
     is_paid = Payment.paid.is_(True)
-    not_paid = db.or_(Payment.paid.is_(False), Payment.paid.is_(None))
-    is_collected = Payment.collected.is_(True)
+    is_refund = Payment.is_refund.is_(True)
+    not_refund = db.or_(Payment.is_refund.is_(False), Payment.is_refund.is_(None))
+    not_paid = db.and_(db.or_(Payment.paid.is_(False), Payment.paid.is_(None)), not_refund)
+    is_collected = db.and_(Payment.collected.is_(True), not_refund)
     not_collected = db.or_(Payment.collected.is_(False), Payment.collected.is_(None))
     not_gratis = db.or_(Payment.is_gratis.is_(False), Payment.is_gratis.is_(None))
 
-    def bucket(cond, value):
-        return (func.coalesce(func.sum(db.case((cond, 1), else_=0)), 0),
+    def bucket(cond, value, counted=None):
+        counted = cond if counted is None else counted
+        return (func.coalesce(func.sum(db.case((counted, 1), else_=0)), 0),
                 func.coalesce(func.sum(db.case((cond, value), else_=0)), 0))
 
+    paid_cond = db.and_(is_paid, not_gratis)
     columns = []
-    for cond, value in (
-        (is_collected, got),
-        (db.and_(is_collected, not_paid), got),
-        (db.and_(not_collected, not_paid), due),
-        (not_paid, due),
-        (db.and_(is_paid, not_gratis), due),
+    for cond, value, counted in (
+        (is_collected, got, None),
+        (db.and_(is_collected, not_paid), got, None),
+        (db.and_(not_collected, not_paid), due, None),
+        (not_paid, due, None),
+        (paid_cond, db.case((is_refund, -due), else_=due), db.and_(paid_cond, not_refund)),
     ):
-        columns.extend(bucket(cond, value))
+        columns.extend(bucket(cond, value, counted))
 
     row = filtered_query.order_by(None).with_entities(*columns).one()
     vals = [float(v or 0) for v in row]
@@ -5671,14 +5684,14 @@ def get_total_sales():
     # -- a no-op multiply-by-1 for an opted-out (single-currency) tenant.
     total_sales = db.session.query(
         month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_sales')
+        func.sum(_signed_payment_amount() * Payment.fx_rate_to_reporting).label('total_sales')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.is_gratis == False,
         # Prepayments count as revenue -- see
         # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-        Payment.is_refund == False,
+        # Refunds are included, as negative amounts (see _signed_payment_amount).
         # A bill paid from existing credit isn't new money: the prepayment that
         # created the credit was already counted.
         Payment.settled_from_credit.isnot(True),
@@ -7177,14 +7190,14 @@ def get_monthly_revenue():
     # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
     sales_query = db.session.query(
         month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_sales')
+        func.sum(_signed_payment_amount() * Payment.fx_rate_to_reporting).label('total_sales')
     ).filter(
         Payment.tenant_id == current_tenant_id(),
         Payment.paid == True,
         Payment.is_gratis == False,
         # Prepayments count as revenue -- see
         # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-        Payment.is_refund == False,
+        # Refunds are included, as negative amounts (see _signed_payment_amount).
         # A bill paid from existing credit isn't new money: the prepayment that
         # created the credit was already counted.
         Payment.settled_from_credit.isnot(True),
@@ -8757,7 +8770,8 @@ def get_dashboard_metrics():
         revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
     if end_date:
         revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) <= end_date)
-    total_revenue = sum(payment.amount for payment in revenue_query.all())
+    # A refund row gives money back: subtract it.
+    total_revenue = sum(-p.amount if p.is_refund else p.amount for p in revenue_query.all())
 
     # employee_id set = a payroll payment, regardless of what the category is named.
     manual_query = tenant_query(Expense).filter_by(is_credit=False).filter(Expense.employee_id.is_(None))
@@ -9930,7 +9944,8 @@ def get_revenue_report():
         end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if end_date_str else None
 
         # Revenue = when the payment was actually paid, not when it was billed/due.
-        query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False, Payment.is_refund == False,
+        # Refunds are included and subtracted (see _signed_payment_amount).
+        query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False,
                                              Payment.settled_from_credit.isnot(True)).options(  # credit already counted
             db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
         )
@@ -9940,7 +9955,12 @@ def get_revenue_report():
             query = query.filter(func.coalesce(Payment.paid_at, Payment.date) <= end_date)
 
         payments = query.all()
-        total_revenue = sum(p.amount for p in payments)
+
+        def signed(p):
+            return -p.amount if p.is_refund else p.amount
+
+        total_revenue = sum(signed(p) for p in payments)
+        refund_total = sum(p.amount for p in payments if p.is_refund)
 
         # Group by subscription plan
         plan_revenue = {}
@@ -9948,12 +9968,13 @@ def get_revenue_report():
             customer = payment.customer
             if customer and customer.subscription_plan:
                 plan = customer.subscription_plan
-                plan_revenue[plan.name] = plan_revenue.get(plan.name, 0) + payment.amount
+                plan_revenue[plan.name] = plan_revenue.get(plan.name, 0) + signed(payment)
 
         return jsonify({
             'total_revenue': total_revenue,
+            'refund_total': refund_total,
             'plan_revenue': plan_revenue,
-            'payment_count': len(payments)
+            'payment_count': sum(1 for p in payments if not p.is_refund)
         })
     except Exception as e:
         traceback.print_exc()
@@ -11481,12 +11502,12 @@ def get_financial_report():
         # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
         income_query = db.session.query(
             month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-            func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total')
+            func.sum(_signed_payment_amount() * Payment.fx_rate_to_reporting).label('total')
         ).filter(
             Payment.tenant_id == current_tenant_id(),
             Payment.paid == True,
             Payment.is_gratis == False,
-            Payment.is_refund == False,
+            # Refunds count as negative income in the month they were paid out.
             Payment.settled_from_credit.isnot(True),  # the prepayment behind it was already counted
             func.coalesce(Payment.paid_at, Payment.date) >= start_date,
             func.coalesce(Payment.paid_at, Payment.date) <= end_date

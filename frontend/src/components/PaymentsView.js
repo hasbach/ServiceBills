@@ -103,10 +103,13 @@ function PaymentTotalsBar({ totals, loading }) {
     );
 }
 
-// Revenue helpers — kept outside component so they are never recreated
+// Revenue helpers — kept outside component so they are never recreated.
+// A refund row gives money back, so it subtracts.
+const revenueAmount = (p) => (p.is_refund ? -1 : 1) * (parseFloat(p.amount) || 0);
+
 const getTotalRevenue = (payments) => {
     if (!Array.isArray(payments)) return 0;
-    return payments.reduce((sum, p) => p.paid ? sum + (parseFloat(p.amount) || 0) : sum, 0);
+    return payments.reduce((sum, p) => p.paid ? sum + revenueAmount(p) : sum, 0);
 };
 
 const getCurrentMonthRevenue = (payments) => {
@@ -117,7 +120,7 @@ const getCurrentMonthRevenue = (payments) => {
     return payments.reduce((sum, p) => {
         if (!p.paid) return sum;
         const d = new Date(p.date);
-        return (d.getFullYear() === y && d.getMonth() === m) ? sum + (Number(p.amount) || 0) : sum;
+        return (d.getFullYear() === y && d.getMonth() === m) ? sum + revenueAmount(p) : sum;
     }, 0);
 };
 
@@ -1667,7 +1670,7 @@ const handlePrint = () => {
                                     Paid Payments
                                 </Typography>
                                 <Typography variant="h6" sx={{ fontWeight: 700 }}>
-                                    {payments.filter(p => p.paid).length}
+                                    {payments.filter(p => p.paid && !p.is_refund).length}
                                 </Typography>
                             </Box>
                         </Box>
