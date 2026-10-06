@@ -229,3 +229,60 @@ def test_paid_via_is_accepted_and_validated(app, client):
     client.post(f"/api/resellers/{rid}/collect_payment", headers=a, json={"amount": 20, "paid_via": "whish"})
     flow = _flow(client, a, _utc_range(datetime.utcnow().strftime("%Y-%m-%d")))
     assert _totals(flow["whish_in"]) == {"Reseller collections": 20}
+
+
+def _pay_revert_repay(client, hdr, pay):
+    assert client.put(f"/api/payments/{pay}/mark_paid", headers=hdr, json={"action": "pay"}).status_code == 200
+    assert client.put(f"/api/payments/{pay}/revert", headers=hdr, json={"reason": "wrong customer"}).status_code == 200
+    assert client.put(f"/api/payments/{pay}/mark_paid", headers=hdr, json={"action": "pay"}).status_code == 200
+
+
+def test_reverted_then_repaid_payment_counts_on_its_new_paid_day(app, client):
+    """A revert is undone by paying the bill again: the money was received,
+    so it shows up on the day of the new payment -- not on the reverted day."""
+    a = make_tenant(client, "Biz A", "flow8")
+    plan = _make_plan(client, a, price=45)
+    cust = _make_customer(client, a, plan)
+    pay = _unpaid_payment_id(client, a, cust)
+    _pay_revert_repay(client, a, pay)
+    with flask_app.app_context():
+        p = Payment.query.get(pay)
+        assert p.paid and p.reverted_at is not None  # revert audit trail is kept
+        p.reverted_at = D + timedelta(hours=10)
+        p.paid_at = D + timedelta(days=1, hours=12)
+        p.collected_at = None
+        db.session.commit()
+
+    nxt = (D + timedelta(days=1)).strftime("%Y-%m-%d")
+    assert _flow(client, a, _utc_range(DAY))["cash_in"]["total"] == 0
+    assert _flow(client, a, _utc_range(nxt))["cash_in"]["total"] == 45
+    start, end = _utc_range(nxt)
+    report = client.get("/api/reports/daily-cash", headers=a,
+                        query_string={"start_date": start, "end_date": end}).get_json()
+    assert report["grand_total"] == 45
+
+
+def test_reverted_then_repaid_today_shows_in_todays_reports(app, client):
+    a = make_tenant(client, "Biz A", "flow9")
+    plan = _make_plan(client, a, price=30)
+    cust = _make_customer(client, a, plan)
+    pay = _unpaid_payment_id(client, a, cust)
+    _pay_revert_repay(client, a, pay)
+
+    rng = _utc_range(datetime.utcnow().strftime("%Y-%m-%d"))
+    assert _flow(client, a, rng)["cash_in"]["total"] == 30
+    report = client.get("/api/reports/daily-cash", headers=a,
+                        query_string={"start_date": rng[0], "end_date": rng[1]}).get_json()
+    assert report["grand_total"] == 30
+
+
+def test_reverted_and_not_repaid_stays_out(app, client):
+    a = make_tenant(client, "Biz A", "flow10")
+    plan = _make_plan(client, a, price=30)
+    cust = _make_customer(client, a, plan)
+    pay = _unpaid_payment_id(client, a, cust)
+    client.put(f"/api/payments/{pay}/mark_paid", headers=a, json={"action": "pay"})
+    client.put(f"/api/payments/{pay}/revert", headers=a, json={"reason": "oops"})
+
+    rng = _utc_range(datetime.utcnow().strftime("%Y-%m-%d"))
+    assert _flow(client, a, rng)["cash_in"]["total"] == 0

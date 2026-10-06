@@ -1398,6 +1398,18 @@ class Payment(db.Model):
     refunded_by = db.relationship('User', foreign_keys=[refunded_by_id])
 
 
+def _payment_not_reverted():
+    """SQL filter: the payment's current collection was not reverted.
+    reverted_at is never cleared (it stays as the audit trail of the last
+    revert), so a bill reverted and then paid again still has it set -- its
+    new paid_at/collected_at, stamped after the revert, is what says the
+    revert is no longer in effect."""
+    return db.or_(
+        Payment.reverted_at.is_(None),
+        Payment.reverted_at < func.coalesce(Payment.collected_at, Payment.paid_at),
+    )
+
+
 class GeneratedReceipt(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -3930,6 +3942,14 @@ def auto_sync_upstream_status_for_tenant(tenant_id):
         except Exception as e:
             db.session.rollback()
             logging.error(f"Auto-sync error for customer {customer.id} (tenant {tenant_id}): {e}")
+        finally:
+            # End this customer's transaction on EVERY path. The `continue`
+            # branches above (no provider, failed portal check) used to skip
+            # the commit, so a run where many checks fail kept one transaction
+            # open for hours, holding read locks that blocked a deploy-time
+            # ALTER TABLE business_settings (2026-10-06 incident). No-op after
+            # the success-path commit.
+            db.session.rollback()
 
 
 def auto_sync_upstream_status_with_context():
@@ -5722,7 +5742,7 @@ def customer_whish_payments_report():
         transfers = tenant_query(Payment).filter(
             Payment.collected_via == 'whish_transfer',
             Payment.is_refund.isnot(True),
-            Payment.reverted_at.is_(None),
+            _payment_not_reverted(),
         ).options(db.joinedload(Payment.customer))
         if start_date:
             transfers = transfers.filter(received_at >= start_date)
@@ -10887,7 +10907,7 @@ def _cash_flow_entries(win_start, win_end, settings):
     payments = tenant_query(Payment).filter(
         Payment.paid == True,
         Payment.is_gratis == False,
-        Payment.reverted_at.is_(None),
+        _payment_not_reverted(),
         Payment.settled_from_credit.isnot(True),
         when >= win_start, when < win_end,
     ).options(db.joinedload(Payment.customer)).all()
@@ -11358,7 +11378,7 @@ def get_daily_cash_report():
             Payment.collected_via.is_(None),   # cash: everything that isn't Whish
             Payment.is_gratis == False,
             Payment.is_refund == False,
-            Payment.reverted_at.is_(None),
+            _payment_not_reverted(),
             func.coalesce(Payment.collected_at, Payment.paid_at) >= start_date,
             func.coalesce(Payment.collected_at, Payment.paid_at) < end_date,
         ).options(
