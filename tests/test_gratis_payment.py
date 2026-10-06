@@ -128,3 +128,16 @@ def test_gratis_payment_excluded_from_revenue_reports(app, client):
     payments = client.get("/api/payments", headers=a,
                           query_string={"customer_id": cust_id}).get_json()["payments"]
     assert any(p["id"] == payment_id and p["is_gratis"] for p in payments)
+
+
+def test_gratis_payment_excluded_from_dashboard_revenue(app, client):
+    a = make_tenant(client, "Biz A", "a_admin_dash")
+    plan = _make_plan(client, a, price=75)
+    gratis_cust = _make_customer(client, a, plan, name="Forgiven")
+    paying_cust = _make_customer(client, a, plan, name="Payer")
+    assert client.put(f"/api/payments/{_unpaid_payment_id(client, a, gratis_cust)}/mark_gratis",
+                      headers=a, json={}).status_code == 200
+    assert client.put(f"/api/payments/{_unpaid_payment_id(client, a, paying_cust)}/mark_paid",
+                      headers=a, json={"action": "pay"}).status_code == 200
+
+    assert client.get("/api/dashboard", headers=a).get_json()["totalRevenue"] == 75

@@ -8765,7 +8765,10 @@ def get_dashboard_metrics():
 
     # Prepayments count as revenue -- see
     # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-    revenue_query = tenant_query(Payment).filter_by(paid=True).filter(Payment.settled_from_credit.isnot(True))  # credit already counted
+    revenue_query = tenant_query(Payment).filter_by(paid=True).filter(
+        Payment.settled_from_credit.isnot(True),  # credit already counted
+        Payment.is_gratis.isnot(True),  # forgiven: no money came in
+    )
     if start_date:
         revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
     if end_date:
