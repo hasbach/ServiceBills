@@ -3,7 +3,7 @@ import {
     Box, Grid, Paper, Typography, Button, Card, CardContent, Collapse, IconButton,
     Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
     Dialog, DialogTitle, DialogContent, DialogActions, TextField, Alert,
-    Tabs, Tab, Chip
+    Tabs, Tab, Chip, Tooltip
 } from '@mui/material';
 import { KeyboardArrowDown as KeyboardArrowDownIcon, KeyboardArrowUp as KeyboardArrowUpIcon } from '@mui/icons-material';
 import { apiService } from '../context/AppContext.js';
@@ -12,7 +12,7 @@ import { apiService } from '../context/AppContext.js';
  * Cash & Whish in / out / on hand for the Daily Cash report's selected day.
  * `flow` is the `cash_flow` object from GET /api/reports/daily-cash.
  */
-function DailyCashFlowSection({ flow, currency, onOpeningSaved }) {
+function DailyCashFlowSection({ flow, currency, onOpeningSaved, openingLocked = false }) {
     const [tab, setTab] = useState('combined'); // 'combined' | 'cash' | 'whish'
     const [expanded, setExpanded] = useState({});
     const [openingDialog, setOpeningDialog] = useState(null); // { date, amount, whish_amount } while editing
@@ -214,13 +214,17 @@ function DailyCashFlowSection({ flow, currency, onOpeningSaved }) {
                                 ? `Opening: Cash ${fmt(flow.opening.amount)} · Whish ${fmt(flow.opening.whish_amount ?? 0)} on ${flow.opening.date}`
                                 : 'Set opening balances to track cash & Whish on hand day by day.'}
                         </Typography>
-                        <Button size="small" variant="outlined" onClick={() => setOpeningDialog({
-                            date: flow.opening?.date || flow.day,
-                            amount: flow.opening ? String(flow.opening.amount ?? '') : '',
-                            whish_amount: flow.opening ? String(flow.opening.whish_amount ?? '') : '',
-                        })}>
-                            {flow.opening ? 'Edit' : 'Set opening balances'}
-                        </Button>
+                        <Tooltip title={openingLocked ? 'Reopen all closed days to change the opening balance' : ''}>
+                            <span>
+                                <Button size="small" variant="outlined" disabled={openingLocked} onClick={() => setOpeningDialog({
+                                    date: flow.opening?.date || flow.day,
+                                    amount: flow.opening ? String(flow.opening.amount ?? '') : '',
+                                    whish_amount: flow.opening ? String(flow.opening.whish_amount ?? '') : '',
+                                })}>
+                                    {flow.opening ? 'Edit' : 'Set opening balances'}
+                                </Button>
+                            </span>
+                        </Tooltip>
                     </Box>
                 </Box>
 

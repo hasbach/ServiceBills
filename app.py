@@ -32,7 +32,8 @@ import uuid
 import secrets
 import requests
 import traceback
-from flask import Flask, jsonify, request, redirect, g
+from flask import Flask, jsonify, request, redirect, g, has_request_context
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from datetime import datetime, timedelta, timezone
@@ -113,6 +114,7 @@ if Config.SENTRY_DSN:
 # Served from frontend/public/serviceBillsLogo.png (build/ in prod). Used whenever
 # a tenant hasn't uploaded their own logo via /api/business-settings.
 DEFAULT_LOGO_URL = '/serviceBillsLogo.png'
+DEFAULT_TIMEZONE = 'Asia/Beirut'
 
 from sqlalchemy import MetaData
 # Explicit naming convention so Alembic can add/drop constraints by name across
@@ -1129,6 +1131,53 @@ class AccountTransfer(db.Model):
         }
 
 
+class DayClose(db.Model):
+    """A closed day: the cash and Whish balances counted by staff against what
+    the register expected. The difference becomes an over/short adjustment on
+    that day, and every day up to the latest close is locked against staff
+    edits (see docs/superpowers/specs/2026-10-06-day-close-design.md)."""
+    __table_args__ = (db.UniqueConstraint('tenant_id', 'day', name='uq_day_close_tenant_day'),)
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    day = db.Column(db.Date, nullable=False)
+    expected_cash = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    counted_cash = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    expected_whish = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    counted_whish = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    note = db.Column(db.String(200), nullable=True)
+    closed_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    closed_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    closed_by = db.relationship('User', foreign_keys=[closed_by_id], lazy=True)
+
+    @property
+    def cash_diff(self):
+        return round(float(self.counted_cash) - float(self.expected_cash), 4)
+
+    @property
+    def whish_diff(self):
+        return round(float(self.counted_whish) - float(self.expected_whish), 4)
+
+    def to_dict(self, zone=None):
+        closed_local = None
+        if zone is not None and self.closed_at:
+            closed_local = self.closed_at.replace(tzinfo=timezone.utc).astimezone(zone).strftime('%Y-%m-%d %H:%M')
+        return {
+            'id': self.id,
+            'day': self.day.isoformat(),
+            'expected_cash': float(self.expected_cash),
+            'counted_cash': float(self.counted_cash),
+            'cash_diff': self.cash_diff,
+            'expected_whish': float(self.expected_whish),
+            'counted_whish': float(self.counted_whish),
+            'whish_diff': self.whish_diff,
+            'note': self.note,
+            'closed_by': self.closed_by.username if self.closed_by else None,
+            'closed_at': (self.closed_at.isoformat() + 'Z') if self.closed_at else None,
+            'closed_at_local': closed_local,
+        }
+
+
 class Expense(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -1495,6 +1544,8 @@ class BusinessSettings(db.Model):
     cash_opening_amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
     # Whish account balance at the start of the same cash_opening_date.
     whish_opening_amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
+    # IANA zone the business's days are counted in (Daily Cash, day close/lock).
+    timezone = db.Column(db.String(64), nullable=False, default='Asia/Beirut', server_default='Asia/Beirut')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1519,6 +1570,7 @@ class BusinessSettings(db.Model):
             'upstream_sync_automation_enabled': bool(self.upstream_sync_automation_enabled),
             'multi_currency_enabled': bool(self.multi_currency_enabled),
             'reporting_currency': self.reporting_currency or 'USD',
+            'timezone': self.timezone or DEFAULT_TIMEZONE,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -4917,6 +4969,12 @@ def delete_customer(customer_id):
         if not customer:
             return jsonify({'message': 'Customer not found!'}), 404
 
+        if _locked_through() is not None:
+            locked_day = _locked_payment_day(Payment.query.filter_by(
+                tenant_id=customer.tenant_id, customer_id=customer.id, paid=True).all())
+            if locked_day is not None:
+                return _assert_day_open(locked_day)
+
         tenant_id = customer.tenant_id
         _delete_customer_core(customer)
         db.session.commit()
@@ -4942,6 +5000,12 @@ def bulk_delete_customers():
 
     customers = tenant_query(Customer).filter(Customer.id.in_(customer_ids)).all()
     found_ids = {c.id for c in customers}
+
+    if found_ids and _locked_through() is not None:
+        locked_day = _locked_payment_day(tenant_query(Payment).filter(
+            Payment.customer_id.in_(found_ids), Payment.paid == True).all())
+        if locked_day is not None:
+            return _assert_day_open(locked_day)
 
     succeeded = []
     failed = [{'id': cid, 'error': 'Customer not found'} for cid in customer_ids if cid not in found_ids]
@@ -5290,6 +5354,10 @@ def add_payment():
         if is_paid and _is_cashier_only():
             return jsonify({'error': 'Your role cannot record a payment as received; '
                                      'add the charge, then collect it.'}), 403
+        if is_paid:
+            closed = _assert_day_open(_tenant_today())
+            if closed:
+                return closed
 
         # Multi-currency: lock the FX rate at creation time (see
         # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md).
@@ -5521,6 +5589,10 @@ def delete_payment(payment_id):
         payment = tenant_query(Payment).filter_by(id=payment_id).first()
         if not payment:
             return jsonify({'message': 'Payment not found!'}), 404
+
+        closed = _assert_day_open(_payment_flow_day(payment))
+        if closed:
+            return closed
 
         # Get customer to update their balance
         customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
@@ -5806,6 +5878,9 @@ def mark_payment_as_paid(payment_id):
         if action == 'collect':
             if not is_collector:
                 return jsonify({'message': 'Unauthorized to collect payments.'}), 403
+            closed = _assert_day_open(_tenant_today())  # collecting stamps collected_at = now
+            if closed:
+                return closed
 
             # How the money arrived, chosen by whoever collects it: cash
             # (default) or a transfer straight to the business's Whish account
@@ -5867,6 +5942,13 @@ def mark_payment_as_paid(payment_id):
         # Otherwise, action is 'pay' (confirm receipt / fully paid)
         if not is_admin_or_finance:
             return jsonify({'message': 'Unauthorized to mark payments as fully paid. Only finance or admin can do this.'}), 403
+        if not payment.paid and payment.collected_at is None:
+            # Brand-new money dated now. A payment already collected on an
+            # earlier (possibly closed) day is the allowed late confirm: it
+            # lands on its collection day and shows as "changed after close".
+            closed = _assert_day_open(_tenant_today())
+            if closed:
+                return closed
 
         partial_payment_flag = data.get('partial_payment', False)
         if partial_payment_flag:
@@ -6094,6 +6176,10 @@ def receive_customer_payment(customer_id):
     reference = (data.get('reference') or '').strip()[:64] or None
     first_payment_id = data.get('first_payment_id')
 
+    closed = _assert_day_open(_tenant_today())
+    if closed:
+        return closed
+
     try:
         if action == 'collect':
             owed = sum(float(b.amount) for b in _open_bills(customer, uncollected_only=True))
@@ -6279,6 +6365,10 @@ def set_payment_method(payment_id):
     if payment.collected_via == 'whish':
         return jsonify({'message': 'This payment was settled through a Whish payment link; its method cannot be changed.'}), 400
 
+    closed = _assert_day_open(_payment_flow_day(payment))
+    if closed:
+        return closed
+
     data = request.json or {}
     method = (data.get('method') or '').strip().lower()
     if method not in PAYMENT_METHODS_STAFF_SETTABLE:
@@ -6365,6 +6455,10 @@ def revert_payment(payment_id):
     if not payment.paid:
         return jsonify({'message': 'Payment is not marked as paid.'}), 400
 
+    closed = _assert_day_open(_payment_flow_day(payment))
+    if closed:
+        return closed
+
     data = request.json or {}
     reason = (data.get('reason') or '').strip()
     if not reason:
@@ -6446,6 +6540,10 @@ def refund_payment(payment_id):
     if refund_amount > payment.amount:
         return jsonify({'message': 'Refund amount cannot exceed the original payment amount.'}), 400
 
+    closed = _assert_day_open(_tenant_today())  # the refund row is dated now
+    if closed:
+        return closed
+
     customer = tenant_query(Customer).filter_by(id=payment.customer_id).first()
     if not customer:
         return jsonify({'message': 'Customer not found for this payment!'}), 404
@@ -6512,6 +6610,13 @@ def bulk_mark_payments_paid():
     ).all()
     found_ids = {p.id for p in payments}
 
+    # Rows that would get a brand-new "paid now" stamp need today open; rows
+    # already collected on an earlier day are allowed late confirms.
+    if any(not p.paid and p.collected_at is None for p in payments):
+        closed = _assert_day_open(_tenant_today())
+        if closed:
+            return closed
+
     succeeded = []
     failed = [{'id': pid, 'error': 'Payment not found'} for pid in payment_ids if pid not in found_ids]
     # A customer with several old unpaid rows settled in one batch only needs
@@ -6553,6 +6658,10 @@ def bulk_delete_payments():
         db.joinedload(Payment.customer)
     ).all()
     found_ids = {p.id for p in payments}
+
+    locked_day = _locked_payment_day(payments)
+    if locked_day is not None:
+        return _assert_day_open(locked_day)
 
     succeeded = []
     failed = [{'id': pid, 'error': 'Payment not found'} for pid in payment_ids if pid not in found_ids]
@@ -7107,6 +7216,18 @@ def save_business_settings():
                                          f"'{_requested_network_access_mode}'. "
                                          f"Must be 'direct' or 'agent'."}), 400
 
+        if 'timezone' in request.form:
+            _requested_tz = (request.form.get('timezone') or '').strip()
+            try:
+                ZoneInfo(_requested_tz)
+            except (ZoneInfoNotFoundError, ValueError, OSError):
+                return jsonify({'error': f"Unknown timezone '{_requested_tz}'. Use an IANA name like 'Asia/Beirut'."}), 400
+            _current_settings = tenant_query(BusinessSettings).first()
+            _current_tz = (_current_settings.timezone if _current_settings else None) or DEFAULT_TIMEZONE
+            if _requested_tz != _current_tz and _latest_close_day() is not None:
+                _msg = 'Reopen all closed days to change the time zone.'
+                return jsonify({'error': _msg, 'message': _msg, 'code': 'timezone_locked'}), 409
+
         _public_url_provided = 'public_url' in request.form
         _public_url_value = None
         if _public_url_provided:
@@ -7160,6 +7281,9 @@ def save_business_settings():
         if 'reporting_currency' in request.form:
             # Already validated above (before the create/update branch).
             settings.reporting_currency = request.form.get('reporting_currency')
+        if 'timezone' in request.form:
+            # Validated above.
+            settings.timezone = request.form.get('timezone').strip()
 
         # Only update logo_url if a new file was uploaded
         if logo_url:
@@ -7194,7 +7318,8 @@ def get_business_settings():
                 'network_access_mode': "direct",
                 'upstream_sync_automation_enabled': False,
                 'multi_currency_enabled': False,
-                'reporting_currency': 'USD'
+                'reporting_currency': 'USD',
+                'timezone': DEFAULT_TIMEZONE
             }
         }), 200
 
@@ -10216,11 +10341,16 @@ def add_expense():
         if employee and not description:
             description = f'Salary paid to {employee.name}'
 
+        expense_date = datetime.strptime(data['date'], '%Y-%m-%d')
+        closed = _assert_day_open(_cal_day(expense_date))
+        if closed:
+            return closed
+
         new_expense = Expense(
             category_id=category.id,
             amount=amount,
             description=description,
-            date=datetime.strptime(data['date'], '%Y-%m-%d'),
+            date=expense_date,
             # A payroll expense is a real cash payment, never a credit purchase.
             is_credit=data.get('is_credit', False) if not employee else False,
             supplier_id=supplier_id if not employee else None,
@@ -10257,7 +10387,12 @@ def update_expense(expense_id):
         expense = tenant_query(Expense).filter_by(id=expense_id).first()
         if not expense:
             return jsonify({'message': 'Expense not found!'}), 404
-        
+
+        new_expense_date = datetime.strptime(data.get('date', expense.date.strftime('%Y-%m-%d')), '%Y-%m-%d')
+        closed = _assert_day_open(_cal_day(expense.date), _cal_day(new_expense_date))
+        if closed:
+            return closed
+
         if 'category' in data:
             category = tenant_query(ExpenseCategory).filter_by(name=data['category']).first()
             if not category:
@@ -10324,6 +10459,10 @@ def delete_expense(expense_id):
         expense = tenant_query(Expense).filter_by(id=expense_id).first()
         if not expense:
             return jsonify({'message': 'Expense not found!'}), 404
+
+        closed = _assert_day_open(_cal_day(expense.date))
+        if closed:
+            return closed
 
         if expense.employee_id:
             employee = tenant_query(Employee).filter_by(id=expense.employee_id).first()
@@ -10536,45 +10675,176 @@ def get_collector_progress():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+_ADJUSTMENT_CATEGORY = 'Over/short adjustment'
 _CASH_IN_CATEGORIES = ('Customer payments', 'Reseller collections', 'Manual cash-in',
-                       'Transfer from Cash', 'Transfer from Whish')
+                       'Transfer from Cash', 'Transfer from Whish', _ADJUSTMENT_CATEGORY)
 _CASH_OUT_CATEGORIES = ('Expenses', 'Payroll', 'Supplier payments', 'Upstream top-ups', 'Customer refunds',
-                        'Transfer to Whish', 'Transfer to Cash')
+                        'Transfer to Whish', 'Transfer to Cash', _ADJUSTMENT_CATEGORY)
 # Moves between the two accounts: shown per channel and in running balances,
 # left out of the combined in/out/net (they net to zero overall).
 _TRANSFER_CATEGORIES = ('Transfer from Cash', 'Transfer from Whish', 'Transfer to Whish', 'Transfer to Cash')
 _WHISH_VIA = ('whish', 'whish_transfer')
 
 
-def _cash_flow_entries(win_start, win_end, offset):
+# --- Business timezone + closed-day lock ------------------------------------
+# See docs/superpowers/specs/2026-10-06-day-close-design.md.
+
+def _zone_for(settings):
+    """The tenant's ZoneInfo (Asia/Beirut when unset or no longer valid)."""
+    name = (getattr(settings, 'timezone', None) or DEFAULT_TIMEZONE)
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return ZoneInfo(DEFAULT_TIMEZONE)
+
+
+def _request_cache():
+    """Per-request scratch dict (None outside a request, so nothing goes stale)."""
+    return request.environ if has_request_context() else None
+
+
+def _tenant_zone():
+    cache = _request_cache()
+    key = '_tenant_zone_cache'
+    if cache is not None and key in cache:
+        return cache[key]
+    zone = _zone_for(tenant_query(BusinessSettings).first())
+    if cache is not None:
+        cache[key] = zone
+    return zone
+
+
+def _is_calendar_value(dt):
+    return dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0
+
+
+def _local_day(settings, dt, calendar=False):
+    """The business-local date of a stored naive-UTC timestamp. For a
+    calendar-type column (a date typed into a form, stored as midnight) a
+    midnight value IS the date it names; everything else is a UTC instant
+    converted into the tenant's zone (DST handled per row)."""
+    if calendar and _is_calendar_value(dt):
+        return dt.date()
+    return dt.replace(tzinfo=timezone.utc).astimezone(_zone_for(settings)).date()
+
+
+def _local_stamp(settings, dt, calendar=False):
+    if calendar and _is_calendar_value(dt):
+        return dt.strftime('%Y-%m-%d')
+    return dt.replace(tzinfo=timezone.utc).astimezone(_zone_for(settings)).strftime('%Y-%m-%d %H:%M')
+
+
+def _tenant_today():
+    """Today's date in the tenant's zone."""
+    return datetime.now(_tenant_zone()).date()
+
+
+def _tenant_today_dt():
+    """Tenant-zone today as a calendar value (midnight), for date defaults."""
+    return datetime.combine(_tenant_today(), datetime.min.time())
+
+
+def _cal_day(dt):
+    """Tenant-local day of a calendar-type timestamp (Expense.date, ...)."""
+    if dt is None:
+        return None
+    if _is_calendar_value(dt):
+        return dt.date()
+    return dt.replace(tzinfo=timezone.utc).astimezone(_tenant_zone()).date()
+
+
+def _inst_day(dt):
+    """Tenant-local day of an instant-type timestamp (collected_at, ...)."""
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).astimezone(_tenant_zone()).date()
+
+
+def _local_day_start_utc(zone, day):
+    """Naive-UTC instant at which local `day` begins in `zone`."""
+    return datetime.combine(day, datetime.min.time(), tzinfo=zone).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _latest_close_day():
+    latest = db.session.query(func.max(DayClose.day)).filter(
+        DayClose.tenant_id == current_tenant_id()).scalar()
+    if isinstance(latest, str):
+        latest = datetime.strptime(latest[:10], '%Y-%m-%d').date()
+    return latest
+
+
+def _locked_through():
+    """Latest closed day for the current tenant (None if nothing is closed).
+    One query per request."""
+    cache = _request_cache()
+    key = '_locked_through_cache'
+    if cache is not None and key in cache:
+        return cache[key]
+    latest = _latest_close_day()
+    if cache is not None:
+        cache[key] = latest
+    return latest
+
+
+def _assert_day_open(*days):
+    """None when every given day is open; otherwise the (response, 409) a route
+    returns as-is: `err = _assert_day_open(d); if err: return err`. Returned
+    rather than raised because most guarded routes wrap their body in a broad
+    `except Exception` that would swallow an exception."""
+    locked = _locked_through()
+    if locked is None:
+        return None
+    for day in days:
+        if day is not None and day <= locked:
+            msg = f"Day {day.isoformat()} is closed — ask an admin to reopen it."
+            return jsonify({'error': msg, 'message': msg, 'code': 'day_closed'}), 409
+    return None
+
+
+def _payment_flow_day(p):
+    """The cash-flow day of a customer payment row, or None when the row isn't
+    money moving (unpaid, gratis, reverted, settled from credit)."""
+    if not p.paid or p.is_gratis or p.reverted_at is not None or p.settled_from_credit:
+        return None
+    return _inst_day(p.collected_at or p.paid_at)
+
+
+def _locked_payment_day(payments):
+    """First locked cash-flow day among `payments`, or None."""
+    locked = _locked_through()
+    if locked is None:
+        return None
+    for p in payments:
+        day = _payment_flow_day(p)
+        if day is not None and day <= locked:
+            return day
+    return None
+
+
+def _cash_flow_entries(win_start, win_end, settings):
     """Every money movement whose raw timestamp falls in [win_start, win_end)
     (naive UTC, deliberately a day wider than needed on each side), as
-    (channel, direction, category, local_date, amount, time_str, description)
-    with channel 'cash' or 'whish'.
+    (channel, direction, category, local_date, amount, time_str, description,
+    created) with channel 'cash' or 'whish'. `created` is when the record was
+    created/confirmed (None when unknown), used to flag "changed after close".
 
     Two kinds of timestamp live in these tables: real instants (utcnow,
     collected_at, ...) and calendar dates typed into a form (an expense's
-    "Date" field -> midnight, no zone). A midnight value is taken as the
-    calendar date it names; anything else is a UTC instant, shifted by the
-    viewer's `offset` (local midnight - UTC midnight) to get its local day.
+    "Date" field -> midnight, no zone). A midnight value of a calendar column
+    is taken as the calendar date it names; anything else is a UTC instant
+    converted into the business timezone (settings.timezone).
 
     Customer payments: Whish (payment link or a transfer to the business's
     Whish account) goes to the whish channel; cash follows
     get_daily_cash_report's collector rules. A bill settled from existing
     credit, gratis and reverted payments are not money moving at all.
-    Everything else follows its own paid_via (NULL = cash)."""
-    def is_calendar(dt):
-        return dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0
-
+    Everything else follows its own paid_via (NULL = cash). Each DayClose adds
+    an over/short adjustment per account on its day."""
     def local_day(dt, calendar=False):
-        if calendar and is_calendar(dt):
-            return dt.date()
-        return (dt + offset).date()
+        return _local_day(settings, dt, calendar)
 
     def stamp(dt, calendar=False):
-        if calendar and is_calendar(dt):
-            return dt.strftime('%Y-%m-%d')
-        return (dt + offset).strftime('%Y-%m-%d %H:%M')
+        return _local_stamp(settings, dt, calendar)
 
     def channel(paid_via):
         return 'whish' if paid_via == 'whish' else 'cash'
@@ -10592,20 +10862,22 @@ def _cash_flow_entries(win_start, win_end, offset):
         t = p.collected_at or p.paid_at
         amount = p.amount * float(p.fx_rate_to_reporting)
         name = p.customer.name if p.customer else 'Unknown customer'
+        made = p.paid_at
         if p.is_refund:
-            out.append(('cash', 'out', 'Customer refunds', local_day(t), amount, stamp(t), f"Refund to {name}"))
+            out.append(('cash', 'out', 'Customer refunds', local_day(t), amount, stamp(t), f"Refund to {name}", made))
         elif p.collected_via in _WHISH_VIA:
             how = 'payment link' if p.collected_via == 'whish' else 'transfer'
-            out.append(('whish', 'in', 'Customer payments', local_day(t), amount, stamp(t), f"{name} (Whish {how})"))
+            out.append(('whish', 'in', 'Customer payments', local_day(t), amount, stamp(t),
+                        f"{name} (Whish {how})", made))
         elif p.collected_via is None and (p.collected_by_id or p.received_by_id or p.pre_payment):
-            out.append(('cash', 'in', 'Customer payments', local_day(t), amount, stamp(t), name))
+            out.append(('cash', 'in', 'Customer payments', local_day(t), amount, stamp(t), name, made))
 
     for rp in tenant_query(ResellerPayment).filter(
             ResellerPayment.type == 'payment_received',
             ResellerPayment.date >= win_start, ResellerPayment.date < win_end).all():
         name = rp.reseller.name if rp.reseller else 'Unknown reseller'
         out.append((channel(rp.paid_via), 'in', 'Reseller collections', local_day(rp.date), float(rp.amount),
-                    stamp(rp.date), name))
+                    stamp(rp.date), name, rp.date))
 
     for e in tenant_query(Expense).filter(
             Expense.is_credit == False, Expense.date >= win_start, Expense.date < win_end).all():
@@ -10613,51 +10885,60 @@ def _cash_flow_entries(win_start, win_end, offset):
         label = e.category.name if e.category else 'Expense'
         desc = f"{label}: {e.description}" if e.description else label
         out.append((channel(e.paid_via), 'out', cat, local_day(e.date, True), float(e.amount),
-                    stamp(e.date, True), desc))
+                    stamp(e.date, True), desc, None))
 
     for sp in tenant_query(SupplierPayment).filter(
             SupplierPayment.payment_date >= win_start, SupplierPayment.payment_date < win_end).all():
         name = sp.supplier.name if sp.supplier else 'Unknown supplier'
         desc = f"{name}: {sp.reference_note}" if sp.reference_note else name
         out.append((channel(sp.paid_via), 'out', 'Supplier payments', local_day(sp.payment_date, True),
-                    float(sp.amount), stamp(sp.payment_date, True), desc))
+                    float(sp.amount), stamp(sp.payment_date, True), desc, None))
 
     # Legacy payroll rows from before payroll moved onto Expense (see get_expenses).
     for sal in tenant_query(SalaryPayment).filter(
             SalaryPayment.payment_date >= win_start, SalaryPayment.payment_date < win_end).all():
         name = sal.employee.name if sal.employee else 'Unknown employee'
         out.append(('cash', 'out', 'Payroll', local_day(sal.payment_date, True), float(sal.amount),
-                    stamp(sal.payment_date, True), name))
+                    stamp(sal.payment_date, True), name, None))
 
     for ce in tenant_query(CashEntry).filter(CashEntry.date >= win_start, CashEntry.date < win_end).all():
         out.append((channel(ce.account), 'in', 'Manual cash-in', local_day(ce.date, True), float(ce.amount),
-                    stamp(ce.date, True), ce.reason))
+                    stamp(ce.date, True), ce.reason, ce.created_at))
 
     for tr in tenant_query(AccountTransfer).filter(
             AccountTransfer.date >= win_start, AccountTransfer.date < win_end).all():
         src, dst = channel(tr.from_account), channel(tr.to_account)
         ld, ts, amt = local_day(tr.date, True), stamp(tr.date, True), float(tr.amount)
-        out.append((src, 'out', f"Transfer to {dst.capitalize()}", ld, amt, ts, tr.note or ''))
-        out.append((dst, 'in', f"Transfer from {src.capitalize()}", ld, amt, ts, tr.note or ''))
+        out.append((src, 'out', f"Transfer to {dst.capitalize()}", ld, amt, ts, tr.note or '', tr.created_at))
+        out.append((dst, 'in', f"Transfer from {src.capitalize()}", ld, amt, ts, tr.note or '', tr.created_at))
 
     for up in tenant_query(UpstreamProviderPayment).filter(
             UpstreamProviderPayment.type == 'balance_topup',
             UpstreamProviderPayment.date >= win_start, UpstreamProviderPayment.date < win_end).all():
         name = up.upstream_provider.name if up.upstream_provider else 'Upstream'
         out.append((channel(up.paid_via), 'out', 'Upstream top-ups', local_day(up.date), float(up.amount),
-                    stamp(up.date), name))
+                    stamp(up.date), name, up.date))
+
+    # Day-close over/short adjustments (real money, so they count in totals).
+    for dc in tenant_query(DayClose).filter(
+            DayClose.day >= win_start.date(), DayClose.day <= win_end.date()).all():
+        desc = dc.note or 'Cash count'
+        ts = stamp(dc.closed_at) if dc.closed_at else dc.day.isoformat()
+        for ch, diff in (('cash', dc.cash_diff), ('whish', dc.whish_diff)):
+            if abs(diff) >= 0.00005:
+                out.append((ch, 'in' if diff > 0 else 'out', _ADJUSTMENT_CATEGORY, dc.day, abs(diff), ts, desc, None))
     return out
 
 
-def _cash_flow_for_day(day, day_start_utc, settings):
+def _cash_flow_for_day(day, settings):
     """In / out / net for local calendar day `day`, per channel (cash, Whish)
     and in total, plus the running balance of each once an opening balance is
     set and `day` is on or after its date.
 
     Keys: cash_in/cash_out/net (cash only, unchanged from before Whish was
     added), whish_in/whish_out/whish_net, total_in/total_out/total_net, and
-    cash_/whish_/total_ start and end (None when not tracked)."""
-    offset = datetime.combine(day, datetime.min.time()) - day_start_utc
+    cash_/whish_/total_ start and end (None when not tracked). Also `close`
+    (the day's DayClose or None), `locked_through` and `closable`."""
     opening_date = settings.cash_opening_date if settings else None
     opening_cash = settings.cash_opening_amount if settings else None
     has_opening = opening_date is not None and opening_cash is not None
@@ -10670,9 +10951,14 @@ def _cash_flow_for_day(day, day_start_utc, settings):
     sections = {(ch, d): {c: [] for c in (_CASH_IN_CATEGORIES if d == 'in' else _CASH_OUT_CATEGORIES)}
                 for ch in ('cash', 'whish') for d in ('in', 'out')}
     before = {'cash': 0.0, 'whish': 0.0}  # net since the opening date, up to (not including) `day`
-    for ch, direction, cat, ld, amount, t, desc in _cash_flow_entries(win_start, win_end, offset):
+    adj_today = {'cash': 0.0, 'whish': 0.0}  # this day's own over/short adjustment, signed
+    day_entries = []
+    for ch, direction, cat, ld, amount, t, desc, created in _cash_flow_entries(win_start, win_end, settings):
         if ld == day:
             sections[(ch, direction)][cat].append({'time': t, 'description': desc, 'amount': round(amount, 4)})
+            day_entries.append((ch, direction, amount, cat, created))
+            if cat == _ADJUSTMENT_CATEGORY:
+                adj_today[ch] += amount if direction == 'in' else -amount
         elif has_opening and opening_date <= ld < day:
             before[ch] += amount if direction == 'in' else -amount
 
@@ -10716,6 +11002,28 @@ def _cash_flow_for_day(day, day_start_utc, settings):
             'total_start': round(cash_start + whish_start, 4),
             'total_end': round(cash_start + whish_start + net + whish_net, 4),
         })
+
+    dc = tenant_query(DayClose).filter_by(day=day).first()
+    close = None
+    if dc is not None:
+        # "Changed after close": only movements ON this day whose record was
+        # created/confirmed after closed_at, signed (in +, out -) per channel.
+        # Nothing cascades from earlier days, so a late movement flags only its own day.
+        late = {'cash': 0.0, 'whish': 0.0}
+        late_count = 0
+        for ch, direction, amount, cat, created in day_entries:
+            if cat != _ADJUSTMENT_CATEGORY and created is not None and dc.closed_at and created > dc.closed_at:
+                late[ch] += amount if direction == 'in' else -amount
+                late_count += 1
+        late_cash, late_whish = round(late['cash'], 4), round(late['whish'], 4)
+        close = dc.to_dict(_zone_for(settings))
+        close['late'] = {'cash': late_cash, 'whish': late_whish, 'count': late_count}
+    latest = _latest_close_day()
+    today = datetime.now(_zone_for(settings)).date()
+    result['close'] = close
+    result['locked_through'] = latest.isoformat() if latest else None
+    result['closable'] = bool(has_opening and day >= opening_date and day <= today
+                              and (latest is None or day > latest))
     return result
 
 
@@ -10730,7 +11038,7 @@ def _parse_money_form(data):
     raw_date = data.get('date')
     try:
         date = (datetime.strptime(raw_date, '%Y-%m-%d') if raw_date
-                else datetime.combine(datetime.utcnow().date(), datetime.min.time()))
+                else _tenant_today_dt())
     except (TypeError, ValueError):
         return None, None, 'Use date YYYY-MM-DD.'
     return amount, date, None
@@ -10771,6 +11079,9 @@ def add_cash_entry():
     amount, date, err = _parse_money_form(data)
     if err:
         return jsonify({'error': err}), 400
+    closed = _assert_day_open(_cal_day(date))
+    if closed:
+        return closed
     user = _current_user()
     entry = new_for_tenant(CashEntry, account=account, amount=amount, reason=reason[:200], date=date,
                       created_by_id=user.id if user else None)
@@ -10786,6 +11097,9 @@ def delete_cash_entry(entry_id):
     entry = tenant_query(CashEntry).filter_by(id=entry_id).first()
     if not entry:
         return jsonify({'message': 'Cash entry not found!'}), 404
+    closed = _assert_day_open(_cal_day(entry.date))
+    if closed:
+        return closed
     db.session.delete(entry)
     db.session.commit()
     return jsonify({'message': 'Cash entry deleted.'}), 200
@@ -10811,6 +11125,9 @@ def add_account_transfer():
     amount, date, err = _parse_money_form(data)
     if err:
         return jsonify({'error': err}), 400
+    closed = _assert_day_open(_cal_day(date))
+    if closed:
+        return closed
     note = data.get('note')
     note = note.strip()[:200] if isinstance(note, str) and note.strip() else None
     user = _current_user()
@@ -10828,6 +11145,9 @@ def delete_account_transfer(transfer_id):
     transfer = tenant_query(AccountTransfer).filter_by(id=transfer_id).first()
     if not transfer:
         return jsonify({'message': 'Transfer not found!'}), 404
+    closed = _assert_day_open(_cal_day(transfer.date))
+    if closed:
+        return closed
     db.session.delete(transfer)
     db.session.commit()
     return jsonify({'message': 'Transfer deleted.'}), 200
@@ -10841,6 +11161,9 @@ def set_cash_opening():
     and money in the Whish account at the start of `date` -- the Daily Cash
     report's running balances start from."""
     data = request.json or {}
+    if _latest_close_day() is not None:
+        msg = 'The opening balance cannot be changed once a day has been closed.'
+        return jsonify({'error': msg, 'message': msg, 'code': 'opening_locked'}), 409
     settings = tenant_query(BusinessSettings).first()
     if not settings:
         # Same defaults update_business_settings uses for a tenant that never saved Settings.
@@ -10862,6 +11185,93 @@ def set_cash_opening():
     return jsonify({'message': 'Opening balances saved.'}), 200
 
 
+def _finite_amount(raw):
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+@app.route('/api/day-closes', methods=['GET'])
+@jwt_required()
+@admin_or_finance_required()
+def list_day_closes():
+    try:
+        limit = max(1, min(int(request.args.get('limit', 50)), 500))
+    except ValueError:
+        return jsonify({'error': 'limit must be a number.'}), 400
+    zone = _tenant_zone()
+    rows = tenant_query(DayClose).order_by(DayClose.day.desc()).limit(limit).all()
+    return jsonify([r.to_dict(zone) for r in rows]), 200
+
+
+@app.route('/api/day-closes', methods=['POST'])
+@jwt_required()
+@admin_or_finance_required()
+def create_day_close():
+    """Close a day with the cash and Whish balances actually counted. The
+    difference to the register's expected end balance is stored and becomes an
+    over/short adjustment on that day."""
+    data = request.get_json(silent=True) or {}
+    try:
+        day = datetime.strptime(str(data.get('day'))[:10], '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': 'Use day as YYYY-MM-DD.'}), 400
+    counted_cash = _finite_amount(data.get('counted_cash'))
+    counted_whish = _finite_amount(data.get('counted_whish'))
+    if counted_cash is None or counted_whish is None:
+        return jsonify({'error': 'counted_cash and counted_whish must be numbers.'}), 400
+    note = data.get('note')
+    note = note.strip()[:200] if isinstance(note, str) and note.strip() else None
+
+    settings = tenant_query(BusinessSettings).first()
+    if (not settings or settings.cash_opening_date is None or settings.cash_opening_amount is None):
+        return jsonify({'error': 'Set the opening balance before closing a day.'}), 400
+    if day < settings.cash_opening_date:
+        return jsonify({'error': 'A day before the opening balance date cannot be closed.'}), 400
+    if day > _tenant_today():
+        return jsonify({'error': 'A future day cannot be closed.'}), 400
+    latest = _latest_close_day()
+    if latest is not None and day <= latest:
+        msg = (f'Day {day.isoformat()} is already closed.' if day == latest
+               else f'Days up to {latest.isoformat()} are already closed; close a later day.')
+        return jsonify({'error': msg, 'message': msg, 'code': 'day_closed'}), 409
+
+    flow = _cash_flow_for_day(day, settings)
+    user = _current_user()
+    close = new_for_tenant(
+        DayClose, day=day,
+        expected_cash=flow['cash_end'], counted_cash=round(counted_cash, 4),
+        expected_whish=flow['whish_end'], counted_whish=round(counted_whish, 4),
+        note=note, closed_by_id=user.id if user else None, closed_at=datetime.utcnow())
+    db.session.add(close)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({'error': f'Day {day.isoformat()} is already closed.', 'code': 'day_closed'}), 409
+    return jsonify(close.to_dict(_zone_for(settings))), 201
+
+
+@app.route('/api/day-closes/<int:close_id>', methods=['DELETE'])
+@jwt_required()
+@admin_required()
+def reopen_day_close(close_id):
+    """Reopen the latest closed day (admin only); its adjustment disappears."""
+    close = tenant_query(DayClose).filter_by(id=close_id).first()
+    if not close:
+        return jsonify({'message': 'Day close not found!', 'error': 'Day close not found!'}), 404
+    latest = _latest_close_day()
+    if latest is not None and close.day != latest:
+        msg = f'Only the latest closed day ({latest.isoformat()}) can be reopened.'
+        return jsonify({'error': msg, 'message': msg, 'code': 'not_latest_close'}), 409
+    day = close.day
+    db.session.delete(close)
+    db.session.commit()
+    return jsonify({'message': f'Day {day.isoformat()} reopened.'}), 200
+
+
 @app.route('/api/reports/daily-cash', methods=['GET'])
 @jwt_required()
 def get_daily_cash_report():
@@ -10881,16 +11291,33 @@ def get_daily_cash_report():
         if 'admin' not in roles and 'finance' not in roles:
             return jsonify({'message': 'Unauthorized. Only finance or admin can view the daily cash report.'}), 403
 
+        settings = tenant_query(BusinessSettings).first()
+        day_param = request.args.get('day')
         start_date_str = request.args.get('start_date')
         end_date_str = request.args.get('end_date')
-        if not start_date_str or not end_date_str:
-            return jsonify({'error': 'start_date and end_date are required'}), 400
-
-        # The caller (the frontend's localDayRange()) already computed the
-        # exact local-day boundary -- unlike get_collector_progress, this
-        # endpoint must NOT reinterpret/override the time component.
-        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
+        if day_param:
+            # Preferred: the business-local day, converted with the tenant's zone.
+            try:
+                day = datetime.strptime(day_param[:10], '%Y-%m-%d').date()
+            except ValueError:
+                return jsonify({'error': 'Use day as YYYY-MM-DD.'}), 400
+            zone = _zone_for(settings)
+            start_date = _local_day_start_utc(zone, day)
+            end_date = _local_day_start_utc(zone, day + timedelta(days=1))
+            start_date_str = start_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            end_date_str = end_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        else:
+            if not start_date_str or not end_date_str:
+                return jsonify({'error': 'start_date and end_date are required'}), 400
+            # Legacy: the caller (the frontend's localDayRange()) already computed the
+            # exact local-day boundary -- unlike get_collector_progress, this
+            # endpoint must NOT reinterpret/override the time component.
+            start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
+            end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
+            # The local calendar day this report is for. The caller sends local
+            # midnight as a UTC instant, so +12h lands mid-day for any zone
+            # within +/-12h of UTC.
+            day = (start_date + timedelta(hours=12)).date()
 
         payments = tenant_query(Payment).filter(
             Payment.paid == True,
@@ -10955,13 +11382,7 @@ def get_daily_cash_report():
         # another collector to rank (spec: Frontend section).
         group_list = sorted(groups.values(), key=lambda g: (g['is_office'], -g['total']))
 
-        settings = tenant_query(BusinessSettings).first()
         reporting_currency = settings.reporting_currency if settings else 'USD'
-
-        # The local calendar day this report is for. The caller sends local
-        # midnight as a UTC instant, so +12h lands mid-day for any zone
-        # within +/-12h of UTC.
-        day = (start_date + timedelta(hours=12)).date()
 
         return jsonify({
             'date_start': start_date_str,
@@ -10969,7 +11390,7 @@ def get_daily_cash_report():
             'grand_total': grand_total,
             'reporting_currency': reporting_currency,
             'groups': group_list,
-            'cash_flow': _cash_flow_for_day(day, start_date, settings),
+            'cash_flow': _cash_flow_for_day(day, settings),
         }), 200
 
     except Exception as e:
@@ -11394,6 +11815,10 @@ def collect_reseller_payment(reseller_id):
     if amount <= 0:
         return jsonify({'error': 'Amount must be positive'}), 400
 
+    closed = _assert_day_open(_tenant_today())
+    if closed:
+        return closed
+
     try:
         reseller.balance -= amount
         new_payment = ResellerPayment(
@@ -11551,6 +11976,10 @@ def topup_upstream_provider(provider_id):
     amount = float(data.get('amount', 0))
     if amount <= 0:
         return jsonify({'error': 'Amount must be positive'}), 400
+
+    closed = _assert_day_open(_tenant_today())
+    if closed:
+        return closed
 
     try:
         provider.balance += amount
@@ -14272,6 +14701,11 @@ def record_supplier_payment(supplier_id):
     try:
         # Reduce the balance
         method, note = data.get('payment_method', ''), data.get('reference_note', '')
+        payment_date = (datetime.strptime(data['payment_date'], '%Y-%m-%d')
+                        if data.get('payment_date') else _tenant_today_dt())
+        closed = _assert_day_open(_cal_day(payment_date))
+        if closed:
+            return closed
         label = f"Payment recorded ({method})" if method else 'Payment recorded'
         _note_balance_reason(supplier, f"{label}: {note}" if note else label)
         supplier.balance -= amount
@@ -14282,10 +14716,9 @@ def record_supplier_payment(supplier_id):
             payment_method=data.get('payment_method', ''),
             reference_note=data.get('reference_note', ''),
             paid_via=_paid_via(data),
+            payment_date=payment_date,
         )
-        if 'payment_date' in data and data['payment_date']:
-            new_payment.payment_date = datetime.strptime(data['payment_date'], '%Y-%m-%d')
-            
+
         db.session.add(new_payment)
         db.session.commit()
         
@@ -14318,6 +14751,15 @@ def update_supplier_payment(supplier_id, payment_id):
         return jsonify({'message': 'Payment not found!'}), 404
     supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
     data = request.json or {}
+    new_day = None
+    if data.get('payment_date'):
+        try:
+            new_day = _cal_day(datetime.strptime(data['payment_date'], '%Y-%m-%d'))
+        except ValueError:
+            return jsonify({'error': 'Invalid payment_date. Use YYYY-MM-DD.'}), 400
+    closed = _assert_day_open(_cal_day(payment.payment_date), new_day)
+    if closed:
+        return closed
     try:
         if 'amount' in data:
             try:
@@ -14357,6 +14799,9 @@ def delete_supplier_payment(supplier_id, payment_id):
     if not payment:
         return jsonify({'message': 'Payment not found!'}), 404
     supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
+    closed = _assert_day_open(_cal_day(payment.payment_date))
+    if closed:
+        return closed
     try:
         _note_balance_reason(supplier, f"Payment deleted ({float(payment.amount):.2f})")
         supplier.balance = float(supplier.balance or 0) + float(payment.amount)
@@ -14691,7 +15136,10 @@ def record_employee_payment(employee_id):
         payroll_category = get_or_create_payroll_category(current_tenant_id())
 
         payment_date = (datetime.strptime(data['payment_date'], '%Y-%m-%d')
-                         if data.get('payment_date') else datetime.utcnow())
+                         if data.get('payment_date') else _tenant_today_dt())
+        closed = _assert_day_open(_cal_day(payment_date))
+        if closed:
+            return closed
 
         # Recorded as a real Expense (not a separate SalaryPayment row) so a
         # payment made from here and one made from the Expenses page's "Add

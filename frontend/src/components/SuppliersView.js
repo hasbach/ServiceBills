@@ -61,7 +61,7 @@ function SuppliersView() {
             setSupplierDialog({ open: false, data: null });
             loadSuppliers();
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error saving supplier.', severity: 'error' });
+            setSnackbar({ open: true, message: error.response?.data?.error || 'Error saving supplier.', severity: 'error' });
         }
     };
 
@@ -84,7 +84,7 @@ function SuppliersView() {
             setPaymentDialog({ open: false, supplierId: null, amount: '' });
             loadSuppliers();
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error recording payment.', severity: 'error' });
+            setSnackbar({ open: true, message: error.response?.data?.error || 'Error recording payment.', severity: 'error' });
         }
     };
     const handleOpenHistory = async (supplier) => {
@@ -111,7 +111,7 @@ function SuppliersView() {
             setHistoryDialog({ ...historyDialog, supplier: res.data.supplier });
             loadSuppliers();
         } catch (err) {
-            setSnackbar({ open: true, message: 'Error updating balance.', severity: 'error' });
+            setSnackbar({ open: true, message: err.response?.data?.error || 'Error updating balance.', severity: 'error' });
         }
     };
 

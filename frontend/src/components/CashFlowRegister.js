@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   Grid, Paper, Typography, Button, TextField, Alert, Collapse, IconButton,
   Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
-  Dialog, DialogTitle, DialogContent, DialogActions, MenuItem,
+  Dialog, DialogTitle, DialogContent, DialogActions, MenuItem, Tooltip,
 } from '@mui/material';
 import {
   KeyboardArrowDown as KeyboardArrowDownIcon,
@@ -15,6 +15,7 @@ import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
 import { localDayRange } from './dailyCashDateRange';
 import DailyCashFlowSection from './DailyCashFlowSection';
 import { apiService, useAppContext } from '../context/AppContext.js';
+import { CloseDayDialog, ClosedDayBanner, ClosesHistory } from './DayClose';
 
 const ACCOUNTS = [
   { value: 'cash', label: 'Cash' },
@@ -154,7 +155,9 @@ export function TransferDialog({ open, defaultDate, onClose, onSaved }) {
 
 function CashFlowRegister() {
   const { user } = useAppContext();
-  const isAdmin = (user?.role || '').split(',').map((r) => r.trim()).includes('admin');
+  const roles = (user?.role || '').split(',').map((r) => r.trim());
+  const isAdmin = roles.includes('admin');
+  const canClose = isAdmin || roles.includes('finance');
 
   const [day, setDay] = useState(new Date());
   const [reportData, setReportData] = useState(null);
@@ -164,6 +167,8 @@ function CashFlowRegister() {
   const [expandedCashGroups, setExpandedCashGroups] = useState({});
   const [dialog, setDialog] = useState(null); // 'cash-in' | 'transfer' | null
   const [listError, setListError] = useState(null);
+  const [historyKey, setHistoryKey] = useState(0);
+  const [reopenError, setReopenError] = useState(null);
 
   const loadAll = useCallback(async () => {
     if (!(day instanceof Date) || Number.isNaN(day.getTime())) return;
@@ -171,6 +176,7 @@ function CashFlowRegister() {
     const params = { start_date: startIso, end_date: endIso };
     setReportError(null);
     setListError(null);
+    setReopenError(null);
     try {
       const res = await apiService.api.get('/reports/daily-cash', { params });
       setExpandedCashGroups({});
@@ -199,6 +205,19 @@ function CashFlowRegister() {
   useEffect(() => { loadAll(); }, [loadAll]);
 
   const closeAndReload = () => { setDialog(null); loadAll(); };
+  const closeDaySaved = () => { setDialog(null); setHistoryKey((k) => k + 1); loadAll(); };
+
+  const reopen = async (close) => {
+    if (!window.confirm(`Reopen ${close.day}? The day will be unlocked and its over/short adjustment removed.`)) return;
+    try {
+      await apiService.api.delete(`/day-closes/${close.id}`);
+      setReopenError(null);
+      setHistoryKey((k) => k + 1);
+      loadAll();
+    } catch (err) {
+      setReopenError(apiError(err, 'Could not reopen the day.'));
+    }
+  };
 
   const remove = async (kind, id) => {
     const label = kind === 'entry' ? 'this cash-in entry' : 'this transfer';
@@ -213,6 +232,15 @@ function CashFlowRegister() {
 
   const toggleGroup = (key) => setExpandedCashGroups((p) => ({ ...p, [key]: !p[key] }));
   const dayIso = toIsoDay(day instanceof Date && !Number.isNaN(day.getTime()) ? day : new Date());
+
+  const flow = reportData?.cash_flow || null;
+  const close = flow?.close || null;
+  const lockedThrough = flow?.locked_through || null;
+  const isLocked = !!lockedThrough && dayIso <= lockedThrough;
+  const todayIso = toIsoDay(new Date());
+  const canCloseDay = canClose && !!flow && !close && !isLocked && !!flow.opening
+    && dayIso >= flow.opening.date && dayIso <= todayIso;
+  const canReopen = isAdmin && !!close && lockedThrough === close.day;
 
   const rows = [
     ...entries.map((e) => ({
@@ -242,16 +270,41 @@ function CashFlowRegister() {
               </LocalizationProvider>
             </Grid>
             <Grid item xs={6} md={2}>
-              <Button variant="contained" fullWidth onClick={() => setDialog('cash-in')}>Cash in</Button>
+              <Tooltip title={isLocked ? 'Day closed' : ''}>
+                <span style={{ display: 'block' }}>
+                  <Button variant="contained" fullWidth disabled={isLocked} onClick={() => setDialog('cash-in')}>Cash in</Button>
+                </span>
+              </Tooltip>
             </Grid>
             <Grid item xs={6} md={2}>
-              <Button variant="outlined" fullWidth onClick={() => setDialog('transfer')}>Transfer</Button>
+              <Tooltip title={isLocked ? 'Day closed' : ''}>
+                <span style={{ display: 'block' }}>
+                  <Button variant="outlined" fullWidth disabled={isLocked} onClick={() => setDialog('transfer')}>Transfer</Button>
+                </span>
+              </Tooltip>
             </Grid>
+            {canCloseDay && (
+              <Grid item xs={12} md={2}>
+                <Button variant="contained" color="secondary" fullWidth onClick={() => setDialog('close-day')}>Close day</Button>
+              </Grid>
+            )}
           </Grid>
         </Paper>
       </Grid>
 
       {reportError && <Grid item xs={12}><Alert severity="error">{reportError}</Alert></Grid>}
+
+      {close && (
+        <Grid item xs={12}>
+          <ClosedDayBanner close={close} currency={reportData.reporting_currency}
+            canReopen={canReopen} onReopen={() => reopen(close)} error={reopenError} />
+        </Grid>
+      )}
+      {isLocked && !close && (
+        <Grid item xs={12}>
+          <Alert severity="info">Locked — books closed through {lockedThrough}</Alert>
+        </Grid>
+      )}
 
       {reportData && reportData.cash_flow && (
         <Grid item xs={12}>
@@ -259,6 +312,7 @@ function CashFlowRegister() {
             flow={reportData.cash_flow}
             currency={reportData.reporting_currency}
             onOpeningSaved={loadAll}
+            openingLocked={!!lockedThrough}
           />
         </Grid>
       )}
@@ -278,7 +332,7 @@ function CashFlowRegister() {
                     <TableCell>Details</TableCell>
                     <TableCell align="right">Amount</TableCell>
                     <TableCell>By</TableCell>
-                    {isAdmin && <TableCell />}
+                    {isAdmin && !isLocked && <TableCell />}
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -288,7 +342,7 @@ function CashFlowRegister() {
                       <TableCell>{r.detail}</TableCell>
                       <TableCell align="right">{Number(r.amount).toFixed(2)}</TableCell>
                       <TableCell>{r.by || '-'}</TableCell>
-                      {isAdmin && (
+                      {isAdmin && !isLocked && (
                         <TableCell align="right">
                           <IconButton size="small" aria-label={`Delete ${r.kind}`}
                             onClick={() => remove(r.kind, r.id)}>
@@ -380,6 +434,14 @@ function CashFlowRegister() {
         </Grid>
       )}
 
+      <Grid item xs={12}>
+        <ClosesHistory refreshKey={historyKey} />
+      </Grid>
+
+      <CloseDayDialog open={dialog === 'close-day'} day={dayIso}
+        expectedCash={flow?.cash_end} expectedWhish={flow?.whish_end}
+        currency={reportData?.reporting_currency}
+        onClose={() => setDialog(null)} onSaved={closeDaySaved} />
       <CashInDialog open={dialog === 'cash-in'} defaultDate={dayIso}
         onClose={() => setDialog(null)} onSaved={closeAndReload} />
       <TransferDialog open={dialog === 'transfer'} defaultDate={dayIso}
