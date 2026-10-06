@@ -17,14 +17,26 @@ export default function useWindowRows(count, estimateSize, itemKey) {
     const anchorRef = React.useRef(null);
     const [scrollMargin, setScrollMargin] = useState(0);
 
-    useLayoutEffect(() => {
+    // Re-measure after EVERY render (no deps) and on window resize: whatever
+    // sits above the list (filters, banners, loading states, summary cards)
+    // changes height without this hook re-rendering for that reason, and a
+    // stale scrollMargin makes the virtual window drift from the real scroll
+    // position so rows near the viewport unmount (blank space). It only sets
+    // state when the offset moved by more than 2px, so it settles in one pass
+    // and cannot loop (measureElement is deferred and flushSync is off).
+    const measureMargin = React.useCallback(() => {
         const el = anchorRef.current;
         if (!el) return;
         const margin = Math.round(el.getBoundingClientRect().top + window.scrollY);
-        if (Math.abs(margin - scrollMargin) > 2) {
-            setScrollMargin(margin);
-        }
-    }, [scrollMargin]);
+        setScrollMargin((prev) => (Math.abs(margin - prev) > 2 ? margin : prev));
+    }, []);
+
+    useLayoutEffect(measureMargin);
+
+    React.useEffect(() => {
+        window.addEventListener('resize', measureMargin);
+        return () => window.removeEventListener('resize', measureMargin);
+    }, [measureMargin]);
 
     const virtualizer = useWindowVirtualizer({
         count,
