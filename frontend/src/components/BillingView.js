@@ -4,6 +4,7 @@ import {
     Dialog, DialogTitle, DialogContent, DialogActions, TextField, Stack, ToggleButtonGroup, ToggleButton,
 } from '@mui/material';
 import { useAppContext } from '../context/AppContext.js';
+import SalesContact from './SalesContact.js';
 
 const FEATURES = {
     free: ['Up to 50 customers', 'Manual WhatsApp (deep-link)', 'Core billing, payments & receipts'],
@@ -119,6 +120,9 @@ const BillingView = () => {
                 </Alert>
             )}
             {banner && <Alert severity={banner.severity} sx={{ mb: 2 }}>{banner.message}</Alert>}
+            <Card variant="outlined" sx={{ mb: 3, p: 2 }}>
+                <SalesContact />
+            </Card>
             <Grid container spacing={2}>
                 {Object.keys(plans).map((name) => (
                     <Grid item xs={12} md={6} key={name}>
@@ -178,6 +182,7 @@ const BillingView = () => {
                     <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
                         Leave your details and we'll get in touch to complete the upgrade.
                     </Typography>
+                    <Box sx={{ mb: 2 }}><SalesContact title="Or reach us directly:" /></Box>
                     <Stack spacing={2} sx={{ mt: 1 }}>
                         <TextField label="Your name" value={contact.name} onChange={(e) => setContact({ ...contact, name: e.target.value })} fullWidth />
                         <TextField label="Email" value={contact.email} onChange={(e) => setContact({ ...contact, email: e.target.value })} fullWidth />

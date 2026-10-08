@@ -6,6 +6,7 @@ import {
     Router as RouterIcon
 } from '@mui/icons-material';
 import { Link } from 'react-router-dom';
+import SalesContact from './SalesContact.js';
 
 const FEATURES = [
     { icon: <GroupsIcon color="primary" />, title: 'Customers & subscriptions', desc: 'Track subscribers, plans, resellers and balances in one place.' },
@@ -96,9 +97,13 @@ const LandingView = () => (
                     </Grid>
                 ))}
             </Grid>
+            <Card variant="outlined" sx={{ mt: 4, p: 2.5 }}>
+                <SalesContact align="center" />
+            </Card>
         </Container>
 
         <Box sx={{ textAlign: 'center', py: 3, color: 'text.secondary', borderTop: '1px solid', borderColor: 'divider' }}>
+            <Box sx={{ mb: 1 }}><SalesContact title="" align="center" /></Box>
             <Typography variant="caption">© servicesBills</Typography>
         </Box>
     </Box>
