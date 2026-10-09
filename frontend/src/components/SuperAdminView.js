@@ -3,9 +3,11 @@ import {
     Box, Typography, Table, TableHead, TableRow, TableCell, TableBody,
     Button, Chip, AppBar, Toolbar, CircularProgress, Paper, Alert, Stack,
     Dialog, DialogTitle, DialogContent, DialogActions, TextField, ToggleButton, ToggleButtonGroup,
-    Switch, Link, Tabs, Tab,
+    Switch, Link, Tabs, Tab, MenuItem, InputAdornment,
 } from '@mui/material';
+import { WhatsApp as WhatsAppIcon } from '@mui/icons-material';
 import LicensesAdmin from './LicensesAdmin.js';
+import PlatformBillingAdmin, { METHOD_LABELS } from './PlatformBillingAdmin.js';
 import { useAppContext } from '../context/AppContext.js';
 
 // Presets shown in the grant/extend dialog. 'custom' hands plan_expires_at
@@ -32,6 +34,51 @@ const ALWAYS_ON_MODULES = [
     { key: 'office', label: 'Office' },
 ];
 
+// Methods for a payment received outside the Whish checkout.
+const MANUAL_METHODS = ['transfer', 'cash', 'whish_direct', 'other'];
+
+// wa.me wants the full international number as digits only. Local Lebanese
+// numbers (e.g. 03 123456 / 70123456) get the 961 country code.
+const whatsAppDigits = (phone) => {
+    let d = String(phone || '').replace(/\D/g, '');
+    if (d.startsWith('00')) d = d.slice(2);
+    if (d && d.length <= 8) d = `961${d.replace(/^0/, '')}`;
+    return d;
+};
+
+const PhoneLink = ({ phone, caption }) => (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, whiteSpace: 'nowrap' }}>
+        <Link href={`tel:${phone.replace(/\s/g, '')}`} underline="hover">{phone}</Link>
+        <Link href={`https://wa.me/${whatsAppDigits(phone)}`} target="_blank" rel="noopener noreferrer"
+              aria-label={`WhatsApp ${phone}`} sx={{ display: 'inline-flex' }}>
+            <WhatsAppIcon sx={{ fontSize: 16, color: '#25D366' }} />
+        </Link>
+        {caption && <Typography variant="caption" color="text.secondary">{caption}</Typography>}
+    </Box>
+);
+
+const TenantContact = ({ t }) => {
+    const phones = [];
+    if (t.contact_phone) phones.push({ phone: t.contact_phone, caption: null });
+    if (t.settings_mobile && whatsAppDigits(t.settings_mobile) !== whatsAppDigits(t.contact_phone)) {
+        phones.push({ phone: t.settings_mobile, caption: t.contact_phone ? '(settings)' : null });
+    }
+    const emails = [...new Set([...(t.admins || []).map((a) => a.email), t.settings_email].filter(Boolean))];
+    const admin = (t.admins || [])[0];
+    return (
+        <Box sx={{ minWidth: 180 }}>
+            {phones.length === 0 && <Typography variant="caption" color="text.secondary" display="block">no mobile</Typography>}
+            {phones.map((p) => <PhoneLink key={p.phone} {...p} />)}
+            {emails.map((e) => (
+                <Link key={e} href={`mailto:${e}`} underline="hover" variant="body2" display="block">{e}</Link>
+            ))}
+            {admin && <Typography variant="caption" color="text.secondary">login: {admin.username}</Typography>}
+        </Box>
+    );
+};
+
+const EMPTY_PAYMENT = { amount: '', method: 'transfer', note: '' };
+
 const formatExpiry = (iso) => {
     if (!iso) return null;
     const d = new Date(iso);
@@ -46,6 +93,7 @@ const SuperAdminView = () => {
     const [duration, setDuration] = useState('1_month');
     const [customDate, setCustomDate] = useState('');
     const [granting, setGranting] = useState(false);
+    const [payment, setPayment] = useState(EMPTY_PAYMENT);
     const [modulesTarget, setModulesTarget] = useState(null); // tenant whose modules dialog is open
     const [modulesBusy, setModulesBusy] = useState(false);
     const [tab, setTab] = useState(0);
@@ -81,6 +129,7 @@ const SuperAdminView = () => {
         setGrantTarget(tenant);
         setDuration('1_month');
         setCustomDate('');
+        setPayment(EMPTY_PAYMENT);
     };
 
     const submitGrant = async () => {
@@ -91,6 +140,13 @@ const SuperAdminView = () => {
         if (duration === 'custom' && !customDate) {
             setSnackbar({ open: true, message: 'Pick a date first.', severity: 'error' });
             return;
+        }
+        if (payment.amount !== '') {
+            if (!(Number(payment.amount) > 0)) {
+                setSnackbar({ open: true, message: 'Amount received must be greater than 0 (or leave it empty).', severity: 'error' });
+                return;
+            }
+            extra.payment = { amount: Number(payment.amount), method: payment.method, note: payment.note };
         }
         setGranting(true);
         try {
@@ -142,9 +198,11 @@ const SuperAdminView = () => {
             </AppBar>
             <Tabs value={tab} onChange={(e, v) => setTab(v)} sx={{ px: { xs: 2, md: 3 } }}>
                 <Tab label="Tenants" />
+                <Tab label="Billing" />
                 <Tab label="On-prem licenses" />
             </Tabs>
-            {tab === 1 && <Box sx={{ p: { xs: 2, md: 3 } }}><LicensesAdmin /></Box>}
+            {tab === 1 && <Box sx={{ p: { xs: 2, md: 3 } }}><PlatformBillingAdmin /></Box>}
+            {tab === 2 && <Box sx={{ p: { xs: 2, md: 3 } }}><LicensesAdmin /></Box>}
             <Box sx={{ p: { xs: 2, md: 3 }, display: tab === 0 ? 'block' : 'none' }}>
                 {/* Pending "contact us to upgrade" requests */}
                 {requests.length > 0 && (
@@ -173,6 +231,7 @@ const SuperAdminView = () => {
                             <TableHead>
                                 <TableRow>
                                     <TableCell>Name</TableCell>
+                                    <TableCell>Contact</TableCell>
                                     <TableCell>Plan</TableCell>
                                     <TableCell>Status</TableCell>
                                     <TableCell align="right">Customers</TableCell>
@@ -183,7 +242,15 @@ const SuperAdminView = () => {
                             <TableBody>
                                 {tenants.map((t) => (
                                     <TableRow key={t.id} hover>
-                                        <TableCell>{t.name}</TableCell>
+                                        <TableCell>
+                                            {t.name}
+                                            {t.created_at && (
+                                                <Typography variant="caption" display="block" color="text.secondary" sx={{ whiteSpace: 'nowrap' }}>
+                                                    joined {formatExpiry(t.created_at)}
+                                                </Typography>
+                                            )}
+                                        </TableCell>
+                                        <TableCell><TenantContact t={t} /></TableCell>
                                         <TableCell>
                                             <Chip size="small" label={t.plan} />
                                             {t.plan === 'pro' && t.plan_expires_at && (
@@ -247,6 +314,33 @@ const SuperAdminView = () => {
                             InputLabelProps={{ shrink: true }}
                         />
                     )}
+                    <Typography variant="subtitle2" sx={{ mt: 3, mb: 0.5 }}>Payment received (optional)</Typography>
+                    <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1.5 }}>
+                        Paid by bank transfer, cash, etc.? Record it so it shows on the Billing tab.
+                        Leave empty for a free/comped grant. Whish checkout payments are recorded automatically.
+                    </Typography>
+                    <Stack direction="row" spacing={1.5}>
+                        <TextField
+                            label="Amount" type="number" size="small" sx={{ flex: 1 }}
+                            value={payment.amount}
+                            onChange={(e) => setPayment({ ...payment, amount: e.target.value })}
+                            InputProps={{ startAdornment: <InputAdornment position="start">$</InputAdornment> }}
+                            inputProps={{ min: 0, step: '0.01' }}
+                        />
+                        <TextField
+                            select label="Method" size="small" sx={{ flex: 1 }}
+                            value={payment.method}
+                            onChange={(e) => setPayment({ ...payment, method: e.target.value })}
+                        >
+                            {MANUAL_METHODS.map((m) => <MenuItem key={m} value={m}>{METHOD_LABELS[m]}</MenuItem>)}
+                        </TextField>
+                    </Stack>
+                    <TextField
+                        label="Note (e.g. transfer reference)" size="small" fullWidth sx={{ mt: 1.5 }}
+                        value={payment.note}
+                        onChange={(e) => setPayment({ ...payment, note: e.target.value })}
+                        inputProps={{ maxLength: 200 }}
+                    />
                 </DialogContent>
                 <DialogActions>
                     <Button onClick={closeGrantDialog} disabled={granting}>Cancel</Button>

@@ -6,7 +6,7 @@ import AuthShell from './AuthShell.js';
 
 const RegisterView = () => {
     const { apiService } = useAppContext();
-    const [form, setForm] = useState({ business_name: '', email: '', username: '', password: '' });
+    const [form, setForm] = useState({ business_name: '', email: '', mobile: '', username: '', password: '' });
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState('');
     const [done, setDone] = useState(false);
@@ -49,6 +49,10 @@ const RegisterView = () => {
                            onChange={set('business_name')} margin="normal" required />
                 <TextField fullWidth type="email" label="Email" value={form.email}
                            onChange={set('email')} margin="normal" required />
+                <TextField fullWidth type="tel" label="Mobile number" value={form.mobile}
+                           onChange={set('mobile')} margin="normal" required
+                           placeholder="+961 70 123 456" inputProps={{ maxLength: 30 }}
+                           helperText="So we can reach you about your account and billing." />
                 <TextField fullWidth label="Username" value={form.username}
                            onChange={set('username')} margin="normal" required />
                 <TextField fullWidth type="password" label="Password" value={form.password}

@@ -141,6 +141,7 @@ const rawApiService = {
     adminLicenseFile: (id) => api.get(`/admin/licenses/${id}/file`, { responseType: 'text' }),
     adminSetModules: (id, overrides) => api.post(`/admin/tenants/${id}/modules`, { overrides }),
     adminUpgradeRequests: () => api.get('/admin/upgrade-requests'),
+    adminBillingPayments: () => api.get('/admin/billing/payments'),
 
     // User Management API methods
     fetchUsers: () => api.get('/users'),

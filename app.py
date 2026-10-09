@@ -268,6 +268,9 @@ class Tenant(db.Model):
     # Super-admin per-tenant module overrides on top of the plan bundle,
     # e.g. {"network": true, "ai_cs": false}. NULL = none. See modules.py.
     module_overrides = db.Column(db.JSON, nullable=True)
+    # Mobile number given at signup, so the platform operator can reach the
+    # tenant (shown on the super-admin page). Null for tenants that predate it.
+    contact_phone = db.Column(db.String(30), nullable=True)
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "slug": self.slug,
@@ -2005,6 +2008,11 @@ def _utc_stamp(dt):
     return dt.strftime('%Y-%m-%d %H:%M:%S') if dt else None
 
 
+def _iso_utc(dt):
+    """ISO-8601 with an explicit 'Z', so `new Date(...)` reads it as UTC."""
+    return dt.strftime('%Y-%m-%dT%H:%M:%SZ') if dt else None
+
+
 class WhatsAppConversation(db.Model):
     """One WhatsApp chat (tenant x customer phone) for the admin inbox -- see
     docs/superpowers/specs/2026-09-23-whatsapp-inbox-design.md."""
@@ -2123,6 +2131,25 @@ class BillingPaymentAttempt(db.Model):
     status = db.Column(db.String(10), nullable=False, default='pending')  # pending, succeeded, failed, expired
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     completed_at = db.Column(db.DateTime, nullable=True)
+
+
+class PlatformPayment(db.Model):
+    """A Pro-plan payment the platform operator received outside Whish (bank
+    transfer, cash, ...) and recorded while granting/extending Pro. Listed next
+    to BillingPaymentAttempt rows on the super-admin Billing tab."""
+    __tablename__ = "platform_payment"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    currency = db.Column(db.String(3), nullable=False, default='USD')
+    method = db.Column(db.String(20), nullable=False)  # see PLATFORM_PAYMENT_METHODS
+    period = db.Column(db.String(20), nullable=True)   # grant duration it paid for, e.g. '1_month'
+    note = db.Column(db.String(200), nullable=True)
+    recorded_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+PLATFORM_PAYMENT_METHODS = ('transfer', 'cash', 'whish_direct', 'other')
 
 
 class Currency(db.Model):
@@ -2737,6 +2764,7 @@ def register():
     password = data.get('password')
     email = (data.get('email') or '').strip().lower() or None
     business_name = data.get('business_name') or username
+    mobile = (data.get('mobile') or '').strip() or None
     if not username or not password:
         return jsonify({"msg": "Username and password required"}), 400
     if User.query.filter_by(username=username).first():
@@ -2744,8 +2772,12 @@ def register():
     if email and User.query.filter_by(email=email).first():
         return jsonify({"msg": "Email already in use"}), 409
 
+    if mobile and len(mobile) > 30:
+        return jsonify({"msg": "Mobile number is too long"}), 400
+
     # Each registration provisions a new tenant (business); the registrant is its admin.
     tenant, new_user = _create_tenant_with_admin(business_name, username, password, email=email)
+    tenant.contact_phone = mobile
     db.session.commit()
 
     # Send an email-verification link (best-effort; failure doesn't block signup).
@@ -3026,12 +3058,25 @@ def stripe_webhook():
 @app.route('/api/admin/tenants', methods=['GET'])
 @superadmin_required
 def admin_list_tenants():
+    settings_by_tenant = {s.tenant_id: s for s in BusinessSettings.query.all()}
+    admins_by_tenant = {}
+    for u in User.query.filter(User.tenant_id.isnot(None), User.role == 'admin').order_by(User.id).all():
+        admins_by_tenant.setdefault(u.tenant_id, []).append(u)
     result = []
     for t in Tenant.query.order_by(Tenant.created_at.desc()).all():
         d = t.to_dict()
         d["customers"] = Customer.query.filter_by(tenant_id=t.id).count()
         d["users"] = User.query.filter_by(tenant_id=t.id).count()
         d["module_overrides"] = t.module_overrides or {}
+        # Ways to reach the tenant: the mobile given at signup, the one in
+        # their business settings (may differ or be the only one for older
+        # tenants), and the admin login(s) with their email.
+        bs = settings_by_tenant.get(t.id)
+        d["contact_phone"] = t.contact_phone
+        d["settings_mobile"] = bs.mobile if bs else None
+        d["settings_email"] = bs.email if bs else None
+        d["admins"] = [{"username": u.username, "email": u.email} for u in admins_by_tenant.get(t.id, [])]
+        d["created_at"] = _iso_utc(t.created_at)
         result.append(d)
     return jsonify(result), 200
 
@@ -3108,6 +3153,27 @@ def admin_set_plan(tid):
     t = db.session.get(Tenant, tid)
     if not t:
         return jsonify({"msg": "Tenant not found"}), 404
+
+    # Optional: money received outside Whish for this grant (bank transfer,
+    # cash...), recorded so it shows on the Billing tab. Validated before any
+    # change so a bad amount doesn't leave the plan half-applied.
+    payment = data.get('payment') or None
+    if payment is not None:
+        if plan != 'pro' or not isinstance(payment, dict):
+            return jsonify({"msg": "payment can only be recorded with a Pro grant"}), 400
+        try:
+            pay_amount = float(payment.get('amount'))
+        except (TypeError, ValueError):
+            return jsonify({"msg": "payment.amount must be a number"}), 400
+        if not pay_amount > 0:
+            return jsonify({"msg": "payment.amount must be greater than 0"}), 400
+        pay_method = payment.get('method') or 'transfer'
+        if pay_method not in PLATFORM_PAYMENT_METHODS:
+            return jsonify({"msg": f"Unknown payment method '{pay_method}'"}), 400
+        pay_note = (str(payment.get('note') or '').strip() or None)
+        if pay_note and len(pay_note) > 200:
+            return jsonify({"msg": "payment.note is too long (200 max)"}), 400
+
     t.plan = plan
 
     if plan == 'pro':
@@ -3145,11 +3211,52 @@ def admin_set_plan(tid):
         t.plan_expires_at = None
         t.plan_expiry_reminder_sent_at = None
 
+    if payment is not None:
+        db.session.add(PlatformPayment(
+            tenant_id=t.id, amount=pay_amount, currency='USD', method=pay_method,
+            period=(data.get('duration') or ('custom' if data.get('plan_expires_at') else None)),
+            note=pay_note,
+            recorded_by_id=getattr(User.query.filter_by(username=get_jwt_identity()).first(), 'id', None),
+        ))
+
     # Resolve any pending upgrade requests for this tenant.
     for r in UpgradeRequest.query.filter_by(tenant_id=tid, status='pending').all():
         r.status = 'handled'
     db.session.commit()
     return jsonify(t.to_dict()), 200
+
+
+@app.route('/api/admin/billing/payments', methods=['GET'])
+@superadmin_required
+def admin_billing_payments():
+    """Every Pro-plan payment across tenants: Whish checkout attempts (any
+    status) plus payments recorded manually on a Pro grant, newest first."""
+    names = {t.id: t.name for t in Tenant.query.all()}
+    rows = []
+    for a in BillingPaymentAttempt.query.all():
+        rows.append({
+            "id": f"whish-{a.id}", "source": "whish", "tenant_id": a.tenant_id,
+            "tenant_name": names.get(a.tenant_id), "amount": float(a.amount),
+            "currency": a.currency, "method": "whish", "period": a.billing_cycle,
+            "status": a.status, "note": None,
+            "created_at": _iso_utc(a.created_at), "completed_at": _iso_utc(a.completed_at),
+            "_sort": a.created_at,
+        })
+    recorders = {u.id: u.username for u in User.query.filter(User.tenant_id.is_(None)).all()}
+    for p in PlatformPayment.query.all():
+        rows.append({
+            "id": f"manual-{p.id}", "source": "manual", "tenant_id": p.tenant_id,
+            "tenant_name": names.get(p.tenant_id), "amount": float(p.amount),
+            "currency": p.currency, "method": p.method, "period": p.period,
+            "status": "succeeded", "note": p.note,
+            "recorded_by": recorders.get(p.recorded_by_id),
+            "created_at": _iso_utc(p.created_at), "completed_at": _iso_utc(p.created_at),
+            "_sort": p.created_at,
+        })
+    rows.sort(key=lambda r: r["_sort"] or datetime.min, reverse=True)
+    for r in rows:
+        del r["_sort"]
+    return jsonify(rows), 200
 
 
 @app.route('/api/admin/upgrade-requests', methods=['GET'])
@@ -3257,7 +3364,7 @@ _TENANT_DELETE_ORDER = [
     # SQLite does not enforce FKs, so getting this wrong is invisible locally
     # and only fails against production Postgres.
     NetworkWriteAudit,
-    UpgradeRequest, BillingPaymentAttempt, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
+    UpgradeRequest, BillingPaymentAttempt, PlatformPayment, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
     CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment, BalanceLog,
     # WhatsAppMessage holds an FK to whatsapp_conversation, and
     # WhatsAppConversation holds an FK to customer, so both must be deleted
