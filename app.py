@@ -32,6 +32,7 @@ import uuid
 import secrets
 import requests
 import traceback
+from types import SimpleNamespace
 from flask import Flask, jsonify, request, redirect, g, has_request_context
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from flask_sqlalchemy import SQLAlchemy
@@ -8689,6 +8690,23 @@ def build_meta_template_payload(settings, template_name, default_language='en', 
     return template_dict
 
 
+def send_reseller_whatsapp(tenant_id, reseller_id, name, phone, event_type, context):
+    """Send a reseller_* template to a reseller. send_whatsapp_message expects a
+    customer-shaped object; resellers aren't customers, so pass a stand-in that
+    carries tenant_id -- without it the sender raised AttributeError, swallowed
+    by its own catch-all, and no reseller message was sent from 2026-07-17
+    (a93cffb) on. Takes plain values so it is safe in a background greenlet."""
+    recipient = SimpleNamespace(tenant_id=tenant_id, id=reseller_id, name=name, phone=phone,
+                                whatsapp_notifications_enabled=True, balance=0)
+    try:
+        res = send_whatsapp_message(recipient, event_type=event_type, context=context)
+    except Exception as wa_error:
+        res = {'success': False, 'error': str(wa_error)}
+    if not res.get('success') and res.get('status') != 'Skipped':
+        logging.warning(f"Reseller WhatsApp [{event_type}] to reseller {reseller_id} not sent: {res.get('error')}")
+    return res
+
+
 def send_whatsapp_message(customer, event_type, context=None):
     """
     Sends a WhatsApp message to a customer if the WhatsApp API mode is enabled.
@@ -10187,24 +10205,13 @@ def _renew_subscription_core(customer, notify_later=None):
                 db.session.add(reseller_payment)
                 db.session.commit()
 
-                r_phone, r_id, r_name = reseller.phone, reseller.id, reseller.name
+                r_tenant_id, r_phone, r_id, r_name = reseller.tenant_id, reseller.phone, reseller.id, reseller.name
                 r_balance, c_name, amount = reseller.balance, customer.name, renewal_amount
 
                 def _send_reseller():
-                    try:
-                        class FakeCustomer:
-                            phone = r_phone
-                            whatsapp_notifications_enabled = True
-                            id = r_id
-                            name = r_name
-
-                        send_whatsapp_message(
-                            FakeCustomer(),
-                            event_type='reseller_customer_renewed',
-                            context={'amount': amount, 'balance': r_balance, 'customer_name': c_name}
-                        )
-                    except Exception as wa_error:
-                        logging.error(f"Failed to send WA message on renew to reseller: {wa_error}")
+                    send_reseller_whatsapp(
+                        r_tenant_id, r_id, r_name, r_phone, 'reseller_customer_renewed',
+                        {'amount': amount, 'balance': r_balance, 'customer_name': c_name})
                 _notify(_send_reseller)
         else:
             new_payment = Payment(
@@ -11929,18 +11936,9 @@ def add_reseller_credit(reseller_id):
         db.session.add(new_payment)
         db.session.commit()
 
-        # Send WhatsApp Notification
-        class FakeCustomer:
-            phone = reseller.phone
-            whatsapp_notifications_enabled = True
-            id = reseller.id
-            name = reseller.name
-
-        send_whatsapp_message(
-            FakeCustomer(),
-            event_type='reseller_credit_added',
-            context={'amount': amount, 'balance': reseller.balance}
-        )
+        send_reseller_whatsapp(
+            reseller.tenant_id, reseller.id, reseller.name, reseller.phone,
+            'reseller_credit_added', {'amount': amount, 'balance': reseller.balance})
 
         return jsonify({'message': 'Credit added successfully!', 'reseller': reseller.to_dict()}), 200
     except Exception as e:
@@ -11971,18 +11969,9 @@ def apply_reseller_discount(reseller_id):
         db.session.add(new_payment)
         db.session.commit()
 
-        # Send WhatsApp Notification
-        class FakeCustomer:
-            phone = reseller.phone
-            whatsapp_notifications_enabled = True
-            id = reseller.id
-            name = reseller.name
-
-        send_whatsapp_message(
-            FakeCustomer(),
-            event_type='reseller_discount_applied',
-            context={'amount': amount, 'balance': reseller.balance}
-        )
+        send_reseller_whatsapp(
+            reseller.tenant_id, reseller.id, reseller.name, reseller.phone,
+            'reseller_discount_applied', {'amount': amount, 'balance': reseller.balance})
 
         return jsonify({'message': 'Discount applied successfully!', 'reseller': reseller.to_dict()}), 200
     except Exception as e:
@@ -12018,22 +12007,9 @@ def collect_reseller_payment(reseller_id):
         db.session.add(new_payment)
         db.session.commit()
 
-        # Send WhatsApp Notification
-        class FakeCustomer:
-            phone = reseller.phone
-            whatsapp_notifications_enabled = True
-            id = reseller.id
-            name = reseller.name
-
-        try:
-            send_whatsapp_message(
-                FakeCustomer(),
-                event_type='reseller_payment_collected',
-                context={'amount': amount, 'balance': reseller.balance, 'reseller_name': reseller.name}
-            )
-        except Exception as wa_error:
-            import logging
-            logging.error(f"Failed to send WA message on payment collect to reseller: {wa_error}")
+        send_reseller_whatsapp(
+            reseller.tenant_id, reseller.id, reseller.name, reseller.phone,
+            'reseller_payment_collected', {'amount': amount, 'balance': reseller.balance})
 
         return jsonify({'message': 'Payment collected successfully!', 'reseller': reseller.to_dict()}), 200
     except Exception as e:
