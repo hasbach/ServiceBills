@@ -4929,6 +4929,7 @@ def update_customer(customer_id):
                         )
                         db.session.add(debt_payment)
                         _maybe_create_customer_payment_link(debt_payment, customer)
+                        apply_customer_balance_to_unpaid_payments(customer)
 
             customer.reseller_id = new_reseller_id
 
@@ -6112,6 +6113,8 @@ def mark_payment_as_paid(payment_id):
 
         # Store the original amount before any modifications
         original_payment_amount = payment.amount
+        # A collected card already sent the customer payment_paid at collect time.
+        already_notified = bool(payment.collected)
         amount_received_in_this_transaction = 0.0
 
         if partial_payment_flag:
@@ -6166,6 +6169,14 @@ def mark_payment_as_paid(payment_id):
         db.session.commit()
 
         mikrotik_result = _maybe_restore_mikrotik_access(customer)
+
+        if amount_received_in_this_transaction > 0 and not already_notified:
+            try:
+                send_whatsapp_message(customer, event_type='payment_paid',
+                                      context={'amount': float(amount_received_in_this_transaction),
+                                               'balance': float(customer.balance)})
+            except Exception as wa_error:
+                logging.error(f"Failed to send WA message on mark paid: {wa_error}")
 
         return jsonify({
             'message': 'Payment updated successfully!',
@@ -6356,6 +6367,11 @@ def receive_customer_payment(customer_id):
                                        'enter one under Settings -> Exchange Rates first.'}), 400
         db.session.commit()
         mikrotik = _maybe_restore_mikrotik_access(customer)
+        try:
+            send_whatsapp_message(customer, event_type='payment_paid',
+                                  context={'amount': amount, 'balance': float(customer.balance)})
+        except Exception as wa_error:
+            logging.error(f"Failed to send WA message on receive payment: {wa_error}")
         msg = f'Received ${amount:.2f}: {count} bill(s) paid'
         if credit:
             msg += f', ${credit:.2f} kept as credit'
@@ -6930,6 +6946,7 @@ def activate_subscription(customer_id):
                     db.session.add(new_payment)
                     _maybe_create_customer_payment_link(new_payment, customer)
                     customer.balance -= amount_due
+                    apply_customer_balance_to_unpaid_payments(customer)
 
         db.session.commit()
         recalculate_estimated_profit(customer.tenant_id)
@@ -10225,6 +10242,7 @@ def _renew_subscription_core(customer, notify_later=None):
             _maybe_create_customer_payment_link(new_payment, customer)
 
             customer.balance -= renewal_amount
+            apply_customer_balance_to_unpaid_payments(customer)
             db.session.commit()
 
             c_id, c_tenant_id = customer.id, customer.tenant_id

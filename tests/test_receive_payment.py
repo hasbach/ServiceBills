@@ -284,3 +284,95 @@ def test_statement_reasons(app, client):
     assert paid["changed_by"] == "st1"
     b = make_tenant(client, "Other", "st1b")
     assert client.get(f"/api/customers/{cid}/balance-log", headers=b).status_code == 404
+
+
+# --- renew / reactivate settle from existing credit -------------------------------
+
+def test_renew_settles_new_bill_from_leftover_credit(app, client):
+    """DeltaNet report: received 30 against a 25 bill (5 credit), then Renew --
+    the subscription card showed 20 owed but the Payments page showed a 25 bill."""
+    a = make_tenant(client, "B", "rn1")
+    cid = _customer(client, a)
+    _prepay(client, a, cid, 5)
+    r = client.post(f"/api/customers/{cid}/renew_subscription", headers=a)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    balance, bills = _state(cid)
+    assert balance == -20
+    assert sorted(bills) == sorted([(5, True), (20, False)])
+
+
+def test_bulk_renew_settles_from_credit(app, client):
+    a = make_tenant(client, "B", "rn2")
+    cid = _customer(client, a)
+    _prepay(client, a, cid, 25)
+    r = client.post("/api/customers/bulk_renew_subscription", headers=a, json={"customer_ids": [cid]})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert _state(cid) == (0, [(25, True)])
+
+
+def test_reactivate_settles_from_credit(app, client):
+    a = make_tenant(client, "B", "rn3")
+    cid = _customer(client, a)
+    _prepay(client, a, cid, 30)
+    with flask_app.app_context():
+        c = db.session.get(Customer, cid)
+        c.is_subscription_active = False
+        c.subscription_expiry_date = datetime(2026, 1, 1)
+        db.session.commit()
+    r = client.put(f"/api/customers/{cid}/activate_subscription", headers=a)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert _state(cid) == (5, [(25, True)])
+
+
+def test_receive_payment_sends_payment_whatsapp(app, client, monkeypatch):
+    """Receive Payment (admin/finance, 'pay') must fire the payment_paid
+    template, like Collect does -- it used to send nothing in API mode."""
+    import app as appmod
+    sent = []
+    monkeypatch.setattr(appmod, "send_whatsapp_message",
+                        lambda c, event_type=None, context=None, **k: sent.append((c.id, event_type, context)) or {})
+    a = make_tenant(client, "B", "wa1")
+    cid = _customer(client, a)
+    _bill(client, a, cid, 25)
+    r = client.post(f"/api/customers/{cid}/receive-payment", headers=a, json={"amount": 30})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert [s for s in sent if s[1] == "payment_paid"] == [(cid, "payment_paid", {"amount": 30.0, "balance": 5.0})]
+
+
+def _capture_wa(monkeypatch):
+    import app as appmod
+    sent = []
+    monkeypatch.setattr(appmod, "send_whatsapp_message",
+                        lambda c, event_type=None, context=None, **k: sent.append((c.id, event_type, context)) or {})
+    return lambda: [s for s in sent if s[1] == "payment_paid"]
+
+
+def test_single_card_pay_sends_payment_whatsapp(app, client, monkeypatch):
+    paid_msgs = _capture_wa(monkeypatch)
+    a = make_tenant(client, "B", "wa2")
+    cid = _customer(client, a)
+    pid = _bill(client, a, cid, 25)
+    r = client.put(f"/api/payments/{pid}/mark_paid", headers=a, json={"action": "pay"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert paid_msgs() == [(cid, "payment_paid", {"amount": 25.0, "balance": 0.0})]
+
+
+def test_single_card_partial_pay_sends_received_amount(app, client, monkeypatch):
+    paid_msgs = _capture_wa(monkeypatch)
+    a = make_tenant(client, "B", "wa3")
+    cid = _customer(client, a)
+    pid = _bill(client, a, cid, 25)
+    client.put(f"/api/payments/{pid}/mark_paid", headers=a,
+               json={"action": "pay", "partial_payment": True, "partial_amount": 10})
+    assert paid_msgs() == [(cid, "payment_paid", {"amount": 10.0, "balance": -15.0})]
+
+
+def test_confirming_a_collected_card_does_not_message_twice(app, client, monkeypatch):
+    paid_msgs = _capture_wa(monkeypatch)
+    a = make_tenant(client, "B", "wa4")
+    cid = _customer(client, a)
+    pid = _bill(client, a, cid, 25)
+    client.put(f"/api/payments/{pid}/mark_paid", headers=a, json={"action": "collect"})
+    client.put(f"/api/payments/{pid}/mark_paid", headers=a, json={"action": "pay"})
+    client.put(f"/api/payments/{pid}/mark_paid", headers=a, json={"action": "pay"})  # repeat: no-op
+    assert len(paid_msgs()) == 1  # only the collect one
