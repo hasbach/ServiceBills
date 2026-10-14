@@ -76,7 +76,7 @@ def test_confirmed_failure_alerts_once_then_recovers_once(app, client, pushes):
         _stamp(device_id, tenant_id, 'unreachable', t0 + timedelta(minutes=60))
         assert len(pushes) == 1
         assert pushes[0]['topic'] == 'network'
-        assert pushes[0]['roles'] == ['admin']
+        assert pushes[0]['roles'] == ['admin', 'employee']
         assert pushes[0]['tenant_id'] == tenant_id
         assert 'CCR' in pushes[0]['payload']['title']
         _stamp(device_id, tenant_id, 'online', t0 + timedelta(minutes=75))

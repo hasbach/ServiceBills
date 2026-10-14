@@ -13333,9 +13333,10 @@ def _validate_agent_result(operation, result):
 # --- Network offline / back-online alerts ------------------------------------
 # See docs/superpowers/specs/2026-10-14-network-offline-alerts-design.md.
 # Three sources, one channel: web push on the 'network' topic to the tenant's
-# admins, each one also recorded as a NetworkAlertEvent.
+# admins and employees (the role that handles tickets/outages), each one
+# also recorded as a NetworkAlertEvent.
 
-NETWORK_ALERT_ROLES = ['admin']
+NETWORK_ALERT_ROLES = ['admin', 'employee']
 NETWORK_ALERT_KINDS = ('device_down', 'device_up', 'agent_offline', 'agent_online',
                        'onu_mass_drop', 'onu_recovered')
 NETWORK_ALERT_EVENT_RETENTION_DAYS = 90
