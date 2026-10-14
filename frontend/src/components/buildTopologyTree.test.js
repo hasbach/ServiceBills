@@ -286,3 +286,24 @@ test('a customer not seen in the last locate is marked as remembered', () => {
     expect(customers[1].meta).toMatch(/^last seen /);
     expect(customers[2].meta).toBe('');
 });
+
+test('an offline ONU shows its deregister reason; an online one never does', () => {
+    const tree = buildTopologyTree([ccr({ children: [olt({
+        last_result: [
+            onu({ mac_address: 'aa:00:00:00:00:01', description: 'Gasp', status: 'offline',
+                  distance_m: 0, dereg_reason: 'power_off' }),
+            onu({ mac_address: 'aa:00:00:00:00:02', description: 'Cut', status: 'offline',
+                  distance_m: 700, dereg_reason: 'wire_down' }),
+            onu({ mac_address: 'aa:00:00:00:00:03', description: 'Live', dereg_reason: 'power_off' }),
+            onu({ mac_address: 'aa:00:00:00:00:04', description: 'Unknown', status: 'offline',
+                  distance_m: 0, dereg_reason: null }),
+            onu({ mac_address: 'aa:00:00:00:00:05', description: 'Odd', status: 'offline',
+                  distance_m: 0, dereg_reason: 'toString' }),
+        ],
+    })] })]);
+    expect(find(tree, 'onu', 'Gasp').meta).toBe('Powered off');
+    expect(find(tree, 'onu', 'Cut').meta).toBe('700 m · Fibre LOS');
+    expect(find(tree, 'onu', 'Live').meta).toBe('531 m');
+    expect(find(tree, 'onu', 'Unknown').meta).toBe('');
+    expect(find(tree, 'onu', 'Odd').meta).toBe('');
+});

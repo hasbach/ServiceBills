@@ -13291,6 +13291,13 @@ def _validate_agent_result(operation, result):
             if description is not None and len(description) > _MAX_OLT_DESCRIPTION_LENGTH:
                 return 'every ONU entry description must be at most {} characters'.format(
                     _MAX_OLT_DESCRIPTION_LENGTH)
+            # dereg_reason is optional (older connectors never send it) and
+            # read by _onu_mass_drop_changes as a dict key. A string outside
+            # ONU_DEREG_REASONS -- a code a newer connector learned -- is
+            # stored and simply counted as unknown, so it is not rejected.
+            reason = entry.get('dereg_reason')
+            if reason is not None and (not isinstance(reason, str) or len(reason) > 32):
+                return 'every ONU entry dereg_reason must be a short string or null'
         return None
     if operation == 'device_health':
         if not isinstance(result, dict):
@@ -13435,10 +13442,23 @@ def _check_agent_heartbeat_alert(tenant_id, now=None):
         db.session.commit()
 
 
+# vsol_olt's dereg_reason values. Anything else (None, N/A, a code a newer
+# connector learned) counts as unknown.
+ONU_DEREG_REASONS = ('power_off', 'wire_down')
+# A PON-port drop is only labelled by cause when more than this share of the
+# dropped ONUs agree. Unknown reasons count against it, so a drop the OLT
+# could not explain is never labelled from a minority that it could.
+ONU_DROP_CAUSE_MIN_FRACTION = 0.5
+
+
 def _onu_mass_drop_changes(prev_rows, cur_rows, active_state):
     """Diff two olt_status ONU lists per PON port. Pure: returns
     (drops, recoveries, new_state) where new_state is the active-alert map to
     store back on the device ({pon_port: {'macs': [...], 'at': iso}}).
+
+    Each drop carries 'reasons': {reason: count} over the dropped ONUs, from
+    the current walk's dereg_reason, with None for an ONU the OLT gave no
+    usable reason for (including one missing from the walk entirely).
 
     An ONU in prev that is missing from cur counts as dropped (the OLT can stop
     listing a deregistered ONU). A port with an active alert never alerts
@@ -13451,6 +13471,11 @@ def _onu_mass_drop_changes(prev_rows, cur_rows, active_state):
         return ports
 
     prev_online = online_by_port(prev_rows)
+    cur_reason = {}
+    for row in cur_rows or []:
+        if isinstance(row, dict) and row.get('mac_address'):
+            reason = row.get('dereg_reason')
+            cur_reason[row['mac_address']] = reason if reason in ONU_DEREG_REASONS else None
     cur_online_all = set()
     for macs in online_by_port(cur_rows).values():
         cur_online_all |= macs
@@ -13469,17 +13494,48 @@ def _onu_mass_drop_changes(prev_rows, cur_rows, active_state):
         dropped = macs - cur_online_all
         if (len(dropped) >= ONU_MASS_DROP_MIN_COUNT
                 and len(dropped) / len(macs) >= ONU_MASS_DROP_MIN_FRACTION):
-            drops.append({'pon_port': port, 'dropped': len(dropped), 'was_online': len(macs)})
+            reasons = {}
+            for mac in dropped:
+                reason = cur_reason.get(mac)
+                reasons[reason] = reasons.get(reason, 0) + 1
+            drops.append({'pon_port': port, 'dropped': len(dropped), 'was_online': len(macs),
+                          'reasons': reasons})
             state[port] = {'macs': sorted(dropped), 'at': datetime.utcnow().isoformat()}
     return drops, recoveries, state
+
+
+def _onu_mass_drop_body(drop):
+    """The alert text for one _onu_mass_drop_changes drop. Names the cause
+    only when most dropped ONUs agree on it (ONU_DROP_CAUSE_MIN_FRACTION):
+    dying gasps mean the ONUs lost mains, i.e. an area power cut nobody
+    needs to be dispatched for; LOS without a dying gasp means the light
+    vanished, i.e. a fibre or splitter fault on that branch."""
+    dropped, port = drop['dropped'], drop['pon_port']
+    reasons = drop.get('reasons') or {}
+    head = '{} of {} online ONUs on {} went offline at once'.format(
+        dropped, drop['was_online'], port)
+    power = reasons.get('power_off', 0)
+    fibre = reasons.get('wire_down', 0)
+    if dropped and power / dropped > ONU_DROP_CAUSE_MIN_FRACTION:
+        return ('{} -- mostly powered off ({} of {} sent a dying gasp): '
+                'probable area power outage.').format(head, power, dropped)
+    if dropped and fibre / dropped > ONU_DROP_CAUSE_MIN_FRACTION:
+        return ('{} -- mostly fibre LOS ({} of {} lost light without a dying gasp): '
+                'probable fibre/splitter cut on that branch.').format(head, fibre, dropped)
+    detail = ''
+    if power or fibre:
+        detail = ' ({} powered off, {} fibre LOS, {} unknown)'.format(
+            power, fibre, dropped - power - fibre)
+    return ('{}{} -- probable fibre/splitter cut or an area power outage on that branch.'
+            ).format(head, detail)
 
 
 def _evaluate_onu_alerts(job):
     """After an olt_status result is stored: compare it with the previous
     successful walk of the same OLT and push one alert per PON port that lost
     many ONUs at once. Individual ONUs going offline are left to the Network
-    Tree. The OLT does not yet report WHY an ONU deregistered (dying-gasp vs.
-    fibre LOS), so the message cannot say which. Commits."""
+    Tree. The message names the likely cause from the ONUs' dereg_reason --
+    see _onu_mass_drop_body. Commits."""
     if job.operation != 'olt_status' or job.error or not isinstance(job.result, list):
         return
     device = NetworkDevice.query.filter_by(id=job.device_id, tenant_id=job.tenant_id).first()
@@ -13501,8 +13557,7 @@ def _evaluate_onu_alerts(job):
         _raise_network_alert(
             device.tenant_id, 'onu_mass_drop',
             '{}: {} ONUs dropped on {}'.format(device.name, d['dropped'], d['pon_port']),
-            ('{} of {} online ONUs on {} went offline at once -- probable fibre/splitter cut '
-             'or an area power outage on that branch.').format(d['dropped'], d['was_online'], d['pon_port']),
+            _onu_mass_drop_body(d),
             device_id=device.id)
     for r in recoveries:
         _raise_network_alert(

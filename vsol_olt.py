@@ -23,6 +23,10 @@ MAC, this module collapses duplicates before returning (see _preference_key).
 Do not consume this device's registration timestamps: it has no RTC/NTP, so
 they read 1970/01/2x and are uptime-relative, not wall-clock.
 
+Why an offline ONU went down -- its last deregister reason, the web UI's "Last
+Deregister Reason" column -- is NOT in that table. It lives in a second one,
+DEREG_TABLE_OID below, read alongside it (see _parse_dereg_reason).
+
 Like mikrotik.py, every public function here catches connection/protocol
 failures and returns (False, message) instead of raising. An OLT being offline
 must never crash a page render.
@@ -55,6 +59,26 @@ _COL_MAC = "6"
 _COL_MODEL = "7"
 _COL_DESCRIPTION = "10"
 _COL_DISTANCE_M = "13"
+
+# Per-ONU status string, one cell per ONU, indexed <pon>.<onu> (NOT the flat
+# row index the table above uses). Found by a full walk of the enterprise root
+# on 2026-10-14 -- an earlier probe had checked only 12.1.12.1 and 12.2.1 and
+# concluded SNMP had no reason at all. Each value is the web UI's ONU Status
+# row, comma-separated and ';'-terminated, for example
+#   29,1,b4:64:15:3f:bf:fc,V2801D,1,0,AbirKerdy,,,620,1GE+CATV,1,1,19,859,
+#   1970/03/05 17:54:08,1970/03/05 17:52:41,08:27:48,8243;
+# Field 12 (0-based) is the last deregister reason code. Only column 3 is
+# walked: 87 varbinds on the real OLT, about a second.
+DEREG_TABLE_OID = "1.3.6.1.4.1.37950.1.1.5.12.1.31.1.3"
+_DEREG_FIELD = 12
+# The web UI shows Power Off, Wire Down and N/A. 0 is N/A: every ONU that
+# never registered reads 0. 1 is Power Off: the ONU sent a dying gasp, i.e.
+# lost mains. 2 is Wire Down: the light vanished without a dying gasp, i.e.
+# the fibre. The 1/2 assignment is inferred from the live device (an ONU the
+# web UI showed as Power Off reads 1; a 20-ONU simultaneous drop across two
+# PONs reads almost all 1), not read from a MIB -- the labels sit behind the
+# web UI's login. Any other code is reported as unknown (None).
+_DEREG_REASON_CODES = {"1": "power_off", "2": "wire_down"}
 
 # dot1dTpFdbPort: {MAC -> bridge port}. The OLT's MAC-learning table -- every
 # address it has seen behind each ONU, i.e. the customers' own routers.
@@ -241,6 +265,37 @@ def _walk_if_names(host, port, community):
     return out
 
 
+def _parse_dereg_reason(status_string):
+    """One DEREG_TABLE_OID value -> 'power_off', 'wire_down' or None.
+
+    None covers N/A, an unknown code, and a string too short to have the
+    field -- never a guess. Defaulting to 'power_off' would tell staff a
+    customer just lost mains when the OLT said nothing of the kind.
+    """
+    fields = str(status_string or "").strip().rstrip(";").split(",")
+    if len(fields) <= _DEREG_FIELD:
+        return None
+    return _DEREG_REASON_CODES.get(fields[_DEREG_FIELD].strip())
+
+
+def _walk_dereg_reasons(host, port, community):
+    """DEREG_TABLE_OID -> {(pon, onu): reason}. An index that is not two
+    integers is skipped. Sync wrapper over _walk_oid, same shape as
+    _walk_fdb_ports."""
+    cells = asyncio.run(_walk_oid(host, port, community, DEREG_TABLE_OID))
+    out = {}
+    for index, value in cells.items():
+        parts = index.split(".")
+        if len(parts) != 2:
+            continue
+        try:
+            key = (int(parts[0]), int(parts[1]))
+        except (TypeError, ValueError):
+            continue
+        out[key] = _parse_dereg_reason(value)
+    return out
+
+
 def _to_int(text, default=0):
     try:
         return int(str(text).strip())
@@ -248,8 +303,14 @@ def _to_int(text, default=0):
         return default
 
 
-def _assemble_rows(cells):
-    """Turn the flat cell map into one dict per ONU row."""
+def _assemble_rows(cells, reasons=None):
+    """Turn the flat cell map into one dict per ONU row.
+
+    `reasons` is _walk_dereg_reasons' {(pon, onu): reason}. The reason is
+    only attached to an OFFLINE row: it is the LAST deregister reason, so on
+    an online ONU it describes an outage that has already ended (the owner's
+    own screenshot showed an online ONU still reading Power Off)."""
+    reasons = reasons or {}
     by_row = {}
     for (column, row), value in cells.items():
         by_row.setdefault(row, {})[column] = value
@@ -265,15 +326,17 @@ def _assemble_rows(cells):
         onu_index = (raw.get(_COL_ONU_INDEX) or "").strip()
         description = (raw.get(_COL_DESCRIPTION) or "").strip()
         model = (raw.get(_COL_MODEL) or "").strip()
+        online = (raw.get(_COL_STATUS) or "").strip() == "1"
         rows.append({
             "pon_port": "PON{}".format(pon),
             "onu_id": "EPON0/{}:{}".format(pon, onu_index),
-            "status": "online" if (raw.get(_COL_STATUS) or "").strip() == "1" else "offline",
+            "status": "online" if online else "offline",
             "mac_address": mac,
             # The OLT writes the literal string NULL for an unlabelled ONU.
             "description": None if description in ("", "NULL") else description,
             "model": model,
             "distance_m": _to_int(raw.get(_COL_DISTANCE_M)),
+            "dereg_reason": None if online else reasons.get((_to_int(pon), _to_int(onu_index))),
             "_pon": _to_int(pon),
             "_onu": _to_int(onu_index),
         })
@@ -317,6 +380,20 @@ def _dedupe_by_mac(rows):
     return winners
 
 
+def _dereg_reasons_or_empty(server, port):
+    """The reason walk is an extra: if it fails, the ONU list still goes out,
+    every reason None. Losing the whole status walk -- and with it the tree
+    and the offline alerts -- over the explanation column would be backwards.
+    WARNING, never ERROR, for the Sentry frame-locals reason get_olt_status's
+    own handler gives."""
+    try:
+        return _walk_dereg_reasons(server.host, port, server.password)
+    except Exception as exc:  # noqa: BLE001 -- this module never raises out
+        logger.warning("VSOL OLT dereg-reason walk failed for device %s: %s",
+                       getattr(server, "id", None) or server.host, exc)
+        return {}
+
+
 def get_olt_status(server):
     """Read the OLT's full ONU inventory in one SNMP walk.
 
@@ -326,12 +403,16 @@ def get_olt_status(server):
     Returns (ok: bool, onus_or_message). On success, onus_or_message is a list
     of dicts sorted by (PON port, ONU index), deduplicated by MAC:
     {"pon_port", "onu_id", "status", "mac_address", "description", "model",
-     "distance_m"}. On failure it is a human-readable message.
+     "distance_m", "dereg_reason"}. dereg_reason is 'power_off', 'wire_down'
+    or None -- always None on an online ONU, and None whenever the OLT
+    reports N/A or the reason walk itself failed. On failure it is a
+    human-readable message.
     """
     port = server.api_port or DEFAULT_SNMP_PORT
     try:
         cells = asyncio.run(_walk_onu_table(server.host, port, server.password))
-        onus = _dedupe_by_mac(_assemble_rows(cells))
+        onus = _dedupe_by_mac(_assemble_rows(
+            cells, _dereg_reasons_or_empty(server, port)))
     except OltRejected as exc:
         _mark_checked(server, "auth_failed")
         logger.warning("VSOL OLT rejected the walk for device %s: %s", server.id, exc)
