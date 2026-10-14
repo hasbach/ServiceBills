@@ -435,6 +435,17 @@ class NetworkDevice(db.Model):
     # after a first Check Now reveals the device's real interface names --
     # nobody has confirmed the exact interface-to-upstream mapping in advance.
     interface_labels = db.Column(db.JSON, nullable=False, default=dict)
+    # Offline-alert state -- see _evaluate_device_alert and
+    # docs/superpowers/specs/2026-10-14-network-offline-alerts-design.md.
+    # alert_status is what staff were last TOLD ('online' | 'down' | None =
+    # never told anything), which is deliberately separate from last_status
+    # (what the last check saw): one failed walk changes last_status, but only
+    # a confirmed outage changes alert_status. failing_since is when the
+    # current run of non-online results began. onu_alert_state holds the PON
+    # ports with an active mass-drop alert: {pon_port: {'macs': [...], 'at': iso}}.
+    alert_status = db.Column(db.String(10), nullable=True)
+    failing_since = db.Column(db.DateTime, nullable=True)
+    onu_alert_state = db.Column(db.JSON, nullable=True)
     # Which connector module handles this row: mikrotik.py for 'mikrotik_ccr',
     # vsol_olt.py for 'vsol_olt'. A string discriminator, mirroring the existing
     # UpstreamProvider.product convention rather than an enum table. The default
@@ -715,6 +726,10 @@ class NetworkAgent(db.Model):
     # AGENT_FINGERPRINT_LENGTH for why that distinction earns a column.
     connector_fingerprint = db.Column(db.String(200), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # Set when staff were told this agent (and so the whole site) went
+    # offline; cleared, with a "back online" push, once it polls again. See
+    # _check_agent_heartbeat_alert.
+    offline_alerted_at = db.Column(db.DateTime, nullable=True)
 
     def is_online(self):
         if not self.last_seen_at:
@@ -772,6 +787,21 @@ class NetworkAgentJob(db.Model):
 
 db.Index('ix_network_agent_job_poll', NetworkAgentJob.tenant_id,
          NetworkAgentJob.status, NetworkAgentJob.created_at)
+
+
+class NetworkAlertEvent(db.Model):
+    """One network alert raised for a tenant (device down/up, agent offline/
+    online, ONU mass drop/recovery) -- the record behind every 'network' push,
+    kept whether or not the push itself was delivered or suppressed. Pruned
+    after NETWORK_ALERT_EVENT_RETENTION_DAYS by the scheduled refresh job."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    # SET NULL: a history row must not block deleting the device it names.
+    device_id = db.Column(db.Integer, db.ForeignKey('network_device.id', ondelete='SET NULL'), nullable=True)
+    kind = db.Column(db.String(20), nullable=False)  # see NETWORK_ALERT_KINDS
+    message = db.Column(db.String(500), nullable=False)
+    pushed = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
 class NetworkWriteAudit(db.Model):
@@ -1792,7 +1822,7 @@ class TicketLog(db.Model):
     timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     user = db.relationship('User', foreign_keys=[user_id])
 
-DEFAULT_PUSH_TOPICS = ('tickets', 'whatsapp_inbox')
+DEFAULT_PUSH_TOPICS = ('tickets', 'whatsapp_inbox', 'network')
 
 
 class PushSubscription(db.Model):
@@ -4137,11 +4167,20 @@ def check_pro_plan_expirations_with_context():
 # someone has the page open, and its CPE-location write only for admin/
 # finance viewers -- this keeps both fresh for agent-mode tenants regardless
 # of who (if anyone) is looking.
-NETWORK_FRESHNESS_OPERATIONS = ('olt_status', 'cpe_locations')
+NETWORK_FRESHNESS_OPERATIONS = ('olt_status', 'cpe_locations', 'device_health')
+# What the scheduled job asks of each device type. The CCR's device_health
+# was added for offline alerts -- before that the CCR was only ever checked
+# on a manual Check Now, so it could be down for days unnoticed.
+NETWORK_FRESHNESS_BY_DEVICE_TYPE = {
+    'vsol_olt': ('olt_status', 'cpe_locations'),
+    'mikrotik_ccr': ('device_health',),
+}
 
 
 def refresh_agent_mode_network_status_for_tenant(tenant_id):
-    """Enqueue a fresh olt_status + cpe_locations job for every OLT this
+    """Check the agent's heartbeat (offline alert, see
+    _check_agent_heartbeat_alert), then enqueue a fresh olt_status +
+    cpe_locations job for every OLT and a device_health job for every CCR this
     tenant owns, skipping a device+operation pair that already has a
     pending/claimed job outstanding -- an agent offline for a while (or this
     job's own Cron Job overlapping itself, e.g. a slow run still going when
@@ -4169,11 +4208,23 @@ def refresh_agent_mode_network_status_for_tenant(tenant_id):
     if not settings or settings.network_access_mode != 'agent':
         return
     _prune_scheduled_agent_jobs(tenant_id)
-    devices = NetworkDevice.query.filter_by(tenant_id=tenant_id, device_type='vsol_olt').all()
+    _prune_network_alert_events(tenant_id)
+    db.session.commit()
+    # Before any job is queued: when the agent is gone nothing below can run,
+    # and this is the only place that notices.
+    try:
+        _check_agent_heartbeat_alert(tenant_id)
+    except Exception as e:
+        db.session.rollback()
+        logging.error(f"Agent heartbeat alert check failed for tenant {tenant_id}: {e}")
+    devices = NetworkDevice.query.filter(
+        NetworkDevice.tenant_id == tenant_id,
+        NetworkDevice.device_type.in_(tuple(NETWORK_FRESHNESS_BY_DEVICE_TYPE)),
+    ).order_by(NetworkDevice.id).all()
     created = 0
     for device in devices:
         try:
-            for operation in NETWORK_FRESHNESS_OPERATIONS:
+            for operation in NETWORK_FRESHNESS_BY_DEVICE_TYPE[device.device_type]:
                 outstanding = NetworkAgentJob.query.filter(
                     NetworkAgentJob.tenant_id == tenant_id,
                     NetworkAgentJob.device_id == device.id,
@@ -13272,6 +13323,207 @@ def _validate_agent_result(operation, result):
     return None
 
 
+# --- Network offline / back-online alerts ------------------------------------
+# See docs/superpowers/specs/2026-10-14-network-offline-alerts-design.md.
+# Three sources, one channel: web push on the 'network' topic to the tenant's
+# admins, each one also recorded as a NetworkAlertEvent.
+
+NETWORK_ALERT_ROLES = ['admin']
+NETWORK_ALERT_KINDS = ('device_down', 'device_up', 'agent_offline', 'agent_online',
+                       'onu_mass_drop', 'onu_recovered')
+NETWORK_ALERT_EVENT_RETENTION_DAYS = 90
+# A device must still be failing this long after its first failure before
+# staff are told. Time-based rather than a count of failures because one
+# scheduled tick posts two OLT results (olt_status + cpe_locations), so "two
+# failures" could be a single timed-out walk.
+DEVICE_DOWN_CONFIRM_SECONDS = 10 * 60
+# The agent polls every few seconds, so a gap this long is not a blip. Much
+# longer than AGENT_ONLINE_WINDOW_SECONDS on purpose: that one decides whether
+# to queue a job right now, this one decides whether to wake someone up.
+AGENT_OFFLINE_ALERT_SECONDS = 5 * 60
+# A PON port's drop is "mass" when at least this many previously-online ONUs
+# went offline between two walks AND they are at least this share of the
+# port's previously-online ONUs -- one customer unplugging is not an outage.
+ONU_MASS_DROP_MIN_COUNT = 3
+ONU_MASS_DROP_MIN_FRACTION = 0.5
+# An active port alert clears (with one "recovered" push) once this share of
+# the dropped ONUs is back online.
+ONU_RECOVERY_FRACTION = 0.5
+
+
+def _raise_network_alert(tenant_id, kind, title, body, device_id=None, push=True):
+    """Record one alert and push it. A push failure is logged, never raised:
+    alerts are evaluated inside the agent's result POST and the scheduled job,
+    and neither may fail because a push service is having a bad day."""
+    db.session.add(NetworkAlertEvent(
+        tenant_id=tenant_id, device_id=device_id, kind=kind,
+        message='{}: {}'.format(title, body)[:500], pushed=push))
+    if not push:
+        return
+    try:
+        send_push_notification(
+            {'title': title, 'body': body, 'tag': 'network-{}-{}'.format(kind, device_id or 'agent'),
+             'url': '/?view=network-tree'},
+            tenant_id=tenant_id, roles=NETWORK_ALERT_ROLES, topic='network')
+    except Exception as e:
+        logging.error(f"Network alert push failed for tenant {tenant_id} ({kind}): {e}")
+
+
+def _agent_flagged_offline(tenant_id):
+    agent = NetworkAgent.query.filter_by(tenant_id=tenant_id).first()
+    return bool(agent and agent.offline_alerted_at)
+
+
+def _evaluate_device_alert(device, status, now):
+    """Turn a just-stamped device status into at most one push per outage.
+
+    While the tenant's agent is flagged offline the site alert already covers
+    this, so nothing is pushed AND alert_status is left alone -- the device
+    alert can still fire once the agent is back and the device is still down.
+    Not committed here; the caller's commit carries it."""
+    if status == 'online':
+        device.failing_since = None
+        if device.alert_status == 'down':
+            _raise_network_alert(
+                device.tenant_id, 'device_up', '{} is back online'.format(device.name),
+                '{} is reachable again.'.format(device.name), device_id=device.id)
+        device.alert_status = 'online'
+        return
+    if device.failing_since is None:
+        device.failing_since = now
+    if device.alert_status == 'down':
+        return
+    if (now - device.failing_since).total_seconds() < DEVICE_DOWN_CONFIRM_SECONDS:
+        return
+    if _agent_flagged_offline(device.tenant_id):
+        return
+    if status == 'auth_failed':
+        body = ('The agent reached {} but could not log in to it (credentials rejected) '
+                'since {} UTC.').format(device.name, device.failing_since.strftime('%H:%M'))
+    else:
+        body = ('{} has not answered since {} UTC. Check its power and the link to it.'
+                ).format(device.name, device.failing_since.strftime('%H:%M'))
+    _raise_network_alert(device.tenant_id, 'device_down', '{} is offline'.format(device.name),
+                         body, device_id=device.id)
+    device.alert_status = 'down'
+
+
+def _check_agent_heartbeat_alert(tenant_id, now=None):
+    """Push once when the agent stops polling, once when it is back. An agent
+    that never connected is not 'offline', it is not set up yet. A full power
+    cut at the office takes the agent down with the CCR and OLT, so this is
+    also the site-power alert. Commits."""
+    agent = NetworkAgent.query.filter_by(tenant_id=tenant_id).first()
+    if not agent or not agent.last_seen_at:
+        return
+    now = now or datetime.utcnow()
+    silent_for = (now - agent.last_seen_at).total_seconds()
+    if silent_for > AGENT_OFFLINE_ALERT_SECONDS and not agent.offline_alerted_at:
+        _raise_network_alert(
+            tenant_id, 'agent_offline', 'Network agent offline',
+            ('The on-prem agent "{}" has not checked in since {} UTC. Either the agent PC is off, '
+             'or the office lost power or internet. Devices cannot be monitored until it is back.'
+             ).format(agent.name, agent.last_seen_at.strftime('%Y-%m-%d %H:%M')))
+        agent.offline_alerted_at = now
+        db.session.commit()
+    elif silent_for <= AGENT_OFFLINE_ALERT_SECONDS and agent.offline_alerted_at:
+        down_min = int((now - agent.offline_alerted_at).total_seconds() // 60)
+        _raise_network_alert(
+            tenant_id, 'agent_online', 'Network agent back online',
+            'The on-prem agent "{}" is checking in again (alerted {} min ago).'.format(agent.name, down_min))
+        agent.offline_alerted_at = None
+        db.session.commit()
+
+
+def _onu_mass_drop_changes(prev_rows, cur_rows, active_state):
+    """Diff two olt_status ONU lists per PON port. Pure: returns
+    (drops, recoveries, new_state) where new_state is the active-alert map to
+    store back on the device ({pon_port: {'macs': [...], 'at': iso}}).
+
+    An ONU in prev that is missing from cur counts as dropped (the OLT can stop
+    listing a deregistered ONU). A port with an active alert never alerts
+    again until it recovers."""
+    def online_by_port(rows):
+        ports = {}
+        for row in rows or []:
+            if isinstance(row, dict) and row.get('status') == 'online' and row.get('mac_address'):
+                ports.setdefault(row.get('pon_port') or '?', set()).add(row['mac_address'])
+        return ports
+
+    prev_online = online_by_port(prev_rows)
+    cur_online_all = set()
+    for macs in online_by_port(cur_rows).values():
+        cur_online_all |= macs
+
+    state = dict(active_state or {})
+    drops, recoveries = [], []
+    for port, entry in sorted(state.items()):
+        macs = set(entry.get('macs') or [])
+        back = len(macs & cur_online_all)
+        if macs and back / len(macs) >= ONU_RECOVERY_FRACTION:
+            recoveries.append({'pon_port': port, 'back': back, 'dropped': len(macs)})
+            del state[port]
+    for port, macs in sorted(prev_online.items()):
+        if port in state:
+            continue
+        dropped = macs - cur_online_all
+        if (len(dropped) >= ONU_MASS_DROP_MIN_COUNT
+                and len(dropped) / len(macs) >= ONU_MASS_DROP_MIN_FRACTION):
+            drops.append({'pon_port': port, 'dropped': len(dropped), 'was_online': len(macs)})
+            state[port] = {'macs': sorted(dropped), 'at': datetime.utcnow().isoformat()}
+    return drops, recoveries, state
+
+
+def _evaluate_onu_alerts(job):
+    """After an olt_status result is stored: compare it with the previous
+    successful walk of the same OLT and push one alert per PON port that lost
+    many ONUs at once. Individual ONUs going offline are left to the Network
+    Tree. The OLT does not yet report WHY an ONU deregistered (dying-gasp vs.
+    fibre LOS), so the message cannot say which. Commits."""
+    if job.operation != 'olt_status' or job.error or not isinstance(job.result, list):
+        return
+    device = NetworkDevice.query.filter_by(id=job.device_id, tenant_id=job.tenant_id).first()
+    if device is None:
+        return
+    previous = NetworkAgentJob.query.filter(
+        NetworkAgentJob.tenant_id == job.tenant_id,
+        NetworkAgentJob.device_id == job.device_id,
+        NetworkAgentJob.operation == 'olt_status',
+        NetworkAgentJob.status == 'done',
+        NetworkAgentJob.error.is_(None),
+        NetworkAgentJob.id < job.id,
+    ).order_by(NetworkAgentJob.id.desc()).first()
+    if previous is None or not isinstance(previous.result, list):
+        return
+    drops, recoveries, state = _onu_mass_drop_changes(
+        previous.result, job.result, device.onu_alert_state)
+    for d in drops:
+        _raise_network_alert(
+            device.tenant_id, 'onu_mass_drop',
+            '{}: {} ONUs dropped on {}'.format(device.name, d['dropped'], d['pon_port']),
+            ('{} of {} online ONUs on {} went offline at once -- probable fibre/splitter cut '
+             'or an area power outage on that branch.').format(d['dropped'], d['was_online'], d['pon_port']),
+            device_id=device.id)
+    for r in recoveries:
+        _raise_network_alert(
+            device.tenant_id, 'onu_recovered',
+            '{}: {} recovering'.format(device.name, r['pon_port']),
+            '{} of the {} ONUs that dropped on {} are back online.'.format(
+                r['back'], r['dropped'], r['pon_port']),
+            device_id=device.id)
+    if drops or recoveries:
+        device.onu_alert_state = state
+        db.session.commit()
+
+
+def _prune_network_alert_events(tenant_id):
+    cutoff = datetime.utcnow() - timedelta(days=NETWORK_ALERT_EVENT_RETENTION_DAYS)
+    NetworkAlertEvent.query.filter(
+        NetworkAlertEvent.tenant_id == tenant_id,
+        NetworkAlertEvent.created_at < cutoff,
+    ).delete(synchronize_session=False)
+
+
 # The three classifications mikrotik.py/vsol_olt.py's _mark_checked ever sets
 # (see NetworkDevice.last_status's comment) -- the only values this endpoint
 # will ever use to stamp a device. Read back by the agent's execute_job and
@@ -13280,7 +13532,7 @@ def _validate_agent_result(operation, result):
 _AGENT_DEVICE_STATUSES = ('online', 'unreachable', 'auth_failed')
 
 
-def _stamp_device_status_from_agent(job, status):
+def _stamp_device_status_from_agent(job, status, now=None):
     """In direct mode, the connector mutates the live NetworkDevice in-process
     and the caller's commit persists it -- see _run_device_operation_direct.
     The on-prem agent has no such side channel: it runs in a different
@@ -13309,8 +13561,10 @@ def _stamp_device_status_from_agent(job, status):
         id=job.device_id, tenant_id=job.tenant_id).first()
     if device is None:
         return  # the device vanished under the job, or tenant mismatch; nothing to stamp
+    now = now or datetime.utcnow()
     device.last_status = status
-    device.last_checked_at = datetime.utcnow()
+    device.last_checked_at = now
+    _evaluate_device_alert(device, status, now)
 
 
 @app.route('/api/agent/jobs/<int:job_id>/result', methods=['POST'])
@@ -13392,6 +13646,14 @@ def agent_post_result(job_id):
     # docstring; this is only the happy-path call site.)
     _complete_write_audit(job)
     db.session.commit()
+    if job.operation == 'olt_status' and not job.error:
+        # Like the auto-apply below: an alerting failure must never turn into
+        # a failure response to the agent.
+        try:
+            _evaluate_onu_alerts(job)
+        except Exception as e:
+            db.session.rollback()
+            logging.error(f"ONU alert evaluation for job {job.id} failed: {e}")
     if job.operation == 'cpe_locations' and not job.error and (job.params or {}).get('_scheduled'):
         # Scheduler-created jobs (see _create_scheduled_device_job) have no
         # human waiting to click a separate "apply" button -- auto-apply
@@ -13556,7 +13818,8 @@ def _prune_scheduled_agent_jobs(tenant_id):
     signal rather than querying the JSON params column, which SQLite and
     Postgres handle very differently for containment and isn't indexed here
     -- every job this feature creates has no requested_by_user_id, and no
-    other code path creates an olt_status/cpe_locations job that way."""
+    other code path creates an olt_status/cpe_locations/device_health job
+    that way."""
     cutoff = datetime.utcnow() - timedelta(days=1)
     NetworkAgentJob.query.filter(
         NetworkAgentJob.tenant_id == tenant_id,

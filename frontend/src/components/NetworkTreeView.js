@@ -8,6 +8,7 @@ import {
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
 import OnuLabelMatcherDialog from './OnuLabelMatcherDialog';
+import InboxNotificationsControl from './inbox/InboxNotificationsControl';
 import pollNetworkJob from './pollNetworkJob';
 import TreeNode from './TreeNode';
 import { buildTopologyTree } from './buildTopologyTree';
@@ -145,6 +146,9 @@ const NetworkTreeView = () => {
     const canEditLinks = (user?.role || '').split(',')
         .map((r) => r.trim().toLowerCase())
         .some((r) => r === 'admin' || r === 'finance');
+    // Offline alerts are pushed to admins only (NETWORK_ALERT_ROLES in app.py),
+    // so only they get the per-device opt-in for the 'network' topic.
+    const isAdmin = (user?.role || '').split(',').map((r) => r.trim().toLowerCase()).includes('admin');
     const [tree, setTree] = useState([]);
     const [loading, setLoading] = useState(true);
     const [errorByDevice, setErrorByDevice] = useState({});
@@ -761,6 +765,7 @@ const NetworkTreeView = () => {
             <Stack direction="row" alignItems="center" sx={{ mb: 2 }}>
                 <Typography variant="h5" sx={{ fontWeight: 600 }}>Network Tree</Typography>
                 <Box sx={{ flexGrow: 1 }} />
+                {isAdmin && accessMode === 'agent' && <InboxNotificationsControl topic="network" label="Network alert" />}
                 <Button startIcon={<RefreshIcon />} onClick={() => loadTree()}>Reload</Button>
             </Stack>
 

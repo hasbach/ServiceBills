@@ -4,12 +4,13 @@ import { NotificationsActive as OnIcon, NotificationsOff as OffIcon, Notificatio
 import { useAppContext } from '../../context/AppContext';
 import * as swReg from '../../serviceWorkerRegistration';
 
-const TOPIC = 'whatsapp_inbox';
 const SW_READY_TIMEOUT_MS = 3000;
 const isIos = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isStandalone = () => window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone === true;
 
-const InboxNotificationsControl = () => {
+// topic: the push topic this button turns on/off for this device (see
+// DEFAULT_PUSH_TOPICS in app.py). label names it in the button and toasts.
+const InboxNotificationsControl = ({ topic: TOPIC = 'whatsapp_inbox', label = 'Inbox' }) => {
     const { apiService, setSnackbar } = useAppContext();
     const [state, setState] = useState('loading'); // loading|unsupported|ios_install|not_configured|blocked|off|on
     const [anchor, setAnchor] = useState(null);
@@ -51,7 +52,7 @@ const InboxNotificationsControl = () => {
             setState(topics.data.subscribed && topics.data.topics.includes(TOPIC) ? 'on' : 'off');
         } catch (e) { setState('off'); }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [apiService]);
+    }, [apiService, TOPIC]);
 
     useEffect(() => { refresh(); }, [refresh]);
 
@@ -71,7 +72,7 @@ const InboxNotificationsControl = () => {
             const { data: t } = await apiService.fetchPushTopics(sub.endpoint);
             const topics = Array.from(new Set([...(t.topics || []), TOPIC]));
             await apiService.setPushTopics(sub.endpoint, topics);
-            toast('Inbox notifications enabled on this device', 'success');
+            toast(`${label} notifications enabled on this device`, 'success');
         } catch (e) {
             // If the user denied the permission prompt, refresh() below will
             // pick that up via Notification.permission and show 'blocked' --
@@ -112,10 +113,10 @@ const InboxNotificationsControl = () => {
     if (state === 'unsupported') return <Typography variant="caption" color="text.secondary">This browser doesn't support notifications.</Typography>;
     if (state === 'not_configured') return <Typography variant="caption" color="text.secondary">Notifications are not configured on the server.</Typography>;
     if (state === 'blocked') return <Tooltip title="Allow notifications for this site in your browser settings"><span><Button size="small" startIcon={<OffIcon />} disabled>Notifications blocked</Button></span></Tooltip>;
-    if (state === 'off') return <Button size="small" variant="outlined" startIcon={<NoneIcon />} onClick={enable}>Enable notifications</Button>;
+    if (state === 'off') return <Button size="small" variant="outlined" startIcon={<NoneIcon />} onClick={enable}>{`Enable ${label.toLowerCase()} notifications`}</Button>;
     return (
         <>
-            <Button size="small" color="success" startIcon={<OnIcon />} onClick={e => setAnchor(e.currentTarget)}>Notifications on</Button>
+            <Button size="small" color="success" startIcon={<OnIcon />} onClick={e => setAnchor(e.currentTarget)}>{`${label} notifications on`}</Button>
             <Menu open={!!anchor} anchorEl={anchor} onClose={() => setAnchor(null)}>
                 <MenuItem onClick={test}>Send test notification</MenuItem>
                 <MenuItem onClick={disable}>Turn off on this device</MenuItem>

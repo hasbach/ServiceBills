@@ -64,5 +64,5 @@ def test_models_exist_and_serialize(app, client):
         assert m.to_dict()["text"] == "hi"
         assert appmod.WhatsAppConversation in appmod.TENANT_OWNED_MODELS
         sub = appmod.PushSubscription(tenant_id=tid, user_id=1, subscription_info='{"endpoint": "https://e/1"}')
-        assert sub.topic_list() == ["tickets", "whatsapp_inbox"]
+        assert sub.topic_list() == ["tickets", "whatsapp_inbox", "network"]
         assert sub.endpoint() == "https://e/1"

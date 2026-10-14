@@ -109,7 +109,7 @@ def test_topics_routes_and_unsubscribe(app, client, monkeypatch):
     with app.app_context():
         assert appmod.PushSubscription.query.count() == 1
     r = client.get("/api/push-subscription/topics", headers=hdr, query_string={"endpoint": "https://e/dev1"})
-    assert r.get_json() == {"subscribed": True, "topics": ["tickets", "whatsapp_inbox"]}
+    assert r.get_json() == {"subscribed": True, "topics": ["tickets", "whatsapp_inbox", "network"]}
     r = client.put("/api/push-subscription/topics", headers=hdr, json={"endpoint": "https://e/dev1", "topics": ["tickets"]})
     assert r.status_code == 200
     r = client.get("/api/push-subscription/topics", headers=hdr, query_string={"endpoint": "https://e/dev1"})
