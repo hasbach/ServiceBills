@@ -749,7 +749,7 @@ Read-Host -Prompt "Press Enter to exit"
 
             {/* Tabs */}
             <Paper elevation={0} sx={{ borderRadius: '16px', mb: 3, overflow: 'hidden', border: `1px solid ${alpha(theme.palette.divider, 0.1)}` }}>
-                <Tabs value={activeTab} onChange={(_, v) => setTab(v)} sx={{ px: 2, '& .MuiTab-root': { textTransform: 'none', fontWeight: 600 } }}>
+                <Tabs value={activeTab} onChange={(_, v) => setTab(v)} variant="scrollable" scrollButtons="auto" allowScrollButtonsMobile sx={{ px: { xs: 0, sm: 2 }, '& .MuiTab-root': { textTransform: 'none', fontWeight: 600 } }}>
                     {SETTINGS_TABS.map(t => <Tab key={t.key} value={t.key} icon={t.icon} iconPosition="start" label={t.label} />)}
                 </Tabs>
             </Paper>
