@@ -51,12 +51,22 @@ tenant's **admin** users, and all recorded in a new `network_alert_event` table.
    single "recovered" push is sent. A single customer's ONU going offline is
    **not** pushed — it stays visible on the Network Tree only.
 
-## Known limitation
+## Deregister reason (added 2026-10-14)
 
-The OLT's deregister reason (dying-gasp/power-off vs. fibre LOS) is not scraped
-yet, so an ONU alert cannot say "powered off" vs. "fibre cut". The message says
-"fibre/splitter cut or area power outage". Adding the reason column to the
-vsol_olt walk is the follow-up that would let us split them.
+`vsol_olt.get_olt_status` now returns `dereg_reason` per ONU (`power_off`,
+`wire_down` or null; always null on an online ONU), read from table
+`1.3.6.1.4.1.37950.1.1.5.12.1.31.1.3` -- a packed per-ONU status string whose
+field 12 is the web UI's "Last Deregister Reason" code. A PON-port mass drop
+says "mostly powered off ... probable area power outage" or "mostly fibre LOS
+... probable fibre/splitter cut" when more than half of the dropped ONUs agree;
+otherwise it keeps the generic wording, with the counts when any are known.
+The Network Tree shows "Powered off" / "Fibre LOS" on offline ONUs.
+
+The code mapping (1 = Power Off, 2 = Wire Down, 0 = N/A) was inferred from the
+live OLT and confirmed by the owner against the web UI on 2026-10-14. It lives
+in one constant, `vsol_olt._DEREG_REASON_CODES`. The field is the LAST reason
+and persists after the ONU comes back, so it is only reported on ONUs that are
+offline in the same walk.
 
 ## Not in scope
 

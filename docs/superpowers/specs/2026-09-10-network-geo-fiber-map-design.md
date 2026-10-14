@@ -39,7 +39,10 @@ Recorded in full in `[[project_network_topology_tree]]`; the load-bearing points
 2. **The OLT's LOS threshold is -32 dBm** — table `...12.2.1.14.1` cols 3 and 4, `-32` for
    every row. This makes "margin to LOS" a real figure, not a guess.
 
-3. **There is no deregistration reason in SNMP.** All 23 offline ONUs read byte-identical
+3. **CORRECTED 2026-10-14: the reason IS in SNMP** -- table
+   `1.3.6.1.4.1.37950.1.1.5.12.1.31.1.3`, field 12 of a packed per-ONU string; `vsol_olt.py`
+   now reads it, so the web-UI scrape below is unnecessary. The original finding follows.
+   **There is no deregistration reason in SNMP.** All 23 offline ONUs read byte-identical
    across every candidate column. The reason exists only in the OLT's web UI —
    `ONU Configuration > ONU list > ONU Status`, column `Last Deregister Reason`, with observed
    values `Power Off`, `Wire Down` and `N/A`. The owner has decided it **is** worth having, so

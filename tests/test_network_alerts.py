@@ -273,5 +273,94 @@ def test_onu_alert_from_posted_olt_result(app, client, pushes):
         assert _events(tenant_id) == ['onu_mass_drop']
 
 
+def _with_reasons(rows, reasons):
+    """Stamp dereg_reason on the offline rows, in order."""
+    it = iter(reasons)
+    for row in rows:
+        if row['status'] == 'offline':
+            row['dereg_reason'] = next(it)
+    return rows
+
+
+def _drop_body(reasons, total=8):
+    prev = _onus('PON1', ['online'] * total)
+    cur = _with_reasons(_onus('PON1', ['offline'] * len(reasons) + ['online'] * (total - len(reasons))),
+                        reasons)
+    drops, _, _ = appmod._onu_mass_drop_changes(prev, cur, {})
+    assert len(drops) == 1
+    return drops[0], appmod._onu_mass_drop_body(drops[0])
+
+
+def test_mass_drop_mostly_power_off_says_power_outage():
+    drop, body = _drop_body(['power_off'] * 5 + ['wire_down'])
+    assert drop['reasons'] == {'power_off': 5, 'wire_down': 1}
+    assert 'mostly powered off (5 of 6' in body
+    assert 'area power outage' in body and 'cut' not in body
+
+
+def test_mass_drop_mostly_wire_down_says_fibre_cut():
+    _, body = _drop_body(['wire_down'] * 4 + [None, 'power_off'])
+    assert 'mostly fibre LOS (4 of 6' in body
+    assert 'probable fibre/splitter cut' in body and 'power outage' not in body
+
+
+def test_mass_drop_without_a_majority_keeps_the_generic_wording():
+    # Half power-off, half unknown: unknown counts against the majority.
+    _, body = _drop_body(['power_off'] * 3 + [None] * 3)
+    assert 'mostly' not in body
+    assert '(3 powered off, 0 fibre LOS, 3 unknown)' in body
+    assert 'fibre/splitter cut or an area power outage' in body
+
+
+def test_mass_drop_with_no_reasons_is_the_old_message():
+    # An agent on an older vsol_olt.py sends no dereg_reason at all.
+    prev = _onus('PON1', ['online'] * 8)
+    cur = _onus('PON1', ['offline'] * 6 + ['online'] * 2)
+    drops, _, _ = appmod._onu_mass_drop_changes(prev, cur, {})
+    assert drops[0]['reasons'] == {None: 6}
+    assert appmod._onu_mass_drop_body(drops[0]) == (
+        '6 of 8 online ONUs on PON1 went offline at once -- probable fibre/splitter cut '
+        'or an area power outage on that branch.')
+
+
+def test_unrecognised_reason_counts_as_unknown():
+    drop, body = _drop_body(['dying_gasp_v2'] * 6)
+    assert drop['reasons'] == {None: 6}
+    assert 'mostly' not in body
+
+
+def test_vanished_onus_count_as_unknown_reason():
+    prev = _onus('PON1', ['online'] * 6)
+    cur = _onus('PON1', ['online'] * 2)  # four ONUs vanished from the walk
+    drops, _, _ = appmod._onu_mass_drop_changes(prev, cur, {})
+    assert drops[0]['reasons'] == {None: 4}
+
+
+def test_olt_status_contract_accepts_and_bounds_dereg_reason():
+    row = {'mac_address': 'aa:bb:cc:dd:ee:ff', 'description': None}
+    assert appmod._validate_agent_result('olt_status', [dict(row)]) is None
+    assert appmod._validate_agent_result('olt_status', [dict(row, dereg_reason=None)]) is None
+    assert appmod._validate_agent_result('olt_status', [dict(row, dereg_reason='power_off')]) is None
+    assert appmod._validate_agent_result('olt_status', [dict(row, dereg_reason=['x'])])
+    assert appmod._validate_agent_result('olt_status', [dict(row, dereg_reason='x' * 33)])
+
+
+def test_posted_power_off_result_pushes_power_outage_wording(app, client, pushes):
+    tenant_id, device_id = _setup(app, client, "Alert R", device_type='vsol_olt')
+    with app.app_context():
+        appmod.db.session.add(appmod.NetworkAgentJob(
+            tenant_id=tenant_id, device_id=device_id, operation='olt_status', status='done',
+            result=_onus('PON3', ['online'] * 8), finished_at=appmod.datetime.utcnow()))
+        job = appmod.NetworkAgentJob(
+            tenant_id=tenant_id, device_id=device_id, operation='olt_status', status='done',
+            result=_with_reasons(_onus('PON3', ['offline'] * 7 + ['online']), ['power_off'] * 7),
+            finished_at=appmod.datetime.utcnow())
+        appmod.db.session.add(job)
+        appmod.db.session.commit()
+        appmod._evaluate_onu_alerts(job)
+        assert len(pushes) == 1
+        assert 'mostly powered off' in pushes[0]['payload']['body']
+
+
 def test_network_is_a_push_topic():
     assert 'network' in appmod.DEFAULT_PUSH_TOPICS

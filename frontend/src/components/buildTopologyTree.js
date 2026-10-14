@@ -18,6 +18,18 @@ export const PON_UNASSIGNED = 'Unassigned';
 
 const asArray = (value) => (Array.isArray(value) ? value : []);
 
+/**
+ * Why an offline ONU went down, from the OLT's last deregister reason
+ * (vsol_olt.py's dereg_reason). A dying gasp means the ONU lost mains; LOS
+ * without one means the light vanished, i.e. the fibre. Anything else --
+ * null, N/A, a code a newer connector learned -- shows nothing rather than
+ * guessing.
+ */
+export const DEREG_REASON_LABELS = {
+    power_off: 'Powered off',
+    wire_down: 'Fibre LOS',
+};
+
 /** ONU/interface status collapses to the four the UI paints. */
 const onuStatus = (status) => (status === 'online' ? 'up' : 'down');
 
@@ -104,13 +116,18 @@ function onuNode(onu, ponKey, index, seenMacs, lastLocateAt) {
     const mac = typeof onu.mac_address === 'string' ? onu.mac_address : '';
     const key = `${ponKey}/onu-${keyPart(mac, index, seenMacs)}`;
     const distance = Number(onu.distance_m) > 0 ? `${onu.distance_m} m` : '';
+    // Only on an offline ONU: it is the LAST reason, so on an online ONU it
+    // describes an outage that has already ended.
+    const reason = onu.status !== 'online'
+        && Object.prototype.hasOwnProperty.call(DEREG_REASON_LABELS, onu.dereg_reason)
+        ? DEREG_REASON_LABELS[onu.dereg_reason] : '';
     const seenCustomerIds = new Map();
     return {
         key,
         kind: 'onu',
         label: onu.description || onu.onu_id || mac || 'ONU',
         sublabel: mac,
-        meta: distance,
+        meta: [distance, reason].filter(Boolean).join(' · '),
         status: onuStatus(onu.status),
         searchText: searchTextOf(onu.description, onu.onu_id, mac),
         children: asArray(onu.customers)

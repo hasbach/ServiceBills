@@ -47,12 +47,19 @@ def cells_from(rows):
     return cells
 
 
-def patch_walk(monkeypatch, cells=None, exc=None):
+def patch_walk(monkeypatch, cells=None, exc=None, reasons=None, reasons_exc=None):
     async def fake_walk(host, port, community):
         if exc is not None:
             raise exc
         return cells
+
+    # Always stubbed, so no test here ever sends a real SNMP request.
+    def fake_reasons(host, port, community):
+        if reasons_exc is not None:
+            raise reasons_exc
+        return reasons or {}
     monkeypatch.setattr(vsol_olt, "_walk_onu_table", fake_walk)
+    monkeypatch.setattr(vsol_olt, "_walk_dereg_reasons", fake_reasons)
 
 
 def test_parses_every_pon_port_and_both_statuses(monkeypatch):
@@ -275,3 +282,61 @@ def test_walk_onu_table_closes_engine_when_the_walk_raises_partway_through(monke
         asyncio.run(vsol_olt._walk_onu_table("192.168.8.100", 161, "public"))
 
     assert fake_engine.closed is True
+
+
+# --- Last deregister reason (DEREG_TABLE_OID) --------------------------------
+
+# Real DEREG_TABLE_OID values captured from DeltaNet's V1600D on 2026-10-14.
+REAL_STATUS_POWER_OFF = ("-1,0,4c:d7:c8:f9:b9:0c,V2801S,1,0,jaafar_kabo,,,227,1GE,0,1,3,215,"
+                         "1970/03/05 05:46:49,1970/03/05 15:24:46,09:37:57,8227;")
+REAL_STATUS_WIRE_DOWN = ("27,1,4c:d7:c8:f9:c9:34,V2801S,1,0,AliKhodor_hassawi,,,681,1GE,1,2,3,959,"
+                         "1970/03/05 17:54:09,1970/03/05 17:52:43,08:27:47,8227;")
+REAL_STATUS_NEVER_REGISTERED = "-1,0,4c:d7:c8:cc:49:e8,unknow,1,0,AlaycheOil,,,0,,0,0,0,0,N/A,N/A,00:00:00,0;"
+
+
+@pytest.mark.parametrize("value, expected", [
+    (REAL_STATUS_POWER_OFF, "power_off"),
+    (REAL_STATUS_WIRE_DOWN, "wire_down"),
+    (REAL_STATUS_NEVER_REGISTERED, None),          # code 0 = N/A
+    (REAL_STATUS_POWER_OFF.replace(",0,1,3,215,", ",0,7,3,215,"), None),  # unknown code
+    ("-1,0,aa:bb", None),                            # truncated string
+    ("", None),
+    (None, None),
+])
+def test_parse_dereg_reason(value, expected):
+    assert vsol_olt._parse_dereg_reason(value) == expected
+
+
+def test_walk_dereg_reasons_keys_by_pon_and_onu(monkeypatch):
+    async def fake_walk_oid(host, port, community, oid):
+        assert oid == vsol_olt.DEREG_TABLE_OID
+        return {"4.16": REAL_STATUS_POWER_OFF, "3.30": REAL_STATUS_WIRE_DOWN,
+                "1.1": REAL_STATUS_NEVER_REGISTERED, "garbage": REAL_STATUS_POWER_OFF,
+                "x.1": REAL_STATUS_POWER_OFF}
+    monkeypatch.setattr(vsol_olt, "_walk_oid", fake_walk_oid)
+    assert vsol_olt._walk_dereg_reasons("h", 161, "c") == {
+        (4, 16): "power_off", (3, 30): "wire_down", (1, 1): None}
+
+
+def test_reason_is_attached_to_offline_onus_only(monkeypatch):
+    patch_walk(monkeypatch, cells_from(REAL_ROWS), reasons={
+        (1, 1): "wire_down",     # offline -> kept
+        (1, 2): "power_off",     # online: a LAST reason from an outage that ended
+    })
+    ok, onus = vsol_olt.get_olt_status(make_device())
+    assert ok
+    by_id = {o["onu_id"]: o for o in onus}
+    assert by_id["EPON0/1:1"]["dereg_reason"] == "wire_down"
+    assert by_id["EPON0/1:2"]["dereg_reason"] is None
+    # No reason reported for that ONU at all -> None, never a default.
+    assert by_id["EPON0/1:3"]["dereg_reason"] is None
+
+
+def test_failed_reason_walk_still_returns_the_onus(monkeypatch):
+    patch_walk(monkeypatch, cells_from(REAL_ROWS),
+               reasons_exc=OSError("No SNMP response received before timeout"))
+    device = make_device()
+    ok, onus = vsol_olt.get_olt_status(device)
+    assert ok and len(onus) == 4
+    assert all(o["dereg_reason"] is None for o in onus)
+    assert device.last_status == "online"
