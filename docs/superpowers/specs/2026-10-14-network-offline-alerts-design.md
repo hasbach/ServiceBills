@@ -62,9 +62,11 @@ says "mostly powered off ... probable area power outage" or "mostly fibre LOS
 otherwise it keeps the generic wording, with the counts when any are known.
 The Network Tree shows "Powered off" / "Fibre LOS" on offline ONUs.
 
-The code mapping (1 = Power Off, 2 = Wire Down, 0 = N/A) is inferred from the
-live OLT, not read from a MIB: the labels sit behind the web UI's login. It
-lives in one constant, `vsol_olt._DEREG_REASON_CODES`.
+The code mapping (1 = Power Off, 2 = Wire Down, 0 = N/A) was inferred from the
+live OLT and confirmed by the owner against the web UI on 2026-10-14. It lives
+in one constant, `vsol_olt._DEREG_REASON_CODES`. The field is the LAST reason
+and persists after the ONU comes back, so it is only reported on ONUs that are
+offline in the same walk.
 
 ## Not in scope
 

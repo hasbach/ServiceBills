@@ -74,10 +74,11 @@ _DEREG_FIELD = 12
 # The web UI shows Power Off, Wire Down and N/A. 0 is N/A: every ONU that
 # never registered reads 0. 1 is Power Off: the ONU sent a dying gasp, i.e.
 # lost mains. 2 is Wire Down: the light vanished without a dying gasp, i.e.
-# the fibre. The 1/2 assignment is inferred from the live device (an ONU the
-# web UI showed as Power Off reads 1; a 20-ONU simultaneous drop across two
-# PONs reads almost all 1), not read from a MIB -- the labels sit behind the
-# web UI's login. Any other code is reported as unknown (None).
+# the fibre. Not from a MIB: inferred from the live device, then confirmed by
+# the owner against the web UI on 2026-10-14 (an ONU reading 2 showed Wire
+# Down, one reading 1 showed Power Off). The field is the LAST reason and
+# survives the ONU coming back online -- hence _assemble_rows only attaches
+# it to offline rows. Any other code is reported as unknown (None).
 _DEREG_REASON_CODES = {"1": "power_off", "2": "wire_down"}
 
 # dot1dTpFdbPort: {MAC -> bridge port}. The OLT's MAC-learning table -- every
