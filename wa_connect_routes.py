@@ -108,8 +108,10 @@ def register_wa_connect_routes(app, appmod):
     @require_module('whatsapp')
     def wa_connect_refresh():
         settings = tenant_query(appmod.WhatsAppSettings).first()
-        if settings is None or not wa_connect.is_automatic(settings) or not settings.access_token:
-            return jsonify({'error': 'There is no automatic WhatsApp connection to check.'}), 400
+        # Works for manual configurations too: it fills the panel's number,
+        # display name and quality from Meta.
+        if settings is None or not settings.access_token or not settings.phone_number_id:
+            return jsonify({'error': 'There is no WhatsApp connection to check.'}), 400
         wa_connect.check_health(appmod, settings, source='user')
         return jsonify(status_payload(settings)), 200
 

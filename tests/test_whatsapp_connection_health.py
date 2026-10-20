@@ -349,3 +349,25 @@ def test_disconnect_manual_tenant(app, client, monkeypatch):
     assert r.status_code == 200
     s = _settings(app, tid)
     assert s.access_token is None and s.app_secret is None and s.mode == "deeplink"
+
+
+def test_refresh_fills_panel_for_manual_configuration(app, client, monkeypatch):
+    hdr, tid = setup_wa_tenant(app, client, "Biz RM", "rm_admin", "PN_RM", token="own-token")
+    with app.app_context():
+        appmod.db.session.get(appmod.Tenant, tid).plan = "pro"
+        s = appmod.WhatsAppSettings.query.filter_by(tenant_id=tid).first()
+        s.business_account_id = "WABA_RM"
+        appmod.db.session.commit()
+
+    def fake_get(url, **kw):
+        if url.endswith("/WABA_RM"):
+            return Resp({"name": "Beta Marketing Solutions"})
+        return Resp({"display_phone_number": "+961 71 228 998", "verified_name": "Beta Marketing Solutions",
+                     "quality_rating": "GREEN"})
+    monkeypatch.setattr(wa_connect.requests, "get", fake_get)
+    r = client.post("/api/whatsapp/connect/refresh", headers=hdr)
+    assert r.status_code == 200, r.get_json()
+    conn = r.get_json()["connection"]
+    assert conn["method"] == "manual" and conn["status"] == "connected"
+    assert conn["display_phone_number"] == "+961 71 228 998"
+    assert conn["meta_business_name"] == "Beta Marketing Solutions"
