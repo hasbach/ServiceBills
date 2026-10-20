@@ -1,0 +1,20 @@
+{
+  "_synthetic": true,
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "WABA_TEST_1",
+      "changes": [
+        {
+          "field": "account_update",
+          "value": {
+            "event": "ACCOUNT_RECONNECTED",
+            "waba_info": {
+              "waba_id": "WABA_TEST_1"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

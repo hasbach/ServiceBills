@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 
 import media_convert
 import storage
+import wa_connect
 
 WINDOW = timedelta(hours=24)
 AI_AUTO_RESUME_AFTER = timedelta(hours=24)
@@ -243,6 +244,57 @@ def record_outbound(appmod, conv, *, sender, msg_type, text=None, transcript=Non
     conv.last_message_preview = preview_for(msg_type, text, reaction_emoji)
     appmod.db.session.flush()
     return msg
+
+
+def record_phone_echoes(appmod, tenant_id, value):
+    """Coexistence `smb_message_echoes`: messages the tenant sent from the
+    WhatsApp Business app on their phone. Each becomes an outbound
+    sender='phone' message in that customer's conversation (and pauses the AI
+    there -- a human has taken over); edit/revoke echoes update the original.
+    Returns ids of new messages whose media still needs downloading. Caller
+    commits. See specs/001-whatsapp-auto-connect/contracts/webhook-events.md."""
+    Msg = appmod.WhatsAppMessage
+    needs_media = []
+    for item in value.get('message_echoes') or []:
+        edit, revoke = item.get('edit'), item.get('revoke')
+        if edit or revoke:
+            target = Msg.query.filter_by(tenant_id=tenant_id, wa_message_id=(edit or revoke).get(
+                'original_message_id')).first()
+            if target is None:
+                continue
+            if edit:
+                body = (edit.get('message') or {})
+                target.text = (body.get('text') or {}).get('body') or target.text
+                target.status = 'edited'
+            else:
+                target.status = 'revoked'
+            continue
+        wamid = item.get('id')
+        if not item.get('to') or is_duplicate(appmod, tenant_id, wamid):
+            continue
+        parsed = parse_inbound(item)
+        conv = upsert_conversation(appmod, tenant_id, item['to'])
+        try:
+            with appmod.db.session.begin_nested():
+                msg = record_outbound(appmod, conv, sender='phone', msg_type=parsed['msg_type'],
+                                      text=parsed.get('text'), wa_message_id=wamid, status='sent',
+                                      reply_to_wa_message_id=parsed.get('reply_to_wa_message_id'),
+                                      reaction_emoji=parsed.get('reaction_emoji'),
+                                      reaction_target_wa_id=parsed.get('reaction_target_wa_id'))
+                msg.created_at = parsed.get('created_at') or msg.created_at
+                if parsed.get('wa_media_id'):
+                    msg.wa_media_id = parsed['wa_media_id']
+                    msg.media_mime = (parsed.get('media_mime') or '').split(';')[0].strip() or None
+                    msg.media_status = 'pending'
+        except IntegrityError:
+            continue   # a concurrent delivery of the same echo won
+        if not conv.ai_paused:
+            conv.ai_paused = True
+            conv.ai_paused_at = _now()
+        if msg.wa_media_id:
+            needs_media.append(msg.id)
+    appmod.db.session.flush()
+    return needs_media
 
 
 def flag_attention(conv, reason):
@@ -530,6 +582,8 @@ def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None,
     settings = appmod.WhatsAppSettings.query.filter_by(tenant_id=conv.tenant_id).first()
     if not settings or not settings.access_token or not settings.phone_number_id:
         raise SendError('not_configured', 'WhatsApp Cloud API is not configured for this business.', 400)
+    if wa_connect.blocks_sends(settings):
+        raise SendError('needs_attention', wa_connect.NEEDS_ATTENTION_SEND_ERROR, 409)
     if kind != 'template' and not window_open(conv):
         raise WindowClosed()
 
@@ -610,6 +664,7 @@ def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None,
         wamid = _post_message(settings, payload)
     except SendError as e:
         _record_send_failure(appmod, conv, user_id, rec, e)
+        wa_connect.note_send_error(appmod, settings, e.meta_code, e.message)
         raise
     msg = record_outbound(appmod, conv, sender='admin', sent_by_user_id=user_id, wa_message_id=wamid,
                           status='sent', **rec)

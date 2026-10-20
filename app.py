@@ -53,6 +53,7 @@ import json
 import cs_agent_tools
 import functools
 import whatsapp_inbox
+import wa_connect
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager, verify_jwt_in_request
 try:
@@ -1682,19 +1683,64 @@ class WhatsAppSettings(db.Model):
     # own device, outside this app -- this template send is only the prompt for that.
     template_forward_keepalive = db.Column(db.String(200), nullable=True, default='daily_checkin')
     last_forwarding_keepalive_sent_at = db.Column(db.DateTime, nullable=True)
+    # How the number was connected -- see specs/001-whatsapp-auto-connect/data-model.md.
+    # 'manual' = tenant's own Meta app + pasted credentials (app_id/app_secret set);
+    # 'coexistence' / 'embedded' = Embedded Signup through the platform Meta app
+    # (app_id/app_secret NULL, resolved by wa_connect.wa_app_identity).
+    connection_method = db.Column(db.String(20), nullable=False, default='manual', server_default='manual')
+    # 'connected' | 'needs_attention' | 'disconnected'
+    connection_status = db.Column(db.String(20), nullable=False, default='disconnected', server_default='disconnected')
+    status_reason = db.Column(db.String(300), nullable=True)
+    meta_business_id = db.Column(db.String(64), nullable=True)
+    meta_business_name = db.Column(db.String(200), nullable=True)
+    display_phone_number = db.Column(db.String(32), nullable=True)
+    verified_name = db.Column(db.String(200), nullable=True)
+    quality_rating = db.Column(db.String(16), nullable=True)
+    messaging_limit_tier = db.Column(db.String(32), nullable=True)
+    payment_method_status = db.Column(db.String(16), nullable=True)  # present | missing | unknown
+    registration_pin = db.Column(EncryptedString, nullable=True)     # 'embedded' method only
+    token_obtained_at = db.Column(db.DateTime, nullable=True)
+    connected_at = db.Column(db.DateTime, nullable=True)
+    connected_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
+    last_health_check_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    connected_by = db.relationship('User', foreign_keys=[connected_by_user_id])
+
+    def connection_view(self):
+        """Connection summary safe to send to the browser: never a token,
+        secret or PIN (contracts/http-api.md ConnectionView)."""
+        def _iso(dt):
+            return dt.strftime('%Y-%m-%dT%H:%M:%SZ') if dt else None
+        return {
+            'method': self.connection_method or 'manual',
+            'status': self.connection_status or 'disconnected',
+            'status_reason': self.status_reason,
+            'display_phone_number': self.display_phone_number,
+            'verified_name': self.verified_name,
+            'meta_business_name': self.meta_business_name,
+            'quality_rating': self.quality_rating,
+            'messaging_limit_tier': self.messaging_limit_tier,
+            'payment_method_status': self.payment_method_status,
+            'connected_at': _iso(self.connected_at),
+            'connected_by': self.connected_by.username if self.connected_by else None,
+            'last_health_check_at': _iso(self.last_health_check_at),
+        }
+
     def to_dict(self):
+        # Automatic connections hold a platform-issued token the tenant never
+        # sees or edits; only manual tenants get their own credentials back.
+        manual = (self.connection_method or 'manual') == 'manual'
         return {
             'id': self.id,
             'mode': self.mode,
             'enabled': self.enabled,
             'phone_number_id': self.phone_number_id or '',
             'business_account_id': self.business_account_id or '',
-            'app_id': self.app_id or '',
-            'app_secret': self.app_secret or '',
-            'access_token': self.access_token or '',
+            'app_id': (self.app_id or '') if manual else '',
+            'app_secret': (self.app_secret or '') if manual else '',
+            'access_token': (self.access_token or '') if manual else '',
             'api_version': self.api_version or 'v19.0',
             'template_payment_paid': self.template_payment_paid or 'payment_confirmation',
             'template_subscription_created': self.template_subscription_created or 'subscription_created',
@@ -1736,6 +1782,11 @@ class WhatsAppTemplate(db.Model):
     rejected_reason = db.Column(db.String(500), nullable=True)
     components = db.Column(db.JSON, nullable=False)
     meta_template_id = db.Column(db.String(64), nullable=True, index=True)
+    # Set when created from the standard catalog (wa_standard_templates.py).
+    # param_map lists the semantic variable key for {{1}}..{{n}} in the body;
+    # NULL means the legacy fixed parameter order.
+    standard_key = db.Column(db.String(40), nullable=True)
+    param_map = db.Column(db.JSON, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1749,8 +1800,42 @@ class WhatsAppTemplate(db.Model):
             'rejected_reason': self.rejected_reason,
             'components': self.components,
             'meta_template_id': self.meta_template_id,
+            'standard_key': self.standard_key,
+            'param_map': self.param_map,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
+        }
+
+class WhatsAppConnectionEvent(db.Model):
+    """Append-only audit of WhatsApp connect / reconnect / disconnect and
+    health-status changes (FR-023). Written via wa_connect.log_event."""
+    __tablename__ = 'whatsapp_connection_event'
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    # SET NULL: NULL also for webhook / scheduler-originated events.
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
+    # connect | reconnect | method_change | disconnect | status_change | connect_failed
+    event = db.Column(db.String(32), nullable=False)
+    method = db.Column(db.String(20), nullable=True)
+    from_status = db.Column(db.String(20), nullable=True)
+    to_status = db.Column(db.String(20), nullable=True)
+    source = db.Column(db.String(20), nullable=False)  # user | webhook | send_error | health_check
+    detail = db.Column(db.String(500), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    user = db.relationship('User', foreign_keys=[user_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'event': self.event,
+            'method': self.method,
+            'from_status': self.from_status,
+            'to_status': self.to_status,
+            'source': self.source,
+            'detail': self.detail,
+            'user': self.user.username if self.user else None,
+            'created_at': self.created_at.strftime('%Y-%m-%dT%H:%M:%SZ') if self.created_at else None,
         }
 
 class TenantWhishSettings(db.Model):
@@ -2101,7 +2186,7 @@ class WhatsAppMessage(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     conversation_id = db.Column(db.Integer, db.ForeignKey('whatsapp_conversation.id'), nullable=False, index=True)
     direction = db.Column(db.String(3), nullable=False)          # 'in' | 'out'
-    sender = db.Column(db.String(10), nullable=False)            # 'customer' | 'ai' | 'admin' | 'system'
+    sender = db.Column(db.String(10), nullable=False)            # 'customer' | 'ai' | 'admin' | 'system' | 'phone' (coexistence echo)
     # SET NULL: deleting a staff account keeps the messages they sent.
     sent_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
     msg_type = db.Column(db.String(20), nullable=False)
@@ -2244,7 +2329,7 @@ TENANT_OWNED_MODELS = (
     UpstreamProvider, UpstreamProviderPayment,
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
-    WhatsAppConversation, WhatsAppMessage, BalanceLog,
+    WhatsAppConversation, WhatsAppMessage, BalanceLog, WhatsAppConnectionEvent,
 )
 
 from sqlalchemy import event as _sa_event
@@ -3403,7 +3488,7 @@ _TENANT_DELETE_ORDER = [
     # raises ForeignKeyViolation on Postgres (SQLite doesn't enforce FKs, so
     # the gap would be invisible there).
     Expense, WhatsAppMessage, WhatsAppConversation, Customer, ServiceOutage, PushSubscription, BusinessSettings,
-    WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
+    WhatsAppConnectionEvent, WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
     # NetworkDevice arrived on the network-topology branch, so origin/main's
     # copy of this list never knew about it and won the merge. Without it a
@@ -4284,6 +4369,14 @@ def refresh_agent_mode_network_status_with_context():
 # genuinely overlap a still-running previous trigger, so the lock is what
 # stops that overlap from double-processing the same customer/payment rows,
 # not anything about the trigger mechanism itself.
+def whatsapp_connection_health_with_context():
+    """Hourly: re-check every live automatic (Embedded Signup) WhatsApp
+    connection so a revoked token shows "Needs attention" within the hour
+    (SC-005) even when no webhook said so. Manual tenants are not polled."""
+    with app.app_context():
+        wa_connect.run_health_checks(sys.modules[__name__])
+
+
 _SCHEDULED_JOBS = {
     "generate_missing_payments": generate_missing_payments_with_context,
     "generate_missing_salary_charges": generate_missing_salary_charges_with_context,
@@ -4298,6 +4391,7 @@ _SCHEDULED_JOBS = {
     "auto_sync_upstream_status": auto_sync_upstream_status_with_context,
     "check_pro_plan_expirations": check_pro_plan_expirations_with_context,
     "refresh_agent_mode_network_status": refresh_agent_mode_network_status_with_context,
+    "whatsapp_connection_health": whatsapp_connection_health_with_context,
 }
 
 
@@ -4320,13 +4414,16 @@ SCHEDULE = {
     "auto_sync_upstream_status": "40 2 * * *",
     "check_pro_plan_expirations": "50 2 * * *",
     "refresh_agent_mode_network_status": "*/15 * * * *",
+    "whatsapp_connection_health": "5 * * * *",
 }
 ONPREM_EXTRA_SCHEDULE = {"refresh_license": "0 3 * * *"}
 
 
 def onprem_schedule():
     """SCHEDULE minus SaaS-only billing jobs, plus on-prem extras."""
-    s = {k: v for k, v in SCHEDULE.items() if k != "check_pro_plan_expirations"}
+    # Automatic WhatsApp connections need the SaaS platform Meta app, so
+    # on-prem never has any to health-check.
+    s = {k: v for k, v in SCHEDULE.items() if k not in ("check_pro_plan_expirations", "whatsapp_connection_health")}
     s.update(ONPREM_EXTRA_SCHEDULE)
     return s
 
@@ -7626,9 +7723,13 @@ def get_whatsapp_settings():
     settings = tenant_query(WhatsAppSettings).first()
     webhook_url = _public_base_url(current_tenant_id()) + "/api/whatsapp/webhook"
     if settings:
-        return jsonify({'settings': settings.to_dict(), 'webhook_url': webhook_url}), 200
+        return jsonify({'settings': settings.to_dict(), 'webhook_url': webhook_url,
+                        'connection': settings.connection_view()}), 200
     # Return safe defaults if not configured yet
-    return jsonify({'webhook_url': webhook_url, 'settings': {
+    return jsonify({'webhook_url': webhook_url,
+                    'connection': WhatsAppSettings(connection_method='manual',
+                                                   connection_status='disconnected').connection_view(),
+                    'settings': {
         'mode': 'deeplink', 'enabled': False,
         'phone_number_id': '', 'business_account_id': '', 'app_id': '',
         'app_secret': '', 'access_token': '', 'api_version': 'v19.0',
@@ -7682,6 +7783,10 @@ def get_whatsapp_deeplink_settings():
         'deeplink_msg_current_balance': full.get('deeplink_msg_current_balance') or 'Dear {customer_name}, your current balance is ${balance}. Expiry date: {expiry_date}. Thank you!',
     }}), 200
 
+_WA_CREDENTIAL_FIELDS = ('phone_number_id', 'business_account_id', 'app_id', 'app_secret',
+                         'access_token', 'api_version', 'webhook_verify_token')
+
+
 @app.route('/api/whatsapp-settings', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
@@ -7705,14 +7810,24 @@ def save_whatsapp_settings():
                   'deeplink_msg_payment_reminder', 'deeplink_msg_current_balance',
                   'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message',
                   'template_forward_keepalive']
+        automatic = wa_connect.is_automatic(settings)
+        if automatic:
+            # Credentials of an Embedded Signup connection come only from the
+            # connect flow; the form must not overwrite them (GET blanks them).
+            fields = [f for f in fields if f not in _WA_CREDENTIAL_FIELDS]
         for f in fields:
             if f in data:
                 setattr(settings, f, data[f])
+        if not automatic:
+            settings.connection_method = 'manual'
+            settings.connection_status = ('connected' if settings.access_token and settings.phone_number_id
+                                          else 'disconnected')
+            settings.status_reason = None
         settings.updated_at = datetime.utcnow()
         db.session.commit()
-        
+
         # Automatically subscribe app to WABA webhooks via Graph API
-        if settings.access_token and settings.business_account_id:
+        if not automatic and settings.access_token and settings.business_account_id:
             try:
                 api_ver = settings.api_version or 'v19.0'
                 sub_url = f"https://graph.facebook.com/{api_ver}/{settings.business_account_id}/subscribed_apps"
@@ -8280,6 +8395,7 @@ def email_customer_payment_link(customer_id, payment_id):
 
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
 @jwt_required()
+@admin_required()
 @require_module('whatsapp')
 def subscribe_waba():
     try:
@@ -8389,6 +8505,24 @@ def _validate_template_components(components):
     return None
 
 
+def _create_template_on_meta(settings, name, language, category, components, **row_fields):
+    """Submit a template to the tenant's WABA and add its local row (caller
+    commits). Returns (row, None) or (None, plain-language Meta error)."""
+    api_version = settings.api_version or 'v19.0'
+    url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates'
+    headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+    payload = {'name': name, 'language': language, 'category': category, 'components': components}
+    resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    if not resp.ok:
+        return None, _parse_meta_error(resp)
+    body = resp.json()
+    row = WhatsAppTemplate(tenant_id=settings.tenant_id, name=name, language=language, category=category,
+                           status=body.get('status', 'PENDING'), components=components,
+                           meta_template_id=body.get('id'), **row_fields)
+    db.session.add(row)
+    return row, None
+
+
 @app.route('/api/whatsapp/templates', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
@@ -8417,18 +8551,9 @@ def create_whatsapp_template():
         return jsonify({'error': error}), 400
 
     try:
-        api_version = settings.api_version or 'v19.0'
-        url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates'
-        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
-        payload = {'name': name, 'language': language, 'category': category, 'components': components}
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        if not resp.ok:
-            return jsonify({'error': _parse_meta_error(resp)}), 400
-        body = resp.json()
-        row = new_for_tenant(WhatsAppTemplate, name=name, language=language, category=category,
-                              status=body.get('status', 'PENDING'), components=components,
-                              meta_template_id=body.get('id'))
-        db.session.add(row)
+        row, meta_error = _create_template_on_meta(settings, name, language, category, components)
+        if meta_error:
+            return jsonify({'error': meta_error}), 400
         db.session.commit()
         return jsonify({'message': 'Template submitted to Meta for review.', 'template': row.to_dict()}), 201
     except Exception as e:
@@ -8522,7 +8647,8 @@ def upload_whatsapp_template_sample():
         return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
     if not plans.limits(current_tenant().plan)["whatsapp_api"]:
         return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
-    if not settings.access_token or not settings.app_id:
+    upload_app_id = wa_connect.wa_app_identity(settings)[0]
+    if not settings.access_token or not upload_app_id:
         return jsonify({'error': 'Please configure your App ID and Access Token first.'}), 400
 
     file = request.files.get('file')
@@ -8532,7 +8658,7 @@ def upload_whatsapp_template_sample():
 
     try:
         api_version = settings.api_version or 'v19.0'
-        session_url = f'https://graph.facebook.com/{api_version}/{settings.app_id}/uploads'
+        session_url = f'https://graph.facebook.com/{api_version}/{upload_app_id}/uploads'
         session_resp = requests.post(session_url, params={
             'file_length': len(file_bytes),
             'file_type': file.mimetype or 'application/octet-stream',
@@ -8775,6 +8901,101 @@ def send_reseller_whatsapp(tenant_id, reseller_id, name, phone, event_type, cont
     return res
 
 
+def _wa_legacy_params(event_type, customer, context):
+    """Body parameters in the fixed order the platform has always sent them."""
+    user_body_params = []
+    if event_type == 'payment_paid':
+        amount_str = f"{float(context.get('amount', 0)):.2f}"
+        balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
+        user_body_params = [customer.name, amount_str, balance_str]
+    elif event_type == 'subscription_renewed':
+        expiry_date = str(context.get('expiry_date', ''))
+        plan_name = str(context.get('plan_name', customer.subscription_plan.name if customer.subscription_plan else 'N/A'))
+        balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
+        user_body_params = [customer.name, plan_name, expiry_date, balance_str]
+    elif event_type in ('payment_reminder', 'current_balance'):
+        balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
+        expiry_date = str(context.get('expiry_date', customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else 'N/A'))
+        user_body_params = [customer.name, balance_str, expiry_date]
+    elif event_type == 'payment_link':
+        # Deliberately the link's view_token ALONE, no other params -- see
+        # this task's design note on why the payment_link template's BODY
+        # component must have zero {{n}} placeholders (so
+        # user_body_params[0] is free for the URL button's {{1}} without
+        # colliding with a body placeholder consuming the same value).
+        user_body_params = [context.get('view_token', '')]
+    elif event_type == 'bulk_outage':
+        user_body_params = [context.get('message', 'an outage occured from the isp , will be repaired soon')]
+    elif event_type == 'bulk_maintenance':
+        user_body_params = [context.get('location', ''), context.get('estimated_time', '')]
+    elif event_type == 'reseller_credit_added':
+        amount_str = f"{float(context.get('amount', 0)):.2f}"
+        balance_str = f"{float(context.get('balance', 0)):.2f}"
+        user_body_params = [amount_str, balance_str]
+    elif event_type == 'reseller_discount_applied':
+        amount_str = f"{float(context.get('amount', 0)):.2f}"
+        balance_str = f"{float(context.get('balance', 0)):.2f}"
+        user_body_params = [amount_str, balance_str]
+    elif event_type == 'reseller_customer_renewed':
+        customer_name = context.get('customer_name', 'Unknown')
+        balance_str = f"{float(context.get('balance', 0)):.2f}"
+        user_body_params = [customer_name, balance_str]
+    elif event_type == 'reseller_payment_collected':
+        amount_str = f"{float(context.get('amount', 0)):.2f}"
+        balance_str = f"{float(context.get('balance', 0)):.2f}"
+        user_body_params = [amount_str, balance_str]
+    elif event_type in ('bulk_feature', 'bulk_offer'):
+        user_body_params = [context.get('message', '')]
+    else:
+        if context and isinstance(context.get('variables'), list):
+            user_body_params = context.get('variables')
+        elif context and context.get('message'):
+            user_body_params = [context.get('message')]
+    return user_body_params
+
+
+def _wa_semantic_params(event_type, customer, context):
+    """Same values as _wa_legacy_params, keyed by the semantic variable names of
+    wa_standard_templates.CATALOG (in that catalog's legacy order), or None for
+    events the catalog doesn't cover (reseller templates, custom sends)."""
+    context = context or {}
+    balance = lambda: f"{float(context.get('balance', customer.balance)):.2f}"
+    plan = lambda: str(context.get('plan_name', customer.subscription_plan.name if customer.subscription_plan else 'N/A'))
+    expiry = lambda: str(context.get('expiry_date', customer.subscription_expiry_date.strftime('%Y-%m-%d')
+                                     if customer.subscription_expiry_date else 'N/A'))
+    if event_type == 'payment_paid':
+        return {'customer_name': customer.name, 'amount': f"{float(context.get('amount', 0)):.2f}",
+                'balance': balance()}
+    if event_type in ('subscription_created', 'subscription_renewed'):
+        return {'customer_name': customer.name, 'plan': plan(), 'expiry_date': str(context.get('expiry_date', '')),
+                'balance': balance()}
+    if event_type in ('payment_reminder', 'current_balance'):
+        return {'customer_name': customer.name, 'balance': balance(), 'expiry_date': expiry()}
+    if event_type == 'payment_link':
+        return {'pay_token': context.get('view_token', '')}
+    if event_type == 'bulk_outage':
+        return {'message': context.get('message', 'an outage occured from the isp , will be repaired soon')}
+    if event_type == 'bulk_maintenance':
+        return {'location': context.get('location', ''), 'eta': context.get('estimated_time', '')}
+    if event_type in ('bulk_feature', 'bulk_offer'):
+        return {'message': context.get('message', '')}
+    return None
+
+
+def _wa_template_body_params(settings, template_name, event_type, customer, context):
+    legacy = _wa_legacy_params(event_type, customer, context)
+    # payment_link's URL button reads the first param, so it never reorders.
+    if event_type == 'payment_link':
+        return legacy
+    semantic = _wa_semantic_params(event_type, customer, context)
+    if semantic is None:
+        return legacy
+    row = WhatsAppTemplate.query.filter_by(tenant_id=settings.tenant_id, name=template_name)         .filter(WhatsAppTemplate.param_map.isnot(None)).first()
+    if row is None or not isinstance(row.param_map, list):
+        return legacy
+    return [semantic.get(k, '') for k in row.param_map]
+
+
 def send_whatsapp_message(customer, event_type, context=None):
     """
     Sends a WhatsApp message to a customer if the WhatsApp API mode is enabled.
@@ -8806,6 +9027,9 @@ def send_whatsapp_message(customer, event_type, context=None):
         if not settings.access_token or not settings.phone_number_id:
             logging.warning('WhatsApp API mode is enabled but credentials are missing – skipping send.')
             return {'success': False, 'status': 'Failed', 'error': 'WhatsApp API credentials missing in settings'}
+        if wa_connect.blocks_sends(settings):
+            # Known-broken automatic connection: fail visibly instead of calling Meta.
+            return {'success': False, 'status': 'Failed', 'error': wa_connect.NEEDS_ATTENTION_SEND_ERROR}
 
         # Normalise the recipient phone number (digits only, no leading +)
         phone = normalize_whatsapp_phone(customer.phone)
@@ -8850,55 +9074,11 @@ def send_whatsapp_message(customer, event_type, context=None):
             'Content-Type': 'application/json',
         }
 
-        # Build template components (header / body parameters)
-        user_body_params = []
-        if event_type == 'payment_paid':
-            amount_str = f"{float(context.get('amount', 0)):.2f}"
-            balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
-            user_body_params = [customer.name, amount_str, balance_str]
-        elif event_type == 'subscription_renewed':
-            expiry_date = str(context.get('expiry_date', ''))
-            plan_name = str(context.get('plan_name', customer.subscription_plan.name if customer.subscription_plan else 'N/A'))
-            balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
-            user_body_params = [customer.name, plan_name, expiry_date, balance_str]
-        elif event_type in ('payment_reminder', 'current_balance'):
-            balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
-            expiry_date = str(context.get('expiry_date', customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else 'N/A'))
-            user_body_params = [customer.name, balance_str, expiry_date]
-        elif event_type == 'payment_link':
-            # Deliberately the link's view_token ALONE, no other params -- see
-            # this task's design note on why the payment_link template's BODY
-            # component must have zero {{n}} placeholders (so
-            # user_body_params[0] is free for the URL button's {{1}} without
-            # colliding with a body placeholder consuming the same value).
-            user_body_params = [context.get('view_token', '')]
-        elif event_type == 'bulk_outage':
-            user_body_params = [context.get('message', 'an outage occured from the isp , will be repaired soon')]
-        elif event_type == 'bulk_maintenance':
-            user_body_params = [context.get('location', ''), context.get('estimated_time', '')]
-        elif event_type == 'reseller_credit_added':
-            amount_str = f"{float(context.get('amount', 0)):.2f}"
-            balance_str = f"{float(context.get('balance', 0)):.2f}"
-            user_body_params = [amount_str, balance_str]
-        elif event_type == 'reseller_discount_applied':
-            amount_str = f"{float(context.get('amount', 0)):.2f}"
-            balance_str = f"{float(context.get('balance', 0)):.2f}"
-            user_body_params = [amount_str, balance_str]
-        elif event_type == 'reseller_customer_renewed':
-            customer_name = context.get('customer_name', 'Unknown')
-            balance_str = f"{float(context.get('balance', 0)):.2f}"
-            user_body_params = [customer_name, balance_str]
-        elif event_type == 'reseller_payment_collected':
-            amount_str = f"{float(context.get('amount', 0)):.2f}"
-            balance_str = f"{float(context.get('balance', 0)):.2f}"
-            user_body_params = [amount_str, balance_str]
-        elif event_type in ('bulk_feature', 'bulk_offer'):
-            user_body_params = [context.get('message', '')]
-        else:
-            if context and isinstance(context.get('variables'), list):
-                user_body_params = context.get('variables')
-            elif context and context.get('message'):
-                user_body_params = [context.get('message')]
+        # Build template components (header / body parameters). A template
+        # submitted from the standard catalog carries a param_map (semantic key
+        # per {{n}}) because the tenant may have moved its variables around;
+        # every other template keeps the legacy fixed order.
+        user_body_params = _wa_template_body_params(settings, template_name, event_type, customer, context)
 
         user_header_params = context.get('header_url') or context.get('image_url') or context.get('media_url')
 
@@ -8931,6 +9111,7 @@ def send_whatsapp_message(customer, event_type, context=None):
                 pass
             err_msg = err_json.get('message') or err_json.get('error_data', {}).get('details') or response.text
             logging.error(f'WhatsApp API error for customer {customer.id}: {response.status_code} {response.text}')
+            wa_connect.note_send_error(sys.modules[__name__], settings, err_json.get('code'), err_msg)
             return {'success': False, 'status': 'Failed', 'error': f'Meta API Error ({response.status_code}): {err_msg}'}
 
     except Exception as exc:
@@ -9711,7 +9892,11 @@ def whatsapp_webhook():
         # this still has a per-tenant value in the DB via the column default;
         # there is no code-level bypass string anymore.)
         token_match = WhatsAppSettings.query.filter_by(webhook_verify_token=token).first() if token else None
-        if mode == 'subscribe' and token_match:
+        # The platform Meta app (Embedded Signup tenants) has one callback for
+        # every tenant it serves, verified with the platform's own token.
+        platform_match = bool(token and Config.META_WEBHOOK_VERIFY_TOKEN
+                              and hmac.compare_digest(token, Config.META_WEBHOOK_VERIFY_TOKEN))
+        if mode == 'subscribe' and (token_match or platform_match):
             logging.info("WhatsApp Webhook verified successfully by Meta!")
             return challenge, 200
         return 'Verification failed', 403
@@ -9728,17 +9913,18 @@ def whatsapp_webhook():
                     if change.get('field') == 'message_template_status_update':
                         waba_id = entry.get('id')
                         tpl_matches = WhatsAppSettings.query.filter_by(business_account_id=waba_id).all() if waba_id else []
-                        tpl_settings = tpl_matches[0] if tpl_matches else None
+                        tpl_settings = wa_connect.pick_routable(tpl_matches)
                         if not tpl_settings:
                             logging.warning(f"WhatsApp template status webhook: no tenant for business_account_id={waba_id}; skipping.")
                             continue
                         if len(tpl_matches) > 1:
                             logging.warning(f"WhatsApp template status webhook: {len(tpl_matches)} settings rows share business_account_id={waba_id} "
                                              f"(tenant_ids={[m.tenant_id for m in tpl_matches]}); using settings.id={tpl_settings.id} tenant_id={tpl_settings.tenant_id}.")
-                        if not tpl_settings.app_secret or not signature_header.startswith('sha256='):
+                        tpl_app_secret = wa_connect.wa_app_identity(tpl_settings)[1]
+                        if not tpl_app_secret or not signature_header.startswith('sha256='):
                             logging.warning(f"WhatsApp template status webhook: missing app_secret/signature for tenant_id={tpl_settings.tenant_id}; rejecting.")
                             return jsonify({'error': 'Invalid signature'}), 401
-                        tpl_expected_sig = hmac.new(tpl_settings.app_secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+                        tpl_expected_sig = hmac.new(tpl_app_secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
                         tpl_provided_sig = signature_header[len('sha256='):]
                         if not hmac.compare_digest(tpl_expected_sig, tpl_provided_sig):
                             logging.warning(f"WhatsApp template status webhook: signature mismatch for tenant_id={tpl_settings.tenant_id}; rejecting.")
@@ -9765,13 +9951,38 @@ def whatsapp_webhook():
                                 logging.warning(f"WhatsApp template status webhook: no local WhatsAppTemplate for tenant_id={tpl_settings.tenant_id} name={tpl_name} language={tpl_language}; skipping.")
                         continue
 
+                    # Connection health from Meta (US4): routed by WABA id, never into
+                    # the messages path below.
+                    if change.get('field') in ('account_update', 'phone_number_quality_update'):
+                        acct_waba = ((val.get('waba_info') or {}).get('waba_id')
+                                     if change.get('field') == 'account_update' else None) or entry.get('id')
+                        acct_rows = WhatsAppSettings.query.filter_by(business_account_id=str(acct_waba)).all() if acct_waba else []
+                        acct_settings = wa_connect.pick_routable(acct_rows)
+                        if not acct_settings:
+                            logging.info(f"WhatsApp {change.get('field')}: no tenant for waba_id={acct_waba} "
+                                         f"(event={val.get('event')}); skipping.")
+                            continue
+                        acct_secret = wa_connect.wa_app_identity(acct_settings)[1]
+                        acct_sig = signature_header[len('sha256='):] if signature_header.startswith('sha256=') else ''
+                        if not acct_secret or not acct_sig or not hmac.compare_digest(
+                                hmac.new(acct_secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest(), acct_sig):
+                            logging.warning(f"WhatsApp {change.get('field')}: bad signature for tenant_id={acct_settings.tenant_id}; rejecting.")
+                            return jsonify({'error': 'Invalid signature'}), 401
+                        _acct_appmod = sys.modules[__name__]
+                        if change.get('field') == 'account_update':
+                            wa_connect.handle_account_update(_acct_appmod, acct_settings, val)
+                        else:
+                            wa_connect.handle_quality_update(_acct_appmod, acct_settings, val)
+                        db.session.commit()
+                        continue
+
                     messages = val.get('messages', [])
                     contacts = val.get('contacts', [])
 
                     # Resolve the owning tenant from the recipient business phone number.
                     incoming_pnid = (val.get('metadata', {}) or {}).get('phone_number_id')
                     matches = WhatsAppSettings.query.filter_by(phone_number_id=incoming_pnid).all() if incoming_pnid else []
-                    settings = matches[0] if matches else None
+                    settings = wa_connect.pick_routable(matches)
                     if not settings:
                         logging.warning(f"WhatsApp webhook: no tenant for phone_number_id={incoming_pnid}; skipping.")
                         continue
@@ -9781,11 +9992,12 @@ def whatsapp_webhook():
                     # message forwarding, auto-reply). Never trust the payload just
                     # because a phone_number_id happened to match a tenant -- reject
                     # the whole request rather than silently skipping this change.
-                    if not settings.app_secret or not signature_header.startswith('sha256='):
+                    wh_app_secret = wa_connect.wa_app_identity(settings)[1]
+                    if not wh_app_secret or not signature_header.startswith('sha256='):
                         logging.warning(f"WhatsApp webhook: missing app_secret or signature header for tenant_id={settings.tenant_id}; rejecting.")
                         return jsonify({'error': 'Invalid signature'}), 401
                     expected_sig = hmac.new(
-                        settings.app_secret.encode('utf-8'), raw_body, hashlib.sha256
+                        wh_app_secret.encode('utf-8'), raw_body, hashlib.sha256
                     ).hexdigest()
                     provided_sig = signature_header[len('sha256='):]
                     if not hmac.compare_digest(expected_sig, provided_sig):
@@ -9806,11 +10018,34 @@ def whatsapp_webhook():
                     logging.info(f"WhatsApp webhook: resolved settings.id={settings.id} tenant_id={settings.tenant_id} "
                                  f"forwarding_mobile={settings.forwarding_mobile!r} for phone_number_id={incoming_pnid}")
                     resolved_tenant_id = settings.tenant_id
+                    _appmod = sys.modules[__name__]
+
+                    # Coexistence: what the tenant typed in the WhatsApp Business app on
+                    # their phone. Recorded as sender='phone' and never routed into the
+                    # inbound / auto-reply / AI / ticket path below.
+                    if change.get('field') == 'smb_message_echoes':
+                        try:
+                            _echo_media = whatsapp_inbox.record_phone_echoes(_appmod, resolved_tenant_id, val)
+                            db.session.commit()
+                        except Exception as ex_echo:
+                            db.session.rollback()
+                            logging.error(f"WhatsApp echo: could not record for tenant_id={resolved_tenant_id}: {ex_echo}")
+                            _echo_media = []
+                        for _echo_id in _echo_media:
+                            if settings.access_token:
+                                whatsapp_inbox.run_background(app, functools.partial(
+                                    whatsapp_inbox.store_inbound_media, _appmod, _echo_id,
+                                    settings.access_token, settings.api_version or 'v19.0'),
+                                    pool=whatsapp_inbox.media_pool())
+                        continue
+                    # Chat history / contact sync is never requested (FR-014); ignore it if it arrives.
+                    if change.get('field') in ('history', 'smb_app_state_sync'):
+                        logging.debug(f"WhatsApp webhook: ignoring {change.get('field')} for tenant_id={resolved_tenant_id}")
+                        continue
 
                     # Delivery/read/failure receipts for messages WE sent (e.g. the forwarded
                     # alert to forwarding_mobile). Meta reports these separately from inbound
                     # "messages" -- log them so a silent delivery failure is diagnosable.
-                    _appmod = sys.modules[__name__]
                     for st in val.get('statuses', []):
                         st_status = st.get('status')
                         st_recipient = st.get('recipient_id')
@@ -10114,6 +10349,9 @@ def whatsapp_webhook():
 
 import whatsapp_inbox_routes
 whatsapp_inbox_routes.register_inbox_routes(app, sys.modules[__name__])
+
+import wa_connect_routes
+wa_connect_routes.register_wa_connect_routes(app, sys.modules[__name__])
 
 import customer_import
 customer_import.register_customer_import_routes(app, sys.modules[__name__])

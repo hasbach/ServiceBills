@@ -3,6 +3,7 @@ import { Box, Paper, Typography, useMediaQuery, useTheme, Stack } from '@mui/mat
 import { useAppContext } from '../../context/AppContext';
 import ConversationList from './ConversationList';
 import ChatThread from './ChatThread';
+import WhatsAppConnectionBanner from './WhatsAppConnectionBanner';
 import { attachReactions, mergeThreadPage } from './inboxFormat';
 
 const LIST_POLL_MS = 20000;
@@ -113,6 +114,7 @@ const InboxView = ({ openConversationId = null, renderComposer = null, headerExt
 
     return (
         <Box>
+            <WhatsAppConnectionBanner />
             {headerExtra && <Stack direction="row" justifyContent="flex-end" sx={{ px: 2, pt: 2 }}>{headerExtra}</Stack>}
             <Paper elevation={0} sx={{ m: 2, border: 1, borderColor: 'divider', borderRadius: 3, overflow: 'hidden', height: { xs: 'calc(100vh - 220px)', md: 640 } }}>
                 {isMobile ? (selectedId ? threadPane : listPane) : (

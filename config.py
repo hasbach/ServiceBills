@@ -53,6 +53,21 @@ class Config:
     # stays False (hiding the self-serve button) until both are set.
     WHISH_CHANNEL = os.environ.get("WHISH_CHANNEL")
     WHISH_SECRET = os.environ.get("WHISH_SECRET")
+    # Platform Meta app (WhatsApp Tech Provider) for automatic tenant WhatsApp
+    # connection via Embedded Signup -- see specs/001-whatsapp-auto-connect/.
+    # Automatic connect stays hidden until APP_ID, APP_SECRET and ES_CONFIG_ID
+    # are all set; manual per-tenant credentials never use these.
+    META_APP_ID = os.environ.get("META_APP_ID")
+    META_APP_SECRET = os.environ.get("META_APP_SECRET")
+    META_ES_CONFIG_ID = os.environ.get("META_ES_CONFIG_ID")
+    META_ES_COEX_CONFIG_ID = os.environ.get("META_ES_COEX_CONFIG_ID") or os.environ.get("META_ES_CONFIG_ID")
+    # Kill switch in case coexistence turns out unavailable for +961 numbers.
+    META_COEXISTENCE_ENABLED = os.environ.get("META_COEXISTENCE_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+    META_WEBHOOK_VERIFY_TOKEN = os.environ.get("META_WEBHOOK_VERIFY_TOKEN")
+    META_GRAPH_VERSION = os.environ.get("META_GRAPH_VERSION", "v24.0")
+    # Optional rollout list (comma-separated tenant ids or slugs): only these
+    # tenants see automatic connect, e.g. while the app awaits App Review.
+    META_AUTO_CONNECT_TENANTS = os.environ.get("META_AUTO_CONNECT_TENANTS", "")
     # Email: "console" (dev/CI, records in-memory), "smtp", or "sendgrid" (recommended
     # in prod -- rides over HTTPS, unlike raw SMTP ports many hosts block outbound).
     MAIL_BACKEND = os.environ.get("MAIL_BACKEND", "console")
