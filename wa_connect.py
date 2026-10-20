@@ -423,6 +423,14 @@ def check_health(appmod, settings, source='health_check'):
                        ('messaging_limit_tier', 'whatsapp_business_manager_messaging_limit')):
         if number.get(key):
             setattr(settings, field, number[key])
+    if settings.business_account_id:
+        # Account name for the status panel; nice to have, never fatal.
+        try:
+            waba = _graph('get', settings.business_account_id, token=settings.access_token,
+                          what='reading the WhatsApp account', params={'fields': 'name'})
+            settings.meta_business_name = waba.get('name') or settings.meta_business_name
+        except ConnectError:
+            pass
     set_connection_status(appmod, settings, 'connected', None, source)
     appmod.db.session.commit()
     return True

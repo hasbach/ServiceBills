@@ -539,7 +539,7 @@ const WhatsAppConnectCard = ({ connection: connectionProp, manualVisible, onSele
                         <Typography variant="body2" sx={{ fontWeight: 600 }}>{METHOD_LABEL[connection.method] || connection.method}</Typography>
                         <Box sx={{ flex: 1 }} />
                         <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', rowGap: 1 }}>
-                                {isAutomatic && isLive && (
+                                {isLive && (
                                     <Button size="small" variant="outlined" startIcon={busy === 'refreshing' ? <CircularProgress size={14} /> : <RefreshIcon />}
                                         onClick={doRefresh} disabled={working} sx={{ textTransform: 'none', borderRadius: '10px' }}>
                                         Refresh
