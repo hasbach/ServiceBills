@@ -51,6 +51,7 @@ import ResetPasswordView from './components/ResetPasswordView.js';
 import BillingView from './components/BillingView.js';
 import SuperAdminView from './components/SuperAdminView.js';
 import LandingView from './components/LandingView.js';
+import TermsView from './components/TermsView.js';
 import ServiceManagementView from './components/ServiceManagementView.js';
 import FinanceView from './components/FinanceView.js';
 import EnhancedReportsView from './components/EnhancedReportsView.js';
@@ -596,6 +597,7 @@ const AppContent = () => {
 
 
     // Public deep-link screens render regardless of auth (email links land here).
+    if (location.pathname === '/terms') return <TermsView />;
     if (location.pathname === '/verify') return <VerifyEmailView />;
     if (location.pathname === '/reset-password') return <ResetPasswordView />;
     if (location.pathname === '/forgot-password') return <ForgotPasswordView />;

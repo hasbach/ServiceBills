@@ -104,7 +104,9 @@ const LandingView = () => (
 
         <Box sx={{ textAlign: 'center', py: 3, color: 'text.secondary', borderTop: '1px solid', borderColor: 'divider' }}>
             <Box sx={{ mb: 1 }}><SalesContact title="" align="center" /></Box>
-            <Typography variant="caption">© servicesBills</Typography>
+            <Typography variant="caption">
+                © servicesBills · <Link to="/terms" style={{ color: 'inherit' }}>Terms of Service</Link>
+            </Typography>
         </Box>
     </Box>
 );
