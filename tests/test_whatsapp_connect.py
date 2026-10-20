@@ -57,7 +57,7 @@ def test_migration_adds_columns_backfills_and_downgrades(tmp_path):
                     "CREATE TABLE user (id INTEGER PRIMARY KEY)",
                     "CREATE TABLE whats_app_settings (id INTEGER PRIMARY KEY, tenant_id INTEGER, "
                     "phone_number_id VARCHAR(100), access_token TEXT)",
-                    "CREATE TABLE whatsapp_template (id INTEGER PRIMARY KEY, tenant_id INTEGER, name VARCHAR(200))"):
+                    "CREATE TABLE whats_app_template (id INTEGER PRIMARY KEY, tenant_id INTEGER, name VARCHAR(200))"):
             conn.exec_driver_sql(ddl)
         conn.exec_driver_sql("INSERT INTO whats_app_settings (id, tenant_id, phone_number_id, access_token) "
                              "VALUES (1, 1, 'PN1', 'tok'), (2, 2, NULL, NULL), (3, 3, '', 'tok')")
@@ -71,7 +71,7 @@ def test_migration_adds_columns_backfills_and_downgrades(tmp_path):
                 "messaging_limit_tier", "payment_method_status", "registration_pin",
                 "token_obtained_at", "connected_at", "connected_by_user_id",
                 "last_health_check_at"} <= cols
-        assert {"standard_key", "param_map"} <= {c["name"] for c in insp.get_columns("whatsapp_template")}
+        assert {"standard_key", "param_map"} <= {c["name"] for c in insp.get_columns("whats_app_template")}
         assert "whatsapp_connection_event" in insp.get_table_names()
         rows = dict((r[0], (r[1], r[2])) for r in conn.exec_driver_sql(
             "SELECT id, connection_method, connection_status FROM whats_app_settings"))
@@ -84,7 +84,22 @@ def test_migration_adds_columns_backfills_and_downgrades(tmp_path):
         insp = sa.inspect(conn)
         assert "whatsapp_connection_event" not in insp.get_table_names()
         assert "connection_method" not in {c["name"] for c in insp.get_columns("whats_app_settings")}
-        assert "param_map" not in {c["name"] for c in insp.get_columns("whatsapp_template")}
+        assert "param_map" not in {c["name"] for c in insp.get_columns("whats_app_template")}
+
+
+def test_migration_table_names_match_models():
+    # Tests build the schema with create_all() from the models, so a migration
+    # that names a table differently only fails in production (it did:
+    # NoSuchTableError 'whatsapp_template' -- the real table is
+    # 'whats_app_template', see a2c8f4e91b3d). Pin every table it touches.
+    import re as _re
+    with open(MIGRATION) as f:
+        src = f.read()
+    touched = set(_re.findall(r"_add_columns\(bind, pg, '([a-z_]+)'", src))
+    touched |= set(_re.findall(r"create_table\(\s*'([a-z_]+)'", src))
+    real = {appmod.WhatsAppSettings.__table__.name, appmod.WhatsAppTemplate.__table__.name,
+            appmod.WhatsAppConnectionEvent.__table__.name}
+    assert touched == real, (touched, real)
 
 
 def test_new_settings_row_defaults_to_manual_disconnected(app, client):
