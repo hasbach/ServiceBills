@@ -226,7 +226,10 @@ const MessagingView = ({ openConversationId = null }) => {
                 <Tabs
                     value={activeTab}
                     onChange={(e, val) => setActiveTab(val)}
-                    sx={{ borderBottom: 1, borderColor: 'divider', px: 3, pt: 1, bgcolor: 'rgba(0,0,0,0.01)' }}
+                    variant="scrollable"
+                    scrollButtons="auto"
+                    allowScrollButtonsMobile
+                    sx={{ borderBottom: 1, borderColor: 'divider', px: { xs: 0, sm: 3 }, pt: 1, bgcolor: 'rgba(0,0,0,0.01)' }}
                 >
                     <Tab label="Inbox" sx={{ fontWeight: 700, fontSize: '0.95rem' }} />
                     <Tab label="Customer Notifications" sx={{ fontWeight: 700, fontSize: '0.95rem' }} />
