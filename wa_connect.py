@@ -55,15 +55,29 @@ def wa_app_identity(settings):
     return settings.app_id, settings.app_secret
 
 
-def automatic_available():
+def tenant_allowed(tenant):
+    """META_AUTO_CONNECT_TENANTS (comma-separated tenant ids or slugs) limits
+    automatic connect to chosen tenants while the platform app is still in
+    App Review; empty means every tenant."""
+    allowed = {x.strip().lower() for x in (Config.META_AUTO_CONNECT_TENANTS or '').split(',') if x.strip()}
+    if not allowed:
+        return True
+    if tenant is None:
+        return False
+    return str(tenant.id) in allowed or (tenant.slug or '').lower() in allowed
+
+
+def automatic_available(tenant=None):
     """Automatic connect needs the platform app configured, and a public SaaS
-    domain allow-listed in its Login configuration -- so never on-prem."""
-    return bool(Config.META_APP_ID and Config.META_APP_SECRET and Config.META_ES_CONFIG_ID) \
+    domain allow-listed in its Login configuration -- so never on-prem. With
+    `tenant`, also applies the META_AUTO_CONNECT_TENANTS rollout list."""
+    configured = bool(Config.META_APP_ID and Config.META_APP_SECRET and Config.META_ES_CONFIG_ID) \
         and not onprem.is_onprem()
+    return configured and (tenant is None or tenant_allowed(tenant))
 
 
-def coexistence_available():
-    return automatic_available() and bool(Config.META_COEXISTENCE_ENABLED)
+def coexistence_available(tenant=None):
+    return automatic_available(tenant) and bool(Config.META_COEXISTENCE_ENABLED)
 
 
 def is_routable(settings):

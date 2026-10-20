@@ -97,6 +97,8 @@ services:
         sync: false
       - key: META_GRAPH_VERSION
         sync: false
+      - key: META_AUTO_CONNECT_TENANTS
+        sync: false        # comma-separated tenant ids/slugs; empty = all tenants
       - key: MAIL_BACKEND
         value: sendgrid
       - key: SENDGRID_API_KEY

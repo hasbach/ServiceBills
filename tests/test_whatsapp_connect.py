@@ -579,3 +579,21 @@ def test_network_error_never_leaks_app_secret(app, client, platform_meta, monkey
     with app.app_context():
         ev = appmod.WhatsAppConnectionEvent.query.filter_by(tenant_id=tid).one()
         assert PLATFORM_SECRET not in (ev.detail or "")
+
+
+# ---- rollout allow-list (META_AUTO_CONNECT_TENANTS) -------------------------
+
+def test_rollout_list_limits_automatic_connect(app, client, platform_meta, monkeypatch):
+    hdr_in, tid_in = _fresh_tenant(app, client, "Biz Roll In", "rollin_admin")
+    hdr_out, _ = _fresh_tenant(app, client, "Biz Roll Out", "rollout_admin")
+    with app.app_context():
+        slug_in = appmod.db.session.get(appmod.Tenant, tid_in).slug
+    monkeypatch.setattr(Config, "META_AUTO_CONNECT_TENANTS", f" 999 , {slug_in.upper()} ")
+    assert client.get("/api/whatsapp/connect/config", headers=hdr_in).get_json()["automatic_available"] is True
+    out = client.get("/api/whatsapp/connect/config", headers=hdr_out).get_json()
+    assert out["automatic_available"] is False and out["coexistence_available"] is False
+    assert client.post("/api/whatsapp/connect/complete", headers=hdr_out, json=COEX_BODY).status_code == 404
+    monkeypatch.setattr(Config, "META_AUTO_CONNECT_TENANTS", str(tid_in))
+    assert client.get("/api/whatsapp/connect/config", headers=hdr_in).get_json()["automatic_available"] is True
+    monkeypatch.setattr(Config, "META_AUTO_CONNECT_TENANTS", "")
+    assert client.get("/api/whatsapp/connect/config", headers=hdr_out).get_json()["automatic_available"] is True

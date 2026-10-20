@@ -43,6 +43,7 @@ Still to do before outside tenants can connect:
 | `META_COEXISTENCE_ENABLED` | `true` (set `false` to hide coexistence, e.g. if +961 numbers turn out ineligible) |
 | `META_WEBHOOK_VERIFY_TOKEN` | a long random string you choose; must match step 3 |
 | `META_GRAPH_VERSION` | optional, default `v24.0` |
+| `META_AUTO_CONNECT_TENANTS` | optional rollout list of tenant ids or slugs (comma-separated). Only these tenants see the automatic options; leave empty once App Review passes, so every tenant gets them. |
 
 ## 3. Webhook (after the code is deployed)
 

@@ -65,6 +65,9 @@ class Config:
     META_COEXISTENCE_ENABLED = os.environ.get("META_COEXISTENCE_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
     META_WEBHOOK_VERIFY_TOKEN = os.environ.get("META_WEBHOOK_VERIFY_TOKEN")
     META_GRAPH_VERSION = os.environ.get("META_GRAPH_VERSION", "v24.0")
+    # Optional rollout list (comma-separated tenant ids or slugs): only these
+    # tenants see automatic connect, e.g. while the app awaits App Review.
+    META_AUTO_CONNECT_TENANTS = os.environ.get("META_AUTO_CONNECT_TENANTS", "")
     # Email: "console" (dev/CI, records in-memory), "smtp", or "sendgrid" (recommended
     # in prod -- rides over HTTPS, unlike raw SMTP ports many hosts block outbound).
     MAIL_BACKEND = os.environ.get("MAIL_BACKEND", "console")

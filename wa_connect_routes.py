@@ -30,7 +30,7 @@ def register_wa_connect_routes(app, appmod):
         @appmod.admin_required()
         @require_module('whatsapp')
         def wrapper(*args, **kwargs):
-            if not wa_connect.automatic_available():
+            if not wa_connect.automatic_available(current_tenant()):
                 return jsonify({'error': 'Automatic WhatsApp connection is not available.'}), 404
             if not plan_allows_api():
                 return jsonify({'error': 'WhatsApp API requires an upgraded plan.'}), 402
@@ -57,10 +57,10 @@ def register_wa_connect_routes(app, appmod):
     @appmod.admin_required()
     @require_module('whatsapp')
     def wa_connect_config():
-        available = wa_connect.automatic_available()
+        available = wa_connect.automatic_available(current_tenant())
         return jsonify({
             'automatic_available': available,
-            'coexistence_available': wa_connect.coexistence_available(),
+            'coexistence_available': wa_connect.coexistence_available(current_tenant()),
             'app_id': Config.META_APP_ID if available else None,
             'graph_version': Config.META_GRAPH_VERSION,
             'es_config_id': Config.META_ES_CONFIG_ID if available else None,
@@ -85,7 +85,7 @@ def register_wa_connect_routes(app, appmod):
         method = data.get('method')
         if method not in wa_connect.EXPECTED_ES_EVENT:
             return jsonify({'error': 'Unknown connection method.'}), 400
-        if method == 'coexistence' and not wa_connect.coexistence_available():
+        if method == 'coexistence' and not wa_connect.coexistence_available(current_tenant()):
             return jsonify({'error': 'Connecting a WhatsApp Business app number is not available.'}), 404
         if data.get('es_event') != wa_connect.EXPECTED_ES_EVENT[method]:
             return jsonify({'error': 'The Meta sign-in finished a different flow than the one you chose.'}), 400
