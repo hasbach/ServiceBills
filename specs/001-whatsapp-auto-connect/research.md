@@ -14,7 +14,14 @@ Meta docs have moved to `developers.facebook.com/documentation/business-messagin
   - `whatsapp_business_management`: **Approved**.
   - `whatsapp_business_messaging`: **Rejected**. The screencast didn't show the full Meta login and permission grant, asset/number selection, a live send from the app UI, and the message arriving in the WhatsApp client. Meta confirmed that the use case itself is allowed. **Action**: after US1 is implemented, re-record the ServiceBills connect-and-send flow and resubmit (task T045).
 - **Webhook callback URL**: empty, so ServiceBills can use the app-level callback directly. No per-WABA override is needed.
-- **Facebook Login for Business**: present on the app. A dedicated ServiceBills Embedded Signup configuration still has to be created.
+- **Facebook Login for Business**: a ServiceBills configuration was **created 2026-10-20**:
+  - Name: "ServiceBills WA Signup". **`META_ES_CONFIG_ID=1455508473309505`**.
+  - Login variation: WhatsApp Embedded Signup. Product: WhatsApp Cloud API only; Marketing Messages API unchecked.
+  - Token expiration: **Never**, chosen so that tenants don't have to reconnect every 60 days. Revocation is still detected via `PARTNER_APP_UNINSTALLED` and error 190 (R-7).
+  - Assets: WhatsApp accounts. Permissions: `whatsapp_business_management` and `whatsapp_business_messaging`.
+  - The pre-existing "Tech Provider Embedded Signup config" (`1616390326897645`) was left untouched.
+  - Login settings saved: JavaScript SDK login = Yes. Allowed SDK domains and Valid OAuth Redirect URIs are `https://servicebills.salloumservices.com` and `https://servicebills.onrender.com`, with a trailing `/` on the redirect URIs. A dev tunnel domain must be added here before local testing.
+- **App settings > Basic**: the privacy policy URL is set (TermsFeed) and the app icon is set. **App domains and Terms of Service URL are empty**; fill both before the App Review resubmission (T045). Display name is "beta business response"; consider renaming it to something tenants recognise before go-live.
 - **Before approval**: Live-mode apps can use permissions that aren't approved yet on assets owned by the app's own admins and business. DeltaNet's own number can therefore be connected and tested end to end now. Outside tenants have to wait for the messaging approval.
 - **Consent-screen branding**: tenants will see "Beta consulting Agency" as the business behind the app. The privacy policy must name Beta as the data processor.
 

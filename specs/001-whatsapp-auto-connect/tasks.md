@@ -22,7 +22,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 **Purpose**: Settle the research items marked VERIFY against real Meta, and add the platform configuration. Meta business verification and App Review are owner actions outside the code and should start now, because they are the critical path.
 
-- [ ] T001 Owner action (no code). The existing app "beta business response" (`8757534751003383`, Beta consulting Agency) is already a verified Tech Provider (see research.md R-0). Steps:
+- [x] T001 (done 2026-10-20: config 1455508473309505 created + Login domains saved; Basic app-domains/ToS still empty — see R-0) Owner action (no code). The existing app "beta business response" (`8757534751003383`, Beta consulting Agency) is already a verified Tech Provider (see research.md R-0). Steps:
   - Create a Facebook Login for Business configuration of type "WhatsApp Embedded Signup" for ServiceBills.
   - Add `servicebills.salloumservices.com` and `servicebills.onrender.com`, plus the dev tunnel domain when testing, to Allowed domains and Valid OAuth redirect URIs.
   - In App settings > Basic, check that the privacy policy URL, terms URL, app icon and app domain are set.
