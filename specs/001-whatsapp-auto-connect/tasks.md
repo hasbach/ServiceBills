@@ -204,7 +204,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 ### Tests for User Story 2
 
-- [ ] T025 [P] [US2] Add tests to `tests/test_whatsapp_connect.py`:
+- [x] T025 [P] [US2] Add tests to `tests/test_whatsapp_connect.py`:
   - `method='embedded'` calls `POST /{phone_number_id}/register` with `{"messaging_product":"whatsapp","pin":<6 digits>}` and stores `registration_pin` encrypted.
   - It does not change `auto_reply_enabled`.
   - Meta error 133016 returns 502 with "Registration limit reached for this number — try again in 72 hours".
@@ -213,9 +213,9 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 ### Implementation for User Story 2
 
-- [ ] T026 [US2] Fill in the register step in `complete_connection` in `wa_connect.py`: generate a PIN with `secrets.randbelow(10**6)`, zero-padded to 6 digits, or reuse `settings.registration_pin` if one is set. POST register, map errors, and store the PIN in `registration_pin`.
-- [ ] T027 [US2] Enable the "New number" card's flow in `frontend/src/components/WhatsAppConnectCard.js` using `es_config_id`, no `featureType`, and expected event `FINISH`. After success, add a "Send test message" action that reuses the existing test-send UI or endpoint if one exists. If none exists, add a small input for a number and send the `forward_keepalive` template through the existing send path.
-- [ ] T028 [US2] Run `python -m pytest tests/test_whatsapp_connect.py -q` and quickstart §2 step 4.
+- [x] T026 [US2] Fill in the register step in `complete_connection` in `wa_connect.py`: generate a PIN with `secrets.randbelow(10**6)`, zero-padded to 6 digits, or reuse `settings.registration_pin` if one is set. POST register, map errors, and store the PIN in `registration_pin`.
+- [x] T027 [US2] Enable the "New number" card's flow in `frontend/src/components/WhatsAppConnectCard.js` using `es_config_id`, no `featureType`, and expected event `FINISH`. After success, add a "Send test message" action that reuses the existing test-send UI or endpoint if one exists. If none exists, add a small input for a number and send the `forward_keepalive` template through the existing send path.
+- [x] T028 (automated only; live quickstart §2.4 pending T002) [US2] Run `python -m pytest tests/test_whatsapp_connect.py -q` and quickstart §2 step 4.
 
 **Checkpoint**: both automatic methods work.
 

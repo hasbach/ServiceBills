@@ -113,6 +113,27 @@ def register_wa_connect_routes(app, appmod):
         wa_connect.check_health(appmod, settings, source='user')
         return jsonify(status_payload(settings)), 200
 
+    @app.route('/api/whatsapp/connect/test-message', methods=['POST'])
+    @jwt_required()
+    @appmod.admin_required()
+    @require_module('whatsapp')
+    def wa_connect_test_message():
+        settings = tenant_query(appmod.WhatsAppSettings).first()
+        if settings is None or not settings.access_token or not settings.phone_number_id:
+            return jsonify({'error': 'Connect WhatsApp first.'}), 400
+        if wa_connect.blocks_sends(settings):
+            return jsonify({'error': wa_connect.NEEDS_ATTENTION_SEND_ERROR}), 409
+        raw = re.sub(r'\D', '', str((request.get_json(silent=True) or {}).get('to') or ''))
+        to = appmod.normalize_whatsapp_phone(raw) if len(raw) >= 7 else ''
+        if not to:
+            return jsonify({'error': 'Enter the WhatsApp number to send the test to, with country code.'}), 400
+        try:
+            wa_connect.send_test_message(settings, to)
+        except wa_connect.ConnectError as exc:
+            wa_connect.note_send_error(appmod, settings, exc.meta_code, exc.message)
+            return jsonify({'error': exc.message, 'meta_code': exc.meta_code}), exc.status_code
+        return jsonify({'message': 'Test message sent to +{}.'.format(to)}), 200
+
     @app.route('/api/whatsapp/connect/disconnect', methods=['POST'])
     @jwt_required()
     @appmod.admin_required()

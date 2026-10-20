@@ -7,6 +7,7 @@ module (`appmod`) first, so this module never imports app.py at import time.
 Functions here do NOT commit unless their docstring says so.
 """
 import logging
+import secrets
 from datetime import datetime, timedelta
 
 import requests
@@ -260,9 +261,37 @@ def complete_connection(appmod, tenant_id, user_id, *, method, code, waba_id, ph
 
 
 def register_number(phone_number_id, token, settings):
-    """Register a new API number with a two-step PIN (never a coexistence
-    number -- Meta forbids it). Filled in by US2; returns the PIN to store."""
-    return None
+    """Register a new API number on Cloud API with a two-step-verification
+    PIN (never a coexistence number -- Meta forbids it). A reconnect reuses
+    the stored PIN, since changing it needs the old one. Returns the PIN."""
+    pin = (settings.registration_pin if settings is not None else None) or \
+        '{:06d}'.format(secrets.randbelow(10 ** 6))
+    try:
+        _graph('post', '{}/register'.format(phone_number_id), token=token, what='registering the number',
+               json={'messaging_product': 'whatsapp', 'pin': pin})
+    except ConnectError as exc:
+        if exc.meta_code != 133016:
+            exc.message += (' If this number is still active in the WhatsApp app, try the coexistence '
+                            'option ("Use my WhatsApp Business app number") or a different number.')
+        raise
+    return pin
+
+
+TEST_TEMPLATE = 'hello_world'   # Meta's sample template on newly created WhatsApp accounts
+
+
+def send_test_message(settings, to_digits):
+    """Send Meta's sample template to `to_digits` with the tenant's own
+    connection (FR: "send a test message from Settings"). Raises ConnectError."""
+    try:
+        return _graph('post', '{}/messages'.format(settings.phone_number_id), token=settings.access_token,
+                      what='sending the test message',
+                      json={'messaging_product': 'whatsapp', 'to': to_digits, 'type': 'template',
+                            'template': {'name': TEST_TEMPLATE, 'language': {'code': 'en_US'}}})
+    except ConnectError as exc:
+        exc.message += (' The test uses Meta\'s sample "{}" template; if your WhatsApp account no longer has it, '
+                        'submit the standard templates and test with a real payment instead.').format(TEST_TEMPLATE)
+        raise
 
 
 # ---- health, reconnect, disconnect (US4, contracts/webhook-events.md) ------

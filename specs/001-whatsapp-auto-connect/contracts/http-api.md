@@ -69,6 +69,21 @@ Runs the health check now: it re-fetches the number and account details and upda
 
 **200**: `{ "connection": <ConnectionView> }`
 
+## POST `/api/whatsapp/connect/test-message`
+
+Added in US2. Sends Meta's sample `hello_world` template (`en_US`) from the connected number. It works for any connected method.
+
+**Request**: `{ "to": "+961 70 123 456" }`. The number must have at least 7 digits, including the country code.
+
+**Responses**:
+
+| Status | Body / meaning |
+|---|---|
+| 200 | `{ "message": "Test message sent to +961..." }` |
+| 400 | Not connected, or the number is invalid |
+| 409 | The connection needs attention |
+| 502 | Meta error, with a hint about the sample template. An auth error also marks the connection `needs_attention`. |
+
 ## POST `/api/whatsapp/connect/disconnect`
 
 **Request**: `{ "confirm": true }`

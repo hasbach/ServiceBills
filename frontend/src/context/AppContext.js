@@ -304,6 +304,7 @@ const rawApiService = {
     getWaConnectStatus: () => api.get('/whatsapp/connect/status'),
     completeWaConnect: (payload) => api.post('/whatsapp/connect/complete', payload),
     refreshWaConnect: () => api.post('/whatsapp/connect/refresh'),
+    sendWaTestMessage: (payload) => api.post('/whatsapp/connect/test-message', payload),
     disconnectWa: (payload = {}) => api.post('/whatsapp/connect/disconnect', { confirm: true, ...payload }),
     getStandardTemplates: () => api.get('/whatsapp/standard-templates'),
     submitStandardTemplates: (payload) => api.post('/whatsapp/standard-templates/submit', payload),

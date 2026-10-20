@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
     Box, Typography, Paper, Button, Chip, Alert, CircularProgress, Collapse,
     Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
-    Grid, Divider, Link, Stack, alpha, useTheme,
+    Grid, Divider, Link, Stack, TextField, alpha, useTheme,
 } from '@mui/material';
 import {
     WhatsApp as WhatsAppIcon,
@@ -18,6 +18,7 @@ import {
     ExpandLess as ExpandLessIcon,
     Description as DescriptionIcon,
     OpenInNew as OpenInNewIcon,
+    Send as SendIcon,
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import StandardTemplatesDialog from './StandardTemplatesDialog.js';
@@ -198,6 +199,9 @@ const WhatsAppConnectCard = ({ connection: connectionProp, manualVisible, onSele
     const [confirmDisconnectOpen, setConfirmDisconnectOpen] = useState(false);
     const [templatesOpen, setTemplatesOpen] = useState(false);
     const [hasStandardTemplates, setHasStandardTemplates] = useState(null); // null = unknown
+    const [testOpen, setTestOpen] = useState(false);
+    const [testTo, setTestTo] = useState('');
+    const [testResult, setTestResult] = useState(null); // { severity, text }
 
     const mountedRef = useRef(true);
     const sessionRef = useRef(null);
@@ -477,6 +481,20 @@ const WhatsAppConnectCard = ({ connection: connectionProp, manualVisible, onSele
         }
     };
 
+    const doSendTest = async () => {
+        setBusy('testing');
+        setTestResult(null);
+        try {
+            const res = await apiService.sendWaTestMessage({ to: testTo });
+            setTestResult({ severity: 'success', text: res.data?.message || 'Test message sent.' });
+        } catch (err) {
+            setTestResult({ severity: 'error', text: errText(err, 'Sending the test message failed.') });
+            loadStatus();
+        } finally {
+            if (mountedRef.current) setBusy(null);
+        }
+    };
+
     // ── Render ───────────────────────────────────────────────────────────────
     if (configLoading) {
         return (
@@ -533,6 +551,13 @@ const WhatsAppConnectCard = ({ connection: connectionProp, manualVisible, onSele
                                         startIcon={<ReplayIcon />} onClick={() => chooseAutomatic(connection.method)}
                                         disabled={working} sx={{ textTransform: 'none', borderRadius: '10px' }}>
                                         Reconnect
+                                    </Button>
+                                )}
+                                {connection.status === 'connected' && (
+                                    <Button size="small" variant="outlined" startIcon={<SendIcon />}
+                                        onClick={() => { setTestResult(null); setTestOpen(true); }} disabled={working}
+                                        sx={{ textTransform: 'none', borderRadius: '10px' }}>
+                                        Send test message
                                     </Button>
                                 )}
                                 {isLive && (
@@ -699,6 +724,27 @@ const WhatsAppConnectCard = ({ connection: connectionProp, manualVisible, onSele
                     Automatic connection isn't included in your plan. Upgrade to connect WhatsApp by signing in to Meta, without copying credentials.
                 </Alert>
             )}
+
+            {/* ── Test message (US2) ── */}
+            <Dialog open={testOpen} onClose={() => !working && setTestOpen(false)} fullWidth maxWidth="xs">
+                <DialogTitle>Send a test message</DialogTitle>
+                <DialogContent>
+                    <DialogContentText sx={{ mb: 2 }}>
+                        Sends Meta's sample "hello_world" message from your connected number. Use a WhatsApp number you
+                        can check, with its country code.
+                    </DialogContentText>
+                    <TextField fullWidth autoFocus label="Send to" placeholder="+961 70 123 456" value={testTo}
+                        onChange={(e) => setTestTo(e.target.value)} inputProps={{ inputMode: 'tel' }} />
+                    {testResult && <Alert severity={testResult.severity} sx={{ mt: 2 }}>{testResult.text}</Alert>}
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setTestOpen(false)} disabled={working}>Close</Button>
+                    <Button variant="contained" onClick={doSendTest} disabled={working || testTo.replace(/\D/g, '').length < 7}
+                        startIcon={busy === 'testing' ? <CircularProgress size={14} /> : <SendIcon />}>
+                        Send
+                    </Button>
+                </DialogActions>
+            </Dialog>
 
             {/* ── Pre-launch dialog (also keeps FB.login inside a user click) ── */}
             <Dialog open={launchOpen} onClose={() => setLaunchOpen(false)} fullWidth maxWidth="sm">

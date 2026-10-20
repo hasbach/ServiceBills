@@ -440,3 +440,89 @@ def test_connect_config_when_unavailable(app, client, monkeypatch):
     hdr, _ = _fresh_tenant(app, client, "Biz C11", "c11_admin")
     cfg = client.get("/api/whatsapp/connect/config", headers=hdr).get_json()
     assert cfg["automatic_available"] is False and cfg["app_id"] is None
+
+
+# ---- US2: new number (embedded) ---------------------------------------------
+
+EMB_BODY = dict(COEX_BODY, method="embedded", es_event="FINISH")
+
+
+def test_connect_embedded_registers_with_pin(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz E1", "e1_admin")
+    graph = FakeGraph(is_on_biz_app=False)
+    _install(monkeypatch, graph)
+    r = client.post("/api/whatsapp/connect/complete", headers=hdr, json=EMB_BODY)
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()["connection"]["method"] == "embedded"
+    reg = [kw for m, p, kw in graph.calls if p == "PN_NEW/register"]
+    assert len(reg) == 1
+    pin = reg[0]["json"]["pin"]
+    assert reg[0]["json"]["messaging_product"] == "whatsapp"
+    assert len(pin) == 6 and pin.isdigit()
+    with app.app_context():
+        s = appmod.WhatsAppSettings.query.filter_by(tenant_id=tid).first()
+        assert s.registration_pin == pin
+        assert s.connection_method == "embedded"
+        assert s.auto_reply_enabled is not False    # only coexistence turns it off
+        raw = appmod.db.session.execute(sa.text(
+            "SELECT registration_pin FROM whats_app_settings WHERE tenant_id=:t"), {"t": tid}).scalar()
+        if os.environ.get("FERNET_KEY"):
+            assert raw != pin                        # encrypted at rest
+
+
+def test_connect_embedded_register_rate_limited(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz E2", "e2_admin")
+    _install(monkeypatch, FakeGraph(overrides={("POST", "PN_NEW/register"): GraphResp(
+        {"error": {"message": "Rate limit hit", "code": 133016}}, status=400)}))
+    r = client.post("/api/whatsapp/connect/complete", headers=hdr, json=EMB_BODY)
+    assert r.status_code == 502
+    assert "try again in 72 hours" in r.get_json()["error"]
+    assert r.get_json()["meta_code"] == 133016
+    with app.app_context():
+        assert appmod.WhatsAppSettings.query.filter_by(tenant_id=tid).first() is None
+
+
+def test_connect_embedded_number_on_consumer_app(app, client, platform_meta, monkeypatch):
+    hdr, _ = _fresh_tenant(app, client, "Biz E3", "e3_admin")
+    _install(monkeypatch, FakeGraph(overrides={("POST", "PN_NEW/register"): GraphResp(
+        {"error": {"message": "Phone number is already registered on WhatsApp", "code": 133005}}, status=400)}))
+    r = client.post("/api/whatsapp/connect/complete", headers=hdr, json=EMB_BODY)
+    assert r.status_code == 502
+    err = r.get_json()["error"]
+    assert "already registered" in err and "coexistence" in err
+
+
+def test_reconnect_embedded_reuses_pin(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz E4", "e4_admin")
+    graph = FakeGraph(is_on_biz_app=False)
+    _install(monkeypatch, graph)
+    client.post("/api/whatsapp/connect/complete", headers=hdr, json=EMB_BODY)
+    client.post("/api/whatsapp/connect/complete", headers=hdr, json=EMB_BODY)
+    pins = [kw["json"]["pin"] for m, p, kw in graph.calls if p == "PN_NEW/register"]
+    assert len(pins) == 2 and pins[0] == pins[1]
+
+
+def test_test_message_sends_hello_world(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz E5", "e5_admin")
+    graph = FakeGraph(is_on_biz_app=False, overrides={("POST", "PN_NEW/messages"): GraphResp(
+        {"messages": [{"id": "wamid.TEST"}]})})
+    _install(monkeypatch, graph)
+    client.post("/api/whatsapp/connect/complete", headers=hdr, json=EMB_BODY)
+    r = client.post("/api/whatsapp/connect/test-message", headers=hdr, json={"to": "+961 70 123 456"})
+    assert r.status_code == 200, r.get_json()
+    sent = [kw for m, p, kw in graph.calls if p == "PN_NEW/messages"][0]
+    assert sent["json"]["to"] == "96170123456"
+    assert sent["json"]["template"]["name"] == "hello_world"
+    assert sent["headers"]["Authorization"] == "Bearer BIZ_TOKEN"
+
+
+def test_test_message_explains_meta_error(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz E6", "e6_admin")
+    graph = FakeGraph(is_on_biz_app=False, overrides={("POST", "PN_NEW/messages"): GraphResp(
+        {"error": {"message": "Template name does not exist in the translation", "code": 132001}}, status=400)})
+    _install(monkeypatch, graph)
+    client.post("/api/whatsapp/connect/complete", headers=hdr, json=EMB_BODY)
+    r = client.post("/api/whatsapp/connect/test-message", headers=hdr, json={"to": "96170123456"})
+    assert r.status_code == 502
+    assert "hello_world" in r.get_json()["error"]
+    assert client.post("/api/whatsapp/connect/test-message", headers=hdr, json={"to": "12"}).status_code == 400
