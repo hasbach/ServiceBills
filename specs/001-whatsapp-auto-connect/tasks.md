@@ -229,7 +229,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 ### Tests for User Story 3
 
-- [ ] T029 [P] [US3] Add regression tests to `tests/test_whatsapp_connect.py`:
+- [x] T029 [P] [US3] Add regression tests to `tests/test_whatsapp_connect.py`:
   - A tenant created by `tests/inbox_helpers.setup_wa_tenant` (manual) can save credentials through `POST /api/whatsapp-settings` exactly as before: all seven credential fields persist, and the post-save `subscribed_apps` call still happens.
   - Its webhook HMAC uses its own `app_secret`.
   - `GET` still returns its own values unmasked.
@@ -238,10 +238,10 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 ### Implementation for User Story 3
 
-- [ ] T030 [US3] In `frontend/src/components/WhatsAppConnectCard.js`:
+- [x] T030 [US3] In `frontend/src/components/WhatsAppConnectCard.js`:
   - Selecting "Manual configuration" while an automatic connection is active shows a confirm dialog: "Switching to manual will disconnect the current automatic connection." On confirm, call disconnect and then reveal the manual form.
   - Selecting an automatic method while connected (manual or automatic) shows "Your current connection stays active until the new one succeeds", then launches the flow.
-- [ ] T031 [US3] Run `python -m pytest tests -q -k "whatsapp or iso_webhook or reseller"` and quickstart §2 step 9 against a migrated copy of an existing manual tenant.
+- [x] T031 [US3] Run `python -m pytest tests -q -k "whatsapp or iso_webhook or reseller"` and quickstart §2 step 9 against a migrated copy of an existing manual tenant.
 
 **Checkpoint**: all three methods are selectable, and existing tenants are unaffected.
 
@@ -304,14 +304,14 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 ## Phase 7: Polish & cross-cutting concerns
 
-- [ ] T040 [P] Write the owner-facing setup doc `docs/whatsapp-auto-connect-setup.md`. It covers the Meta app and Tech Provider steps, the env vars (contracts/http-api.md table), the webhook callback URL and verify token, the fields to subscribe (`messages`, `message_template_status_update`, `account_update`, `phone_number_quality_update`, `smb_message_echoes`; deliberately not `history` or `smb_app_state_sync`), adding domains to the Login config, and the `META_COEXISTENCE_ENABLED` kill switch.
-- [ ] T041 [P] Security pass on the diff:
+- [x] T040 [P] Write the owner-facing setup doc `docs/whatsapp-auto-connect-setup.md`. It covers the Meta app and Tech Provider steps, the env vars (contracts/http-api.md table), the webhook callback URL and verify token, the fields to subscribe (`messages`, `message_template_status_update`, `account_update`, `phone_number_quality_update`, `smb_message_echoes`; deliberately not `history` or `smb_app_state_sync`), adding domains to the Login config, and the `META_COEXISTENCE_ENABLED` kill switch.
+- [x] T041 [P] Security pass on the diff:
   - No token, secret or PIN in any JSON response, log line or event `detail`. Grep the new code for `access_token`, `app_secret` and `registration_pin` inside `logging.` / `jsonify` calls.
   - The postMessage origin check is in place.
   - `debug_token` ownership is enforced before any write.
   - All `/connect/*` and standard-template routes are admin-only.
-- [ ] T042 Run the full suite (`python -m pytest tests -q`) and the frontend build. Then do a final pass of quickstart §2 on an isolated server. Fix any regressions.
-- [ ] T043 Before merging, run a read-only production check through the Render Postgres tool: `SELECT business_account_id, count(*) FROM whats_app_settings WHERE business_account_id IS NOT NULL GROUP BY 1 HAVING count(*)>1`. Record the result in `specs/001-whatsapp-auto-connect/research.md`. If it returns zero rows, note the follow-up of adding unique indexes. Do not add them in this feature.
+- [x] T042 Run the full suite (`python -m pytest tests -q`) and the frontend build. Then do a final pass of quickstart §2 on an isolated server. Fix any regressions.
+- [ ] T043 (BLOCKED 2026-10-20: production DB is not a Render Postgres in the connected workspace — owner runs the query in docs/whatsapp-auto-connect-setup.md §5) Before merging, run a read-only production check through the Render Postgres tool: `SELECT business_account_id, count(*) FROM whats_app_settings WHERE business_account_id IS NOT NULL GROUP BY 1 HAVING count(*)>1`. Record the result in `specs/001-whatsapp-auto-connect/research.md`. If it returns zero rows, note the follow-up of adding unique indexes. Do not add them in this feature.
 - [ ] T045 Owner + Claude: after US1 works on DeltaNet's own number, record the App Review screencast for `whatsapp_business_messaging` on app `8757534751003383`. The app UI must be in English, with captions. The recording must show, in order:
   1. The complete Meta login and permission grant, done through the ServiceBills "Connect" button.
   2. The WhatsApp number being selected.

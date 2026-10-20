@@ -526,3 +526,56 @@ def test_test_message_explains_meta_error(app, client, platform_meta, monkeypatc
     assert r.status_code == 502
     assert "hello_world" in r.get_json()["error"]
     assert client.post("/api/whatsapp/connect/test-message", headers=hdr, json={"to": "12"}).status_code == 400
+
+
+# ---- US3: manual configuration keeps working; switching methods ------------
+
+def test_manual_save_unchanged_and_subscribes(app, client, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz M1", "m1_admin")
+    calls = []
+    monkeypatch.setattr(appmod.requests, "post", lambda url, **k: calls.append(url) or GraphResp({"success": True}))
+    creds = {"enabled": True, "mode": "api", "phone_number_id": "PN_M1", "business_account_id": "WABA_M1",
+             "app_id": "OWN_APP", "app_secret": "own-secret", "access_token": "own-token",
+             "api_version": "v19.0", "webhook_verify_token": "own-verify"}
+    assert client.post("/api/whatsapp-settings", headers=hdr, json=creds).status_code == 200
+    with app.app_context():
+        s = appmod.WhatsAppSettings.query.filter_by(tenant_id=tid).first()
+        for k, v in creds.items():
+            assert getattr(s, k) == v, k
+        assert s.connection_method == "manual" and s.connection_status == "connected"
+    assert calls and calls[0].endswith("/WABA_M1/subscribed_apps")
+    body = client.get("/api/whatsapp-settings", headers=hdr).get_json()["settings"]
+    assert body["access_token"] == "own-token" and body["app_secret"] == "own-secret"
+
+
+def test_manual_to_automatic_is_method_change(app, client, platform_meta, monkeypatch):
+    hdr, tid = setup_wa_tenant(app, client, "Biz M2", "m2_admin", "PN_OLD2", secret="own", token="own-tok")
+    _pro(app, tid)
+    with app.app_context():
+        s = appmod.WhatsAppSettings.query.filter_by(tenant_id=tid).first()
+        s.app_id = "OWN_APP"
+        appmod.db.session.commit()
+    _install(monkeypatch, FakeGraph())
+    assert client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY).status_code == 200
+    with app.app_context():
+        s = appmod.WhatsAppSettings.query.filter_by(tenant_id=tid).first()
+        assert s.connection_method == "coexistence"
+        assert s.app_id is None and s.app_secret is None
+        ev = appmod.WhatsAppConnectionEvent.query.filter_by(tenant_id=tid).one()
+        assert ev.event == "method_change" and "manual" in ev.detail
+
+
+def test_network_error_never_leaks_app_secret(app, client, platform_meta, monkeypatch):
+    import requests as real_requests
+    hdr, tid = _fresh_tenant(app, client, "Biz S1", "s1_admin")
+
+    def boom(url, **kw):
+        # requests puts the full URL (incl. client_secret query param) in its message.
+        raise real_requests.ConnectionError(f"Max retries exceeded with url: {url}?client_secret={PLATFORM_SECRET}")
+    monkeypatch.setattr(wa_connect.requests, "get", boom)
+    r = client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY)
+    assert r.status_code == 502
+    assert PLATFORM_SECRET not in r.get_data(as_text=True)
+    with app.app_context():
+        ev = appmod.WhatsAppConnectionEvent.query.filter_by(tenant_id=tid).one()
+        assert PLATFORM_SECRET not in (ev.detail or "")

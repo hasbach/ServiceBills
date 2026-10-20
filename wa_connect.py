@@ -140,7 +140,11 @@ def _graph(method, path, *, what, token=None, params=None, json=None):
         resp = getattr(requests, method)(graph_url(path), headers=headers, params=params, json=json,
                                          timeout=GRAPH_TIMEOUT)
     except requests.RequestException as exc:
-        raise ConnectError(502, 'Could not reach Meta while {}: {}'.format(what, exc))
+        # Never echo str(exc): it contains the request URL, and the code
+        # exchange / debug_token URLs carry the platform app secret.
+        logging.warning('Meta request failed while %s: %s', what, type(exc).__name__)
+        raise ConnectError(502, 'Could not reach Meta while {} ({}). Please try again.'.format(
+            what, type(exc).__name__))
     if not resp.ok:
         code, message = _meta_error(resp)
         raise ConnectError(502, 'Meta rejected the request while {}: {}'.format(what, message), code)
