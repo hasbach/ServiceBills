@@ -1,0 +1,19 @@
+{
+  "_synthetic": true,
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "WABA_TEST_1",
+      "changes": [
+        {
+          "field": "phone_number_quality_update",
+          "value": {
+            "display_phone_number": "96170000001",
+            "event": "FLAGGED",
+            "current_limit": "TIER_250"
+          }
+        }
+      ]
+    }
+  ]
+}

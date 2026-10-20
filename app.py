@@ -53,6 +53,7 @@ import json
 import cs_agent_tools
 import functools
 import whatsapp_inbox
+import wa_connect
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager, verify_jwt_in_request
 try:
@@ -1682,19 +1683,64 @@ class WhatsAppSettings(db.Model):
     # own device, outside this app -- this template send is only the prompt for that.
     template_forward_keepalive = db.Column(db.String(200), nullable=True, default='daily_checkin')
     last_forwarding_keepalive_sent_at = db.Column(db.DateTime, nullable=True)
+    # How the number was connected -- see specs/001-whatsapp-auto-connect/data-model.md.
+    # 'manual' = tenant's own Meta app + pasted credentials (app_id/app_secret set);
+    # 'coexistence' / 'embedded' = Embedded Signup through the platform Meta app
+    # (app_id/app_secret NULL, resolved by wa_connect.wa_app_identity).
+    connection_method = db.Column(db.String(20), nullable=False, default='manual', server_default='manual')
+    # 'connected' | 'needs_attention' | 'disconnected'
+    connection_status = db.Column(db.String(20), nullable=False, default='disconnected', server_default='disconnected')
+    status_reason = db.Column(db.String(300), nullable=True)
+    meta_business_id = db.Column(db.String(64), nullable=True)
+    meta_business_name = db.Column(db.String(200), nullable=True)
+    display_phone_number = db.Column(db.String(32), nullable=True)
+    verified_name = db.Column(db.String(200), nullable=True)
+    quality_rating = db.Column(db.String(16), nullable=True)
+    messaging_limit_tier = db.Column(db.String(32), nullable=True)
+    payment_method_status = db.Column(db.String(16), nullable=True)  # present | missing | unknown
+    registration_pin = db.Column(EncryptedString, nullable=True)     # 'embedded' method only
+    token_obtained_at = db.Column(db.DateTime, nullable=True)
+    connected_at = db.Column(db.DateTime, nullable=True)
+    connected_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
+    last_health_check_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    connected_by = db.relationship('User', foreign_keys=[connected_by_user_id])
+
+    def connection_view(self):
+        """Connection summary safe to send to the browser: never a token,
+        secret or PIN (contracts/http-api.md ConnectionView)."""
+        def _iso(dt):
+            return dt.strftime('%Y-%m-%dT%H:%M:%SZ') if dt else None
+        return {
+            'method': self.connection_method or 'manual',
+            'status': self.connection_status or 'disconnected',
+            'status_reason': self.status_reason,
+            'display_phone_number': self.display_phone_number,
+            'verified_name': self.verified_name,
+            'meta_business_name': self.meta_business_name,
+            'quality_rating': self.quality_rating,
+            'messaging_limit_tier': self.messaging_limit_tier,
+            'payment_method_status': self.payment_method_status,
+            'connected_at': _iso(self.connected_at),
+            'connected_by': self.connected_by.username if self.connected_by else None,
+            'last_health_check_at': _iso(self.last_health_check_at),
+        }
+
     def to_dict(self):
+        # Automatic connections hold a platform-issued token the tenant never
+        # sees or edits; only manual tenants get their own credentials back.
+        manual = (self.connection_method or 'manual') == 'manual'
         return {
             'id': self.id,
             'mode': self.mode,
             'enabled': self.enabled,
             'phone_number_id': self.phone_number_id or '',
             'business_account_id': self.business_account_id or '',
-            'app_id': self.app_id or '',
-            'app_secret': self.app_secret or '',
-            'access_token': self.access_token or '',
+            'app_id': (self.app_id or '') if manual else '',
+            'app_secret': (self.app_secret or '') if manual else '',
+            'access_token': (self.access_token or '') if manual else '',
             'api_version': self.api_version or 'v19.0',
             'template_payment_paid': self.template_payment_paid or 'payment_confirmation',
             'template_subscription_created': self.template_subscription_created or 'subscription_created',
@@ -1736,6 +1782,11 @@ class WhatsAppTemplate(db.Model):
     rejected_reason = db.Column(db.String(500), nullable=True)
     components = db.Column(db.JSON, nullable=False)
     meta_template_id = db.Column(db.String(64), nullable=True, index=True)
+    # Set when created from the standard catalog (wa_standard_templates.py).
+    # param_map lists the semantic variable key for {{1}}..{{n}} in the body;
+    # NULL means the legacy fixed parameter order.
+    standard_key = db.Column(db.String(40), nullable=True)
+    param_map = db.Column(db.JSON, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1749,8 +1800,42 @@ class WhatsAppTemplate(db.Model):
             'rejected_reason': self.rejected_reason,
             'components': self.components,
             'meta_template_id': self.meta_template_id,
+            'standard_key': self.standard_key,
+            'param_map': self.param_map,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
             'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M:%S') if self.updated_at else None,
+        }
+
+class WhatsAppConnectionEvent(db.Model):
+    """Append-only audit of WhatsApp connect / reconnect / disconnect and
+    health-status changes (FR-023). Written via wa_connect.log_event."""
+    __tablename__ = 'whatsapp_connection_event'
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    # SET NULL: NULL also for webhook / scheduler-originated events.
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
+    # connect | reconnect | method_change | disconnect | status_change | connect_failed
+    event = db.Column(db.String(32), nullable=False)
+    method = db.Column(db.String(20), nullable=True)
+    from_status = db.Column(db.String(20), nullable=True)
+    to_status = db.Column(db.String(20), nullable=True)
+    source = db.Column(db.String(20), nullable=False)  # user | webhook | send_error | health_check
+    detail = db.Column(db.String(500), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    user = db.relationship('User', foreign_keys=[user_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'event': self.event,
+            'method': self.method,
+            'from_status': self.from_status,
+            'to_status': self.to_status,
+            'source': self.source,
+            'detail': self.detail,
+            'user': self.user.username if self.user else None,
+            'created_at': self.created_at.strftime('%Y-%m-%dT%H:%M:%SZ') if self.created_at else None,
         }
 
 class TenantWhishSettings(db.Model):
@@ -2244,7 +2329,7 @@ TENANT_OWNED_MODELS = (
     UpstreamProvider, UpstreamProviderPayment,
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
-    WhatsAppConversation, WhatsAppMessage, BalanceLog,
+    WhatsAppConversation, WhatsAppMessage, BalanceLog, WhatsAppConnectionEvent,
 )
 
 from sqlalchemy import event as _sa_event
@@ -3403,7 +3488,7 @@ _TENANT_DELETE_ORDER = [
     # raises ForeignKeyViolation on Postgres (SQLite doesn't enforce FKs, so
     # the gap would be invisible there).
     Expense, WhatsAppMessage, WhatsAppConversation, Customer, ServiceOutage, PushSubscription, BusinessSettings,
-    WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
+    WhatsAppConnectionEvent, WhatsAppSettings, WhatsAppTemplate, TenantWhishSettings, ExpenseCategory, Sector,
     SubscriptionPlan, Reseller, Supplier,
     # NetworkDevice arrived on the network-topology branch, so origin/main's
     # copy of this list never knew about it and won the merge. Without it a
@@ -7626,9 +7711,13 @@ def get_whatsapp_settings():
     settings = tenant_query(WhatsAppSettings).first()
     webhook_url = _public_base_url(current_tenant_id()) + "/api/whatsapp/webhook"
     if settings:
-        return jsonify({'settings': settings.to_dict(), 'webhook_url': webhook_url}), 200
+        return jsonify({'settings': settings.to_dict(), 'webhook_url': webhook_url,
+                        'connection': settings.connection_view()}), 200
     # Return safe defaults if not configured yet
-    return jsonify({'webhook_url': webhook_url, 'settings': {
+    return jsonify({'webhook_url': webhook_url,
+                    'connection': WhatsAppSettings(connection_method='manual',
+                                                   connection_status='disconnected').connection_view(),
+                    'settings': {
         'mode': 'deeplink', 'enabled': False,
         'phone_number_id': '', 'business_account_id': '', 'app_id': '',
         'app_secret': '', 'access_token': '', 'api_version': 'v19.0',
@@ -7682,6 +7771,10 @@ def get_whatsapp_deeplink_settings():
         'deeplink_msg_current_balance': full.get('deeplink_msg_current_balance') or 'Dear {customer_name}, your current balance is ${balance}. Expiry date: {expiry_date}. Thank you!',
     }}), 200
 
+_WA_CREDENTIAL_FIELDS = ('phone_number_id', 'business_account_id', 'app_id', 'app_secret',
+                         'access_token', 'api_version', 'webhook_verify_token')
+
+
 @app.route('/api/whatsapp-settings', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
@@ -7705,14 +7798,19 @@ def save_whatsapp_settings():
                   'deeplink_msg_payment_reminder', 'deeplink_msg_current_balance',
                   'forwarding_mobile', 'webhook_verify_token', 'auto_reply_enabled', 'auto_reply_message',
                   'template_forward_keepalive']
+        automatic = wa_connect.is_automatic(settings)
+        if automatic:
+            # Credentials of an Embedded Signup connection come only from the
+            # connect flow; the form must not overwrite them (GET blanks them).
+            fields = [f for f in fields if f not in _WA_CREDENTIAL_FIELDS]
         for f in fields:
             if f in data:
                 setattr(settings, f, data[f])
         settings.updated_at = datetime.utcnow()
         db.session.commit()
-        
+
         # Automatically subscribe app to WABA webhooks via Graph API
-        if settings.access_token and settings.business_account_id:
+        if not automatic and settings.access_token and settings.business_account_id:
             try:
                 api_ver = settings.api_version or 'v19.0'
                 sub_url = f"https://graph.facebook.com/{api_ver}/{settings.business_account_id}/subscribed_apps"
@@ -8280,6 +8378,7 @@ def email_customer_payment_link(customer_id, payment_id):
 
 @app.route('/api/whatsapp/subscribe-waba', methods=['POST'])
 @jwt_required()
+@admin_required()
 @require_module('whatsapp')
 def subscribe_waba():
     try:
@@ -8522,7 +8621,8 @@ def upload_whatsapp_template_sample():
         return jsonify({'error': 'WhatsApp API mode is not configured for this account.'}), 400
     if not plans.limits(current_tenant().plan)["whatsapp_api"]:
         return jsonify({'error': 'WhatsApp API mode requires an upgraded plan.'}), 402
-    if not settings.access_token or not settings.app_id:
+    upload_app_id = wa_connect.wa_app_identity(settings)[0]
+    if not settings.access_token or not upload_app_id:
         return jsonify({'error': 'Please configure your App ID and Access Token first.'}), 400
 
     file = request.files.get('file')
@@ -8532,7 +8632,7 @@ def upload_whatsapp_template_sample():
 
     try:
         api_version = settings.api_version or 'v19.0'
-        session_url = f'https://graph.facebook.com/{api_version}/{settings.app_id}/uploads'
+        session_url = f'https://graph.facebook.com/{api_version}/{upload_app_id}/uploads'
         session_resp = requests.post(session_url, params={
             'file_length': len(file_bytes),
             'file_type': file.mimetype or 'application/octet-stream',
@@ -9711,7 +9811,11 @@ def whatsapp_webhook():
         # this still has a per-tenant value in the DB via the column default;
         # there is no code-level bypass string anymore.)
         token_match = WhatsAppSettings.query.filter_by(webhook_verify_token=token).first() if token else None
-        if mode == 'subscribe' and token_match:
+        # The platform Meta app (Embedded Signup tenants) has one callback for
+        # every tenant it serves, verified with the platform's own token.
+        platform_match = bool(token and Config.META_WEBHOOK_VERIFY_TOKEN
+                              and hmac.compare_digest(token, Config.META_WEBHOOK_VERIFY_TOKEN))
+        if mode == 'subscribe' and (token_match or platform_match):
             logging.info("WhatsApp Webhook verified successfully by Meta!")
             return challenge, 200
         return 'Verification failed', 403
@@ -9728,17 +9832,18 @@ def whatsapp_webhook():
                     if change.get('field') == 'message_template_status_update':
                         waba_id = entry.get('id')
                         tpl_matches = WhatsAppSettings.query.filter_by(business_account_id=waba_id).all() if waba_id else []
-                        tpl_settings = tpl_matches[0] if tpl_matches else None
+                        tpl_settings = wa_connect.pick_routable(tpl_matches)
                         if not tpl_settings:
                             logging.warning(f"WhatsApp template status webhook: no tenant for business_account_id={waba_id}; skipping.")
                             continue
                         if len(tpl_matches) > 1:
                             logging.warning(f"WhatsApp template status webhook: {len(tpl_matches)} settings rows share business_account_id={waba_id} "
                                              f"(tenant_ids={[m.tenant_id for m in tpl_matches]}); using settings.id={tpl_settings.id} tenant_id={tpl_settings.tenant_id}.")
-                        if not tpl_settings.app_secret or not signature_header.startswith('sha256='):
+                        tpl_app_secret = wa_connect.wa_app_identity(tpl_settings)[1]
+                        if not tpl_app_secret or not signature_header.startswith('sha256='):
                             logging.warning(f"WhatsApp template status webhook: missing app_secret/signature for tenant_id={tpl_settings.tenant_id}; rejecting.")
                             return jsonify({'error': 'Invalid signature'}), 401
-                        tpl_expected_sig = hmac.new(tpl_settings.app_secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+                        tpl_expected_sig = hmac.new(tpl_app_secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
                         tpl_provided_sig = signature_header[len('sha256='):]
                         if not hmac.compare_digest(tpl_expected_sig, tpl_provided_sig):
                             logging.warning(f"WhatsApp template status webhook: signature mismatch for tenant_id={tpl_settings.tenant_id}; rejecting.")
@@ -9771,7 +9876,7 @@ def whatsapp_webhook():
                     # Resolve the owning tenant from the recipient business phone number.
                     incoming_pnid = (val.get('metadata', {}) or {}).get('phone_number_id')
                     matches = WhatsAppSettings.query.filter_by(phone_number_id=incoming_pnid).all() if incoming_pnid else []
-                    settings = matches[0] if matches else None
+                    settings = wa_connect.pick_routable(matches)
                     if not settings:
                         logging.warning(f"WhatsApp webhook: no tenant for phone_number_id={incoming_pnid}; skipping.")
                         continue
@@ -9781,11 +9886,12 @@ def whatsapp_webhook():
                     # message forwarding, auto-reply). Never trust the payload just
                     # because a phone_number_id happened to match a tenant -- reject
                     # the whole request rather than silently skipping this change.
-                    if not settings.app_secret or not signature_header.startswith('sha256='):
+                    wh_app_secret = wa_connect.wa_app_identity(settings)[1]
+                    if not wh_app_secret or not signature_header.startswith('sha256='):
                         logging.warning(f"WhatsApp webhook: missing app_secret or signature header for tenant_id={settings.tenant_id}; rejecting.")
                         return jsonify({'error': 'Invalid signature'}), 401
                     expected_sig = hmac.new(
-                        settings.app_secret.encode('utf-8'), raw_body, hashlib.sha256
+                        wh_app_secret.encode('utf-8'), raw_body, hashlib.sha256
                     ).hexdigest()
                     provided_sig = signature_header[len('sha256='):]
                     if not hmac.compare_digest(expected_sig, provided_sig):

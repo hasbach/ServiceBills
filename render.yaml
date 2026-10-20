@@ -81,6 +81,22 @@ services:
         sync: false        # not yet issued -- self-serve Whish checkout stays hidden until this is set
       - key: WHISH_SECRET
         sync: false
+      # Platform Meta app for WhatsApp auto-connect (specs/001-whatsapp-auto-connect).
+      # Leave unset until ready -- the automatic connect methods stay hidden.
+      - key: META_APP_ID
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: META_ES_CONFIG_ID
+        sync: false
+      - key: META_ES_COEX_CONFIG_ID
+        sync: false
+      - key: META_COEXISTENCE_ENABLED
+        sync: false
+      - key: META_WEBHOOK_VERIFY_TOKEN
+        sync: false
+      - key: META_GRAPH_VERSION
+        sync: false
       - key: MAIL_BACKEND
         value: sendgrid
       - key: SENDGRID_API_KEY

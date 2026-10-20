@@ -1,0 +1,33 @@
+{
+  "_synthetic": true,
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "WABA_TEST_1",
+      "changes": [
+        {
+          "field": "smb_message_echoes",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "96170000001",
+              "phone_number_id": "PNID_TEST_1"
+            },
+            "message_echoes": [
+              {
+                "from": "96170000001",
+                "to": "96171111111",
+                "timestamp": "1760950000",
+                "id": "wamid.ECHO_TEXT_1",
+                "type": "text",
+                "text": {
+                  "body": "Hello from the phone"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

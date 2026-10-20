@@ -29,8 +29,8 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
   - Leave the webhook unset until slice 1 is deployed.
   - Record the config ID(s) in `specs/001-whatsapp-auto-connect/research.md` R-0.
 - [ ] T002 Run the Meta spike from `specs/001-whatsapp-auto-connect/quickstart.md` §0 with a throwaway HTML page outside the repo. Confirm: (a) the coexistence launch parameters on v4 (`featureType` and/or a separate config ID); (b) that DeltaNet's own +961 Business-app number is accepted for coexistence; (c) that `debug_token` `granular_scopes[].target_ids` contains the WABA ID; (d) whether `GET /{waba_id}?fields=primary_funding_id` reflects a card; (e) whether Meta accepts `{{2}}` before `{{1}}` in a body. Write each outcome back into the matching section of `specs/001-whatsapp-auto-connect/research.md` (R-2, R-3, R-6, R-8).
-- [ ] T003 [P] Save the real webhook payloads captured in the spike as fixtures: `tests/fixtures/meta_smb_message_echoes.json` (text, image, edit and revoke variants), `tests/fixtures/meta_account_update_partner_removed.json`, `tests/fixtures/meta_account_update_partner_app_uninstalled.json`, `tests/fixtures/meta_account_update_offboarded.json`, `tests/fixtures/meta_account_update_reconnected.json`, `tests/fixtures/meta_phone_number_quality_update.json` and `tests/fixtures/meta_history.json`. If one can't be captured, build it from the shapes in `specs/001-whatsapp-auto-connect/contracts/webhook-events.md` and add a top-level `"_synthetic": true` key.
-- [ ] T004 [P] Add the platform settings to the `Config` class in `config.py`, all read with `os.environ.get`: `META_APP_ID`, `META_APP_SECRET`, `META_ES_CONFIG_ID`, `META_ES_COEX_CONFIG_ID` (falls back to `META_ES_CONFIG_ID`), `META_COEXISTENCE_ENABLED` (default true; parse "false"/"0" as false), `META_WEBHOOK_VERIFY_TOKEN`, `META_GRAPH_VERSION` (default `'v24.0'`). Add matching `- key: META_*` entries with `sync: false` to `render.yaml`, beside the WHISH entries.
+- [x] T003 (synthetic fixtures, `_synthetic: true` — replace with real captures in T002) [P] Save the real webhook payloads captured in the spike as fixtures: `tests/fixtures/meta_smb_message_echoes.json` (text, image, edit and revoke variants), `tests/fixtures/meta_account_update_partner_removed.json`, `tests/fixtures/meta_account_update_partner_app_uninstalled.json`, `tests/fixtures/meta_account_update_offboarded.json`, `tests/fixtures/meta_account_update_reconnected.json`, `tests/fixtures/meta_phone_number_quality_update.json` and `tests/fixtures/meta_history.json`. If one can't be captured, build it from the shapes in `specs/001-whatsapp-auto-connect/contracts/webhook-events.md` and add a top-level `"_synthetic": true` key.
+- [x] T004 [P] Add the platform settings to the `Config` class in `config.py`, all read with `os.environ.get`: `META_APP_ID`, `META_APP_SECRET`, `META_ES_CONFIG_ID`, `META_ES_COEX_CONFIG_ID` (falls back to `META_ES_CONFIG_ID`), `META_COEXISTENCE_ENABLED` (default true; parse "false"/"0" as false), `META_WEBHOOK_VERIFY_TOKEN`, `META_GRAPH_VERSION` (default `'v24.0'`). Add matching `- key: META_*` entries with `sync: false` to `render.yaml`, beside the WHISH entries.
 
 ---
 
@@ -40,7 +40,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 **⚠️ CRITICAL**: no user-story work starts until this phase is done.
 
-- [ ] T005 Write the failing tests in `tests/test_whatsapp_connect.py` (foundation section):
+- [x] T005 Write the failing tests in `tests/test_whatsapp_connect.py` (foundation section):
   - The migration backfill leaves an existing settings row with credentials as `connection_method='manual'`, `connection_status='connected'`, and a row without credentials as `'disconnected'`.
   - `wa_app_identity()` returns the tenant's own `app_id`/`app_secret` for manual tenants and `Config.META_APP_ID`/`META_APP_SECRET` for `coexistence`/`embedded` tenants.
   - `GET /api/whatsapp-settings` returns `access_token`, `app_secret` and `app_id` as `""` for automatic tenants, and includes a `connection` object.
@@ -48,7 +48,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
   - The webhook GET accepts `hub.verify_token == META_WEBHOOK_VERIFY_TOKEN`.
   - The webhook POST for an automatic tenant is accepted when signed with `META_APP_SECRET` and rejected (401) when signed with any other secret; a manual tenant keeps today's per-tenant secret behavior.
   - Webhook events for a tenant with `connection_status='disconnected'` are skipped.
-- [ ] T006 Create the Alembic migration `migrations/versions/<random12hex>_whatsapp_auto_connect.py` with down_revision `58a2f084761c`. Generate the revision ID randomly, then run `flask db heads` and confirm there is exactly one head. Copy `_with_lock_retry(bind, ddl)` from `migrations/versions/58a2f084761c_network_offline_alerts.py`. Check existing columns with `inspect(bind)` before each ADD; use `ADD COLUMN IF NOT EXISTS` on Postgres and `batch_alter_table` on SQLite.
+- [x] T006 Create the Alembic migration `migrations/versions/<random12hex>_whatsapp_auto_connect.py` with down_revision `58a2f084761c`. Generate the revision ID randomly, then run `flask db heads` and confirm there is exactly one head. Copy `_with_lock_retry(bind, ddl)` from `migrations/versions/58a2f084761c_network_offline_alerts.py`. Check existing columns with `inspect(bind)` before each ADD; use `ADD COLUMN IF NOT EXISTS` on Postgres and `batch_alter_table` on SQLite.
   - **On `whats_app_settings`**, add exactly:
     - `connection_method` String(20) NOT NULL default `'manual'`
     - `connection_status` String(20) NOT NULL default `'disconnected'`
@@ -80,13 +80,13 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
   - **Backfill**: `UPDATE whats_app_settings SET connection_method='manual', connection_status = CASE WHEN access_token IS NOT NULL AND access_token <> '' AND phone_number_id IS NOT NULL AND phone_number_id <> '' THEN 'connected' ELSE 'disconnected' END`.
   - **No** unique index on `phone_number_id` or `business_account_id` (data-model.md §1).
   - Write a working `downgrade()`.
-- [ ] T007 Extend the models in `app.py`.
+- [x] T007 Extend the models in `app.py`.
   - Add the new columns to `WhatsAppSettings` (app.py ~1631), with `registration_pin = db.Column(EncryptedString, nullable=True)` and `connected_by_user_id` as `db.ForeignKey('user.id', ondelete='SET NULL')`.
   - Add `standard_key` and `param_map` (`db.JSON`) to `WhatsAppTemplate` (~1724), and include both in its `to_dict`.
   - Add a new `WhatsAppConnectionEvent` model with `__tablename__='whatsapp_connection_event'`, matching T006 exactly.
   - Add a `connection_view()` method to `WhatsAppSettings` that returns the ConnectionView from `specs/001-whatsapp-auto-connect/contracts/http-api.md`. It must never include a token, secret or PIN.
   - Change `WhatsAppSettings.to_dict()` to blank `access_token`, `app_secret` and `app_id` when `connection_method != 'manual'`.
-- [ ] T008 Create `wa_connect.py` with the shared core:
+- [x] T008 Create `wa_connect.py` with the shared core:
   - `wa_app_identity(settings) -> (app_id, app_secret)`, as described in research.md R-4.
   - `automatic_available() -> bool`: true when `META_APP_ID`, `META_APP_SECRET` and `META_ES_CONFIG_ID` are set and `not onprem.is_onprem()`.
   - `coexistence_available() -> bool`: `automatic_available()` and `META_COEXISTENCE_ENABLED`.
@@ -94,14 +94,14 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
   - `log_event(tenant_id, event, *, user_id=None, method=None, from_status=None, to_status=None, source, detail=None)`, which writes a `WhatsAppConnectionEvent` and truncates `detail` to 500 characters.
   - `set_connection_status(settings, status, reason, source, *, user_id=None, alert=True)`. If the status changed, it updates `connection_status` and `status_reason`, logs a `status_change` event, and when `alert` is set and the new status is `needs_attention`, calls `app.send_push_notification(payload, tenant_id=..., roles=['admin'], topic='whatsapp_inbox')` with the title "WhatsApp needs attention" and the reason as the body.
   - Import `app` lazily inside functions (as `whatsapp_inbox.py` does as `appmod`) to avoid a circular import.
-- [ ] T009 Wire the resolver and guards into `app.py`.
+- [x] T009 Wire the resolver and guards into `app.py`.
   - **Webhook GET** (~9705): also accept `request.args['hub.verify_token'] == Config.META_WEBHOOK_VERIFY_TOKEN`, when that setting is non-empty.
   - **Webhook POST**: in both HMAC checks (template status ~9738 and messages ~9784), replace `settings.app_secret` with `wa_connect.wa_app_identity(settings)[1]`. Skip any resolved tenant whose `connection_status == 'disconnected'` and whose `connection_method != 'manual'`.
   - **`upload_whatsapp_template_sample`** (~8511): use `wa_app_identity(settings)[0]` as the app ID.
   - **`POST /api/whatsapp-settings`** (~7685): when `settings.connection_method != 'manual'`, drop these keys from the incoming data before the setattr loop: `phone_number_id`, `business_account_id`, `app_id`, `app_secret`, `access_token`, `api_version`, `webhook_verify_token`. Also skip the post-save `subscribed_apps` call.
   - **`GET /api/whatsapp-settings`** (~7621): add `'connection': settings.connection_view()`.
   - **`POST /api/whatsapp/subscribe-waba`** (~8281): add `@admin_required()`.
-- [ ] T010 Run `python -m pytest tests/test_whatsapp_connect.py tests/test_iso_webhook.py tests/test_whatsapp_templates.py tests/test_iso_whatsapp.py -q`. Fix until it passes.
+- [x] T010 Run `python -m pytest tests/test_whatsapp_connect.py tests/test_iso_webhook.py tests/test_whatsapp_templates.py tests/test_iso_whatsapp.py -q`. Fix until it passes.
 
 **Checkpoint**: the schema and guards are in place, manual tenants are unchanged, and the platform app identity is resolvable.
 

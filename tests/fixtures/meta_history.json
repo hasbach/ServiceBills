@@ -1,0 +1,31 @@
+{
+  "_synthetic": true,
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "WABA_TEST_1",
+      "changes": [
+        {
+          "field": "history",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "96170000001",
+              "phone_number_id": "PNID_TEST_1"
+            },
+            "history": [
+              {
+                "metadata": {
+                  "phase": 0,
+                  "chunk_order": 1,
+                  "progress": 10
+                },
+                "threads": []
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
