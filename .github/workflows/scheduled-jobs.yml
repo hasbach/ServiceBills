@@ -20,6 +20,7 @@ on:
     - cron: "40 2 * * *"    # auto_sync_upstream_status
     - cron: "50 2 * * *"    # check_pro_plan_expirations
     - cron: "*/15 * * * *"  # refresh_agent_mode_network_status
+    - cron: "5 * * * *"     # whatsapp_connection_health
   workflow_dispatch:
     inputs:
       job_name:
@@ -41,6 +42,7 @@ jobs:
             "40 2 * * *")   echo "name=auto_sync_upstream_status" >> "$GITHUB_OUTPUT" ;;
             "50 2 * * *")   echo "name=check_pro_plan_expirations" >> "$GITHUB_OUTPUT" ;;
             "*/15 * * * *") echo "name=refresh_agent_mode_network_status" >> "$GITHUB_OUTPUT" ;;
+            "5 * * * *")    echo "name=whatsapp_connection_health" >> "$GITHUB_OUTPUT" ;;
             *)              echo "name=${{ github.event.inputs.job_name }}" >> "$GITHUB_OUTPUT" ;;
           esac
 

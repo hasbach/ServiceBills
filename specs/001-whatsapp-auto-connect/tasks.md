@@ -255,7 +255,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 ### Tests for User Story 4
 
-- [ ] T032 [P] [US4] Create `tests/test_whatsapp_connection_health.py`, using the T003 fixtures signed with `META_APP_SECRET` and monkeypatching `send_push_notification`:
+- [x] T032 [P] [US4] Create `tests/test_whatsapp_connection_health.py`, using the T003 fixtures signed with `META_APP_SECRET` and monkeypatching `send_push_notification`:
   - **Account events**:
     - `PARTNER_APP_UNINSTALLED` → `needs_attention`, plus an event with `source='webhook'` and a push to admins.
     - `PARTNER_REMOVED` with `PRIMARY_INACTIVITY` → `needs_attention` with the reason "WhatsApp Business app not opened for ~14 days".
@@ -272,31 +272,31 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 ### Implementation for User Story 4
 
-- [ ] T033 [US4] Implement in `wa_connect.py`:
+- [x] T033 [US4] Implement in `wa_connect.py`:
   - `handle_account_update(settings, value)`, mapping events per `specs/001-whatsapp-auto-connect/contracts/webhook-events.md` §2 through `set_connection_status`.
   - `handle_quality_update(settings, value)`, per §3.
   - `check_health(settings) -> bool`, which does a `GET /{phone_number_id}` with the stored token, updates the display fields and `last_health_check_at`, and sets `connected` or `needs_attention`.
   - `disconnect(settings, user)`, per contracts/http-api.md. It works for manual tenants too (clears `access_token` and `app_secret`).
   - `disconnect` must also accept `next_method='manual'` (sent by the UI when the tenant picks "Manual configuration" while an automatic connection is live) and then set `connection_method='manual'`. Otherwise `POST /api/whatsapp-settings` keeps ignoring the credentials the tenant types next. Add a test for it.
   - `is_auth_error(meta_error) -> bool`: true for code 190, or 200/10 permission errors.
-- [ ] T034 [US4] Add webhook dispatch in `app.py` for `account_update` (tenant resolved by `value.get('waba_info',{}).get('waba_id') or entry['id']` against `business_account_id`, HMAC-verified via `wa_app_identity`) and for `phone_number_quality_update` (resolved by `entry['id']`). Neither field may fall into the messages path.
-- [ ] T035 [US4] Hook send errors in two places: `send_whatsapp_message` in `app.py` (~8778) and `whatsapp_inbox._post_message` in `whatsapp_inbox.py` (~466).
+- [x] T034 [US4] Add webhook dispatch in `app.py` for `account_update` (tenant resolved by `value.get('waba_info',{}).get('waba_id') or entry['id']` against `business_account_id`, HMAC-verified via `wa_app_identity`) and for `phone_number_quality_update` (resolved by `entry['id']`). Neither field may fall into the messages path.
+- [x] T035 [US4] Hook send errors in two places: `send_whatsapp_message` in `app.py` (~8778) and `whatsapp_inbox._post_message` in `whatsapp_inbox.py` (~466).
   - **Before the Graph call**: if `settings.connection_method != 'manual'` and `settings.connection_status == 'needs_attention'`, return a failure with "WhatsApp connection needs attention — reconnect in Settings" and make no call.
   - **After the call**: if the response error satisfies `wa_connect.is_auth_error`, call `set_connection_status(settings, 'needs_attention', <meta message>, 'send_error')`.
   - Manual tenants: only the post-call detection applies, with no pre-call block.
-- [ ] T036 [US4] Add the scheduled job `whatsapp_connection_health`:
+- [x] T036 [US4] Add the scheduled job `whatsapp_connection_health`:
   - Write the function `whatsapp_connection_health_with_context()` in `app.py`, next to `send_daily_whatsapp_keepalive_with_context` (~3943). It loops over `WhatsAppSettings` with `connection_method in ('coexistence','embedded')` and `connection_status != 'disconnected'` and calls `wa_connect.check_health`.
   - Register it in `_SCHEDULED_JOBS` (~4287) and in `SCHEDULE` (~4314) as hourly.
   - Add the matching hourly cron line to `.github/workflows/scheduled-jobs.yml`, so that the existing schedule-sync test passes.
-- [ ] T037 [US4] Add routes to `wa_connect_routes.py`: `POST /api/whatsapp/connect/refresh` (calls `check_health`, returns `{connection}`) and `POST /api/whatsapp/connect/disconnect` (requires `{"confirm": true}`, calls `disconnect`).
-- [ ] T038 [P] [US4] UI in `frontend/src/components/WhatsAppConnectCard.js`:
+- [x] T037 [US4] Add routes to `wa_connect_routes.py`: `POST /api/whatsapp/connect/refresh` (calls `check_health`, returns `{connection}`) and `POST /api/whatsapp/connect/disconnect` (requires `{"confirm": true}`, calls `disconnect`).
+- [x] T038 [P] [US4] UI in `frontend/src/components/WhatsAppConnectCard.js`:
   - A status chip: Connected (green), Needs attention (amber, showing `status_reason`), Disconnected.
   - A "Refresh" button.
   - A "Reconnect" button that re-runs the same method's flow.
   - A "Disconnect" button with a confirm dialog saying that automatic sending stops and history is kept.
   - A collapsible "Connection history" list of the last 20 events: time, event, by-user or source, detail.
   - Also show a dismissible amber banner in the Inbox header (`frontend/src/components/` inbox view; find the component that renders the Inbox list) when `connection.status === 'needs_attention'`, with a link to Settings > Messaging.
-- [ ] T039 [US4] Run `python -m pytest tests/test_whatsapp_connection_health.py tests -q -k "whatsapp or schedule"` and quickstart §2 steps 7–8.
+- [x] T039 (automated only; live quickstart §2.7–2.8 pending the Meta spike T002) [US4] Run `python -m pytest tests/test_whatsapp_connection_health.py tests -q -k "whatsapp or schedule"` and quickstart §2 steps 7–8.
 
 **Checkpoint**: all user stories work independently.
 

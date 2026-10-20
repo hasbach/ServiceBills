@@ -7,7 +7,7 @@ module (`appmod`) first, so this module never imports app.py at import time.
 Functions here do NOT commit unless their docstring says so.
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 
@@ -263,3 +263,190 @@ def register_number(phone_number_id, token, settings):
     """Register a new API number with a two-step PIN (never a coexistence
     number -- Meta forbids it). Filled in by US2; returns the PIN to store."""
     return None
+
+
+# ---- health, reconnect, disconnect (US4, contracts/webhook-events.md) ------
+
+NEEDS_ATTENTION_SEND_ERROR = 'WhatsApp connection needs attention -- reconnect in Settings.'
+OFFBOARDED_REASON = 'The WhatsApp Business app on the phone was re-registered -- waiting for it to reconnect.'
+OFFBOARDED_GRACE_MINUTES = 15
+_DISCONNECT_REASONS = {
+    'PRIMARY_INACTIVITY': 'WhatsApp Business app not opened for ~14 days, so Meta disconnected the number. '
+                          'Open the app on the phone, then reconnect.',
+    'COMPANION_INACTIVITY': 'The number was disconnected because a linked device was inactive for ~30 days.',
+    'ACCOUNT_DISCONNECTED': 'The number was disconnected from the platform in the WhatsApp Business app.',
+    'BUSINESS_DOWNGRADE': 'The number was moved off the WhatsApp Business app.',
+    'CHANGE_NUMBER': 'The phone number was changed in the WhatsApp Business app.',
+    'USER_RE_REGISTERED': 'The number was registered again on another phone.',
+}
+# account_update event -> (new status or None to keep, reason, push alert?)
+_ACCOUNT_EVENTS = {
+    'PARTNER_APP_UNINSTALLED': ('needs_attention', 'Access to WhatsApp was removed in Meta. Reconnect.', True),
+    'PARTNER_REMOVED': ('needs_attention', 'The WhatsApp account was unshared from the platform. Reconnect.', True),
+    'ACCOUNT_DELETED': ('needs_attention', 'The WhatsApp account was deleted in Meta.', True),
+    'DISABLED_UPDATE': ('needs_attention', 'Meta disabled this WhatsApp account.', True),
+    'ACCOUNT_OFFBOARDED': ('needs_attention', OFFBOARDED_REASON, False),
+    'ACCOUNT_RECONNECTED': ('connected', None, False),
+    'ACCOUNT_RESTRICTION': (None, 'Meta restricted this WhatsApp account -- check WhatsApp Manager.', True),
+    'ACCOUNT_VIOLATION': (None, 'Meta reported a policy violation on this WhatsApp account.', True),
+}
+_QUALITY_EVENTS = {'FLAGGED': 'RED', 'UNFLAGGED': 'GREEN'}
+
+
+def blocks_sends(settings):
+    """An automatic connection known to be broken: don't call Meta at all."""
+    return is_automatic(settings) and settings.connection_status == 'needs_attention'
+
+
+def is_auth_error(meta_code):
+    """Graph errors meaning the token no longer grants access."""
+    return str(meta_code) in ('190', '200', '10')
+
+
+def _alert_admins(appmod, settings, title, body):
+    try:
+        appmod.send_push_notification({'title': title, 'body': body, 'url': '/settings'},
+                                      tenant_id=settings.tenant_id, roles=['admin'], topic='whatsapp_inbox')
+    except Exception:
+        logging.exception('WhatsApp connection alert push failed for tenant_id=%s', settings.tenant_id)
+
+
+def note_send_error(appmod, settings, meta_code, message):
+    """A send got a Graph error: an auth failure means the connection is
+    broken. Commits when it changes the status."""
+    if settings is None or not is_auth_error(meta_code):
+        return False
+    changed = set_connection_status(appmod, settings, 'needs_attention',
+                                    'Meta refused to send: {}'.format(message or meta_code), 'send_error')
+    if changed:
+        appmod.db.session.commit()
+    return changed
+
+
+def handle_account_update(appmod, settings, value):
+    """Apply one account_update webhook value. Caller commits."""
+    event = value.get('event')
+    rule = _ACCOUNT_EVENTS.get(event)
+    if rule is None:
+        logging.info('WhatsApp account_update %s for tenant_id=%s: no action', event, settings.tenant_id)
+        return
+    status, reason, alert = rule
+    if event == 'PARTNER_REMOVED':
+        why = (value.get('disconnection_info') or {}).get('reason')
+        reason = _DISCONNECT_REASONS.get(why, reason)
+    if status is None:
+        settings.status_reason = reason
+        log_event(appmod, settings.tenant_id, 'status_change', source='webhook',
+                  method=settings.connection_method, from_status=settings.connection_status,
+                  to_status=settings.connection_status, detail='{}: {}'.format(event, reason))
+        if alert:
+            _alert_admins(appmod, settings, 'WhatsApp account warning', reason)
+        return
+    set_connection_status(appmod, settings, status, reason, 'webhook', alert=alert)
+
+
+def handle_quality_update(appmod, settings, value):
+    """Apply one phone_number_quality_update webhook value. Caller commits."""
+    event = value.get('event')
+    if value.get('current_limit'):
+        settings.messaging_limit_tier = value['current_limit']
+    if event in _QUALITY_EVENTS:
+        settings.quality_rating = _QUALITY_EVENTS[event]
+    if event in ('FLAGGED', 'DOWNGRADE'):
+        _alert_admins(appmod, settings, 'WhatsApp quality warning',
+                      'Meta {} your WhatsApp number ({}). Check message quality in WhatsApp Manager.'.format(
+                          'flagged' if event == 'FLAGGED' else 'lowered the messaging limit of',
+                          settings.display_phone_number or settings.phone_number_id))
+
+
+def check_health(appmod, settings, source='health_check'):
+    """Ask Meta for the number with the stored token and update status and
+    display fields. Commits. Returns True when healthy."""
+    settings.last_health_check_at = datetime.utcnow()
+    try:
+        number = _graph('get', settings.phone_number_id, token=settings.access_token,
+                        what='checking the connection', params={'fields': _PHONE_FIELDS})
+    except ConnectError as exc:
+        if settings.connection_status != 'needs_attention' or settings.status_reason != OFFBOARDED_REASON:
+            set_connection_status(appmod, settings, 'needs_attention', exc.message, source)
+        appmod.db.session.commit()
+        return False
+    for field, key in (('display_phone_number', 'display_phone_number'), ('verified_name', 'verified_name'),
+                       ('quality_rating', 'quality_rating'),
+                       ('messaging_limit_tier', 'whatsapp_business_manager_messaging_limit')):
+        if number.get(key):
+            setattr(settings, field, number[key])
+    set_connection_status(appmod, settings, 'connected', None, source)
+    appmod.db.session.commit()
+    return True
+
+
+def alert_if_stuck_offboarded(appmod, settings):
+    """ACCOUNT_OFFBOARDED usually clears itself within minutes (ACCOUNT_RECONNECTED).
+    Alert once if it hasn't after OFFBOARDED_GRACE_MINUTES. Commits."""
+    if settings.connection_status != 'needs_attention' or settings.status_reason != OFFBOARDED_REASON:
+        return False
+    Ev = appmod.WhatsAppConnectionEvent
+    since = Ev.query.filter_by(tenant_id=settings.tenant_id, event='status_change', to_status='needs_attention') \
+        .order_by(Ev.created_at.desc(), Ev.id.desc()).first()
+    if since is None or since.created_at > datetime.utcnow() - timedelta(minutes=OFFBOARDED_GRACE_MINUTES):
+        return False
+    if Ev.query.filter(Ev.tenant_id == settings.tenant_id, Ev.event == 'alert', Ev.created_at >= since.created_at).first():
+        return False
+    reason = 'The WhatsApp Business app number has not reconnected. Open the app on the phone, then reconnect.'
+    log_event(appmod, settings.tenant_id, 'alert', source='health_check', method=settings.connection_method,
+              detail=reason)
+    _alert_admins(appmod, settings, 'WhatsApp needs attention', reason)
+    appmod.db.session.commit()
+    return True
+
+
+def run_health_checks(appmod):
+    """Hourly job body: every live automatic connection."""
+    S = appmod.WhatsAppSettings
+    rows = S.query.filter(S.connection_method.in_(AUTOMATIC_METHODS),
+                          S.connection_status != 'disconnected').all()
+    for settings in rows:
+        try:
+            if not (settings.access_token and settings.phone_number_id):
+                continue
+            check_health(appmod, settings)
+            alert_if_stuck_offboarded(appmod, settings)
+        except Exception:
+            appmod.db.session.rollback()
+            logging.exception('WhatsApp health check failed for tenant_id=%s', settings.tenant_id)
+
+
+def disconnect(appmod, settings, user_id, next_method=None):
+    """Stop automatic sending and forget the credentials; message history is
+    kept. Never deregisters the number (forbidden for coexistence, and it
+    would strand an embedded number). Commits."""
+    if is_automatic(settings) and settings.access_token and settings.business_account_id:
+        try:
+            resp = requests.delete(graph_url('{}/subscribed_apps'.format(settings.business_account_id)),
+                                   headers={'Authorization': 'Bearer {}'.format(settings.access_token)},
+                                   timeout=GRAPH_TIMEOUT)
+            if not resp.ok:
+                logging.warning('WhatsApp disconnect: unsubscribe failed for tenant_id=%s: %s',
+                                settings.tenant_id, _meta_error(resp)[1])
+        except requests.RequestException as exc:
+            logging.warning('WhatsApp disconnect: unsubscribe failed for tenant_id=%s: %s', settings.tenant_id, exc)
+    previous = settings.connection_status
+    method = settings.connection_method or 'manual'
+    settings.access_token = None
+    settings.registration_pin = None
+    settings.token_obtained_at = None
+    if method == 'manual':
+        settings.app_secret = None
+    settings.mode = 'deeplink'
+    settings.connection_status = 'disconnected'
+    settings.status_reason = None
+    if next_method == 'manual':
+        # The tenant is switching to their own Meta app; the settings form
+        # only accepts credentials for manual connections.
+        settings.connection_method = 'manual'
+    log_event(appmod, settings.tenant_id, 'disconnect', source='user', user_id=user_id, method=method,
+              from_status=previous, to_status='disconnected',
+              detail='switching to manual configuration' if next_method == 'manual' and method != 'manual' else None)
+    appmod.db.session.commit()
+    return settings

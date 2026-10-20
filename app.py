@@ -4369,6 +4369,14 @@ def refresh_agent_mode_network_status_with_context():
 # genuinely overlap a still-running previous trigger, so the lock is what
 # stops that overlap from double-processing the same customer/payment rows,
 # not anything about the trigger mechanism itself.
+def whatsapp_connection_health_with_context():
+    """Hourly: re-check every live automatic (Embedded Signup) WhatsApp
+    connection so a revoked token shows "Needs attention" within the hour
+    (SC-005) even when no webhook said so. Manual tenants are not polled."""
+    with app.app_context():
+        wa_connect.run_health_checks(sys.modules[__name__])
+
+
 _SCHEDULED_JOBS = {
     "generate_missing_payments": generate_missing_payments_with_context,
     "generate_missing_salary_charges": generate_missing_salary_charges_with_context,
@@ -4383,6 +4391,7 @@ _SCHEDULED_JOBS = {
     "auto_sync_upstream_status": auto_sync_upstream_status_with_context,
     "check_pro_plan_expirations": check_pro_plan_expirations_with_context,
     "refresh_agent_mode_network_status": refresh_agent_mode_network_status_with_context,
+    "whatsapp_connection_health": whatsapp_connection_health_with_context,
 }
 
 
@@ -4405,13 +4414,16 @@ SCHEDULE = {
     "auto_sync_upstream_status": "40 2 * * *",
     "check_pro_plan_expirations": "50 2 * * *",
     "refresh_agent_mode_network_status": "*/15 * * * *",
+    "whatsapp_connection_health": "5 * * * *",
 }
 ONPREM_EXTRA_SCHEDULE = {"refresh_license": "0 3 * * *"}
 
 
 def onprem_schedule():
     """SCHEDULE minus SaaS-only billing jobs, plus on-prem extras."""
-    s = {k: v for k, v in SCHEDULE.items() if k != "check_pro_plan_expirations"}
+    # Automatic WhatsApp connections need the SaaS platform Meta app, so
+    # on-prem never has any to health-check.
+    s = {k: v for k, v in SCHEDULE.items() if k not in ("check_pro_plan_expirations", "whatsapp_connection_health")}
     s.update(ONPREM_EXTRA_SCHEDULE)
     return s
 
@@ -9015,6 +9027,9 @@ def send_whatsapp_message(customer, event_type, context=None):
         if not settings.access_token or not settings.phone_number_id:
             logging.warning('WhatsApp API mode is enabled but credentials are missing – skipping send.')
             return {'success': False, 'status': 'Failed', 'error': 'WhatsApp API credentials missing in settings'}
+        if wa_connect.blocks_sends(settings):
+            # Known-broken automatic connection: fail visibly instead of calling Meta.
+            return {'success': False, 'status': 'Failed', 'error': wa_connect.NEEDS_ATTENTION_SEND_ERROR}
 
         # Normalise the recipient phone number (digits only, no leading +)
         phone = normalize_whatsapp_phone(customer.phone)
@@ -9096,6 +9111,7 @@ def send_whatsapp_message(customer, event_type, context=None):
                 pass
             err_msg = err_json.get('message') or err_json.get('error_data', {}).get('details') or response.text
             logging.error(f'WhatsApp API error for customer {customer.id}: {response.status_code} {response.text}')
+            wa_connect.note_send_error(sys.modules[__name__], settings, err_json.get('code'), err_msg)
             return {'success': False, 'status': 'Failed', 'error': f'Meta API Error ({response.status_code}): {err_msg}'}
 
     except Exception as exc:
@@ -9933,6 +9949,31 @@ def whatsapp_webhook():
                                 logging.info(f"WhatsApp template status webhook: tenant_id={tpl_settings.tenant_id} name={tpl_name} -> {tpl_new_status}")
                             else:
                                 logging.warning(f"WhatsApp template status webhook: no local WhatsAppTemplate for tenant_id={tpl_settings.tenant_id} name={tpl_name} language={tpl_language}; skipping.")
+                        continue
+
+                    # Connection health from Meta (US4): routed by WABA id, never into
+                    # the messages path below.
+                    if change.get('field') in ('account_update', 'phone_number_quality_update'):
+                        acct_waba = ((val.get('waba_info') or {}).get('waba_id')
+                                     if change.get('field') == 'account_update' else None) or entry.get('id')
+                        acct_rows = WhatsAppSettings.query.filter_by(business_account_id=str(acct_waba)).all() if acct_waba else []
+                        acct_settings = wa_connect.pick_routable(acct_rows)
+                        if not acct_settings:
+                            logging.info(f"WhatsApp {change.get('field')}: no tenant for waba_id={acct_waba} "
+                                         f"(event={val.get('event')}); skipping.")
+                            continue
+                        acct_secret = wa_connect.wa_app_identity(acct_settings)[1]
+                        acct_sig = signature_header[len('sha256='):] if signature_header.startswith('sha256=') else ''
+                        if not acct_secret or not acct_sig or not hmac.compare_digest(
+                                hmac.new(acct_secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest(), acct_sig):
+                            logging.warning(f"WhatsApp {change.get('field')}: bad signature for tenant_id={acct_settings.tenant_id}; rejecting.")
+                            return jsonify({'error': 'Invalid signature'}), 401
+                        _acct_appmod = sys.modules[__name__]
+                        if change.get('field') == 'account_update':
+                            wa_connect.handle_account_update(_acct_appmod, acct_settings, val)
+                        else:
+                            wa_connect.handle_quality_update(_acct_appmod, acct_settings, val)
+                        db.session.commit()
                         continue
 
                     messages = val.get('messages', [])

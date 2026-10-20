@@ -102,6 +102,36 @@ def register_wa_connect_routes(app, appmod):
             return jsonify({'error': exc.message, 'meta_code': exc.meta_code}), exc.status_code
         return jsonify({'connection': settings.connection_view()}), 200
 
+    @app.route('/api/whatsapp/connect/refresh', methods=['POST'])
+    @jwt_required()
+    @appmod.admin_required()
+    @require_module('whatsapp')
+    def wa_connect_refresh():
+        settings = tenant_query(appmod.WhatsAppSettings).first()
+        if settings is None or not wa_connect.is_automatic(settings) or not settings.access_token:
+            return jsonify({'error': 'There is no automatic WhatsApp connection to check.'}), 400
+        wa_connect.check_health(appmod, settings, source='user')
+        return jsonify(status_payload(settings)), 200
+
+    @app.route('/api/whatsapp/connect/disconnect', methods=['POST'])
+    @jwt_required()
+    @appmod.admin_required()
+    @require_module('whatsapp')
+    def wa_connect_disconnect():
+        # Deliberately not gated on the platform app or the plan: a tenant
+        # must always be able to stop sending.
+        data = request.get_json(silent=True) or {}
+        if data.get('confirm') is not True:
+            return jsonify({'error': 'Confirm the disconnect.'}), 400
+        next_method = data.get('next_method')
+        if next_method not in (None, 'manual'):
+            return jsonify({'error': 'Unknown next method.'}), 400
+        settings = tenant_query(appmod.WhatsAppSettings).first()
+        if settings is None:
+            return jsonify({'error': 'WhatsApp is not configured.'}), 400
+        wa_connect.disconnect(appmod, settings, current_user_id(), next_method=next_method)
+        return jsonify(status_payload(settings)), 200
+
     # ---- standard templates (FR-015..FR-015d) -----------------------------
 
     def api_settings_or_error():

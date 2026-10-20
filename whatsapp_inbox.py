@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 
 import media_convert
 import storage
+import wa_connect
 
 WINDOW = timedelta(hours=24)
 AI_AUTO_RESUME_AFTER = timedelta(hours=24)
@@ -581,6 +582,8 @@ def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None,
     settings = appmod.WhatsAppSettings.query.filter_by(tenant_id=conv.tenant_id).first()
     if not settings or not settings.access_token or not settings.phone_number_id:
         raise SendError('not_configured', 'WhatsApp Cloud API is not configured for this business.', 400)
+    if wa_connect.blocks_sends(settings):
+        raise SendError('needs_attention', wa_connect.NEEDS_ATTENTION_SEND_ERROR, 409)
     if kind != 'template' and not window_open(conv):
         raise WindowClosed()
 
@@ -661,6 +664,7 @@ def send_admin_message(appmod, conv, user_id, kind, *, text=None, reply_to=None,
         wamid = _post_message(settings, payload)
     except SendError as e:
         _record_send_failure(appmod, conv, user_id, rec, e)
+        wa_connect.note_send_error(appmod, settings, e.meta_code, e.message)
         raise
     msg = record_outbound(appmod, conv, sender='admin', sent_by_user_id=user_id, wa_message_id=wamid,
                           status='sent', **rec)

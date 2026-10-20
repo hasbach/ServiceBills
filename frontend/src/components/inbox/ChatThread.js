@@ -5,7 +5,7 @@ import {
 import {
     ArrowBack as BackIcon, Done as SentIcon, DoneAll as DeliveredIcon, ErrorOutline as FailedIcon,
     SmartToy as AiIcon, Reply as ReplyIcon, AddReaction as ReactIcon, CheckCircle as ResolveIcon,
-    PauseCircle as PauseIcon
+    PauseCircle as PauseIcon, PhoneIphone as PhoneIcon
 } from '@mui/icons-material';
 import InboxMedia from './InboxMedia';
 import { REASON_META, describeWindow } from './inboxFormat';
@@ -16,6 +16,15 @@ const BUBBLE = {
     ai: { align: 'flex-end', bg: '#e3f2fd' },
     admin: { align: 'flex-end', bg: '#dcf8c6' },
     system: { align: 'flex-end', bg: '#f1f1f1' },
+    // Sent by the tenant from the WhatsApp Business app on their phone (coexistence).
+    phone: { align: 'flex-end', bg: '#dcf8c6' },
+};
+
+const senderLabel = (m) => {
+    if (m.sender === 'ai') return <><AiIcon sx={{ fontSize: 14 }} /> AI</>;
+    if (m.sender === 'admin') return m.sent_by || 'Admin';
+    if (m.sender === 'phone') return <><PhoneIcon sx={{ fontSize: 14 }} /> Sent from phone</>;
+    return 'Auto-reply';
 };
 
 const StatusTick = ({ m }) => {
@@ -45,7 +54,7 @@ const Bubble = ({ m, byWamid, onReply, onReact, windowOpen }) => {
                 <Paper elevation={0} sx={{ p: isSticker ? 0 : 1.25, bgcolor: isSticker ? 'transparent' : style.bg, borderRadius: 2, border: isSticker ? 0 : 1, borderColor: 'divider' }}>
                     {m.sender !== 'customer' && (
                         <Typography variant="caption" color="text.secondary" sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                            {m.sender === 'ai' ? <><AiIcon sx={{ fontSize: 14 }} /> AI</> : m.sender === 'admin' ? (m.sent_by || 'Admin') : 'Auto-reply'}
+                            {senderLabel(m)}
                         </Typography>
                     )}
                     {quoted && (
@@ -57,8 +66,11 @@ const Bubble = ({ m, byWamid, onReply, onReact, windowOpen }) => {
                     {failedEmptyLabel && (
                         <Typography variant="body2" color="text.secondary" fontStyle="italic">{failedEmptyLabel}</Typography>
                     )}
+                    {m.status === 'revoked' && (
+                        <Typography variant="caption" color="text.secondary" fontStyle="italic" display="block">Deleted on the phone</Typography>
+                    )}
                     {m.text && m.msg_type !== 'sticker' && (
-                        <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                        <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', ...(m.status === 'revoked' ? { textDecoration: 'line-through', opacity: 0.6 } : {}) }}>
                             {m.msg_type === 'location'
                                 ? <a href={`https://maps.google.com/?q=${encodeURIComponent(m.text.split(' ')[0])}`} target="_blank" rel="noreferrer">📍 {m.text}</a>
                                 : m.text}
@@ -73,6 +85,7 @@ const Bubble = ({ m, byWamid, onReply, onReact, windowOpen }) => {
                         </>
                     )}
                     <Stack direction="row" spacing={0.5} alignItems="center" justifyContent="flex-end">
+                        {m.status === 'edited' && <Typography variant="caption" color="text.secondary">edited</Typography>}
                         <Typography variant="caption" color="text.secondary">{formatStamp(m.created_at)}</Typography>
                         <StatusTick m={m} />
                     </Stack>
