@@ -538,15 +538,14 @@ const WhatsAppConnectCard = ({ connection: connectionProp, manualVisible, onSele
                             sx={statusChip.color === 'warning' ? { fontWeight: 700 } : undefined} />
                         <Typography variant="body2" sx={{ fontWeight: 600 }}>{METHOD_LABEL[connection.method] || connection.method}</Typography>
                         <Box sx={{ flex: 1 }} />
-                        {isAutomatic && (
-                            <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', rowGap: 1 }}>
-                                {isLive && (
+                        <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', rowGap: 1 }}>
+                                {isAutomatic && isLive && (
                                     <Button size="small" variant="outlined" startIcon={busy === 'refreshing' ? <CircularProgress size={14} /> : <RefreshIcon />}
                                         onClick={doRefresh} disabled={working} sx={{ textTransform: 'none', borderRadius: '10px' }}>
                                         Refresh
                                     </Button>
                                 )}
-                                {planAllows && automaticAvailable && (connection.method !== 'coexistence' || coexAvailable) && (
+                                {isAutomatic && planAllows && automaticAvailable && (connection.method !== 'coexistence' || coexAvailable) && (
                                     <Button size="small" variant={connection.status === 'connected' ? 'outlined' : 'contained'} color={connection.status === 'needs_attention' ? 'warning' : 'primary'}
                                         startIcon={<ReplayIcon />} onClick={() => chooseAutomatic(connection.method)}
                                         disabled={working} sx={{ textTransform: 'none', borderRadius: '10px' }}>
@@ -560,14 +559,13 @@ const WhatsAppConnectCard = ({ connection: connectionProp, manualVisible, onSele
                                         Send test message
                                     </Button>
                                 )}
-                                {isLive && (
+                                {isAutomatic && isLive && (
                                     <Button size="small" variant="outlined" color="error" startIcon={busy === 'disconnecting' ? <CircularProgress size={14} /> : <LinkOffIcon />}
                                         onClick={() => setConfirmDisconnectOpen(true)} disabled={working} sx={{ textTransform: 'none', borderRadius: '10px' }}>
                                         Disconnect
                                     </Button>
                                 )}
                             </Stack>
-                        )}
                     </Box>
 
                     {connection.status === 'needs_attention' && (
