@@ -22,7 +22,12 @@ Meta docs have moved to `developers.facebook.com/documentation/business-messagin
   - The pre-existing "Tech Provider Embedded Signup config" (`1616390326897645`) was left untouched.
   - Login settings saved: JavaScript SDK login = Yes. Allowed SDK domains and Valid OAuth Redirect URIs are `https://servicebills.salloumservices.com` and `https://servicebills.onrender.com`, with a trailing `/` on the redirect URIs. A dev tunnel domain must be added here before local testing.
 - **App settings > Basic**: the privacy policy URL is set (TermsFeed) and the app icon is set. **App domains and Terms of Service URL are empty**; fill both before the App Review resubmission (T045). Display name is "beta business response"; consider renaming it to something tenants recognise before go-live.
-- **Before approval**: Live-mode apps can use permissions that aren't approved yet on assets owned by the app's own admins and business. DeltaNet's own number can therefore be connected and tested end to end now. Outside tenants have to wait for the messaging approval.
+- **Before approval: corrected 2026-10-20 by a live test.** The earlier assumption, that the app's own admins can test before approval, was **wrong** for Embedded Signup.
+  - Meta refused at the number step with **#2655111**: "Partner app lacks required advanced WhatsApp Business Management and messaging permissions for onboarding."
+  - It also refused, on a number that was still on the WhatsApp Business app, with **#2655115**: "This account type doesn't support partner sharing."
+  - **No Embedded Signup onboarding is possible until `whatsapp_business_messaging` has Advanced access.**
+  - The App Review recordings therefore use the manual path; see `docs/whatsapp-app-review-screencast.md`.
+- **Coexistence on ES v4: answered 2026-10-20.** Passing `extras.featureType = 'whatsapp_business_app_onboarding'` with config `1455508473309505` still showed the normal "Add your WhatsApp phone number" screen, so v4 ignores it. Coexistence has to be enabled in the Login configuration itself. This is to do after approval.
 - **Consent-screen branding**: tenants will see "Beta consulting Agency" as the business behind the app. The privacy policy must name Beta as the data processor.
 
 ## R-1 Platform role with Meta: Tech Provider
