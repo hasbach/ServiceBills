@@ -99,7 +99,7 @@ def upgrade():
     pg = bind.dialect.name == 'postgresql'
 
     _add_columns(bind, pg, 'whats_app_settings', _SETTINGS_COLUMNS)
-    _add_columns(bind, pg, 'whatsapp_template', _TEMPLATE_COLUMNS)
+    _add_columns(bind, pg, 'whats_app_template', _TEMPLATE_COLUMNS)
 
     # FR-018: every pre-existing row is a manual configuration.
     bind.execute(text(
@@ -143,7 +143,7 @@ def downgrade():
         op.drop_index('ix_whatsapp_connection_event_created_at', table_name='whatsapp_connection_event')
         op.drop_index('ix_whatsapp_connection_event_tenant_id', table_name='whatsapp_connection_event')
         op.drop_table('whatsapp_connection_event')
-    for table, columns in (('whatsapp_template', _TEMPLATE_COLUMNS),
+    for table, columns in (('whats_app_template', _TEMPLATE_COLUMNS),
                            ('whats_app_settings', _SETTINGS_COLUMNS)):
         existing = {c['name'] for c in inspect(bind).get_columns(table)}
         with op.batch_alter_table(table) as batch:

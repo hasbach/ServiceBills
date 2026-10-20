@@ -65,7 +65,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
     - `connected_at` DateTime NULL
     - `connected_by_user_id` Integer NULL, FK `user.id` ON DELETE SET NULL
     - `last_health_check_at` DateTime NULL
-  - **On `whatsapp_template`**, add `standard_key` String(40) NULL and `param_map` JSON NULL.
+  - **On `whats_app_template`** (the ORM's auto-generated name, NOT `whatsapp_template`), add `standard_key` String(40) NULL and `param_map` JSON NULL.
   - **Create table `whatsapp_connection_event`** with:
     - `id` PK
     - `tenant_id` Integer FK tenant.id NOT NULL, indexed
