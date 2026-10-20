@@ -320,7 +320,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
   5. A message template being created through "Submit standard templates".
 
   Resubmit with notes describing the Tech Provider use case. This fixes the 2026-02-24 rejection (research.md R-0). Outside tenants can't connect until it is approved.
-- [ ] T044 Open a PR from `feat/whatsapp-auto-connect` to `main`. The description covers the three methods, the env vars that stay unset until Meta review passes (so the automatic methods remain hidden), the migration ID, and quickstart §3 rollout steps. After merge and deploy, run the quickstart §3 production checks.
+- [x] T044 (PR #47 opened 2026-10-20) Open a PR from `feat/whatsapp-auto-connect` to `main`. The description covers the three methods, the env vars that stay unset until Meta review passes (so the automatic methods remain hidden), the migration ID, and quickstart §3 rollout steps. After merge and deploy, run the quickstart §3 production checks.
 
 ---
 
