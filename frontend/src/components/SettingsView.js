@@ -32,6 +32,7 @@ import ExpenseCategoryManager from './ExpenseCategoryManager.js';
 import UserManagement from './UserManagement.js';
 import SectorManager from './SectorManager.js';
 import WhatsAppTemplatesManager from './WhatsAppTemplatesManager.js';
+import WhatsAppConnectCard from './WhatsAppConnectCard.js';
 import LicenseTab from './LicenseTab.js';
 import WhatsAppPublicUrlHelp from './WhatsAppPublicUrlHelp.js';
 import { formatStamp } from './formatStamp';
@@ -584,17 +585,28 @@ Read-Host -Prompt "Press Enter to exit"
 
     const [waWebhookUrl, setWaWebhookUrl] = useState('');
     const [publicUrlHelpOpen, setPublicUrlHelpOpen] = useState(false);
-    const fetchWASettings = useCallback(async () => {
+    // Automatic connection (WhatsAppConnectCard). The manual credential form
+    // shows for manual tenants (incl. everyone from before this feature),
+    // when the tenant picks "Manual configuration", or when the automatic
+    // methods aren't offered at all (on-prem / no platform Meta app).
+    const [waConnection, setWaConnection] = useState(null);
+    const [waManualSelected, setWaManualSelected] = useState(false);
+    const [waAutoAvailable, setWaAutoAvailable] = useState(null);
+    const waShowManual = !waConnection || waConnection.method === 'manual' || waManualSelected || waAutoAvailable === false;
+    // `silent` refetches without the full-tab spinner, so the connect card
+    // (and an in-progress Meta sign-in) stays mounted.
+    const fetchWASettings = useCallback(async ({ silent = false } = {}) => {
         if (!hasModule('whatsapp')) { setWaFetching(false); return; }
-        setWaFetching(true);
+        if (!silent) setWaFetching(true);
         try {
             const res = await apiService.fetchWhatsAppSettings();
             if (res.data?.settings) setWaForm(prev => ({ ...DEFAULT_WA, ...res.data.settings }));
             setWaWebhookUrl(res.data?.webhook_url || '');
+            setWaConnection(res.data?.connection || null);
         } catch (e) {
             console.error('Failed to load WhatsApp settings', e);
         } finally {
-            setWaFetching(false);
+            if (!silent) setWaFetching(false);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [apiService, modules]);
@@ -924,6 +936,21 @@ Read-Host -Prompt "Press Enter to exit"
                         <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}><CircularProgress /></Box>
                     ) : (
                         <>
+                            {/* Automatic connection: method choice + status */}
+                            <WhatsAppConnectCard
+                                connection={waConnection}
+                                manualVisible={waShowManual && waForm.mode === 'api'}
+                                onAutomaticAvailable={setWaAutoAvailable}
+                                onSelectManual={(on) => {
+                                    setWaManualSelected(on);
+                                    if (on) setWaForm(f => ({ ...f, mode: 'api' }));
+                                }}
+                                onConnectionChange={(conn) => {
+                                    setWaConnection(conn);
+                                    fetchWASettings({ silent: true });
+                                }}
+                            />
+
                             {/* Master Toggle */}
                             <Section icon={<WhatsAppIcon />} title="WhatsApp Notifications" subtitle="Send messages to customers on payment or renewal" color="#25D366">
                                 <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 2 }}>
@@ -991,8 +1018,8 @@ Read-Host -Prompt "Press Enter to exit"
                                 </Section>
                             </Collapse>
 
-                            {/* Meta API Settings */}
-                            <Collapse in={waForm.mode === 'api'}>
+                            {/* Meta API Settings: manual configuration only (own Meta app) */}
+                            <Collapse in={waForm.mode === 'api' && waShowManual}>
                                 <Section icon={<ApiIcon />} title="Meta Cloud API Credentials"
                                     subtitle="Get these from your Meta for Developers dashboard (developers.facebook.com)" color={theme.palette.primary.main}
                                     action={
@@ -1047,6 +1074,66 @@ Read-Host -Prompt "Press Enter to exit"
                                                 helperText="Latest stable: v19.0"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
+                                    </Grid>
+
+                                    <Divider sx={{ my: 3 }} />
+                                    <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1, color: theme.palette.primary.main }}>
+                                        🔗 Webhook (your own Meta app)
+                                    </Typography>
+                                    <Grid container spacing={2}>
+                                        <Grid item xs={12} md={6}>
+                                            <TextField fullWidth label="Webhook Verify Token" placeholder="delta_net_whatsapp_secret" {...waField('webhook_verify_token')}
+                                                helperText="Use this exact secret token in Meta Developer Console when configuring your Webhook"
+                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
+                                        </Grid>
+                                        <Grid item xs={12}>
+                                            <Alert severity="success" sx={{ borderRadius: '12px', bgcolor: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0', mb: 2 }}>
+                                                <strong>Your Webhook URL for Meta Console:</strong> <code>{waWebhookUrl || `${window.location.origin}/api/whatsapp/webhook`}</code>
+                                            </Alert>
+                                            {isOnprem && (
+                                                <Box sx={{ mb: 2 }}>
+                                                    <TextField fullWidth size="small" label="Public URL" placeholder="https://billing.example.com"
+                                                        value={bizForm.public_url}
+                                                        onChange={e => setBizForm(f => ({ ...f, public_url: e.target.value }))}
+                                                        helperText="The internet address of this PC. Used for the WhatsApp webhook and customer payment links." />
+                                                    <Box sx={{ display: 'flex', gap: 1, mt: 1, alignItems: 'center', flexWrap: 'wrap' }}>
+                                                        <Button size="small" variant="outlined" disabled={bizLoading} onClick={handleBizSubmit}
+                                                            sx={{ textTransform: 'none' }}>
+                                                            Save Public URL
+                                                        </Button>
+                                                        <Button size="small" sx={{ textTransform: 'none' }} onClick={() => setPublicUrlHelpOpen(true)}>
+                                                            How do I make this PC reachable from the internet?
+                                                        </Button>
+                                                    </Box>
+                                                    <WhatsAppPublicUrlHelp open={publicUrlHelpOpen} onClose={() => setPublicUrlHelpOpen(false)} />
+                                                </Box>
+                                            )}
+                                            <Button variant="outlined" color="primary" onClick={handleLinkWaba} disabled={linkingWaba}
+                                                sx={{ borderRadius: '12px', fontWeight: 600, textTransform: 'none' }}>
+                                                {linkingWaba ? 'Linking to Meta Account...' : '🔗 Force Link Webhook to Meta Account'}
+                                            </Button>
+                                        </Grid>
+                                    </Grid>
+
+                                    <Box sx={{ mt: 3, p: 2, borderRadius: '12px', bgcolor: alpha(theme.palette.primary.main, 0.05), border: `1px solid ${alpha(theme.palette.primary.main, 0.15)}` }}>
+                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', fontWeight: 600, mb: 0.5 }}>📚 Quick Setup Reference</Typography>
+                                        <Typography variant="caption" color="text.secondary">
+                                            1. Go to <strong>developers.facebook.com</strong> → Create App → Business type<br />
+                                            2. Add <strong>WhatsApp</strong> product → Get Phone Number ID + WABA ID<br />
+                                            3. Create a <strong>System User</strong> in Business Settings → Generate a token with both <strong>whatsapp_business_messaging</strong> and <strong>whatsapp_business_management</strong> permissions (the second is required to create/edit/delete templates from this app)<br />
+                                            4. Create and manage your message templates directly in the <strong>WhatsApp Templates</strong> tab above — no need to go to Meta Business Manager for template creation or approval status anymore, only to obtain your account/App ID/credentials<br />
+                                            5. Paste credentials above and save<br />
+                                            6. For real-time approval-status updates, enable <strong>message_template_status_update</strong> as a subscribed webhook field in your Meta App Dashboard (App configuration on Meta's side — this app's UI can't set it for you)
+                                        </Typography>
+                                    </Box>
+                                </Section>
+                            </Collapse>
+
+                            {/* Meta API Settings shared by every connection method */}
+                            <Collapse in={waForm.mode === 'api'}>
+                                <Section icon={<MessageIcon />} title="Automatic Messages (Meta Cloud API)"
+                                    subtitle="Template names, reply forwarding and auto-reply" color={theme.palette.primary.main}>
+                                    <Grid container spacing={2}>
                                         <Grid item xs={12} md={4}>
                                             <TextField fullWidth label="Template Language Code" placeholder="en" {...waField('template_language')}
                                                 helperText="e.g. en, ar, fr, es"
@@ -1207,11 +1294,6 @@ Read-Host -Prompt "Press Enter to exit"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
                                         </Grid>
                                         <Grid item xs={12} md={6}>
-                                            <TextField fullWidth label="Webhook Verify Token" placeholder="delta_net_whatsapp_secret" {...waField('webhook_verify_token')}
-                                                helperText="Use this exact secret token in Meta Developer Console when configuring your Webhook"
-                                                sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
-                                        </Grid>
-                                        <Grid item xs={12} md={6}>
                                             <TextField fullWidth label="Daily Keep-Alive Template" placeholder="daily_checkin" {...waField('template_forward_keepalive')}
                                                 helperText="Sent to the forwarding number once a day to prompt its own auto-reply and keep the 24h session open"
                                                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: '12px' } }} />
@@ -1222,33 +1304,6 @@ Read-Host -Prompt "Press Enter to exit"
                                                     ? `Last keep-alive sent: ${waForm.last_forwarding_keepalive_sent_at}`
                                                     : 'Keep-alive not sent yet — runs automatically once a day.'}
                                             </Typography>
-                                        </Grid>
-                                        <Grid item xs={12}>
-                                            <Alert severity="success" sx={{ borderRadius: '12px', bgcolor: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0', mb: 2 }}>
-                                                <strong>Your Webhook URL for Meta Console:</strong> <code>{waWebhookUrl || `${window.location.origin}/api/whatsapp/webhook`}</code>
-                                            </Alert>
-                                            {isOnprem && (
-                                                <Box sx={{ mb: 2 }}>
-                                                    <TextField fullWidth size="small" label="Public URL" placeholder="https://billing.example.com"
-                                                        value={bizForm.public_url}
-                                                        onChange={e => setBizForm(f => ({ ...f, public_url: e.target.value }))}
-                                                        helperText="The internet address of this PC. Used for the WhatsApp webhook and customer payment links." />
-                                                    <Box sx={{ display: 'flex', gap: 1, mt: 1, alignItems: 'center', flexWrap: 'wrap' }}>
-                                                        <Button size="small" variant="outlined" disabled={bizLoading} onClick={handleBizSubmit}
-                                                            sx={{ textTransform: 'none' }}>
-                                                            Save Public URL
-                                                        </Button>
-                                                        <Button size="small" sx={{ textTransform: 'none' }} onClick={() => setPublicUrlHelpOpen(true)}>
-                                                            How do I make this PC reachable from the internet?
-                                                        </Button>
-                                                    </Box>
-                                                    <WhatsAppPublicUrlHelp open={publicUrlHelpOpen} onClose={() => setPublicUrlHelpOpen(false)} />
-                                                </Box>
-                                            )}
-                                            <Button variant="outlined" color="primary" onClick={handleLinkWaba} disabled={linkingWaba}
-                                                sx={{ borderRadius: '12px', fontWeight: 600, textTransform: 'none' }}>
-                                                {linkingWaba ? 'Linking to Meta Account...' : '🔗 Force Link Webhook to Meta Account'}
-                                            </Button>
                                         </Grid>
                                         <Grid item xs={12}>
                                             <Divider sx={{ my: 2 }} />
@@ -1267,18 +1322,6 @@ Read-Host -Prompt "Press Enter to exit"
                                             )}
                                         </Grid>
                                     </Grid>
-
-                                    <Box sx={{ mt: 3, p: 2, borderRadius: '12px', bgcolor: alpha(theme.palette.primary.main, 0.05), border: `1px solid ${alpha(theme.palette.primary.main, 0.15)}` }}>
-                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', fontWeight: 600, mb: 0.5 }}>📚 Quick Setup Reference</Typography>
-                                        <Typography variant="caption" color="text.secondary">
-                                            1. Go to <strong>developers.facebook.com</strong> → Create App → Business type<br />
-                                            2. Add <strong>WhatsApp</strong> product → Get Phone Number ID + WABA ID<br />
-                                            3. Create a <strong>System User</strong> in Business Settings → Generate a token with both <strong>whatsapp_business_messaging</strong> and <strong>whatsapp_business_management</strong> permissions (the second is required to create/edit/delete templates from this app)<br />
-                                            4. Create and manage your message templates directly in the <strong>WhatsApp Templates</strong> tab above — no need to go to Meta Business Manager for template creation or approval status anymore, only to obtain your account/App ID/credentials<br />
-                                            5. Paste credentials above and save<br />
-                                            6. For real-time approval-status updates, enable <strong>message_template_status_update</strong> as a subscribed webhook field in your Meta App Dashboard (App configuration on Meta's side — this app's UI can't set it for you)
-                                        </Typography>
-                                    </Box>
                                 </Section>
                             </Collapse>
 

@@ -2186,7 +2186,7 @@ class WhatsAppMessage(db.Model):
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
     conversation_id = db.Column(db.Integer, db.ForeignKey('whatsapp_conversation.id'), nullable=False, index=True)
     direction = db.Column(db.String(3), nullable=False)          # 'in' | 'out'
-    sender = db.Column(db.String(10), nullable=False)            # 'customer' | 'ai' | 'admin' | 'system'
+    sender = db.Column(db.String(10), nullable=False)            # 'customer' | 'ai' | 'admin' | 'system' | 'phone' (coexistence echo)
     # SET NULL: deleting a staff account keeps the messages they sent.
     sent_by_user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
     msg_type = db.Column(db.String(20), nullable=False)
@@ -7806,6 +7806,11 @@ def save_whatsapp_settings():
         for f in fields:
             if f in data:
                 setattr(settings, f, data[f])
+        if not automatic:
+            settings.connection_method = 'manual'
+            settings.connection_status = ('connected' if settings.access_token and settings.phone_number_id
+                                          else 'disconnected')
+            settings.status_reason = None
         settings.updated_at = datetime.utcnow()
         db.session.commit()
 
@@ -8488,6 +8493,24 @@ def _validate_template_components(components):
     return None
 
 
+def _create_template_on_meta(settings, name, language, category, components, **row_fields):
+    """Submit a template to the tenant's WABA and add its local row (caller
+    commits). Returns (row, None) or (None, plain-language Meta error)."""
+    api_version = settings.api_version or 'v19.0'
+    url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates'
+    headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+    payload = {'name': name, 'language': language, 'category': category, 'components': components}
+    resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    if not resp.ok:
+        return None, _parse_meta_error(resp)
+    body = resp.json()
+    row = WhatsAppTemplate(tenant_id=settings.tenant_id, name=name, language=language, category=category,
+                           status=body.get('status', 'PENDING'), components=components,
+                           meta_template_id=body.get('id'), **row_fields)
+    db.session.add(row)
+    return row, None
+
+
 @app.route('/api/whatsapp/templates', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
@@ -8516,18 +8539,9 @@ def create_whatsapp_template():
         return jsonify({'error': error}), 400
 
     try:
-        api_version = settings.api_version or 'v19.0'
-        url = f'https://graph.facebook.com/{api_version}/{settings.business_account_id}/message_templates'
-        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
-        payload = {'name': name, 'language': language, 'category': category, 'components': components}
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        if not resp.ok:
-            return jsonify({'error': _parse_meta_error(resp)}), 400
-        body = resp.json()
-        row = new_for_tenant(WhatsAppTemplate, name=name, language=language, category=category,
-                              status=body.get('status', 'PENDING'), components=components,
-                              meta_template_id=body.get('id'))
-        db.session.add(row)
+        row, meta_error = _create_template_on_meta(settings, name, language, category, components)
+        if meta_error:
+            return jsonify({'error': meta_error}), 400
         db.session.commit()
         return jsonify({'message': 'Template submitted to Meta for review.', 'template': row.to_dict()}), 201
     except Exception as e:
@@ -8875,6 +8889,101 @@ def send_reseller_whatsapp(tenant_id, reseller_id, name, phone, event_type, cont
     return res
 
 
+def _wa_legacy_params(event_type, customer, context):
+    """Body parameters in the fixed order the platform has always sent them."""
+    user_body_params = []
+    if event_type == 'payment_paid':
+        amount_str = f"{float(context.get('amount', 0)):.2f}"
+        balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
+        user_body_params = [customer.name, amount_str, balance_str]
+    elif event_type == 'subscription_renewed':
+        expiry_date = str(context.get('expiry_date', ''))
+        plan_name = str(context.get('plan_name', customer.subscription_plan.name if customer.subscription_plan else 'N/A'))
+        balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
+        user_body_params = [customer.name, plan_name, expiry_date, balance_str]
+    elif event_type in ('payment_reminder', 'current_balance'):
+        balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
+        expiry_date = str(context.get('expiry_date', customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else 'N/A'))
+        user_body_params = [customer.name, balance_str, expiry_date]
+    elif event_type == 'payment_link':
+        # Deliberately the link's view_token ALONE, no other params -- see
+        # this task's design note on why the payment_link template's BODY
+        # component must have zero {{n}} placeholders (so
+        # user_body_params[0] is free for the URL button's {{1}} without
+        # colliding with a body placeholder consuming the same value).
+        user_body_params = [context.get('view_token', '')]
+    elif event_type == 'bulk_outage':
+        user_body_params = [context.get('message', 'an outage occured from the isp , will be repaired soon')]
+    elif event_type == 'bulk_maintenance':
+        user_body_params = [context.get('location', ''), context.get('estimated_time', '')]
+    elif event_type == 'reseller_credit_added':
+        amount_str = f"{float(context.get('amount', 0)):.2f}"
+        balance_str = f"{float(context.get('balance', 0)):.2f}"
+        user_body_params = [amount_str, balance_str]
+    elif event_type == 'reseller_discount_applied':
+        amount_str = f"{float(context.get('amount', 0)):.2f}"
+        balance_str = f"{float(context.get('balance', 0)):.2f}"
+        user_body_params = [amount_str, balance_str]
+    elif event_type == 'reseller_customer_renewed':
+        customer_name = context.get('customer_name', 'Unknown')
+        balance_str = f"{float(context.get('balance', 0)):.2f}"
+        user_body_params = [customer_name, balance_str]
+    elif event_type == 'reseller_payment_collected':
+        amount_str = f"{float(context.get('amount', 0)):.2f}"
+        balance_str = f"{float(context.get('balance', 0)):.2f}"
+        user_body_params = [amount_str, balance_str]
+    elif event_type in ('bulk_feature', 'bulk_offer'):
+        user_body_params = [context.get('message', '')]
+    else:
+        if context and isinstance(context.get('variables'), list):
+            user_body_params = context.get('variables')
+        elif context and context.get('message'):
+            user_body_params = [context.get('message')]
+    return user_body_params
+
+
+def _wa_semantic_params(event_type, customer, context):
+    """Same values as _wa_legacy_params, keyed by the semantic variable names of
+    wa_standard_templates.CATALOG (in that catalog's legacy order), or None for
+    events the catalog doesn't cover (reseller templates, custom sends)."""
+    context = context or {}
+    balance = lambda: f"{float(context.get('balance', customer.balance)):.2f}"
+    plan = lambda: str(context.get('plan_name', customer.subscription_plan.name if customer.subscription_plan else 'N/A'))
+    expiry = lambda: str(context.get('expiry_date', customer.subscription_expiry_date.strftime('%Y-%m-%d')
+                                     if customer.subscription_expiry_date else 'N/A'))
+    if event_type == 'payment_paid':
+        return {'customer_name': customer.name, 'amount': f"{float(context.get('amount', 0)):.2f}",
+                'balance': balance()}
+    if event_type in ('subscription_created', 'subscription_renewed'):
+        return {'customer_name': customer.name, 'plan': plan(), 'expiry_date': str(context.get('expiry_date', '')),
+                'balance': balance()}
+    if event_type in ('payment_reminder', 'current_balance'):
+        return {'customer_name': customer.name, 'balance': balance(), 'expiry_date': expiry()}
+    if event_type == 'payment_link':
+        return {'pay_token': context.get('view_token', '')}
+    if event_type == 'bulk_outage':
+        return {'message': context.get('message', 'an outage occured from the isp , will be repaired soon')}
+    if event_type == 'bulk_maintenance':
+        return {'location': context.get('location', ''), 'eta': context.get('estimated_time', '')}
+    if event_type in ('bulk_feature', 'bulk_offer'):
+        return {'message': context.get('message', '')}
+    return None
+
+
+def _wa_template_body_params(settings, template_name, event_type, customer, context):
+    legacy = _wa_legacy_params(event_type, customer, context)
+    # payment_link's URL button reads the first param, so it never reorders.
+    if event_type == 'payment_link':
+        return legacy
+    semantic = _wa_semantic_params(event_type, customer, context)
+    if semantic is None:
+        return legacy
+    row = WhatsAppTemplate.query.filter_by(tenant_id=settings.tenant_id, name=template_name)         .filter(WhatsAppTemplate.param_map.isnot(None)).first()
+    if row is None or not isinstance(row.param_map, list):
+        return legacy
+    return [semantic.get(k, '') for k in row.param_map]
+
+
 def send_whatsapp_message(customer, event_type, context=None):
     """
     Sends a WhatsApp message to a customer if the WhatsApp API mode is enabled.
@@ -8950,55 +9059,11 @@ def send_whatsapp_message(customer, event_type, context=None):
             'Content-Type': 'application/json',
         }
 
-        # Build template components (header / body parameters)
-        user_body_params = []
-        if event_type == 'payment_paid':
-            amount_str = f"{float(context.get('amount', 0)):.2f}"
-            balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
-            user_body_params = [customer.name, amount_str, balance_str]
-        elif event_type == 'subscription_renewed':
-            expiry_date = str(context.get('expiry_date', ''))
-            plan_name = str(context.get('plan_name', customer.subscription_plan.name if customer.subscription_plan else 'N/A'))
-            balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
-            user_body_params = [customer.name, plan_name, expiry_date, balance_str]
-        elif event_type in ('payment_reminder', 'current_balance'):
-            balance_str = f"{float(context.get('balance', customer.balance)):.2f}"
-            expiry_date = str(context.get('expiry_date', customer.subscription_expiry_date.strftime('%Y-%m-%d') if customer.subscription_expiry_date else 'N/A'))
-            user_body_params = [customer.name, balance_str, expiry_date]
-        elif event_type == 'payment_link':
-            # Deliberately the link's view_token ALONE, no other params -- see
-            # this task's design note on why the payment_link template's BODY
-            # component must have zero {{n}} placeholders (so
-            # user_body_params[0] is free for the URL button's {{1}} without
-            # colliding with a body placeholder consuming the same value).
-            user_body_params = [context.get('view_token', '')]
-        elif event_type == 'bulk_outage':
-            user_body_params = [context.get('message', 'an outage occured from the isp , will be repaired soon')]
-        elif event_type == 'bulk_maintenance':
-            user_body_params = [context.get('location', ''), context.get('estimated_time', '')]
-        elif event_type == 'reseller_credit_added':
-            amount_str = f"{float(context.get('amount', 0)):.2f}"
-            balance_str = f"{float(context.get('balance', 0)):.2f}"
-            user_body_params = [amount_str, balance_str]
-        elif event_type == 'reseller_discount_applied':
-            amount_str = f"{float(context.get('amount', 0)):.2f}"
-            balance_str = f"{float(context.get('balance', 0)):.2f}"
-            user_body_params = [amount_str, balance_str]
-        elif event_type == 'reseller_customer_renewed':
-            customer_name = context.get('customer_name', 'Unknown')
-            balance_str = f"{float(context.get('balance', 0)):.2f}"
-            user_body_params = [customer_name, balance_str]
-        elif event_type == 'reseller_payment_collected':
-            amount_str = f"{float(context.get('amount', 0)):.2f}"
-            balance_str = f"{float(context.get('balance', 0)):.2f}"
-            user_body_params = [amount_str, balance_str]
-        elif event_type in ('bulk_feature', 'bulk_offer'):
-            user_body_params = [context.get('message', '')]
-        else:
-            if context and isinstance(context.get('variables'), list):
-                user_body_params = context.get('variables')
-            elif context and context.get('message'):
-                user_body_params = [context.get('message')]
+        # Build template components (header / body parameters). A template
+        # submitted from the standard catalog carries a param_map (semantic key
+        # per {{n}}) because the tenant may have moved its variables around;
+        # every other template keeps the legacy fixed order.
+        user_body_params = _wa_template_body_params(settings, template_name, event_type, customer, context)
 
         user_header_params = context.get('header_url') or context.get('image_url') or context.get('media_url')
 
@@ -9912,11 +9977,34 @@ def whatsapp_webhook():
                     logging.info(f"WhatsApp webhook: resolved settings.id={settings.id} tenant_id={settings.tenant_id} "
                                  f"forwarding_mobile={settings.forwarding_mobile!r} for phone_number_id={incoming_pnid}")
                     resolved_tenant_id = settings.tenant_id
+                    _appmod = sys.modules[__name__]
+
+                    # Coexistence: what the tenant typed in the WhatsApp Business app on
+                    # their phone. Recorded as sender='phone' and never routed into the
+                    # inbound / auto-reply / AI / ticket path below.
+                    if change.get('field') == 'smb_message_echoes':
+                        try:
+                            _echo_media = whatsapp_inbox.record_phone_echoes(_appmod, resolved_tenant_id, val)
+                            db.session.commit()
+                        except Exception as ex_echo:
+                            db.session.rollback()
+                            logging.error(f"WhatsApp echo: could not record for tenant_id={resolved_tenant_id}: {ex_echo}")
+                            _echo_media = []
+                        for _echo_id in _echo_media:
+                            if settings.access_token:
+                                whatsapp_inbox.run_background(app, functools.partial(
+                                    whatsapp_inbox.store_inbound_media, _appmod, _echo_id,
+                                    settings.access_token, settings.api_version or 'v19.0'),
+                                    pool=whatsapp_inbox.media_pool())
+                        continue
+                    # Chat history / contact sync is never requested (FR-014); ignore it if it arrives.
+                    if change.get('field') in ('history', 'smb_app_state_sync'):
+                        logging.debug(f"WhatsApp webhook: ignoring {change.get('field')} for tenant_id={resolved_tenant_id}")
+                        continue
 
                     # Delivery/read/failure receipts for messages WE sent (e.g. the forwarded
                     # alert to forwarding_mobile). Meta reports these separately from inbound
                     # "messages" -- log them so a silent delivery failure is diagnosable.
-                    _appmod = sys.modules[__name__]
                     for st in val.get('statuses', []):
                         st_status = st.get('status')
                         st_recipient = st.get('recipient_id')
@@ -10220,6 +10308,9 @@ def whatsapp_webhook():
 
 import whatsapp_inbox_routes
 whatsapp_inbox_routes.register_inbox_routes(app, sys.modules[__name__])
+
+import wa_connect_routes
+wa_connect_routes.register_wa_connect_routes(app, sys.modules[__name__])
 
 import customer_import
 customer_import.register_customer_import_routes(app, sys.modules[__name__])

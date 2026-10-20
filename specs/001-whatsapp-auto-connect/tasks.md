@@ -115,7 +115,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 ### Tests for User Story 1 ⚠️ write first, they must fail
 
-- [ ] T011 [P] [US1] Add connect-flow tests to `tests/test_whatsapp_connect.py`, mocking `wa_connect.requests.get`/`post`:
+- [x] T011 [P] [US1] Add connect-flow tests to `tests/test_whatsapp_connect.py`, mocking `wa_connect.requests.get`/`post`:
   - `POST /api/whatsapp/connect/complete` with `method='coexistence'` exchanges the code (`GET /oauth/access_token` with `client_id`, `client_secret`, `code` and no `redirect_uri`), calls `debug_token`, rejects with 403 when `waba_id` is not in the `whatsapp_business_management` `target_ids`, and fetches `/{phone_number_id}`.
   - It never calls `/register`, calls `POST /{waba_id}/subscribed_apps`, and stores `access_token`, `phone_number_id`, `business_account_id`, `meta_business_id`, `display_phone_number`, `verified_name`, `quality_rating`, `token_obtained_at`, `connected_at` and `connected_by_user_id`.
   - After success: `mode='api'`, `enabled=True`, `connection_method='coexistence'`, `connection_status='connected'`, `auto_reply_enabled=False`, `app_id` and `app_secret` are NULL, and a `connect` event is written.
@@ -124,14 +124,14 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
   - Returns 402 when the plan lacks `whatsapp_api`, and 404 when `META_APP_ID` is unset.
   - A non-admin (finance role) gets 403.
   - Calling again for the same tenant and the same `phone_number_id` returns 200 and refreshes the values.
-- [ ] T012 [P] [US1] Create `tests/test_whatsapp_echoes.py`, using `tests/inbox_helpers.py` plus the T003 fixtures, signed with `META_APP_SECRET` for a coexistence tenant:
+- [x] T012 [P] [US1] Create `tests/test_whatsapp_echoes.py`, using `tests/inbox_helpers.py` plus the T003 fixtures, signed with `META_APP_SECRET` for a coexistence tenant:
   - A text echo creates a `WhatsAppMessage` with `direction='out'`, `sender='phone'` and `status='sent'` in the conversation keyed by `to`, sets `conversation.ai_paused=True`, and triggers no auto-reply, AI run or `SupportTicket`.
   - A duplicate echo `id` is ignored.
   - An edit echo replaces the original's `text` and sets `status='edited'`.
   - A revoke echo sets the original's `status='revoked'`.
   - A `history` payload returns 200 and creates nothing.
   - An image echo stores `wa_media_id`.
-- [ ] T013 [P] [US1] Create `tests/test_whatsapp_standard_templates.py`:
+- [x] T013 [P] [US1] Create `tests/test_whatsapp_standard_templates.py`:
   - Each catalog entry's `variables` equals the parameter keys `send_whatsapp_message` sends for that event. This pins the catalog to the real send code: `payment_paid → [customer_name, amount, balance]`, `subscription_renewed → [customer_name, plan, expiry_date, balance]`, `payment_reminder`/`current_balance → [customer_name, balance, expiry_date]`, `bulk_outage → [message]`, `bulk_maintenance → [location, eta]`, `bulk_feature`/`bulk_offer → [message]`, and `payment_link` → a body with no variables plus a URL button `{pay_token}`.
   - Validation rejects a body that is missing a variable (the error names it, e.g. "Missing variable {balance}"), has an extra or unknown variable, uses a variable twice, starts or ends with a variable, or exceeds the limits "body 1024, header 60, footer 60".
   - Renumbering `"Paid {amount} by {customer_name}, balance {balance}"` gives `"Paid {{1}} by {{2}}, balance {{3}}"` with `param_map=["amount","customer_name","balance"]` and `example.body_text` built from `sample_values` in the same order.
@@ -141,7 +141,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
 
 ### Implementation for User Story 1
 
-- [ ] T014 [US1] Implement `complete_connection(tenant, user, *, method, code, waba_id, phone_number_id, business_id, es_event)` in `wa_connect.py`. Follow research.md R-3 steps 1–8 in order, with a 10 s timeout on each Graph call:
+- [x] T014 [US1] Implement `complete_connection(tenant, user, *, method, code, waba_id, phone_number_id, business_id, es_event)` in `wa_connect.py`. Follow research.md R-3 steps 1–8 in order, with a 10 s timeout on each Graph call:
   1. Exchange the code.
   2. Check `debug_token` ownership.
   3. Check for duplicates across *other* tenants.
@@ -152,28 +152,28 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
   8. Only now, in one transaction: write the credentials and display fields, set `mode='api'`, `enabled=True`, `connection_method`, `connection_status='connected'`, `status_reason=None`, NULL `app_id`/`app_secret`, and for coexistence `auto_reply_enabled=False`. Log a `connect` event, or a `reconnect`/`method_change` event when a previous connection existed.
 
   Raise a `ConnectError(status_code, message, meta_code)` with plain-language messages. Map Meta codes: 133016 → "Registration limit reached for this number — try again in 72 hours"; 190 → "Meta sign-in expired, please try again".
-- [ ] T015 [US1] Create `wa_connect_routes.py`, a blueprint registered in `app.py` the same way `whatsapp_inbox_routes` is registered. Every route uses `@jwt_required()`, `@admin_required()` and `@require_module('whatsapp')`, returns 404 when `not wa_connect.automatic_available()` (config excepted), and returns 402 when `not plans.limits(current_tenant().plan)["whatsapp_api"]`. Routes:
+- [x] T015 [US1] Create `wa_connect_routes.py`, a blueprint registered in `app.py` the same way `whatsapp_inbox_routes` is registered. Every route uses `@jwt_required()`, `@admin_required()` and `@require_module('whatsapp')`, returns 404 when `not wa_connect.automatic_available()` (config excepted), and returns 402 when `not plans.limits(current_tenant().plan)["whatsapp_api"]`. Routes:
   - `GET /api/whatsapp/connect/config`: returns `automatic_available`, `coexistence_available`, `app_id`, `graph_version`, `es_config_id`, `es_coex_config_id`, `coex_extras` and `plan_allows_api`. No secrets.
   - `POST /api/whatsapp/connect/complete`: calls `complete_connection` and maps `ConnectError` to its status code with `{"error","meta_code"}`. Rejects 400 when `method='coexistence'` comes with `es_event` other than `FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING`, or `method='embedded'` with `es_event` other than `FINISH`.
   - `GET /api/whatsapp/connect/status`: returns `{connection, events}` with the latest 20 events, newest first.
-- [ ] T016 [US1] Handle `smb_message_echoes` and `history` in the webhook POST loop in `app.py` (~9770, inside the per-change loop and after the HMAC check). When `change['field'] == 'smb_message_echoes'`, call a new `whatsapp_inbox.record_phone_echoes(tenant_id, value)` and `continue`. When the field is `'history'` or `'smb_app_state_sync'`, log at debug level and `continue`. Make sure echoes never reach the inbound-messages, auto-reply, AI or ticket code paths.
-- [ ] T017 [US1] Implement `record_phone_echoes(tenant_id, value)` in `whatsapp_inbox.py`. For each item in `value['message_echoes']`:
+- [x] T016 [US1] Handle `smb_message_echoes` and `history` in the webhook POST loop in `app.py` (~9770, inside the per-change loop and after the HMAC check). When `change['field'] == 'smb_message_echoes'`, call a new `whatsapp_inbox.record_phone_echoes(tenant_id, value)` and `continue`. When the field is `'history'` or `'smb_app_state_sync'`, log at debug level and `continue`. Make sure echoes never reach the inbound-messages, auto-reply, AI or ticket code paths.
+- [x] T017 [US1] Implement `record_phone_echoes(tenant_id, value)` in `whatsapp_inbox.py`. For each item in `value['message_echoes']`:
   - **Edit**: if `edit` is present, update the message with `wa_message_id == edit['original_message_id']`, setting `text` and `status='edited'`.
   - **Revoke**: if `revoke` is present, set that message's `status='revoked'`.
   - **Otherwise**: `upsert_conversation(tenant_id, item['to'])`, then `record_outbound` with `sender='phone'`, `direction='out'`, `status='sent'`, `wa_message_id=item['id']`, `msg_type=item['type']`, the text from `text.body` and the media ID from `<type>.id`. Swallow the duplicate-`wa_message_id` `IntegrityError` the same way `record_inbound` does. Set `conversation.ai_paused=True` and refresh the conversation's last-message preview.
 
   Add `'phone'` to the sender comment on `WhatsAppMessage.sender` in `app.py` (~2105).
-- [ ] T018 [P] [US1] Create `wa_standard_templates.py` with the catalog from data-model.md §5:
+- [x] T018 [P] [US1] Create `wa_standard_templates.py` with the catalog from data-model.md §5:
   - One entry per key: `payment_paid`, `subscription_created`, `subscription_renewed`, `payment_reminder`, `current_balance`, `payment_link`, `forward_alert`, `forward_keepalive`, `bulk_outage`, `bulk_maintenance`, `bulk_feature`, `bulk_offer`.
   - Each entry has `default_name` equal to the current `WhatsAppSettings.template_*` default, plus `settings_field`, `category`, `language='en'`, `header`/`body`/`footer`/`buttons` written with `{named}` placeholders, `variables` in legacy order with human labels, and `sample_values`.
   - Read the real variable lists for `subscription_created`, `forward_alert` and `forward_keepalive` from `send_whatsapp_message` (~8854–8901), `cs_agent_tools.escalate_to_human` (~836–870) and `send_daily_whatsapp_keepalive` (~3878) before writing those entries.
   - Implement `validate_item(key, header, body, footer, buttons) -> list[str]` with the rules in data-model.md §5.
   - Implement `to_meta_components(key, header, body, footer, buttons) -> (components, param_map)`, which renumbers placeholders by order of appearance and fills `example.body_text` and header/button examples from `sample_values`.
-- [ ] T019 [US1] Add the standard-template routes in `wa_connect_routes.py`, both admin-only and requiring `settings.mode=='api'` with a token and a WABA:
+- [x] T019 [US1] Add the standard-template routes in `wa_connect_routes.py`, both admin-only and requiring `settings.mode=='api'` with a token and a WABA:
   - `GET /api/whatsapp/standard-templates`: the catalog merged with the tenant's `WhatsAppTemplate` rows by name, including `existing: {status, id}` when found.
   - `POST /api/whatsapp/standard-templates/submit`: validates each item. Valid items not marked `use_existing` are created through the same code path as `create_whatsapp_template` (app.py ~8396). Extract the Meta POST and local-row creation into a reusable `_create_template_on_meta(settings, name, language, category, components)` helper in `app.py`, and keep the existing route's behavior identical. Set `standard_key` and `param_map` on the row and write the name into `getattr(settings, settings_field)`. Returns per-item results as in contracts/http-api.md.
-- [ ] T020 [US1] Make `send_whatsapp_message` in `app.py` (~8854–8901) build its body parameters as a dict keyed by the semantic names from T018. Then look up the tenant's `WhatsAppTemplate` row by template name and language. If that row has `param_map`, order the values by `param_map`; otherwise use the existing legacy order, so the output stays byte-identical for tenants without a `param_map`. Apply the same ordering wherever `whatsapp_inbox.send_admin_message` calls `build_meta_template_payload` with semantic params, if it does. Do not change the reseller template paths.
-- [ ] T021 [P] [US1] Create `frontend/src/components/WhatsAppConnectCard.js`:
+- [x] T020 [US1] Make `send_whatsapp_message` in `app.py` (~8854–8901) build its body parameters as a dict keyed by the semantic names from T018. Then look up the tenant's `WhatsAppTemplate` row by template name and language. If that row has `param_map`, order the values by `param_map`; otherwise use the existing legacy order, so the output stays byte-identical for tenants without a `param_map`. Apply the same ordering wherever `whatsapp_inbox.send_admin_message` calls `build_meta_template_payload` with semantic params, if it does. Do not change the reseller template paths.
+- [x] T021 [P] [US1] Create `frontend/src/components/WhatsAppConnectCard.js`:
   - **Methods**: on mount, fetch `/api/whatsapp/connect/config` and `/api/whatsapp/connect/status` through new `AppContext` methods. Render three method cards: "Use my WhatsApp Business app number (coexistence)", "New number (WhatsApp Business API)" and "Manual configuration", each with its one-line explanation. Lock the automatic cards with `LockIcon` and an upgrade message when `plan_allows_api` is false, using the Whish-tab pattern in `SettingsView.js` ~1300. Hide coexistence when `coexistence_available` is false, and hide both automatic cards when `automatic_available` is false.
   - **SDK**: load `https://connect.facebook.net/en_US/sdk.js` on first click and call `FB.init({appId, version: graph_version, xfbml:false})`.
   - **Coexistence info**: before launching coexistence, show an info dialog listing what stops working: groups, broadcast lists, disappearing messages, Windows/WearOS companions, and that the phone app must be opened at least every ~14 days.
@@ -183,14 +183,14 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
   - **Status card**: on success, show the ConnectionView fields (method, number, verified name, business name, quality, limit, payment-method status with a WhatsApp Manager link when `missing`/`unknown`, and connected-at/by).
   - **Templates prompt**: if no standard template exists yet, show a "Submit standard templates" button that opens T022's dialog.
   - **Layout**: must work at 375 px width.
-- [ ] T022 [P] [US1] Create `frontend/src/components/StandardTemplatesDialog.js`:
+- [x] T022 [P] [US1] Create `frontend/src/components/StandardTemplatesDialog.js`:
   - Load `GET /api/whatsapp/standard-templates`. List each template with a checkbox, its name, its existing status chip, a "use existing" option when it already exists, and editable header/body/footer/button text fields.
   - Render variables as labeled chips (e.g. "Customer name") inside the text, with an "insert variable" menu limited to that template's `variables`.
   - Show live validation that mirrors the server: name any missing or extra variable, warn about a leading or trailing variable, and show length counters for "body 1024, header 60, footer 60".
   - Disable submit for invalid selected items. POST to `/api/whatsapp/standard-templates/submit` and show per-item results.
   - Must work at 375 px width.
-- [ ] T023 [US1] Integrate in `frontend/src/components/SettingsView.js` on the WhatsApp tab (~921–1295). Render `<WhatsAppConnectCard>` at the top. Move the existing API-credential section (~995–1056) plus the verify-token, webhook URL and "Link WABA" block (~1200–1250) under the "Manual configuration" card, shown only when manual is selected or `connection.method==='manual'`. Leave the deeplink/api toggle, the template-name autocompletes, forwarding and auto-reply fields as they are. Add the API methods to `frontend/src/context/AppContext.js`: `getWaConnectConfig`, `getWaConnectStatus`, `completeWaConnect`, `refreshWaConnect`, `disconnectWa`, `getStandardTemplates`, `submitStandardTemplates`.
-- [ ] T024 [US1] Run `python -m pytest tests/test_whatsapp_connect.py tests/test_whatsapp_echoes.py tests/test_whatsapp_standard_templates.py -q` plus the regression set `tests/test_iso_webhook.py tests/test_whatsapp_templates.py tests/test_whatsapp_inbox_*.py tests/test_reseller_whatsapp.py tests/test_whatsapp_keepalive.py`. Build the frontend (`npm run build` in `frontend/`). Then run quickstart §2 steps 3, 5 and 6 on an isolated local server: pin `cwd` and a scratch `DATABASE_URL`, and never use the real dev DB.
+- [x] T023 [US1] Integrate in `frontend/src/components/SettingsView.js` on the WhatsApp tab (~921–1295). Render `<WhatsAppConnectCard>` at the top. Move the existing API-credential section (~995–1056) plus the verify-token, webhook URL and "Link WABA" block (~1200–1250) under the "Manual configuration" card, shown only when manual is selected or `connection.method==='manual'`. Leave the deeplink/api toggle, the template-name autocompletes, forwarding and auto-reply fields as they are. Add the API methods to `frontend/src/context/AppContext.js`: `getWaConnectConfig`, `getWaConnectStatus`, `completeWaConnect`, `refreshWaConnect`, `disconnectWa`, `getStandardTemplates`, `submitStandardTemplates`.
+- [x] T024 [US1] Run `python -m pytest tests/test_whatsapp_connect.py tests/test_whatsapp_echoes.py tests/test_whatsapp_standard_templates.py -q` plus the regression set `tests/test_iso_webhook.py tests/test_whatsapp_templates.py tests/test_whatsapp_inbox_*.py tests/test_reseller_whatsapp.py tests/test_whatsapp_keepalive.py`. Build the frontend (`npm run build` in `frontend/`). Then run quickstart §2 steps 3, 5 and 6 on an isolated local server: pin `cwd` and a scratch `DATABASE_URL`, and never use the real dev DB.
 
 **Checkpoint**: coexistence works end to end. This is the MVP.
 
@@ -277,6 +277,7 @@ description: "Task list for Automatic WhatsApp Connection (coexistence / new API
   - `handle_quality_update(settings, value)`, per §3.
   - `check_health(settings) -> bool`, which does a `GET /{phone_number_id}` with the stored token, updates the display fields and `last_health_check_at`, and sets `connected` or `needs_attention`.
   - `disconnect(settings, user)`, per contracts/http-api.md. It works for manual tenants too (clears `access_token` and `app_secret`).
+  - `disconnect` must also accept `next_method='manual'` (sent by the UI when the tenant picks "Manual configuration" while an automatic connection is live) and then set `connection_method='manual'`. Otherwise `POST /api/whatsapp-settings` keeps ignoring the credentials the tenant types next. Add a test for it.
   - `is_auth_error(meta_error) -> bool`: true for code 190, or 200/10 permission errors.
 - [ ] T034 [US4] Add webhook dispatch in `app.py` for `account_update` (tenant resolved by `value.get('waba_info',{}).get('waba_id') or entry['id']` against `business_account_id`, HMAC-verified via `wa_app_identity`) and for `phone_number_quality_update` (resolved by `entry['id']`). Neither field may fall into the messages path.
 - [ ] T035 [US4] Hook send errors in two places: `send_whatsapp_message` in `app.py` (~8778) and `whatsapp_inbox._post_message` in `whatsapp_inbox.py` (~466).

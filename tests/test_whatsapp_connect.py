@@ -223,3 +223,220 @@ def test_webhook_prefers_routable_row_when_pnid_shared(app, client, platform_met
     _make_automatic(app, old_tid, status="disconnected")
     setup_wa_tenant(app, client, "Biz New", "new_admin", "PN_SHARED", secret="new-secret")
     assert signed_post(client, wa_payload("PN_SHARED", statuses=[]), "new-secret").status_code == 200
+
+
+# ---- US1: connect flow (POST /api/whatsapp/connect/complete) ----------------
+
+class GraphResp:
+    def __init__(self, body=None, status=200):
+        self.status_code = status
+        self.ok = 200 <= status < 300
+        self._body = body if body is not None else {}
+        self.text = str(self._body)
+
+    def json(self):
+        return self._body
+
+
+class FakeGraph:
+    """Routes wa_connect's Graph calls by (METHOD, path) and records them."""
+
+    def __init__(self, waba="WABA_NEW", pnid="PN_NEW", is_on_biz_app=True, overrides=None):
+        self.calls = []
+        self.routes = {
+            ("GET", "oauth/access_token"): GraphResp({"access_token": "BIZ_TOKEN"}),
+            ("GET", "debug_token"): GraphResp({"data": {"is_valid": True, "granular_scopes": [
+                {"scope": "whatsapp_business_management", "target_ids": [waba]},
+                {"scope": "whatsapp_business_messaging", "target_ids": [waba]}]}}),
+            ("GET", pnid): GraphResp({"id": pnid, "display_phone_number": "+961 70 000 001",
+                                      "verified_name": "Delta Net", "quality_rating": "GREEN",
+                                      "status": "CONNECTED", "platform_type": "CLOUD_API",
+                                      "is_on_biz_app": is_on_biz_app,
+                                      "whatsapp_business_manager_messaging_limit": "TIER_250"}),
+            ("POST", pnid + "/register"): GraphResp({"success": True}),
+            ("POST", waba + "/subscribed_apps"): GraphResp({"success": True}),
+            ("GET", waba): GraphResp({"id": waba, "name": "Delta Net WABA", "primary_funding_id": "F1"}),
+        }
+        self.routes.update(overrides or {})
+
+    def _route(self, method, url, **kw):
+        path = url.split("graph.facebook.com/", 1)[1].split("/", 1)[1]
+        self.calls.append((method, path, kw))
+        resp = self.routes.get((method, path))
+        if resp is None:
+            raise AssertionError(f"unexpected Graph call {method} {path}")
+        return resp
+
+    def get(self, url, **kw):
+        return self._route("GET", url, **kw)
+
+    def post(self, url, **kw):
+        return self._route("POST", url, **kw)
+
+    def delete(self, url, **kw):
+        return self._route("DELETE", url, **kw)
+
+    def paths(self):
+        return [(m, p) for m, p, _ in self.calls]
+
+
+def _pro(app, tid):
+    with app.app_context():
+        appmod.db.session.get(appmod.Tenant, tid).plan = "pro"
+        appmod.db.session.commit()
+
+
+def _fresh_tenant(app, client, name, user, plan="pro"):
+    from tests.conftest import make_tenant
+    hdr = make_tenant(client, name, user)
+    with app.app_context():
+        tid = appmod.User.query.filter_by(username=user).first().tenant_id
+        appmod.db.session.get(appmod.Tenant, tid).plan = plan
+        appmod.db.session.commit()
+    return hdr, tid
+
+
+def _install(monkeypatch, graph):
+    monkeypatch.setattr(wa_connect.requests, "get", graph.get)
+    monkeypatch.setattr(wa_connect.requests, "post", graph.post)
+    monkeypatch.setattr(wa_connect.requests, "delete", graph.delete)
+
+
+COEX_BODY = {"method": "coexistence", "code": "CODE1", "waba_id": "WABA_NEW",
+             "phone_number_id": "PN_NEW", "business_id": "BIZ1",
+             "es_event": "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING"}
+
+
+def test_connect_coexistence_success(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz C1", "c1_admin")
+    graph = FakeGraph()
+    _install(monkeypatch, graph)
+    r = client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY)
+    assert r.status_code == 200, r.get_json()
+    conn = r.get_json()["connection"]
+    assert conn["method"] == "coexistence" and conn["status"] == "connected"
+    assert conn["display_phone_number"] == "+961 70 000 001"
+    assert conn["meta_business_name"] == "Delta Net WABA"
+    assert "access_token" not in conn
+
+    paths = graph.paths()
+    exchange = next(kw for m, p, kw in graph.calls if p == "oauth/access_token")
+    assert exchange["params"]["client_id"] == "PLATFORM_APP"
+    assert exchange["params"]["client_secret"] == PLATFORM_SECRET
+    assert exchange["params"]["code"] == "CODE1"
+    assert "redirect_uri" not in exchange["params"]
+    assert ("GET", "debug_token") in paths
+    assert ("POST", "WABA_NEW/subscribed_apps") in paths
+    assert not any(p.endswith("/register") for _, p in paths)   # forbidden for coexistence
+
+    with app.app_context():
+        s = appmod.WhatsAppSettings.query.filter_by(tenant_id=tid).first()
+        assert s.access_token == "BIZ_TOKEN"
+        assert s.phone_number_id == "PN_NEW" and s.business_account_id == "WABA_NEW"
+        assert s.meta_business_id == "BIZ1"
+        assert s.mode == "api" and s.enabled is True
+        assert s.connection_method == "coexistence" and s.connection_status == "connected"
+        assert s.auto_reply_enabled is False       # FR-013
+        assert s.app_id is None and s.app_secret is None
+        assert s.quality_rating == "GREEN" and s.messaging_limit_tier == "TIER_250"
+        assert s.payment_method_status == "present"
+        assert s.token_obtained_at and s.connected_at
+        assert s.connected_by_user_id == appmod.User.query.filter_by(username="c1_admin").first().id
+        events = [e.event for e in appmod.WhatsAppConnectionEvent.query.filter_by(tenant_id=tid)]
+        assert events == ["connect"]
+
+
+def test_connect_rejects_waba_not_granted(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz C2", "c2_admin")
+    graph = FakeGraph(overrides={("GET", "debug_token"): GraphResp({"data": {"granular_scopes": [
+        {"scope": "whatsapp_business_management", "target_ids": ["SOMEONE_ELSES_WABA"]}]}})})
+    _install(monkeypatch, graph)
+    r = client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY)
+    assert r.status_code == 403
+    assert not any(p.endswith("subscribed_apps") for _, p in graph.paths())
+
+
+def test_connect_rejects_number_owned_by_other_tenant(app, client, platform_meta, monkeypatch):
+    setup_wa_tenant(app, client, "Biz Owner", "owner_admin", "PN_NEW")
+    hdr, tid = _fresh_tenant(app, client, "Biz C3", "c3_admin")
+    _install(monkeypatch, FakeGraph())
+    r = client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY)
+    assert r.status_code == 409
+    assert "already connected" in r.get_json()["error"]
+
+
+def test_connect_failure_leaves_settings_unchanged(app, client, platform_meta, monkeypatch):
+    hdr, tid = setup_wa_tenant(app, client, "Biz C4", "c4_admin", "PN_OLD", secret="old-sec", token="old-tok")
+    _pro(app, tid)
+    with app.app_context():
+        before = appmod.WhatsAppSettings.query.filter_by(tenant_id=tid).first().to_dict()
+    graph = FakeGraph(overrides={("POST", "WABA_NEW/subscribed_apps"): GraphResp(
+        {"error": {"message": "Boom", "code": 100}}, status=400)})
+    _install(monkeypatch, graph)
+    r = client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY)
+    assert r.status_code == 502
+    with app.app_context():
+        after = appmod.WhatsAppSettings.query.filter_by(tenant_id=tid).first().to_dict()
+        assert after == before
+        events = appmod.WhatsAppConnectionEvent.query.filter_by(tenant_id=tid).all()
+        assert [e.event for e in events] == ["connect_failed"]
+        assert "Boom" in events[0].detail
+
+
+def test_connect_coexistence_requires_business_app_number(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz C5", "c5_admin")
+    _install(monkeypatch, FakeGraph(is_on_biz_app=False))
+    r = client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY)
+    assert r.status_code == 502
+    assert "coexistence" in r.get_json()["error"]
+
+
+def test_connect_gates(app, client, platform_meta, monkeypatch):
+    _install(monkeypatch, FakeGraph())
+    hdr, _ = _fresh_tenant(app, client, "Biz C6", "c6_admin", plan="free")
+    assert client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY).status_code == 402
+    hdr2, _ = _fresh_tenant(app, client, "Biz C7", "c7_admin")
+    bad = dict(COEX_BODY, es_event="FINISH")
+    assert client.post("/api/whatsapp/connect/complete", headers=hdr2, json=bad).status_code == 400
+    monkeypatch.setattr(Config, "META_APP_ID", None)
+    assert client.post("/api/whatsapp/connect/complete", headers=hdr2, json=COEX_BODY).status_code == 404
+
+
+def test_connect_requires_admin(app, client, platform_meta, monkeypatch):
+    from tests.conftest import auth_headers
+    _install(monkeypatch, FakeGraph())
+    _fresh_tenant(app, client, "Biz C8", "c8_admin")
+    fin = auth_headers(client, "c8_finance", role="finance")
+    assert client.post("/api/whatsapp/connect/complete", headers=fin, json=COEX_BODY).status_code == 403
+
+
+def test_connect_repeat_same_number_is_idempotent(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz C9", "c9_admin")
+    _install(monkeypatch, FakeGraph())
+    assert client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY).status_code == 200
+    assert client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY).status_code == 200
+    with app.app_context():
+        events = [e.event for e in appmod.WhatsAppConnectionEvent.query.filter_by(tenant_id=tid)
+                  .order_by(appmod.WhatsAppConnectionEvent.id)]
+        assert events == ["connect", "reconnect"]
+
+
+def test_connect_config_and_status_routes(app, client, platform_meta, monkeypatch):
+    hdr, tid = _fresh_tenant(app, client, "Biz C10", "c10_admin")
+    cfg = client.get("/api/whatsapp/connect/config", headers=hdr).get_json()
+    assert cfg["automatic_available"] is True and cfg["coexistence_available"] is True
+    assert cfg["app_id"] == "PLATFORM_APP" and cfg["es_config_id"] == "CFG1"
+    assert cfg["plan_allows_api"] is True
+    assert PLATFORM_SECRET not in str(cfg)
+    _install(monkeypatch, FakeGraph())
+    client.post("/api/whatsapp/connect/complete", headers=hdr, json=COEX_BODY)
+    st = client.get("/api/whatsapp/connect/status", headers=hdr).get_json()
+    assert st["connection"]["status"] == "connected"
+    assert st["events"][0]["event"] == "connect"
+
+
+def test_connect_config_when_unavailable(app, client, monkeypatch):
+    monkeypatch.setattr(Config, "META_APP_ID", None)
+    hdr, _ = _fresh_tenant(app, client, "Biz C11", "c11_admin")
+    cfg = client.get("/api/whatsapp/connect/config", headers=hdr).get_json()
+    assert cfg["automatic_available"] is False and cfg["app_id"] is None
