@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from tests.conftest import make_tenant
+from tests.conftest import auth_headers, make_tenant
 from tests.mcp_helpers import call_tool, connect, enable_connector, mcp, tool_data
 
 
@@ -107,3 +107,59 @@ def test_customer_tools_listed(client):
     _, _, tok = _setup(client)
     names = {t["name"] for t in mcp(client, tok, "tools/list").get_json()["result"]["tools"]}
     assert {"search_customers", "get_customer", "list_customers"} <= names
+
+
+def _role_token(client, username, role):
+    hdr = auth_headers(client, username=username, role=role)
+    tok, _, _ = connect(client, hdr)
+    return tok
+
+
+def test_employee_sees_no_money_through_the_connector(client):
+    hdr, plan, _ = _setup(client)
+    cid = _customer(client, hdr, plan, "Owes Money", "03222333", 2, balance=-25.0, notes="secret note")
+    tok = _role_token(client, "cu_employee", "employee")
+    row = tool_data(call_tool(client, tok, "search_customers", {"query": "Owes"}))["customers"][0]
+    assert "balance" not in row and "owes" not in row and row["plan"] == "Basic"
+    row = tool_data(call_tool(client, tok, "list_customers", {}))["customers"][0]
+    assert "balance" not in row and "owes" not in row
+    d = tool_data(call_tool(client, tok, "get_customer", {"customer_id": cid}))
+    assert "balance" not in d["customer"] and "owes" not in d["customer"]
+    assert "notes" not in d["customer"] and "recent_payments" not in d
+    assert "open_tickets" in d and "hidden" in d
+    r = call_tool(client, tok, "list_customers", {"owing": True})
+    assert r["isError"] is True and "can't filter by money owed" in r["content"][0]["text"]
+    assert "total_owed" not in tool_data(call_tool(client, tok, "list_customers", {}))
+
+
+def test_collector_sees_no_money_but_cashier_does(client):
+    hdr, plan, _ = _setup(client)
+    cid = _customer(client, hdr, plan, "Owes Money", "03222333", 2, balance=-25.0)
+    tok = _role_token(client, "cu_collector", "collector")
+    d = tool_data(call_tool(client, tok, "get_customer", {"customer_id": cid}))
+    assert "balance" not in d["customer"] and "recent_payments" not in d
+    tok = _role_token(client, "cu_cashier", "cashier")
+    d = tool_data(call_tool(client, tok, "get_customer", {"customer_id": cid}))
+    assert d["customer"]["balance"] == -25.0 and "recent_payments" in d and "hidden" not in d
+    row = tool_data(call_tool(client, tok, "search_customers", {"query": "Owes"}))["customers"][0]
+    assert row["balance"] == -25.0 and row["owes"] == 25.0
+
+
+def test_search_notes_possible_truncation(client):
+    hdr, plan, tok = _setup(client)
+    for i in range(2):
+        _customer(client, hdr, plan, f"Dup {i}", f"0310000{i}", 10)
+    d = tool_data(call_tool(client, tok, "search_customers", {"query": "Dup", "limit": 2}))
+    assert d["count"] == 2 and "note" in d
+    d = tool_data(call_tool(client, tok, "search_customers", {"query": "Dup", "limit": 5}))
+    assert "note" not in d
+
+
+def test_arg_helpers_null_and_fractions(client):
+    hdr, plan, tok = _setup(client)
+    d = tool_data(call_tool(client, tok, "list_customers", {"owing": None, "status": None}))
+    assert "total" in d
+    r = call_tool(client, tok, "get_customer", {"customer_id": 3.7})
+    assert r["isError"] is True and "whole number" in r["content"][0]["text"]
+    cid = _customer(client, hdr, plan, "Whole", "03777111", 5)
+    assert tool_data(call_tool(client, tok, "get_customer", {"customer_id": float(cid)}))["found"] is True

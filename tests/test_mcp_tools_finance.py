@@ -71,3 +71,61 @@ def test_financial_summary_month(client):
     assert "active_customers" in d["snapshot"]
     r = call_tool(client, tok, "get_financial_summary", {"month": "October"})
     assert r["isError"] is True
+
+
+def test_list_payments_flags_reverted_but_not_repaid(client):
+    import app as appmod
+    hdr = _seed(client)
+    c = appmod.Customer.query.filter_by(name="Payer").one()
+    # re-paid: reverted at 10:00, paid again at 12:00 -> not reverted any more
+    appmod.db.session.add(appmod.Payment(
+        tenant_id=c.tenant_id, customer_id=c.id, amount=11.0, currency="USD", date=datetime(2026, 10, 6),
+        paid=True, paid_at=datetime(2026, 10, 6, 12, 0), reverted_at=datetime(2026, 10, 6, 10, 0)))
+    # reverted, never re-paid
+    appmod.db.session.add(appmod.Payment(
+        tenant_id=c.tenant_id, customer_id=c.id, amount=22.0, currency="USD", date=datetime(2026, 10, 7),
+        paid=False, paid_at=datetime(2026, 10, 7, 8, 0), reverted_at=datetime(2026, 10, 7, 9, 0)))
+    appmod.db.session.commit()
+    tok, _, _ = connect(client, hdr)
+    d = tool_data(call_tool(client, tok, "list_payments", {}))
+    by_amount = {p["amount"]: p for p in d["payments"]}
+    assert by_amount[11.0]["reverted"] is False
+    assert by_amount[22.0]["reverted"] is True
+    assert by_amount[42.0]["reverted"] is False
+    assert all("reverted_at" not in p for p in d["payments"])
+    assert {"collected_amount", "settled_from_credit"} <= set(by_amount[42.0])
+    assert "timestamps" not in d
+
+
+def test_list_payments_times_are_business_local(client):
+    hdr = _seed(client)
+    tok, _, _ = connect(client, hdr)
+    d = tool_data(call_tool(client, tok, "list_payments", {}))
+    p = [p for p in d["payments"] if p["amount"] == 42.0][0]
+    # stored 09:00 UTC; Asia/Beirut is UTC+2 or +3 (DST) in October
+    assert p["paid_at"] in ("2026-10-05 12:00", "2026-10-05 11:00")
+
+
+def test_financial_summary_month_must_be_exact(client):
+    hdr = _seed(client)
+    tok, _, _ = connect(client, hdr)
+    r = call_tool(client, tok, "get_financial_summary", {"month": "2026-10-15"})
+    assert r["isError"] is True and "2026-10" in tool_error_text(r)
+
+
+def test_5xx_from_wrapped_endpoint_is_generic(client, monkeypatch):
+    import app as appmod
+    hdr = _seed(client)
+    tok, _, _ = connect(client, hdr)
+
+    def boom(*a, **k):
+        raise RuntimeError("secret internal detail")
+    monkeypatch.setitem(appmod.app.view_functions, "get_payments", boom)
+    text = tool_error_text(call_tool(client, tok, "list_payments", {}))
+    assert "couldn't load this (500)" in text and "secret internal detail" not in text
+
+    def soft_500(*a, **k):
+        return appmod.jsonify({"error": "secret internal detail"}), 500
+    monkeypatch.setitem(appmod.app.view_functions, "get_payments", soft_500)
+    text = tool_error_text(call_tool(client, tok, "list_payments", {}))
+    assert "couldn't load this (500)" in text and "secret internal detail" not in text

@@ -66,3 +66,40 @@ def test_upstreams_hide_portal_credentials(client):
     d = tool_data(call_tool(client, tok, "list_upstreams", {}))
     assert d["upstreams"][0]["name"] == "Terra" and d["upstreams"][0]["balance"] == 100.0
     assert "portal_username" not in d["upstreams"][0] and "portal_url" not in d["upstreams"][0]
+
+
+def test_tickets_and_resellers_never_cross_tenants(client):
+    import app as appmod
+    _admin(client, "xa_admin", "Biz XA")
+    tid_a = appmod.User.query.filter_by(username="xa_admin").one().tenant_id
+    appmod.db.session.add_all([
+        appmod.SupportTicket(tenant_id=tid_a, title="A only", description="d", status="open", priority="low"),
+        appmod.Reseller(tenant_id=tid_a, name="A reseller", phone="1", type="type1", balance=0)])
+    appmod.db.session.commit()
+    hdr_b = _admin(client, "xb_admin", "Biz XB")
+    tok_b, _, _ = connect(client, hdr_b)
+    assert tool_data(call_tool(client, tok_b, "list_tickets", {"status": "all"}))["total"] == 0
+    assert tool_data(call_tool(client, tok_b, "list_resellers", {}))["resellers"] == []
+
+
+def test_network_status_unknown_customer_hint(client):
+    hdr = _admin(client)
+    tok, _, _ = connect(client, hdr)
+    d = tool_data(call_tool(client, tok, "get_network_status", {"customer_id": 999999}))
+    assert d["customer"] is None and "No customer with that id" in d["hint"]
+
+
+def test_resellers_and_upstreams_capped_with_note(client):
+    import app as appmod
+    hdr = _admin(client)
+    tid = appmod.User.query.filter_by(username="ot_admin").one().tenant_id
+    appmod.db.session.add_all([appmod.Reseller(tenant_id=tid, name=f"R{i:03d}", phone="1", type="type1", balance=0)
+                               for i in range(53)])
+    appmod.db.session.add_all([appmod.UpstreamProvider(tenant_id=tid, name=f"U{i:03d}", product="manual", balance=0)
+                               for i in range(52)])
+    appmod.db.session.commit()
+    tok, _, _ = connect(client, hdr)
+    d = tool_data(call_tool(client, tok, "list_resellers", {}))
+    assert d["total"] == 53 and d["returned"] == 50 and len(d["resellers"]) == 50 and "note" in d
+    d = tool_data(call_tool(client, tok, "list_upstreams", {}))
+    assert d["total"] == 52 and d["returned"] == 50 and "note" in d

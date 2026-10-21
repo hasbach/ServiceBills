@@ -20,6 +20,14 @@ from mcp_server import ALL_STAFF, FINANCE, PAYMENTS, Tool, ToolError, register_t
 
 MAX_ROWS = 50
 
+# Roles that see balances and payment amounts in the web app. employee and
+# collector get a status-only customer view there, so they get one here too.
+MONEY_ROLES = PAYMENTS
+
+
+def sees_money(ctx):
+    return any(r in MONEY_ROLES for r in ctx.roles)
+
 
 # --- shared helpers ---------------------------------------------------------
 
@@ -28,8 +36,13 @@ def scoped(ctx, model):
 
 
 def zone(ctx):
-    am = ctx.appmod
-    return am._zone_for(scoped(ctx, am.BusinessSettings).first())
+    """Business timezone, looked up once per tool call (cached on the ctx)."""
+    z = getattr(ctx, '_zone', None)
+    if z is None:
+        am = ctx.appmod
+        z = am._zone_for(scoped(ctx, am.BusinessSettings).first())
+        ctx._zone = z
+    return z
 
 
 def as_of(ctx):
@@ -70,9 +83,11 @@ def int_arg(args, key, default=None, lo=None, hi=None, required=False):
         return default
     if isinstance(v, bool):
         raise ToolError(f"'{key}' must be a whole number.")
+    if isinstance(v, float) and not v.is_integer():
+        raise ToolError(f"'{key}' must be a whole number.")
     try:
         n = int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ToolError(f"'{key}' must be a whole number.")
     if (lo is not None and n < lo) or (hi is not None and n > hi):
         raise ToolError(f"'{key}' must be between {lo} and {hi}.")
@@ -80,7 +95,9 @@ def int_arg(args, key, default=None, lo=None, hi=None, required=False):
 
 
 def bool_arg(args, key, default=False):
-    v = args.get(key, default)
+    v = args.get(key)
+    if v is None:
+        return default
     if isinstance(v, bool):
         return v
     if isinstance(v, str) and v.lower() in ('true', 'false'):
@@ -99,7 +116,9 @@ def date_arg(args, key, default=None):
 
 
 def enum_arg(args, key, choices, default):
-    v = args.get(key, default)
+    v = args.get(key)
+    if v is None:
+        return default
     if v not in choices:
         raise ToolError(f"'{key}' must be one of: {', '.join(choices)}.")
     return v
@@ -119,11 +138,18 @@ def call_api(ctx, path, params=None):
                                 additional_claims={'role': ctx.user.role, 'tenant_id': ctx.user.tenant_id},
                                 expires_delta=timedelta(minutes=5))
     query = {k: v for k, v in (params or {}).items() if v is not None}
-    with app.test_request_context(path, method='GET', query_string=query,
-                                  headers={'Authorization': f'Bearer {token}'}):
-        resp = app.full_dispatch_request()
+    try:
+        with app.test_request_context(path, method='GET', query_string=query,
+                                      headers={'Authorization': f'Bearer {token}'}):
+            resp = app.full_dispatch_request()
+    except Exception:
+        ctx.appmod.db.session.rollback()
+        raise ToolError("ServiceBills couldn't load this (500).")
     data = resp.get_json(silent=True)
     if resp.status_code >= 400:
+        if resp.status_code >= 500:
+            # the endpoint's message can be str(exception); never pass it on
+            raise ToolError(f"ServiceBills couldn't load this ({resp.status_code}).")
         msg = None
         if isinstance(data, dict):
             msg = data.get('msg') or data.get('error') or data.get('message')
@@ -133,13 +159,27 @@ def call_api(ctx, path, params=None):
     return data
 
 
-def _is_reverted(p):
+def _reverted(reverted_at, collected_at, paid_at):
     """Python twin of app._payment_not_reverted(): reverted_at stays set as an
     audit trail, so a re-collection stamped after it means 'not reverted'."""
-    if p.reverted_at is None:
+    if reverted_at is None:
         return False
-    later = p.collected_at or p.paid_at
-    return later is None or p.reverted_at >= later
+    later = collected_at or paid_at
+    return later is None or reverted_at >= later
+
+
+def _is_reverted(p):
+    return _reverted(p.reverted_at, p.collected_at, p.paid_at)
+
+
+def _parse_ts(v):
+    """'%Y-%m-%d %H:%M:%S' string from the payments endpoint -> naive datetime."""
+    if not v:
+        return None
+    try:
+        return datetime.strptime(v, '%Y-%m-%d %H:%M:%S')
+    except (TypeError, ValueError):
+        return None
 
 
 # --- customers ----------------------------------------------------------------
@@ -149,18 +189,25 @@ MAC_RE = re.compile(r'^([0-9a-f]{2}:){5}[0-9a-f]{2}$')
 
 def _customer_row(ctx, c, today_):
     exp = c.subscription_expiry_date
-    bal = float(c.balance or 0.0)
-    return {
+    row = {
         'id': c.id, 'name': c.name, 'phone': c.phone, 'address': c.address, 'sector': c.sector,
         'plan': c.subscription_plan.name if c.subscription_plan else None,
         'active': bool(c.is_subscription_active),
         'expiry_date': day(exp),
         'days_to_expiry': (exp.date() - today_).days if exp else None,
-        'balance': round(bal, 2),
-        'owes': round(-bal, 2) if bal < 0 else 0.0,
         'upstream': c.upstream_provider.name if c.upstream_provider else None,
         'upstream_status': c.upstream_last_status,
     }
+    if sees_money(ctx):
+        bal = float(c.balance or 0.0)
+        row['balance'] = round(bal, 2)
+        row['owes'] = round(-bal, 2) if bal < 0 else 0.0
+    return row
+
+
+def _with_plan_and_upstream(q, am):
+    return q.options(am.db.joinedload(am.Customer.subscription_plan),
+                     am.db.joinedload(am.Customer.upstream_provider))
 
 
 def search_customers(ctx, args):
@@ -168,7 +215,7 @@ def search_customers(ctx, args):
     limit = int_arg(args, 'limit', default=20, lo=1, hi=MAX_ROWS)
     am = ctx.appmod
     C = am.Customer
-    base = scoped(ctx, C)
+    base = _with_plan_and_upstream(scoped(ctx, C), am)
     found, seen = [], set()
 
     def add(rows):
@@ -195,6 +242,8 @@ def search_customers(ctx, args):
     out = {'as_of': as_of(ctx), 'count': len(found), 'customers': [_customer_row(ctx, c, t) for c in found]}
     if not found:
         out['hint'] = 'No customer matched. Try part of the name, the phone number, or the PPPoE/upstream username.'
+    elif len(found) >= limit:
+        out['note'] = f'Showing {len(found)} matches; there may be more. Refine the query to narrow it down.'
     return out
 
 
@@ -220,21 +269,29 @@ def get_customer(ctx, args):
         return {'as_of': as_of(ctx), 'found': False,
                 'hint': 'No customer with that id in this business. Use search_customers to find the id.'}
     P, T = am.Payment, am.SupportTicket
-    payments = scoped(ctx, P).filter_by(customer_id=c.id).order_by(P.date.desc(), P.id.desc()).limit(6).all()
+    payments = (scoped(ctx, P).filter_by(customer_id=c.id).order_by(P.date.desc(), P.id.desc()).limit(6).all()
+                if sees_money(ctx) else [])
     tickets = scoped(ctx, T).filter(T.customer_id == c.id, T.status.in_(('open', 'in_progress'))) \
         .order_by(T.created_at.desc()).limit(10).all()
     row = _customer_row(ctx, c, today(ctx))
+    money = sees_money(ctx)
+    if money:
+        row['notes'] = c.notes
     row.update({
-        'start_date': day(c.subscription_start_date), 'notes': c.notes,
+        'start_date': day(c.subscription_start_date),
         'reseller': c.reseller.name if c.reseller else None,
         'upstream_username': c.upstream_username, 'upstream_expiry': day(c.upstream_actual_expiry),
         'upstream_synced_at': local(ctx, c.upstream_last_synced_at),
         'pppoe_username': c.pppoe_username, 'onu_mac': c.onu_mac_address, 'cpe_mac': c.cpe_mac_address,
         'onu_last_seen_at': local(ctx, c.onu_last_seen_at),
     })
-    return {'as_of': as_of(ctx), 'found': True, 'customer': row,
-            'recent_payments': [_payment_row(ctx, p) for p in payments],
-            'open_tickets': [_ticket_row(ctx, t) for t in tickets]}
+    out = {'as_of': as_of(ctx), 'found': True, 'customer': row,
+           'open_tickets': [_ticket_row(ctx, t) for t in tickets]}
+    if money:
+        out['recent_payments'] = [_payment_row(ctx, p) for p in payments]
+    else:
+        out['hidden'] = 'Balances, payments and notes are not available for your role.'
+    return out
 
 
 def list_customers(ctx, args):
@@ -248,6 +305,8 @@ def list_customers(ctx, args):
     plan = str_arg(args, 'plan')
     upstream = str_arg(args, 'upstream')
     limit = int_arg(args, 'limit', default=MAX_ROWS, lo=1, hi=MAX_ROWS)
+    if owing and not sees_money(ctx):
+        raise ToolError("Your role can't filter by money owed.")
 
     q = scoped(ctx, C)
     if status == 'active':
@@ -273,7 +332,7 @@ def list_customers(ctx, args):
         q = q.join(am.UpstreamProvider, C.upstream_provider_id == am.UpstreamProvider.id) \
             .filter(am.UpstreamProvider.name.ilike(upstream))
     total = q.count()
-    rows = q.order_by(C.subscription_expiry_date, C.id).limit(limit).all()
+    rows = _with_plan_and_upstream(q, am).order_by(C.subscription_expiry_date, C.id).limit(limit).all()
     out = {'as_of': as_of(ctx), 'total': total, 'returned': len(rows),
            'customers': [_customer_row(ctx, c, t) for c in rows]}
     if owing:
@@ -286,7 +345,8 @@ def list_customers(ctx, args):
 register_tool(Tool(
     name='search_customers', title='Search customers',
     description=('Find customers by part of their name, phone number (any Lebanese format), '
-                 'PPPoE/upstream username, or router/ONU MAC address. Returns ids for get_customer.'),
+                 'PPPoE/upstream username, or router/ONU MAC address. Returns ids for get_customer, plus '
+                 'plan, status and expiry (and balance, negative = owes, for admin/finance/cashier only).'),
     input_schema={'type': 'object', 'required': ['query'], 'properties': {
         'query': {'type': 'string', 'description': 'Name, phone, username or MAC'},
         'limit': {'type': 'integer', 'minimum': 1, 'maximum': MAX_ROWS, 'default': 20}}},
@@ -294,8 +354,9 @@ register_tool(Tool(
 
 register_tool(Tool(
     name='get_customer', title='Customer details',
-    description=('Full details for one customer: plan, status, expiry, balance (negative = owes), '
-                 'upstream and network identifiers, last 6 bills/payments and open support tickets.'),
+    description=('Full details for one customer: plan, status, expiry, upstream and network identifiers '
+                 'and open support tickets. Admin/finance/cashier also get balance (negative = owes), notes '
+                 'and the last 6 bills/payments; other roles get a status-only view.'),
     input_schema={'type': 'object', 'required': ['customer_id'], 'properties': {
         'customer_id': {'type': 'integer', 'description': 'From search_customers or list_customers'}}},
     handler=get_customer, roles=ALL_STAFF))
@@ -303,12 +364,14 @@ register_tool(Tool(
 register_tool(Tool(
     name='list_customers', title='List customers',
     description=('List customers with filters: active/inactive, expiring within N days, expired in the '
-                 'last N days, owing money, sector, plan name or upstream name. Sorted by expiry date.'),
+                 'last N days, owing money (admin/finance/cashier only), sector, plan name or upstream name. '
+                 'Sorted by expiry date. Balances are shown to admin/finance/cashier only.'),
     input_schema={'type': 'object', 'properties': {
         'status': {'type': 'string', 'enum': ['all', 'active', 'inactive'], 'default': 'all'},
         'expiring_within_days': {'type': 'integer', 'minimum': 0, 'maximum': 90},
         'expired_within_days': {'type': 'integer', 'minimum': 1, 'maximum': 365},
-        'owing': {'type': 'boolean', 'description': 'Only customers with a negative balance'},
+        'owing': {'type': 'boolean',
+                  'description': 'Only customers with a negative balance (admin/finance/cashier only)'},
         'sector': {'type': 'string'}, 'plan': {'type': 'string'}, 'upstream': {'type': 'string'},
         'limit': {'type': 'integer', 'minimum': 1, 'maximum': MAX_ROWS, 'default': MAX_ROWS}}},
     handler=list_customers, roles=ALL_STAFF))
@@ -317,8 +380,17 @@ register_tool(Tool(
 # --- finance (via the app's own report endpoints) -----------------------------
 
 _PAYMENT_KEYS = ('id', 'customer_id', 'customer_name', 'date', 'amount', 'currency', 'paid', 'paid_at',
-                 'collected', 'collected_at', 'collected_by', 'collected_via', 'received_by',
-                 'is_refund', 'is_gratis', 'reverted_at', 'reason')
+                 'collected', 'collected_at', 'collected_amount', 'collected_by', 'collected_via',
+                 'received_by', 'settled_from_credit', 'is_refund', 'is_gratis', 'reason')
+
+
+def _api_payment_row(ctx, p):
+    row = {k: p.get(k) for k in _PAYMENT_KEYS}
+    paid_at, collected_at = _parse_ts(p.get('paid_at')), _parse_ts(p.get('collected_at'))
+    row['paid_at'] = local(ctx, paid_at)
+    row['collected_at'] = local(ctx, collected_at)
+    row['reverted'] = _reverted(_parse_ts(p.get('reverted_at')), collected_at, paid_at)
+    return row
 
 
 def list_payments(ctx, args):
@@ -335,10 +407,11 @@ def list_payments(ctx, args):
         'page': 1, 'per_page': limit,
     }
     data = call_api(ctx, '/api/payments', params)
-    rows = [{k: p.get(k) for k in _PAYMENT_KEYS} for p in data.get('payments', [])]
+    rows = [_api_payment_row(ctx, p) for p in data.get('payments', [])]
     out = {'as_of': as_of(ctx), 'total': data.get('total'), 'returned': len(rows),
            'totals': data.get('totals'), 'payments': rows,
-           'timestamps': 'paid_at / collected_at are UTC as stored; date is the billing date.'}
+           'fields': 'date is the billing date; paid_at / collected_at are business-local. '
+                     'reverted = the collection was reverted and not paid again.'}
     if (data.get('total') or 0) > len(rows):
         out['note'] = f"Showing {len(rows)} of {data.get('total')}; totals cover all of them."
     return out
@@ -386,7 +459,9 @@ def _month_bounds(month):
 
 
 def get_financial_summary(ctx, args):
-    month = str_arg(args, 'month', max_len=7)
+    month = str_arg(args, 'month', max_len=20)
+    if month and not re.fullmatch(r'\d{4}-\d{2}', month):
+        raise ToolError("'month' must look like 2026-10.")
     start, end = date_arg(args, 'start_date'), date_arg(args, 'end_date')
     if month and (start or end):
         raise ToolError("Use either 'month' or a 'start_date'/'end_date' range, not both.")
@@ -479,11 +554,12 @@ def get_network_status(ctx, args):
     am = ctx.appmod
     customer_id = int_arg(args, 'customer_id', lo=1)
     tree = call_api(ctx, '/api/network-tree').get('tree') or []
-    devices = []
-    _flatten_tree(tree, None, devices)
+    all_devices = []
+    _flatten_tree(tree, None, all_devices)
+    devices = all_devices[:MAX_ROWS]
     A = am.NetworkAlertEvent
     alerts = scoped(ctx, A).order_by(A.created_at.desc()).limit(10).all()
-    out = {'as_of': as_of(ctx), 'devices': devices,
+    out = {'as_of': as_of(ctx), 'total_devices': len(all_devices), 'devices': devices,
            'recent_alerts': [{'kind': a.kind, 'message': a.message, 'at': local(ctx, a.created_at)} for a in alerts],
            'note': 'Last known results only; nothing was polled live for this answer.'}
     if customer_id:
@@ -493,6 +569,10 @@ def get_network_status(ctx, args):
             'upstream_synced_at': local(ctx, c.upstream_last_synced_at),
             'onu_mac': c.onu_mac_address, 'onu_last_seen_at': local(ctx, c.onu_last_seen_at),
             'pppoe_username': c.pppoe_username}
+        if c is None:
+            out['hint'] = 'No customer with that id in this business.'
+    if len(all_devices) > len(devices):
+        out['devices_note'] = f'Showing {len(devices)} of {len(all_devices)} devices.'
     return out
 
 
@@ -500,16 +580,25 @@ def get_network_status(ctx, args):
 
 def list_resellers(ctx, args):
     data = call_api(ctx, '/api/resellers') or []
-    return {'as_of': as_of(ctx), 'resellers': [
+    out = {'as_of': as_of(ctx), 'total': len(data), 'returned': min(len(data), MAX_ROWS), 'resellers': [
         {'id': r.get('id'), 'name': r.get('name'), 'phone': r.get('phone'), 'type': r.get('type'),
-         'balance': r.get('balance'), 'customer_count': len(r.get('customers') or [])} for r in data]}
+         'balance': r.get('balance'), 'customer_count': len(r.get('customers') or [])}
+        for r in data[:MAX_ROWS]]}
+    if len(data) > MAX_ROWS:
+        out['note'] = f'Showing {MAX_ROWS} of {len(data)} resellers.'
+    return out
 
 
 def list_upstreams(ctx, args):
     data = call_api(ctx, '/api/upstream-providers') or []
     keep = ('id', 'name', 'product', 'balance', 'status')
-    return {'as_of': as_of(ctx), 'upstreams': [{k: p.get(k) for k in keep} for p in data],
-            'note': 'balance is what this business owes or has prepaid with the upstream provider.'}
+    out = {'as_of': as_of(ctx), 'total': len(data), 'returned': min(len(data), MAX_ROWS),
+           'upstreams': [{k: p.get(k) for k in keep} for p in data[:MAX_ROWS]],
+           'note': 'balance: positive = prepaid credit this business holds with the provider; '
+                   'negative = this business owes the provider.'}
+    if len(data) > MAX_ROWS:
+        out['note'] += f' Showing {MAX_ROWS} of {len(data)} providers.'
+    return out
 
 
 register_tool(Tool(
