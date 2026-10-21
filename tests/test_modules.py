@@ -61,3 +61,10 @@ def test_license_provider_takes_precedence_and_honours_expiry(monkeypatch):
 def test_is_enabled():
     assert modules.is_enabled(T("free"), "network") is True
     assert modules.is_enabled(T("free"), "ai_cs") is False
+
+
+def test_ai_connector_is_paid_and_in_pro_only():
+    assert "ai_connector" in modules.PAID
+    assert "ai_connector" in modules.enabled_for(T("pro"))
+    assert "ai_connector" not in modules.enabled_for(T("free"))
+    assert "ai_connector" in modules.enabled_for(T("free", {"ai_connector": True}))
