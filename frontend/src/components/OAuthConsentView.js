@@ -1,0 +1,97 @@
+import React, { useEffect, useState } from 'react';
+import axios from 'axios';
+import { Alert, Box, Button, CircularProgress, Paper, Stack, TextField, Typography } from '@mui/material';
+import { SmartToy as SmartToyIcon } from '@mui/icons-material';
+import { useAppContext } from '../context/AppContext';
+import { consentParams, describeRole } from './oauthConsent';
+
+// "Claude wants read-only access to <business> as <user>". Reached from
+// GET /oauth/authorize (mcp_oauth.py) with the OAuth request in the query.
+// Signs the user in first if needed, then approves or denies and sends the
+// browser back to the AI app with a one-time code.
+export default function OAuthConsentView() {
+    const { isAuthenticated, login, logout } = useAppContext();
+    const [params] = useState(() => consentParams(window.location.search));
+    const [info, setInfo] = useState(null);
+    const [error, setError] = useState('');
+    const [busy, setBusy] = useState(false);
+    const [creds, setCreds] = useState({ username: '', password: '' });
+
+    useEffect(() => {
+        if (!isAuthenticated) return;
+        const token = localStorage.getItem('token');
+        axios.get('/api/mcp/oauth/consent-info', { params, headers: { Authorization: `Bearer ${token}` } })
+            .then(res => setInfo(res.data))
+            .catch(err => setError(err.response?.data?.error || err.response?.data?.msg || 'This connection request is not valid.'));
+    }, [isAuthenticated, params]);
+
+    const signIn = async (e) => {
+        e.preventDefault();
+        setBusy(true);
+        setError('');
+        try {
+            await login(creds);
+        } catch (err) {
+            setError(err.response?.data?.msg || 'Sign-in failed.');
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const decide = async (decision) => {
+        setBusy(true);
+        try {
+            const token = localStorage.getItem('token');
+            const res = await axios.post('/api/mcp/oauth/approve', { ...params, decision },
+                { headers: { Authorization: `Bearer ${token}` } });
+            window.location.assign(res.data.redirect_url);
+        } catch (err) {
+            setError(err.response?.data?.error || 'Could not complete the connection.');
+            setBusy(false);
+        }
+    };
+
+    return (
+        <Box sx={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', p: 2, bgcolor: 'background.default' }}>
+            <Paper variant="outlined" sx={{ p: 4, maxWidth: 440, width: '100%', borderRadius: '16px' }}>
+                <Stack direction="row" spacing={1.5} alignItems="center" sx={{ mb: 2 }}>
+                    <SmartToyIcon color="primary" />
+                    <Typography variant="h6">Connect an AI app to ServiceBills</Typography>
+                </Stack>
+                {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+                {!isAuthenticated && (
+                    <form onSubmit={signIn}>
+                        <Typography variant="body2" sx={{ mb: 2 }}>Sign in with your ServiceBills account to continue.</Typography>
+                        <TextField fullWidth label="Username" sx={{ mb: 2 }} value={creds.username}
+                            onChange={e => setCreds(c => ({ ...c, username: e.target.value }))} />
+                        <TextField fullWidth type="password" label="Password" sx={{ mb: 2 }} value={creds.password}
+                            onChange={e => setCreds(c => ({ ...c, password: e.target.value }))} />
+                        <Button fullWidth type="submit" variant="contained" disabled={busy}>Sign in</Button>
+                    </form>
+                )}
+                {isAuthenticated && !info && !error && <Box sx={{ textAlign: 'center', py: 3 }}><CircularProgress /></Box>}
+                {isAuthenticated && info && (
+                    <>
+                        <Typography sx={{ mb: 1 }}>
+                            <b>{info.client_name}</b> wants <b>read-only</b> access to <b>{info.tenant_name}</b> as{' '}
+                            <b>{info.username}</b> ({describeRole(info.role)}).
+                        </Typography>
+                        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                            It will be able to look up customers, payments, reports, tickets and network status that
+                            your role can see. It cannot change anything, take payments or send messages.
+                        </Typography>
+                        <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+                            You will be sent back to {info.redirect_host}. You can disconnect it any time in
+                            Settings → AI Connector.
+                        </Typography>
+                        <Stack direction="row" spacing={1.5}>
+                            <Button fullWidth variant="contained" disabled={busy} onClick={() => decide('allow')}>Allow</Button>
+                            <Button fullWidth variant="outlined" disabled={busy} onClick={() => decide('deny')}>Deny</Button>
+                        </Stack>
+                        <Button size="small" sx={{ mt: 2 }} onClick={logout}>Not {info.username}? Sign out</Button>
+                    </>
+                )}
+            </Paper>
+        </Box>
+    );
+}
