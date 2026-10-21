@@ -2010,6 +2010,10 @@ class CSAgentSettings(db.Model):
     admin_mobile_number = db.Column(db.String(50), nullable=True)
     gemini_api_key = db.Column(EncryptedString, nullable=True)   # tenant's own free-tier key; encrypted at rest
     gemini_model = db.Column(db.String(50), nullable=True)       # optional override; None -> default Flash/Flash-Lite chain
+    # SHA-256 of this tenant's ElevenLabs tool-webhook secret (shown once at
+    # generation, never stored raw); the tool endpoints derive the tenant from it.
+    tool_secret_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    tool_secret_created_at = db.Column(db.DateTime, nullable=True)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -16027,9 +16031,12 @@ def cs_agent_config():
     gemini_api_key_raw = ''
     gemini_model = ''
     elevenlabs_api_key_raw = ''
+    tool_secret_created_at = None
     try:
         settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
         if settings:
+            if settings.tool_secret_hash and settings.tool_secret_created_at:
+                tool_secret_created_at = settings.tool_secret_created_at.isoformat()
             agent_id = settings.elevenlabs_agent_id or ''
             elevenlabs_api_key_raw = settings.elevenlabs_api_key or ''
             admin_mobile_number = settings.admin_mobile_number or ''
@@ -16051,7 +16058,49 @@ def cs_agent_config():
         'has_gemini_key': bool(gemini_api_key_raw),
         'has_elevenlabs_key': bool(elevenlabs_api_key_raw),
         'has_agent_id': bool(agent_id),
+        # The tool secret itself is only ever returned by POST /api/cs-agent/tool-secret.
+        'has_tool_secret': bool(tool_secret_created_at),
+        'tool_secret_created_at': tool_secret_created_at,
+        'tool_secret_header': cs_agent_tools.TOOL_SECRET_HEADER,
         'ws_url': f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={agent_id}" if agent_id else None
+    }), 200
+
+
+@app.route('/api/cs-agent/tool-secret', methods=['POST', 'DELETE'])
+def cs_agent_tool_secret():
+    """Admin-only: POST generates (or rotates) this tenant's ElevenLabs
+    tool-webhook secret and returns it ONCE; DELETE revokes it. Rotating or
+    revoking invalidates the previous secret immediately. Requires a real JWT
+    -- a tool secret can never mint another one."""
+    appmod = sys.modules[__name__]
+    tenant_id = _require_authenticated_tenant_id(appmod)
+    if not tenant_id:
+        return jsonify(error="Unauthorized"), 401
+    if 'admin' not in _jwt_roles():
+        return jsonify(msg="Admins only!"), 403
+    if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'ai_cs'):
+        return modules.disabled_response('ai_cs')
+
+    settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
+    if request.method == 'DELETE':
+        if settings:
+            settings.tool_secret_hash = None
+            settings.tool_secret_created_at = None
+            db.session.commit()
+        return jsonify(status='ok', has_tool_secret=False), 200
+
+    if not settings:
+        settings = CSAgentSettings(tenant_id=tenant_id)
+        db.session.add(settings)
+    secret = cs_agent_tools.generate_tool_secret(appmod, settings)
+    db.session.commit()
+    app.logger.info("CS agent tool secret generated for tenant %s", tenant_id)
+    return jsonify({
+        'status': 'ok',
+        'secret': secret,
+        'header_name': cs_agent_tools.TOOL_SECRET_HEADER,
+        'header_value': secret,
+        'created_at': settings.tool_secret_created_at.isoformat(),
     }), 200
 
 
@@ -16238,7 +16287,7 @@ def cs_get_recent_tickets():
 
 def _require_authenticated_tenant_id(appmod):
     """Resolves tenant_id from a real JWT's claims only -- never from a
-    query-string/body tenant_id or the CS_AGENT_SECRET fallback that
+    query-string/body tenant_id or the tool-secret path that
     resolve_tenant_id() otherwise allows. Used by the memory CRUD and config
     endpoints below: unlike the tool-webhook endpoints (which legitimately
     need the secret-based path for server-to-server calls with no user

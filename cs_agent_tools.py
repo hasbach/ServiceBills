@@ -4,11 +4,14 @@ Multi-tenant ready tools for customer lookup, account status,
 network diagnostics (relayed to on-premise agent), payment links,
 and human escalation.
 """
+import hashlib
+import hmac
 import io
 import json
 import logging
 import os
 import re
+import secrets
 import time
 from datetime import datetime, timedelta
 import requests
@@ -143,9 +146,46 @@ def delete_knowledge_entry(appmod, tenant_id, entry_id):
     return True
 
 
+TOOL_SECRET_HEADER = 'X-CS-Agent-Secret'
+TOOL_SECRET_PREFIX = 'csat_'
+
+
+def hash_tool_secret(secret):
+    return hashlib.sha256(secret.encode('utf-8')).hexdigest()
+
+
+def generate_tool_secret(appmod, settings):
+    """Gives `settings` a fresh tool secret, replacing (and so invalidating)
+    any previous one. Returns the raw secret -- the only time it exists; only
+    its hash is stored. Caller commits."""
+    secret = TOOL_SECRET_PREFIX + secrets.token_urlsafe(32)
+    settings.tool_secret_hash = hash_tool_secret(secret)
+    settings.tool_secret_created_at = datetime.utcnow()
+    return secret
+
+
+def _requested_tenant_id():
+    """tenant_id named in the query string or JSON body: None if absent,
+    False if present but not an integer."""
+    tid = request.args.get('tenant_id')
+    if not tid and request.is_json:
+        tid = (request.get_json(silent=True) or {}).get('tenant_id')
+    if tid in (None, ''):
+        return None
+    try:
+        return int(tid)
+    except (ValueError, TypeError):
+        return False
+
+
 def resolve_tenant_id(appmod):
-    """Resolve tenant_id from JWT claims or request parameters / header.
-    Returns (tenant_id, is_jwt_authenticated).
+    """Resolve tenant_id from JWT claims, or for server-to-server tool calls
+    (ElevenLabs) from the tenant's own tool secret. Returns
+    (tenant_id, is_jwt_authenticated); (None, False) means reject.
+
+    The tenant is derived FROM the secret, never from the request: a
+    tenant_id in the request is only accepted when it matches. Fails closed
+    when nothing matches.
     """
     # 1. Try JWT
     try:
@@ -156,32 +196,41 @@ def resolve_tenant_id(appmod):
     except Exception:
         pass
 
-    # 2. Check CS Agent Secret
-    configured_secret = current_app.config.get('CS_AGENT_SECRET')
-    provided_secret = (
-        request.headers.get('X-CS-Agent-Secret') or
-        request.args.get('secret')
-    )
-    if not provided_secret and request.headers.get('Authorization'):
-        auth_val = request.headers.get('Authorization')
+    # 2. Per-tenant tool secret (header or bearer).
+    provided_secret = (request.headers.get(TOOL_SECRET_HEADER) or '').strip()
+    if not provided_secret:
+        auth_val = request.headers.get('Authorization') or ''
         if auth_val.startswith('Bearer '):
             provided_secret = auth_val[7:].strip()
+    requested = _requested_tenant_id()
 
-    # If CS_AGENT_SECRET is configured, provided secret must match
-    if configured_secret and provided_secret != configured_secret:
-        return None, False
+    if provided_secret:
+        settings = appmod.CSAgentSettings.query.filter_by(
+            tool_secret_hash=hash_tool_secret(provided_secret)).first()
+        if settings:
+            if requested is not None and requested != settings.tenant_id:
+                logging.warning("CS agent tool call rejected: secret of tenant %s named tenant_id=%r",
+                                settings.tenant_id, requested)
+                return None, False
+            return settings.tenant_id, False
 
-    # 3. Read tenant_id from query or JSON body
-    tid = request.args.get('tenant_id')
-    if not tid and request.is_json:
-        data = request.get_json(silent=True) or {}
-        tid = data.get('tenant_id')
-
-    if tid:
-        try:
-            return int(tid), False
-        except (ValueError, TypeError):
-            pass
+    # 3. TEMPORARY legacy fallback: the old platform-wide CS_AGENT_SECRET plus
+    # a request tenant_id, kept only so DeltaNet's existing ElevenLabs agent
+    # works until it is re-pointed at its own secret. Never for a tenant that
+    # has its own secret, and never when CS_AGENT_SECRET is unset.
+    legacy_secret = current_app.config.get('CS_AGENT_SECRET') or ''
+    presented = provided_secret or (request.args.get('secret') or '').strip()
+    if legacy_secret and presented and requested and hmac.compare_digest(
+            presented.encode('utf-8'), legacy_secret.encode('utf-8')):
+        own = appmod.CSAgentSettings.query.filter_by(tenant_id=requested).first()
+        if own and own.tool_secret_hash:
+            logging.warning("CS agent tool call rejected: legacy global secret used for tenant %s, "
+                            "which has its own tool secret", requested)
+            return None, False
+        logging.warning("CS agent tool call for tenant %s authenticated with the LEGACY global "
+                        "CS_AGENT_SECRET; generate a per-tenant tool secret and update the "
+                        "ElevenLabs agent tools", requested)
+        return requested, False
 
     return None, False
 
