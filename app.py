@@ -2134,6 +2134,71 @@ def _iso_utc(dt):
     return dt.strftime('%Y-%m-%dT%H:%M:%SZ') if dt else None
 
 
+class McpClient(db.Model):
+    """An AI app (Claude, ChatGPT, ...) registered through OAuth dynamic client
+    registration for the MCP connector. Not tenant-scoped: one registration is
+    shared by every tenant whose staff connect that app. See
+    docs/superpowers/specs/2026-10-21-mcp-connector-design.md."""
+    __tablename__ = 'mcp_client'
+    id = db.Column(db.Integer, primary_key=True)
+    client_id = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    client_name = db.Column(db.String(200), nullable=False)
+    redirect_uris = db.Column(db.JSON, nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class McpGrant(db.Model):
+    """One user's consent for one AI app on their tenant. Holds the pending
+    auth code, then the current access/refresh token pair -- SHA-256 hashes
+    only, never the tokens themselves. prev_refresh_token_hash is kept so a
+    replayed (already-rotated) refresh token can be detected and the whole
+    grant revoked."""
+    __tablename__ = 'mcp_grant'
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    client_id = db.Column(db.String(64), nullable=False, index=True)
+    scope = db.Column(db.String(100), nullable=False, default='read')
+    resource = db.Column(db.String(300), nullable=True)
+    code_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    code_challenge = db.Column(db.String(128), nullable=True)
+    redirect_uri = db.Column(db.String(500), nullable=True)
+    code_expires_at = db.Column(db.DateTime, nullable=True)
+    code_used_at = db.Column(db.DateTime, nullable=True)
+    access_token_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    access_expires_at = db.Column(db.DateTime, nullable=True)
+    refresh_token_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    prev_refresh_token_hash = db.Column(db.String(64), nullable=True, index=True)
+    refresh_expires_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    last_used_at = db.Column(db.DateTime, nullable=True)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+    user = db.relationship('User')
+
+    def to_dict(self, client_name=None):
+        def z(dt):
+            return dt.strftime('%Y-%m-%dT%H:%M:%SZ') if dt else None
+        return {'id': self.id, 'client_id': self.client_id, 'client_name': client_name,
+                'username': self.user.username if self.user else None,
+                'role': self.user.role if self.user else None,
+                'created_at': z(self.created_at), 'last_used_at': z(self.last_used_at)}
+
+
+class McpToolCall(db.Model):
+    """Audit row for every MCP tools/call (success or failure)."""
+    __tablename__ = 'mcp_tool_call'
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    grant_id = db.Column(db.Integer, db.ForeignKey('mcp_grant.id'), nullable=False, index=True)
+    tool = db.Column(db.String(64), nullable=False)
+    args_summary = db.Column(db.String(500), nullable=True)
+    ok = db.Column(db.Boolean, nullable=False, default=True)
+    error = db.Column(db.String(300), nullable=True)
+    duration_ms = db.Column(db.Integer, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
 class WhatsAppConversation(db.Model):
     """One WhatsApp chat (tenant x customer phone) for the admin inbox -- see
     docs/superpowers/specs/2026-09-23-whatsapp-inbox-design.md."""
@@ -2335,6 +2400,7 @@ TENANT_OWNED_MODELS = (
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
     WhatsAppConversation, WhatsAppMessage, BalanceLog, WhatsAppConnectionEvent,
+    McpGrant, McpToolCall,
 )
 
 from sqlalchemy import event as _sa_event
@@ -3451,6 +3517,10 @@ _EXPORT_COLUMN_DENYLIST = {
     # token_hash is a bearer-secret hash, not tenant-visible data -- same
     # class of secret as callback_token above, just for a different feature.
     NetworkAgent: {"token_hash"},
+    # Bearer-secret hashes for the MCP connector -- same class of secret as
+    # NetworkAgent.token_hash above.
+    McpGrant: {"code_hash", "code_challenge", "access_token_hash",
+               "refresh_token_hash", "prev_refresh_token_hash"},
 }
 
 
@@ -3480,6 +3550,9 @@ def tenant_export():
 
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
+    # MCP connector rows hold FKs to user (and tool calls to mcp_grant), so
+    # they go first: tool calls, then grants.
+    McpToolCall, McpGrant,
     # First: it holds FKs to customer, network_device, user and
     # network_agent_job, so every one of those must still exist when it goes.
     # SQLite does not enforce FKs, so getting this wrong is invisible locally
