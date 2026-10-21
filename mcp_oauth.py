@@ -17,6 +17,7 @@ from flask import Response, jsonify, redirect, request
 from flask_jwt_extended import get_jwt_identity, jwt_required
 
 import modules
+from tenancy import current_tenant, tenant_query
 
 ACCESS_TTL = timedelta(hours=1)
 REFRESH_TTL = timedelta(days=30)
@@ -375,3 +376,42 @@ def register_mcp_oauth_routes(app, appmod):
                 revoke_grant(grant, datetime.utcnow())
                 db.session.commit()
         return ('', 200)
+
+    def _active_grants_query():
+        now = datetime.utcnow()
+        return tenant_query(Grant).filter(Grant.revoked_at.is_(None),
+                                          Grant.refresh_token_hash.isnot(None),
+                                          Grant.refresh_expires_at > now)
+
+    def _me():
+        return appmod.User.query.filter_by(username=get_jwt_identity()).first()
+
+    @app.route('/api/mcp/grants', methods=['GET'])
+    @jwt_required()
+    def mcp_list_grants():
+        me = _me()
+        is_admin = 'admin' in appmod._jwt_roles()
+        q = _active_grants_query()
+        if not is_admin:
+            q = q.filter(Grant.user_id == (me.id if me else -1))
+        grants = q.order_by(Grant.created_at.desc()).all()
+        names = {c.client_id: c.client_name for c in Client.query.filter(
+            Client.client_id.in_({g.client_id for g in grants})).all()} if grants else {}
+        return jsonify(mcp_url=origin() + '/mcp',
+                       enabled=modules.is_enabled(current_tenant(), 'ai_connector'),
+                       is_admin=is_admin,
+                       grants=[g.to_dict(names.get(g.client_id)) for g in grants])
+
+    @app.route('/api/mcp/grants/<int:grant_id>', methods=['DELETE'])
+    @jwt_required()
+    def mcp_revoke_grant(grant_id):
+        me = _me()
+        q = tenant_query(Grant).filter(Grant.id == grant_id, Grant.revoked_at.is_(None))
+        if 'admin' not in appmod._jwt_roles():
+            q = q.filter(Grant.user_id == (me.id if me else -1))
+        grant = q.first()
+        if grant is None:
+            return jsonify(msg='Connection not found'), 404
+        revoke_grant(grant, datetime.utcnow())
+        db.session.commit()
+        return jsonify(ok=True)
