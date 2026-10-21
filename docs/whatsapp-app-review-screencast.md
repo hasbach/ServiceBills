@@ -11,7 +11,7 @@
 - **ServiceBills tenant:** WA Test (`wa-test`), Pro plan, **Manual configuration** with the app's own credentials:
   - App ID: `8757534751003383`
   - Phone Number ID: `919682917904290`, which is **+961 71 228 998** on the "Beta Marketing Solutions" WhatsApp account. That account has a payment method and is subscribed to the app's webhook.
-  - WABA ID: `1528337918265430`
+  - WABA ID: **`476341515566281`**. This is the **Messaging Account** that owns templates and billing. Do NOT use the phone number's WhatsApp Account id: template creation fails with "Object ... does not exist". Under Meta's WhatsApp Account + Messaging Account model, use the Messaging Account id.
   - Token: a system-user token from Beta consulting Agency, with `business_management`, `whatsapp_business_messaging` and `whatsapp_business_management`.
 - **Recording setup:**
   - Browser UI language: **English**.
