@@ -10445,6 +10445,8 @@ customer_import.register_customer_import_routes(app, sys.modules[__name__])
 
 import mcp_oauth
 mcp_oauth.register_mcp_oauth_routes(app, sys.modules[__name__])
+import mcp_server
+mcp_server.register_mcp_routes(app, sys.modules[__name__])
 
 import onprem
 onprem.register(app, sys.modules[__name__])
