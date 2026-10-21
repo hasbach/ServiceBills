@@ -18,11 +18,19 @@ export default function OAuthConsentView() {
     const [creds, setCreds] = useState({ username: '', password: '' });
 
     useEffect(() => {
-        if (!isAuthenticated) return;
+        // A different person may have just signed in: drop the previous
+        // identity's data and error before fetching, and ignore late replies.
+        setInfo(null);
+        setError('');
+        if (!isAuthenticated) return undefined;
+        let cancelled = false;
         const token = localStorage.getItem('token');
         axios.get('/api/mcp/oauth/consent-info', { params, headers: { Authorization: `Bearer ${token}` } })
-            .then(res => setInfo(res.data))
-            .catch(err => setError(err.response?.data?.error || err.response?.data?.msg || 'This connection request is not valid.'));
+            .then(res => { if (!cancelled) setInfo(res.data); })
+            .catch(err => {
+                if (!cancelled) setError(err.response?.data?.error || err.response?.data?.msg || 'This connection request is not valid.');
+            });
+        return () => { cancelled = true; };
     }, [isAuthenticated, params]);
 
     const signIn = async (e) => {
@@ -40,6 +48,7 @@ export default function OAuthConsentView() {
 
     const decide = async (decision) => {
         setBusy(true);
+        setError('');
         try {
             const token = localStorage.getItem('token');
             const res = await axios.post('/api/mcp/oauth/approve', { ...params, decision },
@@ -68,6 +77,9 @@ export default function OAuthConsentView() {
                             onChange={e => setCreds(c => ({ ...c, password: e.target.value }))} />
                         <Button fullWidth type="submit" variant="contained" disabled={busy}>Sign in</Button>
                     </form>
+                )}
+                {isAuthenticated && !info && error && (
+                    <Button size="small" onClick={logout}>Use a different account</Button>
                 )}
                 {isAuthenticated && !info && !error && <Box sx={{ textAlign: 'center', py: 3 }}><CircularProgress /></Box>}
                 {isAuthenticated && info && (
