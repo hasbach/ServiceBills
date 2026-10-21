@@ -26,6 +26,7 @@ import {
     Autorenew as AutorenewIcon,
     Download as DownloadIcon,
     HelpOutline as HelpOutlineIcon,
+    SmartToy as SmartToyIcon,
 } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext.js';
 import ExpenseCategoryManager from './ExpenseCategoryManager.js';
@@ -34,6 +35,7 @@ import SectorManager from './SectorManager.js';
 import WhatsAppTemplatesManager from './WhatsAppTemplatesManager.js';
 import WhatsAppConnectCard from './WhatsAppConnectCard.js';
 import LicenseTab from './LicenseTab.js';
+import AIConnectorCard from './AIConnectorCard';
 import WhatsAppPublicUrlHelp from './WhatsAppPublicUrlHelp.js';
 import { formatStamp } from './formatStamp';
 import { describeStaleConnectors } from './connectorFiles';
@@ -203,6 +205,7 @@ const SettingsView = ({ businessSettings, setBusinessSettings, setSnackbar, init
         { key: 'wa-notifications', label: 'WhatsApp Notifications', icon: <WhatsAppIcon sx={{ fontSize: 18 }} />, module: 'whatsapp' },
         { key: 'wa-templates', label: 'WhatsApp Templates', icon: <WhatsAppIcon sx={{ fontSize: 18 }} />, module: 'whatsapp' },
         { key: 'whish', label: 'Whish Payments', icon: <PaymentsIcon sx={{ fontSize: 18 }} />, module: 'whish_payments' },
+        { key: 'ai-connector', label: 'AI Connector', icon: <SmartToyIcon sx={{ fontSize: 18 }} />, module: 'ai_connector' },
         { key: 'expense-categories', label: 'Expense Categories', icon: <MessageIcon sx={{ fontSize: 18 }} /> },
         { key: 'users', label: 'User Management', icon: <PeopleIcon sx={{ fontSize: 18 }} /> },
         { key: 'sectors', label: 'Sectors', icon: <LocationOnIcon sx={{ fontSize: 18 }} /> },
@@ -1525,6 +1528,10 @@ Read-Host -Prompt "Press Enter to exit"
             {/* Tab 6: Sectors */}
             {activeTab === 'sectors' && (
                 <SectorManager />
+            )}
+
+            {activeTab === 'ai-connector' && (
+                <AIConnectorCard />
             )}
 
             {/* Tab 7: License (on-prem only) */}
