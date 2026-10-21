@@ -84,9 +84,9 @@ class Config:
 
     # --- Customer Service AI Agent ---
     CS_AGENT_SECRET = os.environ.get("CS_AGENT_SECRET", "")
-    ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID", "")
-    ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
-    ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "")
+    # No platform-wide ElevenLabs or Gemini credentials: each tenant saves its
+    # own key / agent id in AI Voice Agent settings (CSAgentSettings, encrypted),
+    # and nothing falls back to a global value.
 
     # --- Deployment mode / on-prem ---
     DEPLOYMENT_MODE = os.environ.get("DEPLOYMENT_MODE", "saas").strip().lower()
