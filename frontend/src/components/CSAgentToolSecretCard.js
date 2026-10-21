@@ -18,7 +18,7 @@ const TOOL_PATHS = [
 // This business's own secret for the ElevenLabs agent's server tools. The
 // backend derives the business FROM this secret, so one business's agent can
 // never read another's customers. Shown once on generation; only a hash is kept.
-export default function CSAgentToolSecretCard({ hasSecret, createdAt, headerName, onChange }) {
+export default function CSAgentToolSecretCard({ hasSecret, createdAt, masked, headerName, onChange }) {
     const [secret, setSecret] = useState('');
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState('');
@@ -38,7 +38,7 @@ export default function CSAgentToolSecretCard({ hasSecret, createdAt, headerName
                 headers: { Authorization: `Bearer ${token}` }
             });
             setSecret(res.data.secret);
-            if (onChange) onChange({ hasSecret: true, createdAt: res.data.created_at });
+            if (onChange) onChange({ hasSecret: true, createdAt: res.data.created_at, masked: res.data.masked || '' });
         } catch (err) {
             setError(err.response?.data?.error || err.response?.data?.msg || 'تعذر إنشاء المفتاح.');
         } finally {
@@ -63,8 +63,8 @@ export default function CSAgentToolSecretCard({ hasSecret, createdAt, headerName
                     مفتاح أدوات الـ Agent (Tool Secret)
                 </Typography>
                 {hasSecret ? (
-                    <Chip icon={<CheckCircleIcon />} color="success" size="small"
-                        label={`مفعّل${createdAt ? ` منذ ${createdAt.slice(0, 10)}` : ''}`} />
+                    <Chip icon={<CheckCircleIcon />} color="success" variant="filled" sx={{ fontWeight: 700 }}
+                        label={`مفتاح الأدوات محفوظ: ${masked || '(مخفي)'}${createdAt ? ` (${createdAt.slice(0, 10)})` : ''}`} />
                 ) : (
                     <Chip color="warning" size="small" label="غير مُنشأ" />
                 )}

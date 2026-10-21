@@ -12,7 +12,7 @@ beforeEach(() => {
 });
 
 test('generates a secret and shows it once with the exact header', async () => {
-    axios.post.mockResolvedValue({ data: { secret: 'csat_abc123', created_at: '2026-10-21T18:00:00' } });
+    axios.post.mockResolvedValue({ data: { secret: 'csat_abc123', masked: 'csat_a...c123', created_at: '2026-10-21T18:00:00' } });
     const onChange = jest.fn();
     render(<CSAgentToolSecretCard hasSecret={false} headerName="X-CS-Agent-Secret" onChange={onChange} />);
 
@@ -22,13 +22,13 @@ test('generates a secret and shows it once with the exact header', async () => {
         .toHaveTextContent('X-CS-Agent-Secret: csat_abc123'));
     expect(axios.post).toHaveBeenCalledWith('/api/cs-agent/tool-secret', {}, expect.any(Object));
     expect(window.confirm).not.toHaveBeenCalled();
-    expect(onChange).toHaveBeenCalledWith({ hasSecret: true, createdAt: '2026-10-21T18:00:00' });
+    expect(onChange).toHaveBeenCalledWith({ hasSecret: true, createdAt: '2026-10-21T18:00:00', masked: 'csat_a...c123' });
 });
 
 test('rotating asks for confirmation and does nothing when declined', () => {
     window.confirm = jest.fn(() => false);
-    render(<CSAgentToolSecretCard hasSecret createdAt="2026-10-01T00:00:00" />);
-    expect(screen.getByText(/2026-10-01/)).toBeInTheDocument();
+    render(<CSAgentToolSecretCard hasSecret masked="csat_x...9143" createdAt="2026-10-01T00:00:00" />);
+    expect(screen.getByText('مفتاح الأدوات محفوظ: csat_x...9143 (2026-10-01)')).toBeInTheDocument();
     fireEvent.click(screen.getByText('تدوير المفتاح (Rotate)'));
     expect(window.confirm).toHaveBeenCalled();
     expect(axios.post).not.toHaveBeenCalled();

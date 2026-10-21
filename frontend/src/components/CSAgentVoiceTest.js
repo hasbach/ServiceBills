@@ -30,7 +30,7 @@ export default function CSAgentVoiceTest() {
     const [geminiKeyMask, setGeminiKeyMask] = useState('');
     const [hasGeminiKey, setHasGeminiKey] = useState(false);
     const [isEditingGeminiKey, setIsEditingGeminiKey] = useState(false);
-    const [toolSecret, setToolSecret] = useState({ hasSecret: false, createdAt: null, headerName: '' });
+    const [toolSecret, setToolSecret] = useState({ hasSecret: false, createdAt: null, masked: '', headerName: '' });
     const [status, setStatus] = useState('idle'); // idle | connecting | connected | speaking | listening | error
     const [errorMessage, setErrorMessage] = useState('');
     const [isMuted, setIsMuted] = useState(false);
@@ -77,6 +77,7 @@ export default function CSAgentVoiceTest() {
                     setToolSecret({
                         hasSecret: !!res.data.has_tool_secret,
                         createdAt: res.data.tool_secret_created_at || null,
+                        masked: res.data.tool_secret || '',
                         headerName: res.data.tool_secret_header || '',
                     });
                 }
@@ -690,6 +691,7 @@ export default function CSAgentVoiceTest() {
                             <CSAgentToolSecretCard
                                 hasSecret={toolSecret.hasSecret}
                                 createdAt={toolSecret.createdAt}
+                                masked={toolSecret.masked}
                                 headerName={toolSecret.headerName}
                                 onChange={(next) => setToolSecret((prev) => ({ ...prev, ...next }))}
                             />

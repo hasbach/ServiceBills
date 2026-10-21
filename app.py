@@ -2014,6 +2014,7 @@ class CSAgentSettings(db.Model):
     # generation, never stored raw); the tool endpoints derive the tenant from it.
     tool_secret_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
     tool_secret_created_at = db.Column(db.DateTime, nullable=True)
+    tool_secret_hint = db.Column(db.String(20), nullable=True)  # _mask_secret_key() form, for the UI chip
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -16032,11 +16033,13 @@ def cs_agent_config():
     gemini_model = ''
     elevenlabs_api_key_raw = ''
     tool_secret_created_at = None
+    tool_secret_hint = ''
     try:
         settings = CSAgentSettings.query.filter_by(tenant_id=tenant_id).first()
         if settings:
             if settings.tool_secret_hash and settings.tool_secret_created_at:
                 tool_secret_created_at = settings.tool_secret_created_at.isoformat()
+                tool_secret_hint = settings.tool_secret_hint or ''
             agent_id = settings.elevenlabs_agent_id or ''
             elevenlabs_api_key_raw = settings.elevenlabs_api_key or ''
             admin_mobile_number = settings.admin_mobile_number or ''
@@ -16061,6 +16064,7 @@ def cs_agent_config():
         # The tool secret itself is only ever returned by POST /api/cs-agent/tool-secret.
         'has_tool_secret': bool(tool_secret_created_at),
         'tool_secret_created_at': tool_secret_created_at,
+        'tool_secret': tool_secret_hint,  # masked, like the other keys
         'tool_secret_header': cs_agent_tools.TOOL_SECRET_HEADER,
         'ws_url': f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={agent_id}" if agent_id else None
     }), 200
@@ -16086,6 +16090,7 @@ def cs_agent_tool_secret():
         if settings:
             settings.tool_secret_hash = None
             settings.tool_secret_created_at = None
+            settings.tool_secret_hint = None
             db.session.commit()
         return jsonify(status='ok', has_tool_secret=False), 200
 
@@ -16100,6 +16105,7 @@ def cs_agent_tool_secret():
         'secret': secret,
         'header_name': cs_agent_tools.TOOL_SECRET_HEADER,
         'header_value': secret,
+        'masked': settings.tool_secret_hint,
         'created_at': settings.tool_secret_created_at.isoformat(),
     }), 200
 

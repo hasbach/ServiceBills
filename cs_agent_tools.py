@@ -161,6 +161,7 @@ def generate_tool_secret(appmod, settings):
     secret = TOOL_SECRET_PREFIX + secrets.token_urlsafe(32)
     settings.tool_secret_hash = hash_tool_secret(secret)
     settings.tool_secret_created_at = datetime.utcnow()
+    settings.tool_secret_hint = appmod._mask_secret_key(secret)
     return secret
 
 

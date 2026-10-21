@@ -32,6 +32,7 @@ INDEX = 'ix_cs_agent_settings_tool_secret_hash'
 _COLUMNS = (
     ('tool_secret_hash', 'VARCHAR(64)', sa.String(length=64)),
     ('tool_secret_created_at', 'TIMESTAMP WITHOUT TIME ZONE', sa.DateTime()),
+    ('tool_secret_hint', 'VARCHAR(20)', sa.String(length=20)),
 )
 
 

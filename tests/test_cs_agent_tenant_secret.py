@@ -54,6 +54,9 @@ def test_generate_returns_secret_once_and_header_instructions(app, client):
     assert cfg["has_tool_secret"] is True
     assert cfg["tool_secret_created_at"]
     assert body["secret"] not in str(cfg)
+    # Masked chip, same form as the other keys.
+    assert cfg["tool_secret"] == body["masked"] == f"{body['secret'][:6]}...{body['secret'][-4:]}"
+    assert cfg["tool_secret_header"] == "X-CS-Agent-Secret"
 
     # Stored hashed, not in plain text.
     with app.app_context():
@@ -166,7 +169,9 @@ def test_revoke_removes_secret(app, client):
     _, _, secret, hdr = _make_tenant_with_secret(client, "ts_revoke", "70787878", "Revoke Me")
     assert client.delete("/api/cs-agent/tool-secret", headers=hdr).status_code == 200
     assert client.get(f"{LOOKUP}?phone=70787878", headers={"X-CS-Agent-Secret": secret}).status_code == 401
-    assert client.get("/api/cs-agent/config", headers=hdr).get_json()["has_tool_secret"] is False
+    cfg = client.get("/api/cs-agent/config", headers=hdr).get_json()
+    assert cfg["has_tool_secret"] is False
+    assert cfg["tool_secret"] == ""
 
 
 def test_tool_secret_endpoint_requires_admin_jwt(app, client):
@@ -222,7 +227,7 @@ def test_migration_up_and_down(tmp_path):
             mod.upgrade()  # idempotent: inspect() skips existing columns
         insp = sa.inspect(conn)
         cols = {c["name"] for c in insp.get_columns("cs_agent_settings")}
-        assert {"tool_secret_hash", "tool_secret_created_at"} <= cols
+        assert {"tool_secret_hash", "tool_secret_created_at", "tool_secret_hint"} <= cols
         assert any(ix["name"] == "ix_cs_agent_settings_tool_secret_hash"
                    for ix in insp.get_indexes("cs_agent_settings"))
         with Operations.context(ctx):
