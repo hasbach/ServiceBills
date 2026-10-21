@@ -97,7 +97,16 @@ if os.environ.get("TRUST_PROXY") == "1":
     # Behind exactly one reverse proxy (Render): key rate limits on the real client IP.
     from werkzeug.middleware.proxy_fix import ProxyFix
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
-CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
+CORS(app, resources={
+    r"/api/*": {"origins": Config.CORS_ORIGINS},
+    # MCP connector: AI clients (including browser-based ones like MCP
+    # Inspector) call discovery, registration, token and /mcp cross-origin.
+    # Bearer tokens only, never cookies, so a wildcard origin is safe here.
+    r"/.well-known/oauth-*": {"origins": "*", "send_wildcard": True},
+    r"/oauth/*": {"origins": "*", "send_wildcard": True},
+    r"/mcp": {"origins": "*", "send_wildcard": True,
+              "expose_headers": ["WWW-Authenticate"]},
+})
 
 # Error tracking (Phase 2). Dormant/no-op if SENTRY_DSN is unset -- same optional-
 # feature pattern as Stripe/FERNET_KEY elsewhere in this file. Import is inside the
@@ -10433,6 +10442,9 @@ wa_connect_routes.register_wa_connect_routes(app, sys.modules[__name__])
 
 import customer_import
 customer_import.register_customer_import_routes(app, sys.modules[__name__])
+
+import mcp_oauth
+mcp_oauth.register_mcp_oauth_routes(app, sys.modules[__name__])
 
 import onprem
 onprem.register(app, sys.modules[__name__])
