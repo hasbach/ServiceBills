@@ -435,3 +435,108 @@ register_tool(Tool(
         'month': {'type': 'string', 'description': 'YYYY-MM'},
         'start_date': {'type': 'string', 'format': 'date'}, 'end_date': {'type': 'string', 'format': 'date'}}},
     handler=get_financial_summary, roles=FINANCE))
+
+
+# --- tickets --------------------------------------------------------------------
+
+def list_tickets(ctx, args):
+    T = ctx.appmod.SupportTicket
+    status = enum_arg(args, 'status', ('open_or_in_progress', 'open', 'in_progress', 'resolved', 'closed', 'all'),
+                      'open_or_in_progress')
+    customer_id = int_arg(args, 'customer_id', lo=1)
+    limit = int_arg(args, 'limit', default=MAX_ROWS, lo=1, hi=MAX_ROWS)
+    q = scoped(ctx, T)
+    if status == 'open_or_in_progress':
+        q = q.filter(T.status.in_(('open', 'in_progress')))
+    elif status != 'all':
+        q = q.filter(T.status == status)
+    if customer_id:
+        q = q.filter(T.customer_id == customer_id)
+    total = q.count()
+    rows = q.order_by(T.created_at.desc()).limit(limit).all()
+    names = {c.id: c.name for c in scoped(ctx, ctx.appmod.Customer).filter(
+        ctx.appmod.Customer.id.in_({t.customer_id for t in rows if t.customer_id})).all()} if rows else {}
+    out = {'as_of': as_of(ctx), 'total': total, 'returned': len(rows),
+           'tickets': [{**_ticket_row(ctx, t), 'customer_name': names.get(t.customer_id)} for t in rows]}
+    if total > len(rows):
+        out['note'] = f'Showing the newest {len(rows)} of {total}.'
+    return out
+
+
+# --- network --------------------------------------------------------------------
+
+def _flatten_tree(nodes, parent, out):
+    for n in nodes or []:
+        out.append({'id': n.get('id'), 'name': n.get('name'), 'type': n.get('device_type'), 'parent': parent,
+                    'status': n.get('status'), 'last_status': n.get('last_status'),
+                    'last_checked_at_utc': n.get('last_checked_at'),
+                    'last_result_operation': n.get('last_result_operation'),
+                    'last_result_at': n.get('last_result_at')})
+        _flatten_tree(n.get('children'), n.get('name'), out)
+
+
+def get_network_status(ctx, args):
+    am = ctx.appmod
+    customer_id = int_arg(args, 'customer_id', lo=1)
+    tree = call_api(ctx, '/api/network-tree').get('tree') or []
+    devices = []
+    _flatten_tree(tree, None, devices)
+    A = am.NetworkAlertEvent
+    alerts = scoped(ctx, A).order_by(A.created_at.desc()).limit(10).all()
+    out = {'as_of': as_of(ctx), 'devices': devices,
+           'recent_alerts': [{'kind': a.kind, 'message': a.message, 'at': local(ctx, a.created_at)} for a in alerts],
+           'note': 'Last known results only; nothing was polled live for this answer.'}
+    if customer_id:
+        c = scoped(ctx, am.Customer).filter_by(id=customer_id).first()
+        out['customer'] = None if c is None else {
+            'id': c.id, 'name': c.name, 'upstream_status': c.upstream_last_status,
+            'upstream_synced_at': local(ctx, c.upstream_last_synced_at),
+            'onu_mac': c.onu_mac_address, 'onu_last_seen_at': local(ctx, c.onu_last_seen_at),
+            'pppoe_username': c.pppoe_username}
+    return out
+
+
+# --- resellers & upstreams --------------------------------------------------------
+
+def list_resellers(ctx, args):
+    data = call_api(ctx, '/api/resellers') or []
+    return {'as_of': as_of(ctx), 'resellers': [
+        {'id': r.get('id'), 'name': r.get('name'), 'phone': r.get('phone'), 'type': r.get('type'),
+         'balance': r.get('balance'), 'customer_count': len(r.get('customers') or [])} for r in data]}
+
+
+def list_upstreams(ctx, args):
+    data = call_api(ctx, '/api/upstream-providers') or []
+    keep = ('id', 'name', 'product', 'balance', 'status')
+    return {'as_of': as_of(ctx), 'upstreams': [{k: p.get(k) for k in keep} for p in data],
+            'note': 'balance is what this business owes or has prepaid with the upstream provider.'}
+
+
+register_tool(Tool(
+    name='list_tickets', title='Support tickets',
+    description='Support tickets, newest first. Default: open and in-progress. Filter by status or customer id.',
+    input_schema={'type': 'object', 'properties': {
+        'status': {'type': 'string', 'enum': ['open_or_in_progress', 'open', 'in_progress', 'resolved', 'closed', 'all'],
+                   'default': 'open_or_in_progress'},
+        'customer_id': {'type': 'integer'},
+        'limit': {'type': 'integer', 'minimum': 1, 'maximum': MAX_ROWS, 'default': MAX_ROWS}}},
+    handler=list_tickets, roles=ALL_STAFF))
+
+register_tool(Tool(
+    name='get_network_status', title='Network status',
+    description=('Last known status of every network device (router, OLT, ...) in the topology, recent '
+                 'network alerts, and optionally one customer\'s ONU/upstream state. No live polling.'),
+    input_schema={'type': 'object', 'properties': {'customer_id': {'type': 'integer'}}},
+    handler=get_network_status, roles=ALL_STAFF, module='network'))
+
+register_tool(Tool(
+    name='list_resellers', title='Resellers',
+    description='All resellers with their balance and number of customers.',
+    input_schema={'type': 'object', 'properties': {}},
+    handler=list_resellers, roles=FINANCE))
+
+register_tool(Tool(
+    name='list_upstreams', title='Upstream providers',
+    description='Upstream RADIUS providers this business resells, with balance and status.',
+    input_schema={'type': 'object', 'properties': {}},
+    handler=list_upstreams, roles=FINANCE, module='upstream_sync'))
