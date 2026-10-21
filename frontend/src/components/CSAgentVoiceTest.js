@@ -15,6 +15,7 @@ import {
 } from '@mui/icons-material';
 import axios from 'axios';
 import AgentMemoryManager from './AgentMemoryManager';
+import CSAgentToolSecretCard from './CSAgentToolSecretCard';
 
 export default function CSAgentVoiceTest() {
     const [agentId, setAgentId] = useState('');
@@ -29,6 +30,7 @@ export default function CSAgentVoiceTest() {
     const [geminiKeyMask, setGeminiKeyMask] = useState('');
     const [hasGeminiKey, setHasGeminiKey] = useState(false);
     const [isEditingGeminiKey, setIsEditingGeminiKey] = useState(false);
+    const [toolSecret, setToolSecret] = useState({ hasSecret: false, createdAt: null, masked: '', headerName: '' });
     const [status, setStatus] = useState('idle'); // idle | connecting | connected | speaking | listening | error
     const [errorMessage, setErrorMessage] = useState('');
     const [isMuted, setIsMuted] = useState(false);
@@ -72,6 +74,12 @@ export default function CSAgentVoiceTest() {
                     // the mask as a hint that a key is already on file.
                     setHasGeminiKey(!!res.data.has_gemini_key);
                     setGeminiKeyMask(res.data.gemini_api_key || '');
+                    setToolSecret({
+                        hasSecret: !!res.data.has_tool_secret,
+                        createdAt: res.data.tool_secret_created_at || null,
+                        masked: res.data.tool_secret || '',
+                        headerName: res.data.tool_secret_header || '',
+                    });
                 }
             })
             .catch(() => {
@@ -679,6 +687,14 @@ export default function CSAgentVoiceTest() {
                                     )}
                                 </Box>
                             </Box>
+
+                            <CSAgentToolSecretCard
+                                hasSecret={toolSecret.hasSecret}
+                                createdAt={toolSecret.createdAt}
+                                masked={toolSecret.masked}
+                                headerName={toolSecret.headerName}
+                                onChange={(next) => setToolSecret((prev) => ({ ...prev, ...next }))}
+                            />
 
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2, flexWrap: 'wrap' }}>
                                 <Chip
