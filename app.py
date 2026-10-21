@@ -2159,9 +2159,9 @@ class McpClient(db.Model):
 class McpGrant(db.Model):
     """One user's consent for one AI app on their tenant. Holds the pending
     auth code, then the current access/refresh token pair -- SHA-256 hashes
-    only, never the tokens themselves. prev_refresh_token_hash is kept so a
-    replayed (already-rotated) refresh token can be detected and the whole
-    grant revoked."""
+    only, never the tokens themselves. Every refresh hash a grant rotates away
+    from is kept in McpRotatedRefresh so a replayed (already-rotated) refresh
+    token can be detected and the whole grant revoked."""
     __tablename__ = 'mcp_grant'
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -2177,7 +2177,6 @@ class McpGrant(db.Model):
     access_token_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
     access_expires_at = db.Column(db.DateTime, nullable=True)
     refresh_token_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
-    prev_refresh_token_hash = db.Column(db.String(64), nullable=True, index=True)
     refresh_expires_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     last_used_at = db.Column(db.DateTime, nullable=True)
@@ -2191,6 +2190,18 @@ class McpGrant(db.Model):
                 'username': self.user.username if self.user else None,
                 'role': self.user.role if self.user else None,
                 'created_at': z(self.created_at), 'last_used_at': z(self.last_used_at)}
+
+
+class McpRotatedRefresh(db.Model):
+    """Every refresh-token hash a grant has rotated away from. Presenting any
+    of them again means the token leaked, so the grant is revoked. tenant_id
+    is copied from the grant so the row follows the tenant lifecycle."""
+    __tablename__ = 'mcp_rotated_refresh'
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    grant_id = db.Column(db.Integer, db.ForeignKey('mcp_grant.id'), nullable=False, index=True)
+    token_hash = db.Column(db.String(64), nullable=False, unique=True, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
 class McpToolCall(db.Model):
@@ -2409,7 +2420,7 @@ TENANT_OWNED_MODELS = (
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
     WhatsAppConversation, WhatsAppMessage, BalanceLog, WhatsAppConnectionEvent,
-    McpGrant, McpToolCall,
+    McpGrant, McpRotatedRefresh, McpToolCall,
 )
 
 from sqlalchemy import event as _sa_event
@@ -3529,7 +3540,8 @@ _EXPORT_COLUMN_DENYLIST = {
     # Bearer-secret hashes for the MCP connector -- same class of secret as
     # NetworkAgent.token_hash above.
     McpGrant: {"code_hash", "code_challenge", "access_token_hash",
-               "refresh_token_hash", "prev_refresh_token_hash"},
+               "refresh_token_hash"},
+    McpRotatedRefresh: {"token_hash"},
 }
 
 
@@ -3559,9 +3571,10 @@ def tenant_export():
 
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
-    # MCP connector rows hold FKs to user (and tool calls to mcp_grant), so
-    # they go first: tool calls, then grants.
-    McpToolCall, McpGrant,
+    # MCP connector rows hold FKs to user (and rotated-refresh/tool-call rows
+    # to mcp_grant), so they go first: rotated refresh hashes, tool calls,
+    # then grants.
+    McpRotatedRefresh, McpToolCall, McpGrant,
     # First: it holds FKs to customer, network_device, user and
     # network_agent_job, so every one of those must still exist when it goes.
     # SQLite does not enforce FKs, so getting this wrong is invisible locally

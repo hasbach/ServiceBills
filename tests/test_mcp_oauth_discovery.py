@@ -17,6 +17,13 @@ def test_redirect_uri_rules():
     assert not valid_redirect_uri("https://claude.ai/cb#frag")
     assert not valid_redirect_uri("javascript:alert(1)")
     assert not valid_redirect_uri("")
+    # Consent-screen spoofing: the host shown must be the host the code goes to.
+    assert not valid_redirect_uri("https://claude.ai@evil.example/cb")      # userinfo
+    assert not valid_redirect_uri("https://evil.example\\@claude.ai/cb")   # backslash
+    assert not valid_redirect_uri("https://:443/cb")                        # empty hostname
+    assert not valid_redirect_uri("https://claude.ai /cb")                  # whitespace
+    assert not valid_redirect_uri("https://clаude.ai/cb")               # Cyrillic a
+    assert valid_redirect_uri("http://localhost:6274/cb")
 
 
 def test_protected_resource_metadata(client):
@@ -34,6 +41,7 @@ def test_authorization_server_metadata(client):
     assert j["registration_endpoint"] == "http://localhost/oauth/register"
     assert j["code_challenge_methods_supported"] == ["S256"]
     assert j["token_endpoint_auth_methods_supported"] == ["none"]
+    assert j["authorization_response_iss_parameter_supported"] is True
 
 
 def test_register_public_client(client):

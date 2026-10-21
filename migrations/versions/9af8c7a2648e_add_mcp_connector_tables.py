@@ -1,4 +1,4 @@
-"""mcp connector: OAuth clients, grants, tool-call audit
+"""mcp connector: OAuth clients, grants, rotated refresh hashes, tool-call audit
 
 Revision ID: 9af8c7a2648e
 Revises: 18c24f5699dc
@@ -49,7 +49,6 @@ def upgrade():
             sa.Column('access_token_hash', sa.String(64), nullable=True),
             sa.Column('access_expires_at', sa.DateTime(), nullable=True),
             sa.Column('refresh_token_hash', sa.String(64), nullable=True),
-            sa.Column('prev_refresh_token_hash', sa.String(64), nullable=True),
             sa.Column('refresh_expires_at', sa.DateTime(), nullable=True),
             sa.Column('created_at', sa.DateTime(), nullable=False),
             sa.Column('last_used_at', sa.DateTime(), nullable=True),
@@ -61,7 +60,18 @@ def upgrade():
         op.create_index('ix_mcp_grant_code_hash', 'mcp_grant', ['code_hash'], unique=True)
         op.create_index('ix_mcp_grant_access_token_hash', 'mcp_grant', ['access_token_hash'], unique=True)
         op.create_index('ix_mcp_grant_refresh_token_hash', 'mcp_grant', ['refresh_token_hash'], unique=True)
-        op.create_index('ix_mcp_grant_prev_refresh_token_hash', 'mcp_grant', ['prev_refresh_token_hash'])
+    if 'mcp_rotated_refresh' not in existing:
+        op.create_table(
+            'mcp_rotated_refresh',
+            sa.Column('id', sa.Integer(), primary_key=True),
+            sa.Column('tenant_id', sa.Integer(), sa.ForeignKey('tenant.id'), nullable=False),
+            sa.Column('grant_id', sa.Integer(), sa.ForeignKey('mcp_grant.id'), nullable=False),
+            sa.Column('token_hash', sa.String(64), nullable=False),
+            sa.Column('created_at', sa.DateTime(), nullable=False),
+        )
+        op.create_index('ix_mcp_rotated_refresh_tenant_id', 'mcp_rotated_refresh', ['tenant_id'])
+        op.create_index('ix_mcp_rotated_refresh_grant_id', 'mcp_rotated_refresh', ['grant_id'])
+        op.create_index('ix_mcp_rotated_refresh_token_hash', 'mcp_rotated_refresh', ['token_hash'], unique=True)
     if 'mcp_tool_call' not in existing:
         op.create_table(
             'mcp_tool_call',
@@ -83,6 +93,6 @@ def upgrade():
 
 def downgrade():
     existing = set(inspect(op.get_bind()).get_table_names())
-    for table in ('mcp_tool_call', 'mcp_grant', 'mcp_client'):
+    for table in ('mcp_rotated_refresh', 'mcp_tool_call', 'mcp_grant', 'mcp_client'):
         if table in existing:
             op.drop_table(table)

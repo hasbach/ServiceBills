@@ -34,14 +34,22 @@ def test_mcp_migration_up_and_down(tmp_path):
             mod.upgrade()
             mod.upgrade()  # idempotent: guarded by inspect()
         insp = sa.inspect(conn)
-        assert {"mcp_client", "mcp_grant", "mcp_tool_call"} <= set(insp.get_table_names())
+        assert {"mcp_client", "mcp_grant", "mcp_tool_call", "mcp_rotated_refresh"} <= set(insp.get_table_names())
         grant_cols = {c["name"] for c in insp.get_columns("mcp_grant")}
-        assert {"access_token_hash", "refresh_token_hash", "prev_refresh_token_hash",
+        assert {"access_token_hash", "refresh_token_hash",
                 "code_hash", "code_challenge", "code_used_at", "revoked_at"} <= grant_cols
+        assert "prev_refresh_token_hash" not in grant_cols   # replaced by mcp_rotated_refresh
+        rot_cols = {c["name"] for c in insp.get_columns("mcp_rotated_refresh")}
+        assert rot_cols == {"id", "tenant_id", "grant_id", "token_hash", "created_at"}
+        rot_ix = {i["name"]: i for i in insp.get_indexes("mcp_rotated_refresh")}
+        assert {"ix_mcp_rotated_refresh_tenant_id", "ix_mcp_rotated_refresh_grant_id",
+                "ix_mcp_rotated_refresh_token_hash"} <= set(rot_ix)
+        assert rot_ix["ix_mcp_rotated_refresh_token_hash"]["unique"]
         with Operations.context(ctx):
             mod.downgrade()
         insp = sa.inspect(conn)
-        assert not ({"mcp_client", "mcp_grant", "mcp_tool_call"} & set(insp.get_table_names()))
+        assert not ({"mcp_client", "mcp_grant", "mcp_tool_call", "mcp_rotated_refresh"}
+                    & set(insp.get_table_names()))
 
 
 def test_mcp_models_registered_and_serialize(app, client):
@@ -59,6 +67,10 @@ def test_mcp_models_registered_and_serialize(app, client):
     assert "access_token_hash" not in d and "refresh_token_hash" not in d
     assert appmod.McpGrant in appmod.TENANT_OWNED_MODELS
     assert appmod.McpToolCall in appmod.TENANT_OWNED_MODELS
+    assert appmod.McpRotatedRefresh in appmod.TENANT_OWNED_MODELS
     order = appmod._TENANT_DELETE_ORDER
-    assert order.index(appmod.McpToolCall) < order.index(appmod.McpGrant)
+    assert order[0] is appmod.McpRotatedRefresh
+    assert order.index(appmod.McpRotatedRefresh) < order.index(appmod.McpToolCall) < order.index(appmod.McpGrant)
     assert "access_token_hash" in appmod._EXPORT_COLUMN_DENYLIST[appmod.McpGrant]
+    assert "prev_refresh_token_hash" not in appmod._EXPORT_COLUMN_DENYLIST[appmod.McpGrant]
+    assert appmod._EXPORT_COLUMN_DENYLIST[appmod.McpRotatedRefresh] == {"token_hash"}

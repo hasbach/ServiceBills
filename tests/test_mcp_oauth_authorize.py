@@ -53,6 +53,18 @@ def test_consent_info(client):
     assert j["username"] == "ox_admin" and j["redirect_host"] == "claude.ai"
 
 
+def test_consent_info_shows_explicit_port(client):
+    hdr = make_tenant(client, "Port Biz", "port_admin")
+    enable_connector("port_admin")
+    uri = "https://claude.ai:8443/cb"
+    cid = register_client(client, redirect=uri)
+    _, challenge = pkce_pair()
+    r = client.get("/api/mcp/oauth/consent-info", headers=hdr,
+                   query_string=authorize_params(cid, challenge, redirect=uri))
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["redirect_host"] == "claude.ai:8443"
+
+
 def test_consent_info_module_off(client):
     hdr = make_tenant(client, "Off Biz", "off_admin")   # free plan, no override
     cid = register_client(client)

@@ -47,17 +47,35 @@ def origin():
 
 
 def valid_redirect_uri(uri):
+    """https with a host, or http loopback; no fragment. Also rejects every
+    shape the consent screen could be fooled by: userinfo
+    (https://claude.ai@evil.example), backslashes (parsers disagree on where
+    the host ends), an empty hostname, and whitespace/non-ASCII (homoglyph
+    hosts)."""
     if not isinstance(uri, str) or not uri:
+        return False
+    if '\\' in uri or any(ord(c) <= 0x20 or ord(c) >= 0x7f for c in uri):
         return False
     try:
         p = urlparse(uri)
+        p.port   # raises ValueError on a malformed port
     except ValueError:
         return False
-    if p.fragment:
+    if p.fragment or p.username is not None or p.password is not None or not p.hostname:
         return False
-    if p.scheme == 'https' and p.netloc:
+    if p.scheme == 'https':
         return True
     return p.scheme == 'http' and p.hostname in _LOOPBACK
+
+
+def redirect_host(uri):
+    """What the consent screen shows as the destination: hostname, plus the
+    port only when one is explicitly present."""
+    p = urlparse(uri)
+    host = p.hostname or ''
+    if ':' in host:
+        host = '[' + host + ']'
+    return host + (':' + str(p.port) if p.port is not None else '')
 
 
 def oauth_error(code, description, status=400):
@@ -95,7 +113,7 @@ _VERIFIER_RE = re.compile(r'^[A-Za-z0-9\-._~]{43,128}$')
 
 def revoke_grant(grant, now):
     """Kill a grant: clear live token hashes (so lookups fail even if a check
-    is ever missed), keep code_hash/prev_refresh_token_hash for replay
+    is ever missed), keep code_hash and the McpRotatedRefresh rows for replay
     detection."""
     if grant.revoked_at is None:
         grant.revoked_at = now
@@ -103,14 +121,15 @@ def revoke_grant(grant, now):
     grant.refresh_token_hash = None
 
 
-def _issue_tokens(grant, now):
+def _issue_tokens(now):
+    """The one place token values and their hashes/expiries are computed.
+    Returns the plaintext pair plus the McpGrant column values that go with
+    it; callers write `columns` with a conditional UPDATE (atomic claim)."""
     access, refresh = new_token(), new_token()
-    grant.access_token_hash = hash_token(access)
-    grant.access_expires_at = now + ACCESS_TTL
-    grant.prev_refresh_token_hash = grant.refresh_token_hash
-    grant.refresh_token_hash = hash_token(refresh)
-    grant.refresh_expires_at = now + REFRESH_TTL
-    return access, refresh
+    return access, refresh, {
+        'access_token_hash': hash_token(access), 'access_expires_at': now + ACCESS_TTL,
+        'refresh_token_hash': hash_token(refresh), 'refresh_expires_at': now + REFRESH_TTL,
+    }
 
 
 def _token_response(access, refresh):
@@ -148,6 +167,7 @@ def register_mcp_oauth_routes(app, appmod):
             'token_endpoint_auth_methods_supported': ['none'],
             'revocation_endpoint_auth_methods_supported': ['none'],
             'scopes_supported': [SCOPE],
+            'authorization_response_iss_parameter_supported': True,
         })
 
     @app.route('/oauth/register', methods=['POST'])
@@ -226,7 +246,7 @@ def register_mcp_oauth_routes(app, appmod):
             return jsonify(error=problem), 403
         return jsonify(client_name=client.client_name, tenant_name=tenant.name,
                        username=user.username, role=user.role,
-                       redirect_host=urlparse(params['redirect_uri']).netloc)
+                       redirect_host=redirect_host(params['redirect_uri']))
 
     @app.route('/api/mcp/oauth/approve', methods=['POST'])
     @jwt_required()
@@ -262,9 +282,12 @@ def register_mcp_oauth_routes(app, appmod):
         if grant is None:
             return oauth_error('invalid_grant', 'Unknown or expired authorization code')
         if grant.code_used_at is not None:
-            # A replayed code revokes whatever it already issued (RFC 6749 4.1.2).
-            revoke_grant(grant, now)
-            db.session.commit()
+            # A replayed code revokes whatever it already issued (RFC 6749 4.1.2)
+            # -- but only when the owner's client_id presents it, so a stranger
+            # who merely learns a code can't kill someone's connection.
+            if f.get('client_id') == grant.client_id:
+                revoke_grant(grant, now)
+                db.session.commit()
             return oauth_error('invalid_grant', 'Authorization code already used')
         if grant.revoked_at is not None or grant.code_expires_at is None or grant.code_expires_at < now:
             return oauth_error('invalid_grant', 'Unknown or expired authorization code')
@@ -276,8 +299,14 @@ def register_mcp_oauth_routes(app, appmod):
         if not _VERIFIER_RE.match(verifier) or not hmac.compare_digest(
                 pkce_s256(verifier), grant.code_challenge or ''):
             return oauth_error('invalid_grant', 'PKCE verification failed')
-        grant.code_used_at = now
-        access, refresh = _issue_tokens(grant, now)
+        access, refresh, columns = _issue_tokens(now)
+        # Claim the code atomically: of two concurrent requests with the same
+        # code only the one whose UPDATE flips code_used_at from NULL wins.
+        claimed = Grant.query.filter(Grant.id == grant.id, Grant.code_used_at.is_(None)).update(
+            {'code_used_at': now, **columns}, synchronize_session=False)
+        if claimed != 1:
+            db.session.rollback()
+            return oauth_error('invalid_grant', 'Authorization code already used')
         db.session.commit()
         return _token_response(access, refresh)
 
@@ -287,11 +316,13 @@ def register_mcp_oauth_routes(app, appmod):
         h = hash_token(presented) if presented else None
         grant = Grant.query.filter_by(refresh_token_hash=h).first() if h else None
         if grant is None:
-            stale = Grant.query.filter_by(prev_refresh_token_hash=h).first() if h else None
-            if stale is not None:
-                # A rotated-out refresh token came back: treat as stolen.
-                revoke_grant(stale, now)
-                db.session.commit()
+            rotated = appmod.McpRotatedRefresh.query.filter_by(token_hash=h).first() if h else None
+            if rotated is not None:
+                # A rotated-out refresh token (any generation) came back: stolen.
+                stale = db.session.get(Grant, rotated.grant_id)
+                if stale is not None:
+                    revoke_grant(stale, now)
+                    db.session.commit()
             return oauth_error('invalid_grant', 'Unknown refresh token')
         if (grant.revoked_at is not None or grant.refresh_expires_at is None
                 or grant.refresh_expires_at < now
@@ -302,7 +333,22 @@ def register_mcp_oauth_routes(app, appmod):
             revoke_grant(grant, now)
             db.session.commit()
             return oauth_error('invalid_grant', 'This connection is no longer valid')
-        access, refresh = _issue_tokens(grant, now)
+        # Suspension and a switched-off module are reversible, so refuse
+        # without revoking: the connection works again once they come back.
+        tenant = db.session.get(appmod.Tenant, grant.tenant_id)
+        if tenant is None or tenant.status != 'active' or not modules.is_enabled(tenant, 'ai_connector'):
+            return oauth_error('invalid_grant', "This business's connector is not active")
+        access, refresh, columns = _issue_tokens(now)
+        # Claim the rotation atomically: only the request that still sees the
+        # presented hash as current gets to replace it.
+        claimed = Grant.query.filter(
+            Grant.id == grant.id, Grant.refresh_token_hash == h, Grant.revoked_at.is_(None)
+        ).update(columns, synchronize_session=False)
+        if claimed != 1:
+            db.session.rollback()
+            return oauth_error('invalid_grant', 'Refresh token already used')
+        db.session.add(appmod.McpRotatedRefresh(
+            tenant_id=grant.tenant_id, grant_id=grant.id, token_hash=h))
         db.session.commit()
         return _token_response(access, refresh)
 
