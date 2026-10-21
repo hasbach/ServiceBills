@@ -312,3 +312,126 @@ register_tool(Tool(
         'sector': {'type': 'string'}, 'plan': {'type': 'string'}, 'upstream': {'type': 'string'},
         'limit': {'type': 'integer', 'minimum': 1, 'maximum': MAX_ROWS, 'default': MAX_ROWS}}},
     handler=list_customers, roles=ALL_STAFF))
+
+
+# --- finance (via the app's own report endpoints) -----------------------------
+
+_PAYMENT_KEYS = ('id', 'customer_id', 'customer_name', 'date', 'amount', 'currency', 'paid', 'paid_at',
+                 'collected', 'collected_at', 'collected_by', 'collected_via', 'received_by',
+                 'is_refund', 'is_gratis', 'reverted_at', 'reason')
+
+
+def list_payments(ctx, args):
+    limit = int_arg(args, 'limit', default=MAX_ROWS, lo=1, hi=MAX_ROWS)
+    status = enum_arg(args, 'status', ('any', 'paid', 'unpaid'), 'any')
+    params = {
+        'start_date': day(date_arg(args, 'billed_from')),
+        'end_date': day(date_arg(args, 'billed_to')),
+        'paid_date_start': day(date_arg(args, 'paid_from')),
+        'paid_date_end': day(date_arg(args, 'paid_to')),
+        'customer_id': int_arg(args, 'customer_id', lo=1),
+        'search_query': str_arg(args, 'customer_name'),
+        'status': None if status == 'any' else status,
+        'page': 1, 'per_page': limit,
+    }
+    data = call_api(ctx, '/api/payments', params)
+    rows = [{k: p.get(k) for k in _PAYMENT_KEYS} for p in data.get('payments', [])]
+    out = {'as_of': as_of(ctx), 'total': data.get('total'), 'returned': len(rows),
+           'totals': data.get('totals'), 'payments': rows,
+           'timestamps': 'paid_at / collected_at are UTC as stored; date is the billing date.'}
+    if (data.get('total') or 0) > len(rows):
+        out['note'] = f"Showing {len(rows)} of {data.get('total')}; totals cover all of them."
+    return out
+
+
+def get_cash_flow(ctx, args):
+    the_day = date_arg(args, 'day')
+    start, end = date_arg(args, 'start_date'), date_arg(args, 'end_date')
+    if (start is None) != (end is None):
+        raise ToolError("Give both 'start_date' and 'end_date', or neither.")
+    if start is not None and the_day is not None:
+        raise ToolError("Use either 'day' or a 'start_date'/'end_date' range, not both.")
+    if start is None and the_day is None:
+        the_day = today(ctx)
+    params = {'start_date': day(start), 'end_date': day(end)} if start else {'day': day(the_day)}
+    data = call_api(ctx, '/api/reports/daily-cash', params)
+    groups = [{'collector': g.get('collector_name') or 'Office / Direct', 'is_office': g.get('is_office'),
+               'total': g.get('total'), 'payments': g.get('payment_count')} for g in data.get('groups', [])]
+    out = {'as_of': as_of(ctx), 'date_start': data.get('date_start'), 'date_end': data.get('date_end'),
+           'currency': data.get('reporting_currency'), 'collected_total': data.get('grand_total'),
+           'by_collector': groups}
+    cf = data.get('cash_flow')
+    if cf and not start:
+        def tot(k):
+            return (cf.get(k) or {}).get('total')
+        out['cash_flow'] = {
+            'day': cf.get('day'), 'closed': bool(cf.get('close')), 'locked_through': cf.get('locked_through'),
+            'cash_start': cf.get('cash_start'), 'cash_in': tot('cash_in'), 'cash_out': tot('cash_out'),
+            'cash_end': cf.get('cash_end'), 'whish_start': cf.get('whish_start'), 'whish_in': tot('whish_in'),
+            'whish_out': tot('whish_out'), 'whish_end': cf.get('whish_end'),
+            'total_in': cf.get('total_in'), 'total_out': cf.get('total_out'), 'total_net': cf.get('total_net'),
+            'money_out_items': ((cf.get('cash_out') or {}).get('items') or [])[:20]
+                               + ((cf.get('whish_out') or {}).get('items') or [])[:20],
+        }
+    return out
+
+
+def _month_bounds(month):
+    try:
+        first = datetime.strptime(month, '%Y-%m').date()
+    except ValueError:
+        raise ToolError("'month' must look like 2026-10.")
+    nxt = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return first, nxt - timedelta(days=1)
+
+
+def get_financial_summary(ctx, args):
+    month = str_arg(args, 'month', max_len=7)
+    start, end = date_arg(args, 'start_date'), date_arg(args, 'end_date')
+    if month and (start or end):
+        raise ToolError("Use either 'month' or a 'start_date'/'end_date' range, not both.")
+    if (start is None) != (end is None):
+        raise ToolError("Give both 'start_date' and 'end_date', or neither.")
+    if not start:
+        start, end = _month_bounds(month or today(ctx).strftime('%Y-%m'))
+    period = {'start_date': day(start), 'end_date': day(end)}
+    report = call_api(ctx, '/api/reports/financial', period)
+    dash = call_api(ctx, '/api/dashboard', period)
+    return {'as_of': as_of(ctx), 'period': period, 'currency': report.get('currency'),
+            'totals': report.get('totals'), 'by_month': report.get('monthly_data'),
+            'snapshot': {'active_customers': dash.get('activeCustomers'),
+                         'total_customers': dash.get('totalCustomers'),
+                         'outstanding_balance': dash.get('outstandingBalance')},
+            'note': 'income = money received; profit = income - expenses; estimated_* include '
+                    'payroll estimates. Customer counts are as of now, not for the period.'}
+
+
+register_tool(Tool(
+    name='list_payments', title='List payments',
+    description=('Bills and payments with filters (billing date range, paid date range, paid/unpaid, '
+                 'customer id or name). Totals cover every match, converted to the reporting currency.'),
+    input_schema={'type': 'object', 'properties': {
+        'billed_from': {'type': 'string', 'format': 'date'}, 'billed_to': {'type': 'string', 'format': 'date'},
+        'paid_from': {'type': 'string', 'format': 'date'}, 'paid_to': {'type': 'string', 'format': 'date'},
+        'status': {'type': 'string', 'enum': ['any', 'paid', 'unpaid'], 'default': 'any'},
+        'customer_id': {'type': 'integer'}, 'customer_name': {'type': 'string'},
+        'limit': {'type': 'integer', 'minimum': 1, 'maximum': MAX_ROWS, 'default': MAX_ROWS}}},
+    handler=list_payments, roles=PAYMENTS))
+
+register_tool(Tool(
+    name='get_cash_flow', title='Daily cash flow',
+    description=('Money collected per collector for a day (default today) or a date range, plus for a '
+                 'single day the cash/Whish register: opening, in, out, closing and whether the day is closed.'),
+    input_schema={'type': 'object', 'properties': {
+        'day': {'type': 'string', 'format': 'date'},
+        'start_date': {'type': 'string', 'format': 'date'}, 'end_date': {'type': 'string', 'format': 'date'}}},
+    handler=get_cash_flow, roles=FINANCE))
+
+register_tool(Tool(
+    name='get_financial_summary', title='Financial summary',
+    description=('Income, expenses (manual, supplier, payroll) and profit for a month (default this month) '
+                 'or a date range, broken down by month, plus current customer counts and outstanding balance.'),
+    input_schema={'type': 'object', 'properties': {
+        'month': {'type': 'string', 'description': 'YYYY-MM'},
+        'start_date': {'type': 'string', 'format': 'date'}, 'end_date': {'type': 'string', 'format': 'date'}}},
+    handler=get_financial_summary, roles=FINANCE))
