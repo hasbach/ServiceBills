@@ -128,11 +128,30 @@ def _summarize(args):
     return json.dumps(args, ensure_ascii=False, default=str, sort_keys=True)[:500]
 
 
+def _safe_commit(db):
+    """Commit the audit/last_used writes; a failure here must never turn an
+    already-computed answer into a 500."""
+    try:
+        db.session.commit()
+    except Exception:
+        logging.exception('MCP audit commit failed')
+        try:
+            db.session.rollback()
+        except Exception:
+            logging.exception('MCP rollback after failed commit also failed')
+
+
 def call_tool(ctx, tool, args):
     started = time.monotonic()
+    appmod = ctx.appmod
+    db = appmod.db
+    # Plain values: a rollback below expires the ORM objects on ctx.
+    tenant_id, user_id, grant_id = ctx.tenant.id, ctx.user.id, ctx.grant.id
+    role = ctx.user.role
+    rolled_back = False
     ok, error = True, None
     if not any(r in tool.roles for r in ctx.roles):
-        ok, error = False, f"Your role ({ctx.user.role}) can't use {tool.name}."
+        ok, error = False, f"Your role ({role}) can't use {tool.name}."
         out = _tool_error(error)
     else:
         try:
@@ -144,20 +163,40 @@ def call_tool(ctx, tool, args):
             out = _tool_error(error)
         except Exception:
             logging.exception('MCP tool %s failed', tool.name)
-            ctx.appmod.db.session.rollback()
+            try:
+                db.session.rollback()
+            except Exception:
+                logging.exception('MCP rollback failed')
+            rolled_back = True
             ok, error = False, 'internal error'
             out = _tool_error('Something went wrong reading this data. Try again or narrow the request.')
-    ctx.appmod.db.session.add(ctx.appmod.McpToolCall(
-        tenant_id=ctx.tenant.id, user_id=ctx.user.id, grant_id=ctx.grant.id, tool=tool.name,
-        args_summary=_summarize(args), ok=ok, error=(error or None) and error[:300],
-        duration_ms=int((time.monotonic() - started) * 1000)))
+    try:
+        if rolled_back:   # the rollback also discarded last_used_at set in resolve_context
+            appmod.McpGrant.query.filter_by(id=grant_id).update(
+                {'last_used_at': datetime.utcnow()}, synchronize_session=False)
+        db.session.add(appmod.McpToolCall(
+            tenant_id=tenant_id, user_id=user_id, grant_id=grant_id, tool=tool.name,
+            args_summary=_summarize(args), ok=ok, error=(error or None) and error[:300],
+            duration_ms=int((time.monotonic() - started) * 1000)))
+    except Exception:
+        logging.exception('MCP audit write failed')
+        try:
+            db.session.rollback()
+        except Exception:
+            logging.exception('MCP rollback failed')
     return out
 
 
 def handle_message(ctx, msg):
     msg_id = msg.get('id')
     method = msg.get('method')
-    params = msg.get('params') or {}
+    if not isinstance(method, str):
+        return _error(msg_id, -32600, 'Invalid Request')
+    params = msg.get('params')
+    if params is None:
+        params = {}
+    elif not isinstance(params, dict):
+        return _error(msg_id, -32602, 'params must be an object')
     if method == 'initialize':
         requested = params.get('protocolVersion')
         version = requested if requested in SUPPORTED_VERSIONS else SUPPORTED_VERSIONS[0]
@@ -171,6 +210,8 @@ def handle_message(ctx, msg):
         return _result(msg_id, {'tools': [_describe(t) for t in visible]})
     if method == 'tools/call':
         name = params.get('name')
+        if not isinstance(name, str):
+            return _error(msg_id, -32602, 'Tool name must be a string')
         args = params.get('arguments') or {}
         tool = TOOLS.get(name)
         if tool is None or (tool.module and not modules.is_enabled(ctx.tenant, tool.module)):
@@ -188,6 +229,7 @@ def register_mcp_routes(app, appmod):
         return mcp_oauth.hash_token(request.headers.get('Authorization', '') or (request.remote_addr or ''))
 
     @app.route('/mcp', methods=['POST'])
+    @appmod.limiter.limit('300/minute')   # per-IP backstop
     @appmod.limiter.limit('60/minute', key_func=_per_token_key)
     def mcp_endpoint():
         ctx, err = resolve_context(appmod)
@@ -196,14 +238,18 @@ def register_mcp_routes(app, appmod):
         version = request.headers.get('MCP-Protocol-Version')
         if version and version not in SUPPORTED_VERSIONS:
             return jsonify(_error(None, -32600, f'Unsupported MCP-Protocol-Version: {version}')), 400
-        msg = request.get_json(silent=True)
+        try:
+            msg = json.loads(request.get_data() or b'')
+        except ValueError:   # includes JSONDecodeError and UnicodeDecodeError
+            return jsonify(_error(None, -32700, 'Parse error')), 400
         if not isinstance(msg, dict) or msg.get('jsonrpc') != '2.0':
             return jsonify(_error(None, -32600, 'Invalid Request (batches are not supported)')), 400
-        if 'id' not in msg:   # notification or client response: nothing to answer
-            db.session.commit()
+        is_response = 'method' not in msg and ('result' in msg or 'error' in msg)
+        if 'id' not in msg or is_response:   # notification or client response: nothing to answer
+            _safe_commit(db)
             return ('', 202)
         out = handle_message(ctx, msg)
-        db.session.commit()
+        _safe_commit(db)
         return jsonify(out)
 
     @app.route('/mcp', methods=['GET', 'DELETE'])

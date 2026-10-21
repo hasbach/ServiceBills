@@ -132,3 +132,106 @@ def test_tenant_isolation_of_context(client, echo_tool):
     tok_b = _token(client, "iso_b", "Biz B")
     assert tool_data(call_tool(client, tok_a, "test_echo"))["tenant"] == "Biz A"
     assert tool_data(call_tool(client, tok_b, "test_echo"))["tenant"] == "Biz B"
+
+
+def _raw(client, tok, body, **kw):
+    return client.post("/mcp", json=body, headers={"Authorization": f"Bearer {tok}"}, **kw)
+
+
+def test_malformed_shapes_get_jsonrpc_errors(client, echo_tool):
+    tok = _token(client)
+    r = mcp(client, tok, "tools/list", ["not", "an", "object"])
+    assert r.status_code == 200 and r.get_json()["error"]["code"] == -32602
+    r = mcp(client, tok, "tools/call", {"name": ["x"], "arguments": {}})
+    assert r.status_code == 200 and r.get_json()["error"]["code"] == -32602
+    r = mcp(client, tok, "tools/call", {"name": {"a": 1}})
+    assert r.status_code == 200 and r.get_json()["error"]["code"] == -32602
+    r = _raw(client, tok, {"jsonrpc": "2.0", "id": 1, "method": 42})
+    assert r.status_code == 200 and r.get_json()["error"]["code"] == -32600
+    r = _raw(client, tok, {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": "str"})
+    assert r.get_json()["error"]["code"] == -32602
+
+
+def test_tool_handler_db_error_is_audited_and_returned(client):
+    import app as appmod
+    from sqlalchemy.exc import OperationalError
+
+    def handler(ctx, args):
+        raise OperationalError("SELECT 1", {}, Exception("boom"))
+    mcp_server.register_tool(mcp_server.Tool(
+        name="test_dberr", title="DbErr", description="test only",
+        input_schema={"type": "object"}, handler=handler))
+    try:
+        tok = _token(client)
+        assert "went wrong" in tool_error_text(call_tool(client, tok, "test_dberr"))
+        row = appmod.McpToolCall.query.one()
+        assert row.ok is False and row.tool == "test_dberr"
+        assert appmod.McpGrant.query.one().last_used_at is not None
+    finally:
+        mcp_server.TOOLS.pop("test_dberr", None)
+
+
+def test_audit_write_failure_never_breaks_the_answer(client, echo_tool, monkeypatch):
+    import app as appmod
+    tok = _token(client)
+    real_commit = appmod.db.session.commit
+    calls = {"n": 0}
+
+    def flaky_commit():
+        calls["n"] += 1
+        raise RuntimeError("commit failed")
+    monkeypatch.setattr(appmod.db.session, "commit", flaky_commit)
+    r = mcp(client, tok, "tools/call", {"name": "test_echo", "arguments": {"text": "hi"}})
+    assert r.status_code == 200
+    assert r.get_json()["result"]["isError"] is False
+    assert calls["n"] >= 1
+    monkeypatch.setattr(appmod.db.session, "commit", real_commit)
+
+
+def test_expired_access_token_is_401(client):
+    import app as appmod
+    from datetime import datetime, timedelta
+    tok = _token(client)
+    grant = appmod.McpGrant.query.one()
+    grant.access_expires_at = datetime.utcnow() - timedelta(seconds=5)
+    appmod.db.session.commit()
+    assert mcp(client, tok, "ping").status_code == 401
+
+
+def test_client_response_message_is_202(client):
+    tok = _token(client)
+    r = _raw(client, tok, {"jsonrpc": "2.0", "id": 7, "result": {}})
+    assert r.status_code == 202 and r.get_data() == b""
+    r = _raw(client, tok, {"jsonrpc": "2.0", "id": 8, "error": {"code": -1, "message": "x"}})
+    assert r.status_code == 202 and r.get_data() == b""
+
+
+def test_invalid_json_is_parse_error_and_batch_is_invalid_request(client):
+    tok = _token(client)
+    r = client.post("/mcp", data="{not json", content_type="application/json",
+                    headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 400 and r.get_json()["error"]["code"] == -32700
+    r = _raw(client, tok, [{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
+    assert r.status_code == 400 and r.get_json()["error"]["code"] == -32600
+
+
+def test_module_gated_tool_hidden_and_rejected(client):
+    import app as appmod
+    mcp_server.register_tool(mcp_server.Tool(
+        name="test_net", title="Net", description="test only",
+        input_schema={"type": "object"}, handler=lambda ctx, args: {"ok": 1}, module="network"))
+    try:
+        tok = _token(client)
+        tenant = appmod.Tenant.query.filter_by(name="Srv Biz").one()
+        tenant.module_overrides = {**(tenant.module_overrides or {}), "network": True}
+        appmod.db.session.commit()
+        names = [t["name"] for t in mcp(client, tok, "tools/list").get_json()["result"]["tools"]]
+        assert "test_net" in names
+        tenant.module_overrides = {**(tenant.module_overrides or {}), "network": False}
+        appmod.db.session.commit()
+        names = [t["name"] for t in mcp(client, tok, "tools/list").get_json()["result"]["tools"]]
+        assert "test_net" not in names
+        r = mcp(client, tok, "tools/call", {"name": "test_net", "arguments": {}})
+        assert r.get_json()["error"]["code"] == -32602
+    finally:
+        mcp_server.TOOLS.pop("test_net", None)
