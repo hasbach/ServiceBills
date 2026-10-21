@@ -6,6 +6,7 @@ Public clients only (PKCE S256, no client secrets). Tokens are random
 strings; only their SHA-256 hashes are stored (McpGrant)."""
 import base64
 import hashlib
+import hmac
 import re
 import secrets
 import time
@@ -87,6 +88,37 @@ def validate_authorize_params(params, expected_resource):
     if resource and str(resource).rstrip('/') != expected_resource:
         return 'invalid_target', 'This server only issues tokens for ' + expected_resource
     return None
+
+
+_VERIFIER_RE = re.compile(r'^[A-Za-z0-9\-._~]{43,128}$')
+
+
+def revoke_grant(grant, now):
+    """Kill a grant: clear live token hashes (so lookups fail even if a check
+    is ever missed), keep code_hash/prev_refresh_token_hash for replay
+    detection."""
+    if grant.revoked_at is None:
+        grant.revoked_at = now
+    grant.access_token_hash = None
+    grant.refresh_token_hash = None
+
+
+def _issue_tokens(grant, now):
+    access, refresh = new_token(), new_token()
+    grant.access_token_hash = hash_token(access)
+    grant.access_expires_at = now + ACCESS_TTL
+    grant.prev_refresh_token_hash = grant.refresh_token_hash
+    grant.refresh_token_hash = hash_token(refresh)
+    grant.refresh_expires_at = now + REFRESH_TTL
+    return access, refresh
+
+
+def _token_response(access, refresh):
+    resp = jsonify(access_token=access, token_type='Bearer',
+                   expires_in=int(ACCESS_TTL.total_seconds()), refresh_token=refresh, scope=SCOPE)
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['Pragma'] = 'no-cache'
+    return resp
 
 
 def register_mcp_oauth_routes(app, appmod):
@@ -222,3 +254,78 @@ def register_mcp_oauth_routes(app, appmod):
         db.session.commit()
         return jsonify(redirect_url=with_query(params['redirect_uri'], {
             'code': code, 'state': params.get('state'), 'iss': origin()}))
+
+    def _exchange_code(f):
+        now = datetime.utcnow()
+        code = f.get('code') or ''
+        grant = Grant.query.filter_by(code_hash=hash_token(code)).first() if code else None
+        if grant is None:
+            return oauth_error('invalid_grant', 'Unknown or expired authorization code')
+        if grant.code_used_at is not None:
+            # A replayed code revokes whatever it already issued (RFC 6749 4.1.2).
+            revoke_grant(grant, now)
+            db.session.commit()
+            return oauth_error('invalid_grant', 'Authorization code already used')
+        if grant.revoked_at is not None or grant.code_expires_at is None or grant.code_expires_at < now:
+            return oauth_error('invalid_grant', 'Unknown or expired authorization code')
+        if f.get('client_id') != grant.client_id:
+            return oauth_error('invalid_grant', 'Code was issued to another client')
+        if f.get('redirect_uri') and f.get('redirect_uri') != grant.redirect_uri:
+            return oauth_error('invalid_grant', 'redirect_uri mismatch')
+        verifier = f.get('code_verifier') or ''
+        if not _VERIFIER_RE.match(verifier) or not hmac.compare_digest(
+                pkce_s256(verifier), grant.code_challenge or ''):
+            return oauth_error('invalid_grant', 'PKCE verification failed')
+        grant.code_used_at = now
+        access, refresh = _issue_tokens(grant, now)
+        db.session.commit()
+        return _token_response(access, refresh)
+
+    def _refresh(f):
+        now = datetime.utcnow()
+        presented = f.get('refresh_token') or ''
+        h = hash_token(presented) if presented else None
+        grant = Grant.query.filter_by(refresh_token_hash=h).first() if h else None
+        if grant is None:
+            stale = Grant.query.filter_by(prev_refresh_token_hash=h).first() if h else None
+            if stale is not None:
+                # A rotated-out refresh token came back: treat as stolen.
+                revoke_grant(stale, now)
+                db.session.commit()
+            return oauth_error('invalid_grant', 'Unknown refresh token')
+        if (grant.revoked_at is not None or grant.refresh_expires_at is None
+                or grant.refresh_expires_at < now
+                or (f.get('client_id') and f.get('client_id') != grant.client_id)):
+            return oauth_error('invalid_grant', 'Refresh token expired or revoked')
+        user = db.session.get(appmod.User, grant.user_id)
+        if user is None or user.tenant_id != grant.tenant_id:
+            revoke_grant(grant, now)
+            db.session.commit()
+            return oauth_error('invalid_grant', 'This connection is no longer valid')
+        access, refresh = _issue_tokens(grant, now)
+        db.session.commit()
+        return _token_response(access, refresh)
+
+    @app.route('/oauth/token', methods=['POST'])
+    @appmod.limiter.limit('60/minute')
+    def mcp_oauth_token():
+        f = request.form if request.form else (request.get_json(silent=True) or {})
+        grant_type = f.get('grant_type')
+        if grant_type == 'authorization_code':
+            return _exchange_code(f)
+        if grant_type == 'refresh_token':
+            return _refresh(f)
+        return oauth_error('unsupported_grant_type', 'Use authorization_code or refresh_token')
+
+    @app.route('/oauth/revoke', methods=['POST'])
+    def mcp_oauth_revoke():
+        f = request.form if request.form else (request.get_json(silent=True) or {})
+        token = f.get('token') or ''
+        if token:
+            h = hash_token(token)
+            grant = Grant.query.filter(db.or_(Grant.access_token_hash == h,
+                                              Grant.refresh_token_hash == h)).first()
+            if grant is not None:
+                revoke_grant(grant, datetime.utcnow())
+                db.session.commit()
+        return ('', 200)
