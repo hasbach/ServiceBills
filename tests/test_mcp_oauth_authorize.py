@@ -16,7 +16,7 @@ def test_authorize_redirects_to_consent_page(client):
     r = client.get("/oauth/authorize", query_string=params)
     assert r.status_code == 302
     loc = r.headers["Location"]
-    assert loc.startswith("/oauth/consent?")
+    assert loc.startswith("/oauth-consent?")
     assert query_of(loc)["client_id"] == params["client_id"]
 
 

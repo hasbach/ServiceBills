@@ -169,7 +169,7 @@ Actions, as a secret named `CRON_TRIGGER_SECRET`.
   render.yaml) so the advertised URLs are https.
 - Enable per tenant with the `ai_connector` module (super-admin -> modules), or the pro plan.
 - Users add the URL as a custom connector in Claude.ai / ChatGPT; the consent page is
-  `/oauth/consent`. Connections are listed and revoked under Settings -> AI Connector.
+  `/oauth-consent`. Connections are listed and revoked under Settings -> AI Connector.
 - Rate limits are in-memory per worker (WEB_CONCURRENCY=4), so the effective /mcp limit is
   up to 4 x 60/minute per token.
 

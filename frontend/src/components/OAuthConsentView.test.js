@@ -34,7 +34,7 @@ beforeEach(() => {
     login = jest.fn();
     logout = jest.fn();
     assign = jest.fn();
-    window.history.pushState({}, '', `/oauth/consent${QUERY}`);
+    window.history.pushState({}, '', `/oauth-consent${QUERY}`);
     delete window.location;
     window.location = { ...realLocation, search: QUERY, assign };
 });

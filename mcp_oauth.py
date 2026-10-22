@@ -230,7 +230,7 @@ def register_mcp_oauth_routes(app, appmod):
             return redirect(with_query(params['redirect_uri'], {
                 'error': bad[0], 'error_description': bad[1],
                 'state': params.get('state'), 'iss': origin()}))
-        return redirect('/oauth/consent?' + urlencode({k: v for k, v in params.items() if v is not None}))
+        return redirect('/oauth-consent?' + urlencode({k: v for k, v in params.items() if v is not None}))
 
     @app.route('/api/mcp/oauth/consent-info', methods=['GET'])
     @jwt_required()
