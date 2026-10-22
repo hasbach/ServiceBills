@@ -3700,6 +3700,18 @@ def delete_user(user_id):
     # is ondelete='SET NULL' too -- this also covers SQLite in tests).
     WhatsAppMessage.query.filter_by(sent_by_user_id=user.id).update(
         {'sent_by_user_id': None}, synchronize_session=False)
+    # AI-connector rows hold NOT NULL FKs to this user with no ondelete, so on
+    # Postgres they would block the delete (offboarding 500s and the user keeps
+    # web access). Remove them FK-safe: rotated refresh hashes, then tool-call
+    # audit rows, then the grants themselves.
+    grant_ids = [g.id for g in McpGrant.query.filter_by(user_id=user.id).with_entities(McpGrant.id)]
+    if grant_ids:
+        McpRotatedRefresh.query.filter(McpRotatedRefresh.grant_id.in_(grant_ids)).delete(
+            synchronize_session=False)
+    McpToolCall.query.filter(db.or_(McpToolCall.user_id == user.id,
+                                    McpToolCall.grant_id.in_(grant_ids or [-1]))).delete(
+        synchronize_session=False)
+    McpGrant.query.filter_by(user_id=user.id).delete(synchronize_session=False)
     db.session.delete(user)
     db.session.commit()
     return jsonify({"msg": "User deleted successfully"}), 200
