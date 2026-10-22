@@ -78,6 +78,7 @@ def test_refresh_rotates_and_reuse_revokes(client):
     assert r.status_code == 200
     new = r.get_json()
     assert new["refresh_token"] != refresh and new["access_token"] != access
+    _age_rotations(timedelta(minutes=2))   # past the reuse grace window
     # replaying the rotated refresh token revokes the whole grant
     r = client.post("/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh, "client_id": cid})
     assert r.status_code == 400
@@ -106,6 +107,40 @@ def _refresh_post(client, refresh, cid):
                                              "refresh_token": refresh, "client_id": cid})
 
 
+def _age_rotations(delta):
+    """Backdate every rotated-refresh row (moves it out of the grace window)."""
+    import app as appmod
+    for row in appmod.McpRotatedRefresh.query.all():
+        row.created_at = row.created_at - delta
+    appmod.db.session.commit()
+
+
+def test_refresh_reuse_within_grace_window_is_refused_without_revoking(client):
+    import app as appmod
+    hdr = make_tenant(client, "GR Biz", "gr_admin")
+    enable_connector("gr_admin")
+    _, r1, cid = connect(client, hdr)
+    new = _refresh_post(client, r1, cid).get_json()
+    # A retry of the same refresh within 60 s (lost response, double-click)
+    # is refused but must not kill the connection or the newer token.
+    r = _refresh_post(client, r1, cid)
+    assert r.status_code == 400 and r.get_json()["error"] == "invalid_grant"
+    assert appmod.McpGrant.query.one().revoked_at is None
+    assert _refresh_post(client, new["refresh_token"], cid).status_code == 200
+
+
+def test_refresh_reuse_after_grace_window_revokes(client):
+    import app as appmod
+    hdr = make_tenant(client, "GA Biz", "ga_admin")
+    enable_connector("ga_admin")
+    _, r1, cid = connect(client, hdr)
+    new = _refresh_post(client, r1, cid).get_json()
+    _age_rotations(timedelta(minutes=2))
+    assert _refresh_post(client, r1, cid).status_code == 400
+    assert appmod.McpGrant.query.one().revoked_at is not None
+    assert _refresh_post(client, new["refresh_token"], cid).status_code == 400
+
+
 def test_refresh_reuse_two_rotations_back_revokes(client):
     import app as appmod
     hdr = make_tenant(client, "R2 Biz", "r2_admin")
@@ -114,6 +149,7 @@ def test_refresh_reuse_two_rotations_back_revokes(client):
     r2 = _refresh_post(client, r1, cid).get_json()["refresh_token"]
     r3 = _refresh_post(client, r2, cid).get_json()["refresh_token"]
     assert appmod.McpRotatedRefresh.query.count() == 2
+    _age_rotations(timedelta(minutes=2))
     # the real client comes back with R1, two rotations behind the thief's R3
     r = _refresh_post(client, r1, cid)
     assert r.status_code == 400 and r.get_json()["error"] == "invalid_grant"

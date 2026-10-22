@@ -22,6 +22,9 @@ from tenancy import current_tenant, tenant_query
 ACCESS_TTL = timedelta(hours=1)
 REFRESH_TTL = timedelta(days=30)
 CODE_TTL = timedelta(seconds=60)
+# A rotated refresh token presented again this soon after its rotation is a
+# client retry (lost response, double submit), not theft: refuse, don't revoke.
+REFRESH_REUSE_GRACE = timedelta(seconds=60)
 SCOPE = 'read'
 AUTHORIZE_KEYS = ('client_id', 'redirect_uri', 'response_type', 'code_challenge',
                   'code_challenge_method', 'state', 'scope', 'resource')
@@ -319,6 +322,10 @@ def register_mcp_oauth_routes(app, appmod):
         if grant is None:
             rotated = appmod.McpRotatedRefresh.query.filter_by(token_hash=h).first() if h else None
             if rotated is not None:
+                if rotated.created_at is not None and rotated.created_at > now - REFRESH_REUSE_GRACE:
+                    # Just rotated: the client most likely missed the response
+                    # and keeps the newer token it already holds.
+                    return oauth_error('invalid_grant', 'Refresh token already used')
                 # A rotated-out refresh token (any generation) came back: stolen.
                 stale = db.session.get(Grant, rotated.grant_id)
                 if stale is not None:
