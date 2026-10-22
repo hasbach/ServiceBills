@@ -99,3 +99,30 @@ def test_approve_requires_login(client):
     _, _, params = _setup(client)
     r = client.post("/api/mcp/oauth/approve", json={**params, "decision": "allow"})
     assert r.status_code == 401
+
+
+def test_consent_info_verified_flag(client):
+    hdr = make_tenant(client, "Ver Biz", "ver_admin")
+    enable_connector("ver_admin")
+    _, challenge = pkce_pair()
+    for uri, expected in (("https://claude.ai/cb", True), ("https://chatgpt.com/cb", True),
+                          ("http://localhost:6274/cb", True), ("http://127.0.0.1:1/cb", True),
+                          ("https://other.example/cb", False),
+                          ("https://claude.ai.evil.example/cb", False)):
+        cid = register_client(client, redirect=uri)
+        r = client.get("/api/mcp/oauth/consent-info", headers=hdr,
+                       query_string=authorize_params(cid, challenge, redirect=uri))
+        assert r.status_code == 200, r.get_data(as_text=True)
+        assert r.get_json()["verified"] is expected, uri
+
+
+def test_consent_and_authorize_responses_forbid_framing(client):
+    _, _, params = _setup(client)
+    for resp in (client.get("/oauth/authorize", query_string=params),
+                 client.get("/oauth/authorize"),          # the 400 path too
+                 client.get("/oauth-consent")):
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert resp.headers["Content-Security-Policy"] == "frame-ancestors 'none'"
+    # not app-wide
+    other = client.get("/.well-known/oauth-protected-resource")
+    assert "X-Frame-Options" not in other.headers

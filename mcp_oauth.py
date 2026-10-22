@@ -29,6 +29,10 @@ SCOPE = 'read'
 AUTHORIZE_KEYS = ('client_id', 'redirect_uri', 'response_type', 'code_challenge',
                   'code_challenge_method', 'state', 'scope', 'resource')
 _LOOPBACK = ('localhost', '127.0.0.1', '::1')
+# Redirect hosts the consent screen can vouch for; anything else is shown
+# with an "unverified app" warning. Not an allow-list: registration is open.
+KNOWN_CLIENT_HOSTS = {'claude.ai', 'chatgpt.com', 'chat.openai.com'}
+CLIENT_NAME_MAX = 60
 
 
 def new_token():
@@ -55,7 +59,7 @@ def valid_redirect_uri(uri):
     shape the consent screen could be fooled by: userinfo
     (https://claude.ai@evil.example), backslashes (parsers disagree on where
     the host ends), an empty hostname, and whitespace/non-ASCII (homoglyph
-    hosts)."""
+    hosts), and a '%' in the authority (percent-encoded lookalike hosts)."""
     if not isinstance(uri, str) or not uri:
         return False
     if '\\' in uri or any(ord(c) <= 0x20 or ord(c) >= 0x7f for c in uri):
@@ -65,11 +69,19 @@ def valid_redirect_uri(uri):
         p.port   # raises ValueError on a malformed port
     except ValueError:
         return False
+    if '%' in p.netloc:
+        return False
     if p.fragment or p.username is not None or p.password is not None or not p.hostname:
         return False
     if p.scheme == 'https':
         return True
     return p.scheme == 'http' and p.hostname in _LOOPBACK
+
+
+def is_verified_host(uri):
+    """True for the AI apps we know (claude.ai, chatgpt.com) and loopback."""
+    host = (urlparse(uri).hostname or '').lower()
+    return host in KNOWN_CLIENT_HOSTS or host in _LOOPBACK
 
 
 def redirect_host(uri):
@@ -183,7 +195,7 @@ def register_mcp_oauth_routes(app, appmod):
                 or not all(isinstance(u, str) and len(u) <= 500 and valid_redirect_uri(u) for u in uris)):
             return oauth_error('invalid_redirect_uri',
                                'redirect_uris must be 1-10 https:// or loopback http:// URLs')
-        name = str(data.get('client_name') or 'AI app').strip()[:200] or 'AI app'
+        name = str(data.get('client_name') or 'AI app').strip()[:CLIENT_NAME_MAX] or 'AI app'
         client = Client(client_id=secrets.token_urlsafe(24), client_name=name, redirect_uris=uris)
         db.session.add(client)
         db.session.commit()
@@ -222,6 +234,16 @@ def register_mcp_oauth_routes(app, appmod):
                                 "Ask ServiceBills to enable it.")
         return user, tenant, None
 
+    @app.after_request
+    def _forbid_framing_of_consent(resp):
+        # Clickjacking guard: nobody may embed the consent screen (or the
+        # redirect into it) in a frame. Keyed on path so no other response
+        # changes.
+        if request.path in ('/oauth-consent', '/oauth/authorize'):
+            resp.headers['X-Frame-Options'] = 'DENY'
+            resp.headers['Content-Security-Policy'] = "frame-ancestors 'none'"
+        return resp
+
     @app.route('/oauth/authorize', methods=['GET'])
     def mcp_oauth_authorize():
         params = {k: request.args.get(k) for k in AUTHORIZE_KEYS}
@@ -250,7 +272,8 @@ def register_mcp_oauth_routes(app, appmod):
             return jsonify(error=problem), 403
         return jsonify(client_name=client.client_name, tenant_name=tenant.name,
                        username=user.username, role=user.role,
-                       redirect_host=redirect_host(params['redirect_uri']))
+                       redirect_host=redirect_host(params['redirect_uri']),
+                       verified=is_verified_host(params['redirect_uri']))
 
     @app.route('/api/mcp/oauth/approve', methods=['POST'])
     @jwt_required()

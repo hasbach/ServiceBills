@@ -23,6 +23,7 @@ def test_redirect_uri_rules():
     assert not valid_redirect_uri("https://:443/cb")                        # empty hostname
     assert not valid_redirect_uri("https://claude.ai /cb")                  # whitespace
     assert not valid_redirect_uri("https://clаude.ai/cb")               # Cyrillic a
+    assert not valid_redirect_uri("https://claude.ai%2eevil.example/cb")    # percent-encoded host
     assert valid_redirect_uri("http://localhost:6274/cb")
 
 
@@ -68,3 +69,12 @@ def test_register_rejects_bad_redirects(client):
 def test_cors_on_discovery_and_token(client):
     r = client.get("/.well-known/oauth-authorization-server", headers={"Origin": "https://inspector.example"})
     assert r.headers.get("Access-Control-Allow-Origin") == "*"
+
+
+def test_register_truncates_long_client_name(client):
+    r = client.post("/oauth/register", json={
+        "client_name": "A" * 200, "redirect_uris": ["https://claude.ai/cb"]})
+    assert r.status_code == 201
+    assert r.get_json()["client_name"] == "A" * 60
+    import app as appmod
+    assert appmod.McpClient.query.one().client_name == "A" * 60

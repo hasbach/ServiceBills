@@ -16,7 +16,7 @@ const PARAMS = {
 };
 const INFO = {
     client_name: 'Claude', tenant_name: 'Acme ISP', username: 'ali', role: 'cashier',
-    redirect_host: 'claude.ai',
+    redirect_host: 'claude.ai', verified: true,
 };
 
 const realLocation = window.location;
@@ -122,4 +122,31 @@ test('signing in as someone else never leaves the previous identity clickable', 
     resolveSecond({ data: { ...INFO, username: 'sara' } });
     expect(await screen.findByText('sara')).toBeInTheDocument();
     expect(screen.queryByText('ali')).not.toBeInTheDocument();
+});
+
+test('shows where the browser will be sent, without a warning for a verified app', async () => {
+    setAuth(true);
+    axios.get.mockResolvedValue({ data: INFO });
+    render(<OAuthConsentView />);
+    expect(await screen.findByText('claude.ai')).toBeInTheDocument();
+    expect(screen.getByText(/Will send you back to/)).toBeInTheDocument();
+    expect(screen.queryByText(/Unverified app/)).not.toBeInTheDocument();
+});
+
+test('an unverified app gets a warning and its destination host', async () => {
+    setAuth(true);
+    axios.get.mockResolvedValue({
+        data: { ...INFO, redirect_host: 'other.example', verified: false },
+    });
+    render(<OAuthConsentView />);
+    expect(await screen.findByText('other.example')).toBeInTheDocument();
+    expect(screen.getByText(/Unverified app/)).toBeInTheDocument();
+    expect(screen.getByText('Allow')).toBeInTheDocument();
+});
+
+test('a very long client name is cut to 60 characters', async () => {
+    setAuth(true);
+    axios.get.mockResolvedValue({ data: { ...INFO, client_name: 'N'.repeat(200) } });
+    render(<OAuthConsentView />);
+    expect(await screen.findByText('N'.repeat(60) + '…')).toBeInTheDocument();
 });

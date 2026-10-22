@@ -5,6 +5,12 @@ import { SmartToy as SmartToyIcon } from '@mui/icons-material';
 import { useAppContext } from '../context/AppContext';
 import { consentParams, describeRole } from './oauthConsent';
 
+const NAME_MAX = 60;
+const shortName = (name) => {
+    const n = String(name || '');
+    return n.length > NAME_MAX ? `${n.slice(0, NAME_MAX)}…` : n;
+};
+
 // "Claude wants read-only access to <business> as <user>". Reached from
 // GET /oauth/authorize (mcp_oauth.py) with the OAuth request in the query.
 // Signs the user in first if needed, then approves or denies and sends the
@@ -84,8 +90,16 @@ export default function OAuthConsentView() {
                 {isAuthenticated && !info && !error && <Box sx={{ textAlign: 'center', py: 3 }}><CircularProgress /></Box>}
                 {isAuthenticated && info && (
                     <>
-                        <Typography sx={{ mb: 1 }}>
-                            <b>{info.client_name}</b> wants <b>read-only</b> access to <b>{info.tenant_name}</b> as{' '}
+                        <Typography sx={{ mb: 1.5, fontSize: '1.05rem' }}>
+                            Will send you back to: <b>{info.redirect_host}</b>
+                        </Typography>
+                        {info.verified === false && (
+                            <Alert severity="warning" sx={{ mb: 2 }}>
+                                Unverified app — only continue if you added this connector yourself in Claude or ChatGPT.
+                            </Alert>
+                        )}
+                        <Typography sx={{ mb: 1, overflowWrap: 'anywhere' }}>
+                            <b>{shortName(info.client_name)}</b> wants <b>read-only</b> access to <b>{info.tenant_name}</b> as{' '}
                             <b>{info.username}</b> ({describeRole(info.role)}).
                         </Typography>
                         <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
@@ -93,8 +107,7 @@ export default function OAuthConsentView() {
                             your role can see. It cannot change anything, take payments or send messages.
                         </Typography>
                         <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-                            You will be sent back to {info.redirect_host}. You can disconnect it any time in
-                            Settings → AI Connector.
+                            You can disconnect it any time in Settings → AI Connector.
                         </Typography>
                         <Stack direction="row" spacing={1.5}>
                             <Button fullWidth variant="contained" disabled={busy} onClick={() => decide('allow')}>Allow</Button>
