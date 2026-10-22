@@ -129,3 +129,29 @@ def test_5xx_from_wrapped_endpoint_is_generic(client, monkeypatch):
     monkeypatch.setitem(appmod.app.view_functions, "get_payments", soft_500)
     text = tool_error_text(call_tool(client, tok, "list_payments", {}))
     assert "couldn't load this (500)" in text and "secret internal detail" not in text
+
+
+def test_4xx_from_wrapped_endpoint_passes_only_safe_messages(client, monkeypatch):
+    import app as appmod
+    hdr = _seed(client)
+    tok, _, _ = connect(client, hdr)
+
+    def respond(status, key, text):
+        def view(*a, **k):
+            return appmod.jsonify({key: text}), status
+        monkeypatch.setitem(appmod.app.view_functions, "get_payments", view)
+        return tool_error_text(call_tool(client, tok, "list_payments", {}))
+
+    # 400 catch-alls can carry str(exception): never passed on, whatever the key
+    for key in ("msg", "error", "message"):
+        t = respond(400, key, "secret internal detail")
+        assert "couldn't load this (400)" in t and "secret internal detail" not in t
+    t = respond(422, "msg", "secret internal detail")
+    assert "couldn't load this (422)" in t and "secret internal detail" not in t
+    # 403/404 pass `msg` through, but not `error`
+    assert "Not allowed here" in respond(403, "msg", "Not allowed here")
+    assert "Nothing there" in respond(404, "msg", "Nothing there")
+    t = respond(404, "error", "secret internal detail")
+    assert "couldn't load this (404)" in t and "secret internal detail" not in t
+    t = respond(403, "error", "secret internal detail")
+    assert "secret internal detail" not in t

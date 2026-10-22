@@ -132,7 +132,12 @@ def call_api(ctx, path, params=None):
     pipeline runs -- before_request hooks, the route's own @jwt_required and
     role/module decorators -- so the result is exactly what that user would
     see in the web app. test_request_context reuses the current app context,
-    so the DB session is shared and nothing is committed by the call."""
+    so the DB session is shared and nothing is committed by the call.
+
+    The inner request shares flask.g with the outer /mcp request; that is
+    fine because its JWT claims are for the same user. Sentry's request scope
+    is relabelled to the inner path while it runs (errors raised inside show
+    the wrapped endpoint, not /mcp)."""
     app = ctx.appmod.app
     token = create_access_token(identity=ctx.user.username,
                                 additional_claims={'role': ctx.user.role, 'tenant_id': ctx.user.tenant_id},
@@ -150,12 +155,14 @@ def call_api(ctx, path, params=None):
         if resp.status_code >= 500:
             # the endpoint's message can be str(exception); never pass it on
             raise ToolError(f"ServiceBills couldn't load this ({resp.status_code}).")
-        msg = None
-        if isinstance(data, dict):
-            msg = data.get('msg') or data.get('error') or data.get('message')
+        # Only `msg` from 403/404 is ours to relay (permission/not-found
+        # wording); a 400 catch-all or an `error` key can carry str(exception).
+        msg = data.get('msg') if isinstance(data, dict) and isinstance(data.get('msg'), str) else None
         if resp.status_code == 403:
             raise ToolError(msg or "You don't have access to this in ServiceBills.")
-        raise ToolError(f"ServiceBills couldn't load this ({resp.status_code}){': ' + msg if msg else ''}.")
+        if resp.status_code == 404 and msg:
+            raise ToolError(f"ServiceBills couldn't load this (404): {msg}.")
+        raise ToolError(f"ServiceBills couldn't load this ({resp.status_code}).")
     return data
 
 

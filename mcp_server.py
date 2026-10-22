@@ -92,7 +92,12 @@ def _describe(tool):
 def _unauthorized(description='Missing or invalid access token'):
     meta = mcp_oauth.origin() + '/.well-known/oauth-protected-resource'
     resp = make_response(jsonify(error='invalid_token', error_description=description), 401)
-    resp.headers['WWW-Authenticate'] = f'Bearer resource_metadata="{meta}", error="invalid_token"'
+    challenge = f'Bearer resource_metadata="{meta}"'
+    if request.headers.get('Authorization'):
+        # RFC 6750 3.1: an error code only when credentials were presented
+        # and rejected; a request with none just gets the bare challenge.
+        challenge += ', error="invalid_token"'
+    resp.headers['WWW-Authenticate'] = challenge
     return resp
 
 

@@ -32,6 +32,15 @@ def test_no_token_gives_401_with_resource_metadata(client):
     r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
     assert r.status_code == 401
     assert 'resource_metadata="http://localhost/.well-known/oauth-protected-resource"' in r.headers["WWW-Authenticate"]
+    # RFC 6750 3.1: no credentials at all -> no error code
+    assert "error=" not in r.headers["WWW-Authenticate"]
+
+
+def test_bad_token_gives_401_with_invalid_token_error(client):
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                    headers={"Authorization": "Bearer not-a-real-token"})
+    assert r.status_code == 401
+    assert r.headers["WWW-Authenticate"].endswith('error="invalid_token"')
 
 
 def test_initialize_negotiates_version(client):
