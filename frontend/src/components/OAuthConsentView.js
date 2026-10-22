@@ -93,7 +93,7 @@ export default function OAuthConsentView() {
                         <Typography sx={{ mb: 1.5, fontSize: '1.05rem' }}>
                             Will send you back to: <b>{info.redirect_host}</b>
                         </Typography>
-                        {info.verified === false && (
+                        {!info.verified && (
                             <Alert severity="warning" sx={{ mb: 2 }}>
                                 Unverified app — only continue if you added this connector yourself in Claude or ChatGPT.
                             </Alert>

@@ -17,16 +17,20 @@ def fk_enforced(app):
     raw = appmod.db.engine.raw_connection()
     try:
         raw.cursor().execute("PRAGMA foreign_keys=ON")
-        assert raw.cursor().execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        enabled = raw.cursor().execute("PRAGMA foreign_keys").fetchone()[0]
     finally:
         raw.close()
-    yield
-    appmod.db.session.rollback()
-    raw = appmod.db.engine.raw_connection()
     try:
-        raw.cursor().execute("PRAGMA foreign_keys=OFF")
+        assert enabled == 1
+        yield
     finally:
-        raw.close()
+        # Always switch it back: the connection is shared with later tests.
+        appmod.db.session.rollback()
+        raw = appmod.db.engine.raw_connection()
+        try:
+            raw.cursor().execute("PRAGMA foreign_keys=OFF")
+        finally:
+            raw.close()
 
 
 def test_deleting_a_user_with_mcp_history_removes_their_mcp_rows(client, fk_enforced):
