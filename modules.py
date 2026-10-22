@@ -8,7 +8,7 @@ license (sub-project 2 fills `license_provider`) replaces both.
 from datetime import date
 
 ALWAYS_ON = frozenset({"core", "office"})
-PAID = frozenset({"whatsapp", "ai_cs", "network", "upstream_sync", "whish_payments"})
+PAID = frozenset({"whatsapp", "ai_cs", "network", "upstream_sync", "whish_payments", "ai_connector"})
 REQUIRES = {"ai_cs": frozenset({"whatsapp"})}
 
 # Callable (tenant) -> license payload dict, or None when no license layer is

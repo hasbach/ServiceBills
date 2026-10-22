@@ -97,7 +97,16 @@ if os.environ.get("TRUST_PROXY") == "1":
     # Behind exactly one reverse proxy (Render): key rate limits on the real client IP.
     from werkzeug.middleware.proxy_fix import ProxyFix
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
-CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
+CORS(app, resources={
+    r"/api/*": {"origins": Config.CORS_ORIGINS},
+    # MCP connector: AI clients (including browser-based ones like MCP
+    # Inspector) call discovery, registration, token and /mcp cross-origin.
+    # Bearer tokens only, never cookies, so a wildcard origin is safe here.
+    r"/.well-known/oauth-*": {"origins": "*", "send_wildcard": True},
+    r"/oauth/*": {"origins": "*", "send_wildcard": True},
+    r"/mcp": {"origins": "*", "send_wildcard": True,
+              "expose_headers": ["WWW-Authenticate"]},
+})
 
 # Error tracking (Phase 2). Dormant/no-op if SENTRY_DSN is unset -- same optional-
 # feature pattern as Stripe/FERNET_KEY elsewhere in this file. Import is inside the
@@ -2134,6 +2143,82 @@ def _iso_utc(dt):
     return dt.strftime('%Y-%m-%dT%H:%M:%SZ') if dt else None
 
 
+class McpClient(db.Model):
+    """An AI app (Claude, ChatGPT, ...) registered through OAuth dynamic client
+    registration for the MCP connector. Not tenant-scoped: one registration is
+    shared by every tenant whose staff connect that app. See
+    docs/superpowers/specs/2026-10-21-mcp-connector-design.md."""
+    __tablename__ = 'mcp_client'
+    id = db.Column(db.Integer, primary_key=True)
+    client_id = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    client_name = db.Column(db.String(200), nullable=False)
+    redirect_uris = db.Column(db.JSON, nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class McpGrant(db.Model):
+    """One user's consent for one AI app on their tenant. Holds the pending
+    auth code, then the current access/refresh token pair -- SHA-256 hashes
+    only, never the tokens themselves. Every refresh hash a grant rotates away
+    from is kept in McpRotatedRefresh so a replayed (already-rotated) refresh
+    token can be detected and the whole grant revoked."""
+    __tablename__ = 'mcp_grant'
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    client_id = db.Column(db.String(64), nullable=False, index=True)
+    scope = db.Column(db.String(100), nullable=False, default='read')
+    resource = db.Column(db.String(300), nullable=True)
+    code_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    code_challenge = db.Column(db.String(128), nullable=True)
+    redirect_uri = db.Column(db.String(500), nullable=True)
+    code_expires_at = db.Column(db.DateTime, nullable=True)
+    code_used_at = db.Column(db.DateTime, nullable=True)
+    access_token_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    access_expires_at = db.Column(db.DateTime, nullable=True)
+    refresh_token_hash = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    refresh_expires_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    last_used_at = db.Column(db.DateTime, nullable=True)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+    user = db.relationship('User')
+
+    def to_dict(self, client_name=None):
+        def z(dt):
+            return dt.strftime('%Y-%m-%dT%H:%M:%SZ') if dt else None
+        return {'id': self.id, 'client_id': self.client_id, 'client_name': client_name,
+                'username': self.user.username if self.user else None,
+                'role': self.user.role if self.user else None,
+                'created_at': z(self.created_at), 'last_used_at': z(self.last_used_at)}
+
+
+class McpRotatedRefresh(db.Model):
+    """Every refresh-token hash a grant has rotated away from. Presenting any
+    of them again means the token leaked, so the grant is revoked. tenant_id
+    is copied from the grant so the row follows the tenant lifecycle."""
+    __tablename__ = 'mcp_rotated_refresh'
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    grant_id = db.Column(db.Integer, db.ForeignKey('mcp_grant.id'), nullable=False, index=True)
+    token_hash = db.Column(db.String(64), nullable=False, unique=True, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class McpToolCall(db.Model):
+    """Audit row for every MCP tools/call (success or failure)."""
+    __tablename__ = 'mcp_tool_call'
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    grant_id = db.Column(db.Integer, db.ForeignKey('mcp_grant.id'), nullable=False, index=True)
+    tool = db.Column(db.String(64), nullable=False)
+    args_summary = db.Column(db.String(500), nullable=True)
+    ok = db.Column(db.Boolean, nullable=False, default=True)
+    error = db.Column(db.String(300), nullable=True)
+    duration_ms = db.Column(db.Integer, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
 class WhatsAppConversation(db.Model):
     """One WhatsApp chat (tenant x customer phone) for the admin inbox -- see
     docs/superpowers/specs/2026-09-23-whatsapp-inbox-design.md."""
@@ -2335,6 +2420,7 @@ TENANT_OWNED_MODELS = (
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
     WhatsAppConversation, WhatsAppMessage, BalanceLog, WhatsAppConnectionEvent,
+    McpGrant, McpRotatedRefresh, McpToolCall,
 )
 
 from sqlalchemy import event as _sa_event
@@ -3451,6 +3537,11 @@ _EXPORT_COLUMN_DENYLIST = {
     # token_hash is a bearer-secret hash, not tenant-visible data -- same
     # class of secret as callback_token above, just for a different feature.
     NetworkAgent: {"token_hash"},
+    # Bearer-secret hashes for the MCP connector -- same class of secret as
+    # NetworkAgent.token_hash above.
+    McpGrant: {"code_hash", "code_challenge", "access_token_hash",
+               "refresh_token_hash"},
+    McpRotatedRefresh: {"token_hash"},
 }
 
 
@@ -3480,6 +3571,10 @@ def tenant_export():
 
 # Child-first order so intra-tenant FKs (payment->customer, etc.) don't block deletes on Postgres.
 _TENANT_DELETE_ORDER = [
+    # MCP connector rows hold FKs to user (and rotated-refresh/tool-call rows
+    # to mcp_grant), so they go first: rotated refresh hashes, tool calls,
+    # then grants.
+    McpRotatedRefresh, McpToolCall, McpGrant,
     # First: it holds FKs to customer, network_device, user and
     # network_agent_job, so every one of those must still exist when it goes.
     # SQLite does not enforce FKs, so getting this wrong is invisible locally
@@ -3605,6 +3700,18 @@ def delete_user(user_id):
     # is ondelete='SET NULL' too -- this also covers SQLite in tests).
     WhatsAppMessage.query.filter_by(sent_by_user_id=user.id).update(
         {'sent_by_user_id': None}, synchronize_session=False)
+    # AI-connector rows hold NOT NULL FKs to this user with no ondelete, so on
+    # Postgres they would block the delete (offboarding 500s and the user keeps
+    # web access). Remove them FK-safe: rotated refresh hashes, then tool-call
+    # audit rows, then the grants themselves.
+    grant_ids = [g.id for g in McpGrant.query.filter_by(user_id=user.id).with_entities(McpGrant.id)]
+    if grant_ids:
+        McpRotatedRefresh.query.filter(McpRotatedRefresh.grant_id.in_(grant_ids)).delete(
+            synchronize_session=False)
+    McpToolCall.query.filter(db.or_(McpToolCall.user_id == user.id,
+                                    McpToolCall.grant_id.in_(grant_ids or [-1]))).delete(
+        synchronize_session=False)
+    McpGrant.query.filter_by(user_id=user.id).delete(synchronize_session=False)
     db.session.delete(user)
     db.session.commit()
     return jsonify({"msg": "User deleted successfully"}), 200
@@ -10360,6 +10467,12 @@ wa_connect_routes.register_wa_connect_routes(app, sys.modules[__name__])
 
 import customer_import
 customer_import.register_customer_import_routes(app, sys.modules[__name__])
+
+import mcp_oauth
+mcp_oauth.register_mcp_oauth_routes(app, sys.modules[__name__])
+import mcp_server
+mcp_server.register_mcp_routes(app, sys.modules[__name__])
+import mcp_tools  # noqa: F401 -- registers the MCP connector's tools
 
 import onprem
 onprem.register(app, sys.modules[__name__])

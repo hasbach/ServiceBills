@@ -59,6 +59,7 @@ import MessagingView from './components/MessagingView.js';
 import UpstreamProviderManagementView from './components/UpstreamProviderManagementView.js';
 import NetworkDeviceManagementView from './components/NetworkDeviceManagementView.js';
 import NetworkTreeView from './components/NetworkTreeView.js';
+import OAuthConsentView from './components/OAuthConsentView.js';
 import NetworkMapPage from './components/NetworkMapPage.js';
 import CSAgentVoiceTest from './components/CSAgentVoiceTest.js';
 import ErrorBoundary from './components/ErrorBoundary.js';
@@ -603,6 +604,7 @@ const AppContent = () => {
     if (location.pathname === '/forgot-password') return <ForgotPasswordView />;
     if (location.pathname === '/pay') return <PublicPaymentView />;
     if (location.pathname === '/pay-business') return <PublicTenantPayView />;
+    if (location.pathname === '/oauth-consent') return <OAuthConsentView />;
 
     // First-run setup wins over a stale token left from a previous install.
     if (systemInfoLoaded && systemInfo?.setup_required) {

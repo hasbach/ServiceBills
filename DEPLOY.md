@@ -162,6 +162,17 @@ servicesbills-web -> Environment; `render.yaml` has it as `generateValue: true`)
 copy that same value into the GitHub repo's Settings -> Secrets and variables ->
 Actions, as a secret named `CRON_TRIGGER_SECRET`.
 
+## AI connector (MCP)
+
+- Endpoint: `{APP_BASE_URL}/mcp`, OAuth discovery at `/.well-known/oauth-protected-resource`
+  and `/.well-known/oauth-authorization-server`. Needs `TRUST_PROXY=1` (already set in
+  render.yaml) so the advertised URLs are https.
+- Enable per tenant with the `ai_connector` module (super-admin -> modules), or the pro plan.
+- Users add the URL as a custom connector in Claude.ai / ChatGPT; the consent page is
+  `/oauth-consent`. Connections are listed and revoked under Settings -> AI Connector.
+- Rate limits are in-memory per worker (WEB_CONCURRENCY=4), so the effective /mcp limit is
+  up to 4 x 60/minute per token.
+
 ## Notes
 - HTTPS/custom domain: configure on the host; then set `APP_BASE_URL`/`CORS_ORIGINS`
   to the custom domain.

@@ -23,7 +23,7 @@ PLANS = {
         "whish_price_yearly": 1000.0,
         "max_customers": None,
         "whatsapp_api": True,
-        "modules": ("whatsapp", "ai_cs", "network", "upstream_sync", "whish_payments"),
+        "modules": ("whatsapp", "ai_cs", "network", "upstream_sync", "whish_payments", "ai_connector"),
     },
 }
 

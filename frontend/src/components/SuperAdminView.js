@@ -28,6 +28,7 @@ const PAID_MODULES = [
     { key: 'network', label: 'Network' },
     { key: 'upstream_sync', label: 'Upstream sync' },
     { key: 'whish_payments', label: 'Whish customer payments' },
+    { key: 'ai_connector', label: 'AI connector (Claude / ChatGPT)' },
 ];
 const ALWAYS_ON_MODULES = [
     { key: 'core', label: 'Core' },
