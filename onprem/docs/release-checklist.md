@@ -10,7 +10,7 @@
    git push origin v1.0.0
    ```
 
-3. Watch the **Release** workflow: image pushed to `ghcr.io/hasbach/servicebills:1.0.0` and `:latest`, installer built and uploaded to R2 (`installer/ServiceBills-Setup-1.0.0.exe` and the stable `installer/ServiceBills-Setup.exe`), release metadata published to servicebills.onrender.com.
+3. Watch the **Release** workflow: image pushed to `ghcr.io/hasbach/servicebills:1.0.0` and `:latest`, installer built and uploaded to R2 (`installer/ServiceBills-Setup-1.0.0.exe` and the stable `installer/ServiceBills-Setup.exe`), release metadata published to servicebills.salloumservices.com.
 4. Confirm `INSTALLER_URL` on Render still points at the stable installer object.
 
 One-time owner setup before the first release: create the bot GitHub account and a classic PAT with `read:packages` only; add the GitHub secrets listed at the top of `.github/workflows/release.yml`; set `RELEASE_PUBLISH_SECRET` and `INSTALLER_URL` on Render; make the R2 installer object publicly readable. **Grant the GHCR bot account read access to the `servicebills` package** (package settings > Manage access), otherwise customers' `docker pull` fails with "denied".
