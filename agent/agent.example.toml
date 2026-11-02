@@ -2,7 +2,7 @@
 # This file contains device credentials -- restrict it to SYSTEM and
 # Administrators (see README.md).
 
-cloud_url    = "https://servicebills.onrender.com"
+cloud_url    = "https://servicebills.salloumservices.com"
 token        = "PASTE-THE-TOKEN-SHOWN-ONCE-WHEN-YOU-CREATED-THE-AGENT"
 poll_seconds = 2
 

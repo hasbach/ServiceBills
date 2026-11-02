@@ -78,7 +78,7 @@ try {
     }
 
     # Ask the update server.
-    $server = 'https://servicebills.onrender.com'
+    $server = 'https://servicebills.salloumservices.com'
     if ($envMap.Contains('LICENSE_SERVER_URL') -and $envMap['LICENSE_SERVER_URL']) { $server = ([string]$envMap['LICENSE_SERVER_URL']).TrimEnd('/') }
     $latestInfo = $null
     try { $latestInfo = Invoke-RestMethod -Uri "$server/api/updates/latest" -TimeoutSec 30 }

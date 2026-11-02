@@ -49,5 +49,5 @@ jobs:
       - name: Trigger the job
         run: |
           curl -sS -f --max-time 60 --retry 1 \
-            -X POST "https://servicebills.onrender.com/api/internal/scheduled-jobs/${{ steps.job.outputs.name }}" \
+            -X POST "https://servicebills.salloumservices.com/api/internal/scheduled-jobs/${{ steps.job.outputs.name }}" \
             -H "X-Cron-Secret: ${{ secrets.CRON_TRIGGER_SECRET }}"

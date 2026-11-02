@@ -185,7 +185,7 @@ jobs:
         run: |
           BODY="$(jq -n --arg v "$VERSION" --arg d "$RELEASE_DATE" --arg n "$NOTES" \
             '{version:$v, release_date:$d} + (if $n == "" then {} else {notes:$n} end)')"
-          curl -fsS -X POST https://servicebills.onrender.com/api/internal/releases \
+          curl -fsS -X POST https://servicebills.salloumservices.com/api/internal/releases \
             -H "X-Release-Secret: $RELEASE_PUBLISH_SECRET" \
             -H "Content-Type: application/json" \
             -d "$BODY"
