@@ -93,10 +93,13 @@ app = Flask(__name__, static_folder='build', static_url_path='/_assets')
 
 from config import Config
 app.config.from_object(Config)
-if os.environ.get("TRUST_PROXY") == "1":
-    # Behind exactly one reverse proxy (Render): key rate limits on the real client IP.
+_trust_proxy = os.environ.get("TRUST_PROXY", "")
+if _trust_proxy.isdigit() and int(_trust_proxy) > 0:
+    # TRUST_PROXY=N: N reverse proxies append to X-Forwarded-For in front of us, so
+    # rate limits key on the real client IP. Render is 1 hop; Cloudflare Tunnel
+    # behind Coolify's Traefik is 2 (the edge adds the client, Traefik adds cloudflared).
     from werkzeug.middleware.proxy_fix import ProxyFix
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=int(_trust_proxy), x_proto=1)
 CORS(app, resources={
     r"/api/*": {"origins": Config.CORS_ORIGINS},
     # MCP connector: AI clients (including browser-based ones like MCP
