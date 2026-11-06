@@ -89,3 +89,15 @@ def tool_data(result):
 def tool_error_text(result):
     assert result["isError"] is True, result
     return result["content"][0]["text"]
+
+
+def enable_writes(username, on=True):
+    """Turn the 'Allow the AI to make changes' switch on/off for `username`'s tenant."""
+    from app import db, BusinessSettings, User
+    user = User.query.filter_by(username=username).first()
+    s = BusinessSettings.query.filter_by(tenant_id=user.tenant_id).first()
+    if s is None:
+        s = BusinessSettings(tenant_id=user.tenant_id, business_name="Biz", address="", mobile="")
+        db.session.add(s)
+    s.ai_connector_writes_enabled = on
+    db.session.commit()

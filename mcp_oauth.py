@@ -427,8 +427,10 @@ def register_mcp_oauth_routes(app, appmod):
         grants = q.order_by(Grant.created_at.desc()).all()
         names = {c.client_id: c.client_name for c in Client.query.filter(
             Client.client_id.in_({g.client_id for g in grants})).all()} if grants else {}
+        settings = tenant_query(appmod.BusinessSettings).first()
         return jsonify(mcp_url=origin() + '/mcp',
                        enabled=modules.is_enabled(current_tenant(), 'ai_connector'),
+                       writes_enabled=bool(settings and settings.ai_connector_writes_enabled),
                        is_admin=is_admin,
                        grants=[g.to_dict(names.get(g.client_id)) for g in grants])
 
@@ -445,3 +447,20 @@ def register_mcp_oauth_routes(app, appmod):
         revoke_grant(grant, datetime.utcnow())
         db.session.commit()
         return jsonify(ok=True)
+
+    @app.route('/api/mcp/settings', methods=['PUT'])
+    @jwt_required()
+    def mcp_update_settings():
+        if 'admin' not in appmod._jwt_roles():
+            return jsonify(msg='Only an admin can change this.'), 403
+        value = (request.get_json(silent=True) or {}).get('writes_enabled')
+        if not isinstance(value, bool):
+            return jsonify(msg='writes_enabled must be true or false.'), 400
+        settings = tenant_query(appmod.BusinessSettings).first()
+        if settings is None:
+            # Same defaults set_cash_opening uses for a tenant that never saved Settings.
+            settings = appmod.BusinessSettings(business_name='Default Business', address='', mobile='')
+            db.session.add(settings)
+        settings.ai_connector_writes_enabled = value
+        db.session.commit()
+        return jsonify(writes_enabled=value)

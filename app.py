@@ -1603,6 +1603,9 @@ class BusinessSettings(db.Model):
     # path (always convert-and-sum) rather than a flag-gated branch.
     multi_currency_enabled = db.Column(db.Boolean, nullable=False, default=False)
     reporting_currency = db.Column(db.String(3), db.ForeignKey('currency.code'), nullable=False, default='USD')
+    # AI connector (MCP) may make changes, not just read. Off until an admin turns it on.
+    ai_connector_writes_enabled = db.Column(db.Boolean, nullable=False, default=False,
+                                            server_default=db.false())
     # Cash on hand at the START of cash_opening_date -- the anchor the Daily
     # Cash report's running balance counts forward from. Both null = not set
     # (the report then shows only the day's in/out/net).
@@ -2219,6 +2222,7 @@ class McpToolCall(db.Model):
     ok = db.Column(db.Boolean, nullable=False, default=True)
     error = db.Column(db.String(300), nullable=True)
     duration_ms = db.Column(db.Integer, nullable=True)
+    wrote = db.Column(db.Boolean, nullable=False, default=False, server_default=db.false())
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 
