@@ -1,6 +1,8 @@
 import pytest
 
 import mcp_server
+from mcp_server import ToolError
+from mcp_tools import amount_arg, safe_message
 from tests.conftest import auth_headers, make_tenant
 from tests.mcp_helpers import (call_tool, connect, enable_connector, enable_writes, mcp,
                                tool_data, tool_error_text)
@@ -114,3 +116,24 @@ def test_failed_call_does_not_block_retry(client, fake_tools, monkeypatch):
     assert "closed" in tool_error_text(call_tool(client, tok, "zz_write", {"n": 5}))
     monkeypatch.setattr(mcp_server.TOOLS["zz_write"], "handler", _fake_write)
     assert tool_data(call_tool(client, tok, "zz_write", {"n": 5}))["ok"] is True
+
+
+def test_safe_message_filters_internal_text():
+    assert safe_message({"message": "Day 2026-11-06 is closed — ask an admin to reopen it."}).startswith("Day")
+    assert safe_message({"error": "Category 'Fuel' not found."}) == "Category 'Fuel' not found."
+    assert safe_message({"error": "'phone'"}) is None
+    assert safe_message({"error": "(psycopg2.errors.UniqueViolation) duplicate key"}) is None
+    assert safe_message({"error": "Traceback (most recent call last):\n ..."}) is None
+    assert safe_message({"error": "x" * 250}) is None
+    assert safe_message(["not a dict"]) is None
+
+
+def test_amount_arg():
+    assert amount_arg({"a": "12.5"}, "a") == 12.5
+    assert amount_arg({}, "a", required=False) is None
+    assert amount_arg({"a": 0}, "a", allow_zero=True) == 0.0
+    for bad in (0, -1, "abc", True, 1.234):
+        with pytest.raises(ToolError):
+            amount_arg({"a": bad}, "a")
+    with pytest.raises(ToolError):
+        amount_arg({}, "a")
