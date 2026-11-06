@@ -1,5 +1,9 @@
+import pytest
+
+import mcp_server
 from tests.conftest import auth_headers, make_tenant
-from tests.mcp_helpers import enable_connector
+from tests.mcp_helpers import (call_tool, connect, enable_connector, enable_writes, mcp,
+                               tool_data, tool_error_text)
 
 
 def _admin(client, username="wf_admin", business="WF Biz"):
@@ -27,3 +31,86 @@ def test_audit_column_defaults_false(client):
     import app as appmod
     assert appmod.McpToolCall.__table__.c.wrote.default.arg is False
     assert appmod.BusinessSettings.__table__.name == "business_settings"
+
+
+CALLS = []
+
+
+def _fake_write(ctx, args):
+    CALLS.append(dict(args))
+    return {"ok": True, "args": args}
+
+
+@pytest.fixture
+def fake_tools(monkeypatch):
+    CALLS.clear()
+    monkeypatch.setitem(mcp_server.TOOLS, "zz_write", mcp_server.Tool(
+        name="zz_write", title="Fake write", description="test",
+        input_schema={"type": "object", "properties": {"n": {"type": "integer"}}},
+        handler=_fake_write, roles=mcp_server.DESK, writes=True, dedupe=True))
+    monkeypatch.setitem(mcp_server.TOOLS, "zz_undo", mcp_server.Tool(
+        name="zz_undo", title="Fake undo", description="test",
+        input_schema={"type": "object", "properties": {}},
+        handler=_fake_write, roles=mcp_server.ADMIN, writes=True, destructive=True))
+
+
+def _names(client, tok):
+    return {t["name"]: t for t in mcp(client, tok, "tools/list").get_json()["result"]["tools"]}
+
+
+def test_write_tools_hidden_and_refused_while_switch_off(client, fake_tools):
+    hdr = _admin(client)
+    tok, _, _ = connect(client, hdr)
+    assert "zz_write" not in _names(client, tok)
+    assert "turned off for this business" in tool_error_text(call_tool(client, tok, "zz_write", {"n": 1}))
+    assert CALLS == []
+    instr = mcp(client, tok, "initialize", {"protocolVersion": "2025-06-18"}).get_json()["result"]["instructions"]
+    assert "You cannot change anything" in instr
+
+
+def test_switch_on_lists_with_annotations_and_role_filter(client, fake_tools):
+    hdr = _admin(client)
+    enable_writes("wf_admin")
+    tok, _, _ = connect(client, hdr)
+    tools = _names(client, tok)
+    ann = tools["zz_write"]["annotations"]
+    assert ann["readOnlyHint"] is False and ann["destructiveHint"] is False and ann["idempotentHint"] is False
+    assert "confirm_duplicate" in tools["zz_write"]["inputSchema"]["properties"]
+    assert tools["zz_undo"]["annotations"]["destructiveHint"] is True
+    assert tools["search_customers"]["annotations"]["readOnlyHint"] is True
+    instr = mcp(client, tok, "initialize", {"protocolVersion": "2025-06-18"}).get_json()["result"]["instructions"]
+    assert "You cannot change anything" not in instr and "confirm amounts" in instr
+    fin = auth_headers(client, username="wf_fin2", role="finance")
+    tok_fin, _, _ = connect(client, fin)
+    names = _names(client, tok_fin)
+    assert "zz_write" in names and "zz_undo" not in names
+    assert "role (finance)" in tool_error_text(call_tool(client, tok_fin, "zz_undo", {}))
+
+
+def test_dedupe_guard(client, fake_tools):
+    import app as appmod
+    hdr = _admin(client)
+    enable_writes("wf_admin")
+    tok, _, _ = connect(client, hdr)
+    assert tool_data(call_tool(client, tok, "zz_write", {"n": 1}))["ok"] is True
+    msg = tool_error_text(call_tool(client, tok, "zz_write", {"n": 1}))
+    assert "already made" in msg and "confirm_duplicate" in msg
+    assert tool_data(call_tool(client, tok, "zz_write", {"n": 2}))["ok"] is True
+    assert tool_data(call_tool(client, tok, "zz_write", {"n": 1, "confirm_duplicate": True}))["ok"] is True
+    assert CALLS == [{"n": 1}, {"n": 2}, {"n": 1}]   # confirm_duplicate is stripped
+    rows = appmod.McpToolCall.query.filter_by(tool="zz_write").all()
+    assert len(rows) == 4 and all(r.wrote for r in rows)
+    assert appmod.McpToolCall.query.filter_by(tool="search_customers").count() == 0
+
+
+def test_failed_call_does_not_block_retry(client, fake_tools, monkeypatch):
+    hdr = _admin(client)
+    enable_writes("wf_admin")
+    tok, _, _ = connect(client, hdr)
+
+    def boom(ctx, args):
+        raise mcp_server.ToolError("Day 2026-11-06 is closed.")
+    monkeypatch.setattr(mcp_server.TOOLS["zz_write"], "handler", boom)
+    assert "closed" in tool_error_text(call_tool(client, tok, "zz_write", {"n": 5}))
+    monkeypatch.setattr(mcp_server.TOOLS["zz_write"], "handler", _fake_write)
+    assert tool_data(call_tool(client, tok, "zz_write", {"n": 5}))["ok"] is True
