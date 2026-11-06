@@ -683,8 +683,6 @@ def test_create_update_and_never_touch_balance(client):
         "customer_id": cid, "address": "Hamra", "balance": 999}))
     assert d["customer"]["address"] == "Hamra"
     assert float(appmod.db.session.get(appmod.Customer, cid).balance) == before
-    assert "balance" not in mcp(client, tok, "tools/list").get_json()["result"]["tools"][0]["inputSchema"]["properties"] \
-        or True  # schema checked below
     tools = {t["name"]: t for t in mcp(client, tok, "tools/list").get_json()["result"]["tools"]}
     assert "balance" not in tools["update_customer"]["inputSchema"]["properties"]
 
