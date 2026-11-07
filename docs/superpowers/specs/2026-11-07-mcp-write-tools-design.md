@@ -1,7 +1,7 @@
 # ServiceBills MCP connector — write tools
 
 Date: 2026-11-07
-Status: approved design, not yet planned or built
+Status: implemented on feat/mcp-write-tools (plan: docs/superpowers/plans/2026-11-07-mcp-write-tools.md)
 Builds on: `2026-10-21-mcp-connector-design.md` (read-only v1, live since 2026-10-22)
 
 ## Goal
@@ -95,36 +95,36 @@ $ = `dedupe` (double-submit guard, below).
 | `receive_payment` $ | POST `/api/customers/<id>/receive-payment` | customer_id*, amount*, method (cash \| whish_transfer), reference, action (pay \| collect; default pay for admin/finance, collect otherwise) | admin, finance, cashier, collector |
 | `confirm_collected` | POST `/api/customers/<id>/confirm-collected` | customer_id* | admin, finance |
 | `revert_payment` ⚠ | PUT `/api/payments/<id>/revert` | payment_id*, reason* | admin, finance |
-| `refund_payment` ⚠ $ | POST `/api/payments/<id>/refund` | payment_id*, amount*, reason* | admin, finance |
+| `refund_payment` ⚠ $ | POST `/api/payments/<id>/refund` | payment_id*, amount*, reason*, paid_via | admin, finance |
 | `mark_payment_gratis` | PUT `/api/payments/<id>/mark_gratis` | payment_id*, note | admin, finance |
 
 ### Expenses, cash, suppliers — admin, finance
 
 | Tool | Endpoint | Inputs |
 |---|---|---|
-| `add_expense` $ | POST `/api/expenses` | amount*, category*, date, description, supplier_id, employee_id, is_credit |
+| `add_expense` $ | POST `/api/expenses` | amount*, category*, date, description, supplier_id, employee_id, is_credit, paid_via |
 | `update_expense` | PUT `/api/expenses/<id>` | expense_id* + any of the above |
 | `delete_expense` ⚠ | DELETE `/api/expenses/<id>` | expense_id*, reason* |
-| `add_cash_entry` $ | POST `/api/cash-entries` | account*, amount*, direction (in \| out — mapped to the endpoint's sign convention), reason* |
-| `delete_cash_entry` ⚠ | DELETE `/api/cash-entries/<id>` | entry_id*, reason* |
+| `add_cash_entry` $ | POST `/api/cash-entries` | account*, amount*, date, reason* |
+| `delete_cash_entry` ⚠ | DELETE `/api/cash-entries/<id>` | entry_id*, reason* — admin only |
 | `transfer_between_accounts` $ | POST `/api/account-transfers` | from_account*, to_account*, amount*, note |
-| `delete_transfer` ⚠ | DELETE `/api/account-transfers/<id>` | transfer_id*, reason* |
-| `pay_supplier` $ | POST `/api/suppliers/<id>/payments` | supplier_id*, amount*, payment_date, payment_method, reference_note |
-| `delete_supplier_payment` ⚠ | DELETE `/api/suppliers/<id>/payments/<pid>` | supplier_id*, payment_id*, reason* |
+| `delete_transfer` ⚠ | DELETE `/api/account-transfers/<id>` | transfer_id*, reason* — admin only |
+| `pay_supplier` $ | POST `/api/suppliers/<id>/payments` | supplier_id*, amount*, payment_date, payment_method, reference_note, paid_via |
+| `delete_supplier_payment` ⚠ | DELETE `/api/suppliers/<id>/payments/<pid>` | supplier_id*, payment_id*, reason* — admin only |
 
 ### Payroll — admin only
 
 | Tool | Endpoint | Inputs |
 |---|---|---|
 | `add_employee_charge` $ | POST `/api/employees/<id>/charges` | employee_id*, type*, amount*, period, date, reason |
-| `pay_employee` $ | POST `/api/employees/<id>/payments` | employee_id*, amount*, is_advance, method, payment_date, note |
+| `pay_employee` $ | POST `/api/employees/<id>/payments` | employee_id*, amount*, is_advance, method, payment_date, note, paid_via |
 
 ### Resellers — admin, finance
 
 | Tool | Endpoint | Inputs |
 |---|---|---|
 | `reseller_add_credit` $ | POST `/api/resellers/<id>/add_credit` | reseller_id*, amount*, description |
-| `reseller_collect_payment` $ | POST `/api/resellers/<id>/collect_payment` | reseller_id*, amount*, description |
+| `reseller_collect_payment` $ | POST `/api/resellers/<id>/collect_payment` | reseller_id*, amount*, description, paid_via |
 
 ### Tickets — all staff
 
@@ -140,6 +140,8 @@ $ = `dedupe` (double-submit guard, below).
 | `list_plans` | Subscription plans: id, name, price, cycle | all staff |
 | `list_expense_categories` | Category names | admin, finance |
 | `find_payments` | One customer's recent payments (up to 20) with ids, amounts, status, reverted flag | admin, finance, cashier |
+
+Cash entries are cash-in only (the endpoint takes a positive amount). `paid_via` is `cash` (default) or `whish` — which account the money left or reached; without it everything books as cash. Ticket priorities: low, medium, high, critical (as the web app offers).
 
 `*` = required. Exact enum values (ticket status/priority, charge type, cash
 account names, payment methods) are taken from the endpoint code during
