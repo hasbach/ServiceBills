@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import axios from 'axios';
-import { Alert, Box, Button, CircularProgress, IconButton, List, ListItem, ListItemText, Paper, Tooltip, Typography } from '@mui/material';
+import { Alert, Box, Button, CircularProgress, FormControlLabel, IconButton, List, ListItem, ListItemText, Paper, Switch, Tooltip, Typography } from '@mui/material';
 import { ContentCopy as ContentCopyIcon } from '@mui/icons-material';
 
 const auth = () => ({ headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } });
@@ -36,6 +36,15 @@ export default function AIConnectorCard() {
         load(failed);
     };
 
+    const setWrites = async (on) => {
+        try {
+            const res = await axios.put('/api/mcp/settings', { writes_enabled: on }, auth());
+            setData(d => ({ ...d, writes_enabled: res.data.writes_enabled }));
+        } catch (err) {
+            setError(err.response?.data?.msg || 'Could not change this setting.');
+        }
+    };
+
     const copy = async () => {
         try {
             await navigator.clipboard.writeText(data.mcp_url);
@@ -58,7 +67,7 @@ export default function AIConnectorCard() {
                 <Alert severity="info" sx={{ mb: 2 }}>The AI connector is not part of your plan. Contact ServiceBills to enable it.</Alert>
             )}
             <Typography variant="body2" sx={{ mb: 1 }}>
-                Let Claude, ChatGPT or another AI app answer questions about your business (read-only).
+                Let Claude, ChatGPT or another AI app answer questions about your business{data.writes_enabled ? ' and make changes for you' : ' (read-only)'}.
                 Add this URL as a custom connector:
             </Typography>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2, p: 1.5, bgcolor: 'action.hover', borderRadius: '8px' }}>
@@ -69,6 +78,17 @@ export default function AIConnectorCard() {
                 <b>Claude:</b> Settings → Connectors → Add custom connector → paste the URL → Connect.<br />
                 <b>ChatGPT:</b> Settings → Apps &amp; Connectors → Create (developer mode) → paste the URL → OAuth.<br />
                 Each person signs in with their own ServiceBills account and sees only what their role allows.
+            </Typography>
+            <FormControlLabel
+                sx={{ mb: 1 }}
+                control={<Switch checked={!!data.writes_enabled} disabled={!data.is_admin}
+                                 onChange={e => setWrites(e.target.checked)} />}
+                label="Allow the AI to make changes" />
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                When on, connected staff can add and edit customers, renew, take payments, record expenses,
+                cash, supplier and salary payments, and manage tickets from their AI app, limited to what their
+                role can do here. Deleting customers, bulk actions, day close and settings stay in ServiceBills.
+                {!data.is_admin && ' Only an admin can change this.'}
             </Typography>
             <Typography variant="subtitle2" sx={{ mb: 1 }}>{data.is_admin ? 'Connected AI apps' : 'Your connected AI apps'}</Typography>
             {data.grants.length === 0 ? (
