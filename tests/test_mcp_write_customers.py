@@ -77,5 +77,5 @@ def test_employee_cannot_see_or_use_desk_tools(client):
     emp = auth_headers(client, username="wc_emp", role="employee")
     tok, _, _ = connect(client, emp)
     names = {t["name"] for t in mcp(client, tok, "tools/list").get_json()["result"]["tools"]}
-    assert "create_customer" not in names
+    assert "create_customer" not in names and "create_ticket" in names
     assert "role (employee)" in tool_error_text(call_tool(client, tok, "renew_subscription", {"customer_id": 1}))

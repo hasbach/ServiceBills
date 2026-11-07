@@ -546,3 +546,62 @@ register_tool(Tool(
     description='Record money received from a reseller.',
     input_schema={'type': 'object', 'required': ['reseller_id', 'amount'], 'properties': _RESELLER_PROPS},
     handler=_reseller_money('collect_payment', 'Payment received'), roles=FINANCE, writes=True, dedupe=True))
+
+
+# --- tickets -------------------------------------------------------------------------
+
+STATUSES = ('open', 'in_progress', 'resolved', 'closed')
+PRIORITIES = ('low', 'medium', 'high', 'critical')
+
+
+def _ticket_after(ctx, tid):
+    t = scoped(ctx, ctx.appmod.SupportTicket).filter_by(id=tid).first()
+    return {'id': t.id, 'title': t.title, 'status': t.status, 'priority': t.priority,
+            'customer_id': t.customer_id} if t else None
+
+
+def create_ticket(ctx, args):
+    body = {'customer_id': _cid(args), 'title': str_arg(args, 'title', required=True, max_len=200),
+            'description': str_arg(args, 'description', max_len=2000) or '',
+            'priority': enum_arg(args, 'priority', PRIORITIES, 'medium')}
+    resp = call_api(ctx, '/api/support-tickets', method='POST', json=body)
+    tid = resp.get('id') if isinstance(resp, dict) else None
+    if tid is None:
+        T = ctx.appmod.SupportTicket
+        tid = scoped(ctx, T).filter_by(customer_id=body['customer_id']).order_by(T.id.desc()).first().id
+    return {'result': 'Ticket opened.', 'ticket': _ticket_after(ctx, tid)}
+
+
+def update_ticket(ctx, args):
+    tid = int_arg(args, 'ticket_id', lo=1, required=True)
+    body = {}
+    if args.get('status') is not None:
+        body['status'] = enum_arg(args, 'status', STATUSES, None)
+    if args.get('priority') is not None:
+        body['priority'] = enum_arg(args, 'priority', PRIORITIES, None)
+    for key, n in (('title', 200), ('description', 2000)):
+        v = str_arg(args, key, max_len=n)
+        if v is not None:
+            body[key] = v
+    if not body:
+        raise ToolError('Nothing to change: pass status, priority, title or description.')
+    call_api(ctx, f'/api/support-tickets/{tid}', method='PUT', json=body)
+    return {'result': 'Ticket updated.', 'ticket': _ticket_after(ctx, tid)}
+
+
+register_tool(Tool(
+    name='create_ticket', title='Open support ticket',
+    description='Open a support ticket for a customer (staff get the usual push notification).',
+    input_schema={'type': 'object', 'required': ['customer_id', 'title'], 'properties': {
+        'customer_id': CUSTOMER_ID, 'title': {'type': 'string'}, 'description': {'type': 'string'},
+        'priority': {'type': 'string', 'enum': list(PRIORITIES), 'default': 'medium'}}},
+    handler=create_ticket, roles=ALL_STAFF, writes=True, dedupe=True))
+
+register_tool(Tool(
+    name='update_ticket', title='Update support ticket',
+    description='Change a ticket\'s status, priority, title or description (find ids with list_tickets).',
+    input_schema={'type': 'object', 'required': ['ticket_id'], 'properties': {
+        'ticket_id': {'type': 'integer'}, 'status': {'type': 'string', 'enum': list(STATUSES)},
+        'priority': {'type': 'string', 'enum': list(PRIORITIES)},
+        'title': {'type': 'string'}, 'description': {'type': 'string'}}},
+    handler=update_ticket, roles=ALL_STAFF, writes=True))
