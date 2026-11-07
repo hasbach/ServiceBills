@@ -136,10 +136,10 @@ def update_customer(ctx, args):
     return _done(resp, customer=_customer_after(ctx, cid))
 
 
-def _subscription_action(method, suffix):
+def _subscription_action(method, suffix, needs_reason=False):
     def handler(ctx, args):
         cid = _cid(args)
-        if suffix == 'cancel_subscription':
+        if needs_reason:
             _reason(args)
         resp = call_api(ctx, f'/api/customers/{cid}/{suffix}', method=method, json={})
         return _done(resp, customer=_customer_after(ctx, cid))
@@ -182,7 +182,7 @@ register_tool(Tool(
     description='Cancel (deactivate) a customer\'s subscription. Undo with activate_subscription.',
     input_schema={'type': 'object', 'required': ['customer_id', 'reason'],
                   'properties': {'customer_id': CUSTOMER_ID, 'reason': REASON}},
-    handler=_subscription_action('PUT', 'cancel_subscription'), roles=DESK, writes=True, destructive=True))
+    handler=_subscription_action('PUT', 'cancel_subscription', needs_reason=True), roles=DESK, writes=True, destructive=True))
 
 register_tool(Tool(
     name='network_suspend', title='Suspend on network',
@@ -200,6 +200,14 @@ register_tool(Tool(
 # --- customer money ---------------------------------------------------------------
 
 PAYMENT_ID = {'type': 'integer', 'description': 'From find_payments'}
+PAID_VIA = {'type': 'string', 'enum': ['cash', 'whish'],
+            'description': 'Which account the money came from (default cash)'}
+
+
+def _put_paid_via(args, body):
+    pv = enum_arg(args, 'paid_via', ('cash', 'whish'), None)
+    if pv is not None:
+        body['paid_via'] = pv
 
 
 def _pid(args):
@@ -234,6 +242,7 @@ def revert_payment(ctx, args):
 def refund_payment(ctx, args):
     pid = _pid(args)
     body = {'amount': amount_arg(args, 'amount'), 'reason': _reason(args)}
+    _put_paid_via(args, body)
     resp = call_api(ctx, f'/api/payments/{pid}/refund', method='POST', json=body)
     return _done(resp, payment_id=pid)
 
@@ -273,9 +282,12 @@ register_tool(Tool(
 
 register_tool(Tool(
     name='refund_payment', title='Refund payment',
-    description='Give money back on a paid payment (full or part, not more than the payment). Find the id with find_payments.',
+    description=('Give money back on a paid payment (full or part, not more than the payment). Find the id with '
+                 'find_payments. paid_via whish if the refund was sent from the Whish account; by default it '
+                 'follows how the customer paid.'),
     input_schema={'type': 'object', 'required': ['payment_id', 'amount', 'reason'], 'properties': {
-        'payment_id': PAYMENT_ID, 'amount': {'type': 'number', 'exclusiveMinimum': 0}, 'reason': REASON}},
+        'payment_id': PAYMENT_ID, 'amount': {'type': 'number', 'exclusiveMinimum': 0}, 'reason': REASON,
+        'paid_via': PAID_VIA}},
     handler=refund_payment, roles=FINANCE, writes=True, destructive=True, dedupe=True))
 
 register_tool(Tool(
@@ -317,6 +329,7 @@ def _expense_fields(ctx, args, creating):
             body[key] = v
     if 'is_credit' in args:
         body['is_credit'] = bool_arg(args, 'is_credit')
+    _put_paid_via(args, body)
     return body
 
 
@@ -387,6 +400,7 @@ def pay_supplier(ctx, args):
     d = date_arg(args, 'payment_date')
     if d is not None:
         body['payment_date'] = day(d)
+    _put_paid_via(args, body)
     resp = call_api(ctx, f'/api/suppliers/{sid}/payments', method='POST', json=body)
     return _done(resp, supplier=resp.get('supplier'), payment=resp.get('payment'))
 
@@ -400,11 +414,13 @@ def delete_supplier_payment(ctx, args):
 _EXPENSE_PROPS = {'amount': MONEY, 'category': {'type': 'string', 'description': 'From list_expense_categories'},
                   'date': DATE, 'description': {'type': 'string'},
                   'supplier_id': {'type': 'integer'}, 'employee_id': {'type': 'integer'},
-                  'is_credit': {'type': 'boolean', 'description': 'Bought on credit from the supplier (not paid yet)'}}
+                  'is_credit': {'type': 'boolean', 'description': 'Bought on credit from the supplier (not paid yet)'},
+                  'paid_via': PAID_VIA}
 
 register_tool(Tool(
     name='add_expense', title='Add expense',
-    description='Record a business expense in a category (see list_expense_categories). Counts in cash flow and profit.',
+    description=('Record a business expense in a category (see list_expense_categories). Counts in cash flow and '
+                 'profit. paid_via whish if it was paid from the Whish account (default cash).'),
     input_schema={'type': 'object', 'required': ['amount', 'category'], 'properties': _EXPENSE_PROPS},
     handler=add_expense, roles=FINANCE, writes=True, dedupe=True))
 
@@ -455,10 +471,11 @@ register_tool(Tool(
 
 register_tool(Tool(
     name='pay_supplier', title='Pay supplier',
-    description='Record a payment to a supplier (reduces what the business owes them).',
+    description=('Record a payment to a supplier (reduces what the business owes them). paid_via whish if paid '
+                 'from the Whish account (default cash).'),
     input_schema={'type': 'object', 'required': ['supplier_id', 'amount'], 'properties': {
         'supplier_id': {'type': 'integer'}, 'amount': MONEY, 'payment_date': DATE,
-        'payment_method': {'type': 'string'}, 'reference_note': {'type': 'string'}}},
+        'payment_method': {'type': 'string'}, 'reference_note': {'type': 'string'}, 'paid_via': PAID_VIA}},
     handler=pay_supplier, roles=FINANCE, writes=True, dedupe=True))
 
 register_tool(Tool(
@@ -479,7 +496,7 @@ def add_employee_charge(ctx, args):
         raise ToolError("'type' is required.")
     period = str_arg(args, 'period', max_len=7)
     if period:
-        if not re.fullmatch(r'\d{4}-\d{2}', period):
+        if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', period):
             raise ToolError("'period' must look like 2026-11.")
         body['period'] = period
     d = date_arg(args, 'date')
@@ -497,6 +514,7 @@ def pay_employee(ctx, args):
     d = date_arg(args, 'payment_date')
     if d is not None:
         body['payment_date'] = day(d)
+    _put_paid_via(args, body)
     resp = call_api(ctx, f'/api/employees/{emp}/payments', method='POST', json=body)
     return _done(resp, employee=resp.get('employee'), payment=resp.get('payment'))
 
@@ -513,20 +531,24 @@ register_tool(Tool(
 
 register_tool(Tool(
     name='pay_employee', title='Pay employee',
-    description='Pay an employee their salary, or an advance (is_advance true). Recorded as an expense.',
+    description=('Pay an employee their salary, or an advance (is_advance true). Recorded as an expense. '
+                 'paid_via whish if paid from the Whish account (default cash).'),
     input_schema={'type': 'object', 'required': ['employee_id', 'amount'], 'properties': {
         'employee_id': {'type': 'integer'}, 'amount': MONEY, 'is_advance': {'type': 'boolean', 'default': False},
-        'method': {'type': 'string'}, 'payment_date': DATE, 'note': {'type': 'string'}}},
+        'method': {'type': 'string'}, 'payment_date': DATE, 'note': {'type': 'string'},
+        'paid_via': PAID_VIA}},
     handler=pay_employee, roles=ADMIN, writes=True, dedupe=True))
 
 
 # --- resellers ------------------------------------------------------------------------
 
-def _reseller_money(suffix, default_desc):
+def _reseller_money(suffix, default_desc, takes_paid_via=False):
     def handler(ctx, args):
         rid = _id(args, 'reseller_id')
         body = {'amount': amount_arg(args, 'amount'),
                 'description': str_arg(args, 'description', max_len=200) or default_desc}
+        if takes_paid_via:
+            _put_paid_via(args, body)
         resp = call_api(ctx, f'/api/resellers/{rid}/{suffix}', method='POST', json=body)
         return _done(resp, reseller=resp.get('reseller'))
     return handler
@@ -543,9 +565,11 @@ register_tool(Tool(
 
 register_tool(Tool(
     name='reseller_collect_payment', title='Collect from reseller',
-    description='Record money received from a reseller.',
-    input_schema={'type': 'object', 'required': ['reseller_id', 'amount'], 'properties': _RESELLER_PROPS},
-    handler=_reseller_money('collect_payment', 'Payment received'), roles=FINANCE, writes=True, dedupe=True))
+    description=('Record money received from a reseller. paid_via whish if it arrived in the Whish account '
+                 '(default cash).'),
+    input_schema={'type': 'object', 'required': ['reseller_id', 'amount'],
+                  'properties': {**_RESELLER_PROPS, 'paid_via': PAID_VIA}},
+    handler=_reseller_money('collect_payment', 'Payment received', takes_paid_via=True), roles=FINANCE, writes=True, dedupe=True))
 
 
 # --- tickets -------------------------------------------------------------------------
@@ -561,15 +585,14 @@ def _ticket_after(ctx, tid):
 
 
 def create_ticket(ctx, args):
-    body = {'customer_id': _cid(args), 'title': str_arg(args, 'title', required=True, max_len=200),
+    cid = _cid(args)
+    if not scoped(ctx, ctx.appmod.Customer).filter_by(id=cid).first():
+        raise ToolError(f'Customer {cid} not found.')
+    body = {'customer_id': cid, 'title': str_arg(args, 'title', required=True, max_len=200),
             'description': str_arg(args, 'description', max_len=2000) or '',
             'priority': enum_arg(args, 'priority', PRIORITIES, 'medium')}
     resp = call_api(ctx, '/api/support-tickets', method='POST', json=body)
-    tid = resp.get('id') if isinstance(resp, dict) else None
-    if tid is None:
-        T = ctx.appmod.SupportTicket
-        tid = scoped(ctx, T).filter_by(customer_id=body['customer_id']).order_by(T.id.desc()).first().id
-    return {'result': 'Ticket opened.', 'ticket': _ticket_after(ctx, tid)}
+    return {'result': 'Ticket opened.', 'ticket': _ticket_after(ctx, resp['id'])}
 
 
 def update_ticket(ctx, args):

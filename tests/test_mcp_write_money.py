@@ -33,11 +33,14 @@ def test_receive_payment_then_revert(client):
 
 
 def test_refund(client):
+    import app as appmod
     _, tok, cid = _setup(client)
     tool_data(call_tool(client, tok, "receive_payment", {"customer_id": cid, "amount": 10}))
     p = _paid_payment(client, tok, cid)
     d = tool_data(call_tool(client, tok, "refund_payment", {"payment_id": p["id"], "amount": 4, "reason": "outage"}))
     assert "result" in d
+    refund = appmod.Payment.query.filter_by(customer_id=cid, is_refund=True).one()
+    assert float(refund.amount) == 4.0
     msg = tool_error_text(call_tool(client, tok, "refund_payment", {"payment_id": p["id"], "amount": 50,
                                                                     "reason": "too much"}))
     assert "cannot exceed" in msg

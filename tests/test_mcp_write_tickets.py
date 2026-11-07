@@ -43,3 +43,20 @@ def test_write_through_mcp_end_to_end_and_switch_off_again(client):
     assert "create_ticket" not in names and "search_customers" in names
     assert "turned off" in tool_error_text(call_tool(client, tok, "create_ticket",
                                                      {"customer_id": cid, "title": "Again"}))
+
+
+def test_create_ticket_rejects_other_tenants_customer(client):
+    import app as appmod
+    _, tok, _ = _setup(client)
+    other = make_tenant(client, "Other Biz", "wt_other")
+    plan = client.post("/api/subscription_plans", headers=other,
+                       json={"name": "P", "price": 5, "billing_cycle": "monthly"}).get_json()["plan"]["id"]
+    enable_connector("wt_other")
+    enable_writes("wt_other")
+    otok, _, _ = connect(client, other)
+    ocid = tool_data(call_tool(client, otok, "create_customer", {
+        "name": "Foreign", "phone": "03999000", "subscription_plan_id": plan}))["customer"]["id"]
+    before = appmod.SupportTicket.query.count()
+    msg = tool_error_text(call_tool(client, tok, "create_ticket", {"customer_id": ocid, "title": "x"}))
+    assert "not found" in msg
+    assert appmod.SupportTicket.query.count() == before
