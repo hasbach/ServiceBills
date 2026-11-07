@@ -6,7 +6,9 @@ call_api(), so role checks, the day-close lock, balance log, upstream sync and
 WhatsApp sends run exactly as for a click in the web app. Nothing here writes
 business data directly. Registered at import time (app.py imports this module
 after mcp_tools)."""
-from mcp_server import ALL_STAFF, COLLECT, DESK, FINANCE, PAYMENTS, Tool, ToolError, register_tool
+import re
+
+from mcp_server import ADMIN, ALL_STAFF, COLLECT, DESK, FINANCE, PAYMENTS, Tool, ToolError, register_tool
 from mcp_tools import (MAX_ROWS, _customer_row, _payment_row, amount_arg, bool_arg, call_api,
                        date_arg, day, enum_arg, int_arg, scoped, str_arg, today)
 
@@ -282,3 +284,265 @@ register_tool(Tool(
     input_schema={'type': 'object', 'required': ['payment_id'], 'properties': {
         'payment_id': PAYMENT_ID, 'note': {'type': 'string'}}},
     handler=mark_payment_gratis, roles=FINANCE, writes=True))
+
+
+# --- expenses, cash, suppliers ----------------------------------------------------
+
+ACCOUNT = {'type': 'string', 'enum': ['cash', 'whish']}
+DATE = {'type': 'string', 'description': 'YYYY-MM-DD; default today'}
+MONEY = {'type': 'number', 'exclusiveMinimum': 0}
+
+
+def _id(args, key):
+    return int_arg(args, key, lo=1, required=True)
+
+
+def _expense_fields(ctx, args, creating):
+    body = {}
+    amount = amount_arg(args, 'amount', required=creating)
+    if amount is not None:
+        body['amount'] = amount
+    category = str_arg(args, 'category', required=creating)
+    if category:
+        body['category'] = category
+    d = date_arg(args, 'date', default=today(ctx) if creating else None)
+    if d is not None:
+        body['date'] = day(d)
+    desc = str_arg(args, 'description', max_len=500)
+    if desc is not None:
+        body['description'] = desc
+    for key in ('supplier_id', 'employee_id'):
+        v = int_arg(args, key, lo=1)
+        if v is not None:
+            body[key] = v
+    if 'is_credit' in args:
+        body['is_credit'] = bool_arg(args, 'is_credit')
+    return body
+
+
+def add_expense(ctx, args):
+    resp = call_api(ctx, '/api/expenses', method='POST', json=_expense_fields(ctx, args, True))
+    return {'result': 'Expense added.', 'expense': resp}
+
+
+def update_expense(ctx, args):
+    eid = _id(args, 'expense_id')
+    body = _expense_fields(ctx, args, False)
+    if not body:
+        raise ToolError('Nothing to change: pass at least one field.')
+    resp = call_api(ctx, f'/api/expenses/{eid}', method='PUT', json=body)
+    return {'result': 'Expense updated.', 'expense': resp}
+
+
+def delete_expense(ctx, args):
+    eid = _id(args, 'expense_id')
+    _reason(args)
+    return _done(call_api(ctx, f'/api/expenses/{eid}', method='DELETE'), expense_id=eid)
+
+
+def add_cash_entry(ctx, args):
+    body = {'account': enum_arg(args, 'account', ('cash', 'whish'), None),
+            'amount': amount_arg(args, 'amount'), 'reason': _reason(args)}
+    if body['account'] is None:
+        raise ToolError("'account' is required.")
+    d = date_arg(args, 'date')
+    if d is not None:
+        body['date'] = day(d)
+    return {'result': 'Cash entry added.', 'entry': call_api(ctx, '/api/cash-entries', method='POST', json=body)}
+
+
+def delete_cash_entry(ctx, args):
+    eid = _id(args, 'entry_id')
+    _reason(args)
+    return _done(call_api(ctx, f'/api/cash-entries/{eid}', method='DELETE'), entry_id=eid)
+
+
+def transfer_between_accounts(ctx, args):
+    body = {'from_account': enum_arg(args, 'from_account', ('cash', 'whish'), None),
+            'to_account': enum_arg(args, 'to_account', ('cash', 'whish'), None),
+            'amount': amount_arg(args, 'amount')}
+    if body['from_account'] is None or body['to_account'] is None:
+        raise ToolError("'from_account' and 'to_account' are required.")
+    note = str_arg(args, 'note', max_len=200)
+    if note:
+        body['note'] = note
+    d = date_arg(args, 'date')
+    if d is not None:
+        body['date'] = day(d)
+    return {'result': 'Transfer recorded.',
+            'transfer': call_api(ctx, '/api/account-transfers', method='POST', json=body)}
+
+
+def delete_transfer(ctx, args):
+    tid = _id(args, 'transfer_id')
+    _reason(args)
+    return _done(call_api(ctx, f'/api/account-transfers/{tid}', method='DELETE'), transfer_id=tid)
+
+
+def pay_supplier(ctx, args):
+    sid = _id(args, 'supplier_id')
+    body = {'amount': amount_arg(args, 'amount'),
+            'payment_method': str_arg(args, 'payment_method', max_len=50) or '',
+            'reference_note': str_arg(args, 'reference_note', max_len=200) or ''}
+    d = date_arg(args, 'payment_date')
+    if d is not None:
+        body['payment_date'] = day(d)
+    resp = call_api(ctx, f'/api/suppliers/{sid}/payments', method='POST', json=body)
+    return _done(resp, supplier=resp.get('supplier'), payment=resp.get('payment'))
+
+
+def delete_supplier_payment(ctx, args):
+    sid, pid = _id(args, 'supplier_id'), _id(args, 'payment_id')
+    _reason(args)
+    return _done(call_api(ctx, f'/api/suppliers/{sid}/payments/{pid}', method='DELETE'), payment_id=pid)
+
+
+_EXPENSE_PROPS = {'amount': MONEY, 'category': {'type': 'string', 'description': 'From list_expense_categories'},
+                  'date': DATE, 'description': {'type': 'string'},
+                  'supplier_id': {'type': 'integer'}, 'employee_id': {'type': 'integer'},
+                  'is_credit': {'type': 'boolean', 'description': 'Bought on credit from the supplier (not paid yet)'}}
+
+register_tool(Tool(
+    name='add_expense', title='Add expense',
+    description='Record a business expense in a category (see list_expense_categories). Counts in cash flow and profit.',
+    input_schema={'type': 'object', 'required': ['amount', 'category'], 'properties': _EXPENSE_PROPS},
+    handler=add_expense, roles=FINANCE, writes=True, dedupe=True))
+
+register_tool(Tool(
+    name='update_expense', title='Edit expense',
+    description='Change an expense; only the fields you pass change.',
+    input_schema={'type': 'object', 'required': ['expense_id'],
+                  'properties': {'expense_id': {'type': 'integer'}, **_EXPENSE_PROPS}},
+    handler=update_expense, roles=FINANCE, writes=True))
+
+register_tool(Tool(
+    name='delete_expense', title='Delete expense',
+    description='Delete an expense recorded by mistake.',
+    input_schema={'type': 'object', 'required': ['expense_id', 'reason'],
+                  'properties': {'expense_id': {'type': 'integer'}, 'reason': REASON}},
+    handler=delete_expense, roles=FINANCE, writes=True, destructive=True))
+
+register_tool(Tool(
+    name='add_cash_entry', title='Add cash-in',
+    description=('Record money received that is not a customer or reseller payment, into the cash box or the '
+                 'Whish account. Feeds the Daily Cash flow.'),
+    input_schema={'type': 'object', 'required': ['account', 'amount', 'reason'], 'properties': {
+        'account': ACCOUNT, 'amount': MONEY, 'date': DATE,
+        'reason': {'type': 'string', 'description': 'What the money is'}}},
+    handler=add_cash_entry, roles=FINANCE, writes=True, dedupe=True))
+
+register_tool(Tool(
+    name='delete_cash_entry', title='Delete cash-in',
+    description='Delete a cash-in entry recorded by mistake (admin only).',
+    input_schema={'type': 'object', 'required': ['entry_id', 'reason'],
+                  'properties': {'entry_id': {'type': 'integer'}, 'reason': REASON}},
+    handler=delete_cash_entry, roles=ADMIN, writes=True, destructive=True))
+
+register_tool(Tool(
+    name='transfer_between_accounts', title='Move money between accounts',
+    description='Record moving money between the cash box and the Whish account.',
+    input_schema={'type': 'object', 'required': ['from_account', 'to_account', 'amount'], 'properties': {
+        'from_account': ACCOUNT, 'to_account': ACCOUNT, 'amount': MONEY, 'date': DATE,
+        'note': {'type': 'string'}}},
+    handler=transfer_between_accounts, roles=FINANCE, writes=True, dedupe=True))
+
+register_tool(Tool(
+    name='delete_transfer', title='Delete account transfer',
+    description='Delete an account transfer recorded by mistake (admin only).',
+    input_schema={'type': 'object', 'required': ['transfer_id', 'reason'],
+                  'properties': {'transfer_id': {'type': 'integer'}, 'reason': REASON}},
+    handler=delete_transfer, roles=ADMIN, writes=True, destructive=True))
+
+register_tool(Tool(
+    name='pay_supplier', title='Pay supplier',
+    description='Record a payment to a supplier (reduces what the business owes them).',
+    input_schema={'type': 'object', 'required': ['supplier_id', 'amount'], 'properties': {
+        'supplier_id': {'type': 'integer'}, 'amount': MONEY, 'payment_date': DATE,
+        'payment_method': {'type': 'string'}, 'reference_note': {'type': 'string'}}},
+    handler=pay_supplier, roles=FINANCE, writes=True, dedupe=True))
+
+register_tool(Tool(
+    name='delete_supplier_payment', title='Delete supplier payment',
+    description='Delete a supplier payment recorded by mistake (admin only).',
+    input_schema={'type': 'object', 'required': ['supplier_id', 'payment_id', 'reason'], 'properties': {
+        'supplier_id': {'type': 'integer'}, 'payment_id': {'type': 'integer'}, 'reason': REASON}},
+    handler=delete_supplier_payment, roles=ADMIN, writes=True, destructive=True))
+
+
+# --- payroll (admin only) ------------------------------------------------------------
+
+def add_employee_charge(ctx, args):
+    emp = _id(args, 'employee_id')
+    body = {'type': enum_arg(args, 'type', ('salary', 'bonus', 'deduction'), None),
+            'amount': amount_arg(args, 'amount'), 'reason': str_arg(args, 'reason', max_len=200) or ''}
+    if body['type'] is None:
+        raise ToolError("'type' is required.")
+    period = str_arg(args, 'period', max_len=7)
+    if period:
+        if not re.fullmatch(r'\d{4}-\d{2}', period):
+            raise ToolError("'period' must look like 2026-11.")
+        body['period'] = period
+    d = date_arg(args, 'date')
+    if d is not None:
+        body['date'] = day(d)
+    resp = call_api(ctx, f'/api/employees/{emp}/charges', method='POST', json=body)
+    return {'result': f"{body['type'].capitalize()} added.", 'employee': resp.get('employee'),
+            'charge': resp.get('charge')}
+
+
+def pay_employee(ctx, args):
+    emp = _id(args, 'employee_id')
+    body = {'amount': amount_arg(args, 'amount'), 'is_advance': bool_arg(args, 'is_advance'),
+            'method': str_arg(args, 'method', max_len=50) or '', 'note': str_arg(args, 'note', max_len=200) or ''}
+    d = date_arg(args, 'payment_date')
+    if d is not None:
+        body['payment_date'] = day(d)
+    resp = call_api(ctx, f'/api/employees/{emp}/payments', method='POST', json=body)
+    return _done(resp, employee=resp.get('employee'), payment=resp.get('payment'))
+
+
+register_tool(Tool(
+    name='add_employee_charge', title='Add salary / bonus / deduction',
+    description=("Add what an employee is owed for a period: 'salary' or 'bonus' increase it, 'deduction' "
+                 'reduces it. Pay it with pay_employee.'),
+    input_schema={'type': 'object', 'required': ['employee_id', 'type', 'amount'], 'properties': {
+        'employee_id': {'type': 'integer'}, 'type': {'type': 'string', 'enum': ['salary', 'bonus', 'deduction']},
+        'amount': MONEY, 'period': {'type': 'string', 'description': 'YYYY-MM; default the month of date'},
+        'date': DATE, 'reason': {'type': 'string'}}},
+    handler=add_employee_charge, roles=ADMIN, writes=True, dedupe=True))
+
+register_tool(Tool(
+    name='pay_employee', title='Pay employee',
+    description='Pay an employee their salary, or an advance (is_advance true). Recorded as an expense.',
+    input_schema={'type': 'object', 'required': ['employee_id', 'amount'], 'properties': {
+        'employee_id': {'type': 'integer'}, 'amount': MONEY, 'is_advance': {'type': 'boolean', 'default': False},
+        'method': {'type': 'string'}, 'payment_date': DATE, 'note': {'type': 'string'}}},
+    handler=pay_employee, roles=ADMIN, writes=True, dedupe=True))
+
+
+# --- resellers ------------------------------------------------------------------------
+
+def _reseller_money(suffix, default_desc):
+    def handler(ctx, args):
+        rid = _id(args, 'reseller_id')
+        body = {'amount': amount_arg(args, 'amount'),
+                'description': str_arg(args, 'description', max_len=200) or default_desc}
+        resp = call_api(ctx, f'/api/resellers/{rid}/{suffix}', method='POST', json=body)
+        return _done(resp, reseller=resp.get('reseller'))
+    return handler
+
+
+_RESELLER_PROPS = {'reseller_id': {'type': 'integer', 'description': 'From list_resellers'},
+                   'amount': MONEY, 'description': {'type': 'string'}}
+
+register_tool(Tool(
+    name='reseller_add_credit', title='Add reseller credit',
+    description="Add credit to a reseller's account.",
+    input_schema={'type': 'object', 'required': ['reseller_id', 'amount'], 'properties': _RESELLER_PROPS},
+    handler=_reseller_money('add_credit', 'Manual credit addition'), roles=FINANCE, writes=True, dedupe=True))
+
+register_tool(Tool(
+    name='reseller_collect_payment', title='Collect from reseller',
+    description='Record money received from a reseller.',
+    input_schema={'type': 'object', 'required': ['reseller_id', 'amount'], 'properties': _RESELLER_PROPS},
+    handler=_reseller_money('collect_payment', 'Payment received'), roles=FINANCE, writes=True, dedupe=True))
