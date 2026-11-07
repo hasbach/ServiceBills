@@ -4,10 +4,10 @@ import axios from 'axios';
 import AIConnectorCard from './AIConnectorCard';
 
 // Factory mock: axios ships ESM that CRA's Jest won't transform.
-jest.mock('axios', () => ({ get: jest.fn(), delete: jest.fn() }));
+jest.mock('axios', () => ({ get: jest.fn(), delete: jest.fn(), put: jest.fn() }));
 
 const LIST = {
-    mcp_url: 'https://servicebills.example/mcp', enabled: true, is_admin: true,
+    mcp_url: 'https://servicebills.example/mcp', enabled: true, is_admin: true, writes_enabled: false,
     grants: [{ id: 7, client_name: 'Claude', username: 'ali', role: 'cashier',
                created_at: '2026-10-21T10:00:00Z', last_used_at: null }],
 };
@@ -15,6 +15,7 @@ const LIST = {
 beforeEach(() => {
     axios.get.mockReset();
     axios.delete.mockReset();
+    axios.put.mockReset();
     window.confirm = jest.fn(() => true);
 });
 
@@ -94,4 +95,44 @@ test('copy button is labelled and the Copied state resets', async () => {
     act(() => { jest.advanceTimersByTime(2100); });
     expect(screen.getByRole('tooltip')).toHaveTextContent('Copy');
     expect(screen.getByRole('tooltip')).not.toHaveTextContent('Copied');
+});
+
+test('admin can allow the AI to make changes', async () => {
+    axios.get.mockResolvedValue({ data: LIST });
+    axios.put.mockResolvedValue({ data: { writes_enabled: true } });
+    render(<AIConnectorCard />);
+    const toggle = await screen.findByRole('checkbox', { name: /allow the ai to make changes/i });
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(axios.put).toHaveBeenCalledWith(
+        '/api/mcp/settings', { writes_enabled: true }, expect.anything()));
+    await waitFor(() => expect(toggle).toBeChecked());
+});
+
+test('non-admins see the setting but cannot change it', async () => {
+    axios.get.mockResolvedValue({ data: { ...LIST, is_admin: false, writes_enabled: true } });
+    render(<AIConnectorCard />);
+    const toggle = await screen.findByRole('checkbox', { name: /allow the ai to make changes/i });
+    expect(toggle).toBeChecked();
+    expect(toggle).toBeDisabled();
+});
+
+test('the switch is disabled when the AI connector module is off', async () => {
+    axios.get.mockResolvedValue({ data: { ...LIST, enabled: false, grants: [] } });
+    render(<AIConnectorCard />);
+    const toggle = await screen.findByRole('checkbox', { name: /allow the ai to make changes/i });
+    expect(toggle).toBeDisabled();
+});
+
+test('the switch is disabled while the change is saving', async () => {
+    axios.get.mockResolvedValue({ data: LIST });
+    let resolvePut;
+    axios.put.mockReturnValue(new Promise(r => { resolvePut = r; }));
+    render(<AIConnectorCard />);
+    const toggle = await screen.findByRole('checkbox', { name: /allow the ai to make changes/i });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toBeDisabled());
+    await act(async () => { resolvePut({ data: { writes_enabled: true } }); });
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+    expect(toggle).toBeChecked();
 });

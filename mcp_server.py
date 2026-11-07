@@ -7,11 +7,12 @@ mcp_tools.py.
 Auth is an OAuth access token issued by mcp_oauth.py. Every request re-reads
 the user, tenant and module from the DB, so a revoke, demotion, suspension or
 module switch-off applies on the very next call."""
+import hashlib
 import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from flask import jsonify, make_response, request
@@ -29,9 +30,25 @@ INSTRUCTIONS = (
     "business's own timezone unless a field name ends in _utc. Find a customer's "
     "id with search_customers before calling get_customer.")
 
+INSTRUCTIONS_WRITE = (
+    "Access to one ISP business's ServiceBills data: customers, subscriptions, "
+    "payments, cash flow, finances, support tickets and network status, plus "
+    "write tools that change real data (customers, renewals, payments, expenses, "
+    "cash, suppliers, payroll, resellers, tickets). Write tools change real data -- "
+    "confirm amounts and the customer with the user before calling them. Customer "
+    "balance: negative means the customer owes money, positive is credit. Dates and "
+    "times are in the business's own timezone unless a field name ends in _utc. Find "
+    "a customer's id with search_customers before calling get_customer.")
+WRITES_OFF = ("Changes through the AI are turned off for this business. "
+              "An admin can turn them on in Settings → AI connector.")
+DEDUPE_WINDOW = timedelta(minutes=2)
+
 ALL_STAFF = ('admin', 'finance', 'employee', 'collector', 'cashier')
 FINANCE = ('admin', 'finance')
 PAYMENTS = ('admin', 'finance', 'cashier')
+DESK = ('admin', 'finance', 'cashier')          # subscription_desk_required
+COLLECT = ('admin', 'finance', 'cashier', 'collector')
+ADMIN = ('admin',)
 
 
 class ToolError(Exception):
@@ -47,6 +64,9 @@ class Tool:
     handler: Callable
     roles: tuple = ALL_STAFF
     module: Optional[str] = None
+    writes: bool = False        # changes data; hidden/refused while the switch is off
+    destructive: bool = False   # undo-style (revert/refund/cancel/delete)
+    dedupe: bool = False        # refuse an identical successful call within DEDUPE_WINDOW
 
 
 @dataclass
@@ -70,6 +90,28 @@ def roles_of(user):
     return [r.strip().lower() for r in (user.role or '').split(',') if r.strip()]
 
 
+def _settings(ctx):
+    return ctx.appmod.BusinessSettings.query.filter_by(tenant_id=ctx.tenant.id).first()
+
+
+def writes_enabled(ctx):
+    """Re-read on every request so the admin toggle applies on the next call."""
+    s = _settings(ctx)
+    return bool(s and s.ai_connector_writes_enabled)
+
+
+def _has_role(ctx, tool):
+    return any(r in tool.roles for r in ctx.roles)
+
+
+def _visible(ctx, tool, writes_on):
+    if tool.module and not modules.is_enabled(ctx.tenant, tool.module):
+        return False
+    if tool.writes:
+        return writes_on and _has_role(ctx, tool)
+    return True
+
+
 def _result(msg_id, result):
     return {'jsonrpc': '2.0', 'id': msg_id, 'result': result}
 
@@ -82,11 +124,22 @@ def _tool_error(text):
     return {'content': [{'type': 'text', 'text': text}], 'isError': True}
 
 
+_CONFIRM_DUPLICATE = {'type': 'boolean',
+                      'description': ('Only after this tool said the same change was just made AND the user '
+                                      'confirmed they want it twice.')}
+
+
 def _describe(tool):
+    schema = tool.input_schema
+    if tool.dedupe:
+        schema = {**schema, 'properties': {**schema.get('properties', {}),
+                                           'confirm_duplicate': _CONFIRM_DUPLICATE}}
+    annotations = {'title': tool.title, 'readOnlyHint': not tool.writes,
+                   'destructiveHint': tool.destructive, 'openWorldHint': False}
+    if tool.writes:
+        annotations['idempotentHint'] = False
     return {'name': tool.name, 'title': tool.title, 'description': tool.description,
-            'inputSchema': tool.input_schema,
-            'annotations': {'title': tool.title, 'readOnlyHint': True,
-                            'destructiveHint': False, 'openWorldHint': False}}
+            'inputSchema': schema, 'annotations': annotations}
 
 
 def _unauthorized(description='Missing or invalid access token'):
@@ -130,7 +183,13 @@ def resolve_context(appmod):
 
 
 def _summarize(args):
-    return json.dumps(args, ensure_ascii=False, default=str, sort_keys=True)[:500]
+    """Human-readable args for the audit row, also the dedupe key. Past 500
+    chars the tail is replaced by a hash of the full JSON so two calls that
+    differ only after the cut (long notes) never look identical."""
+    full = json.dumps(args, ensure_ascii=False, default=str, sort_keys=True)
+    if len(full) <= 500:
+        return full
+    return full[:483] + '#' + hashlib.sha256(full.encode('utf-8')).hexdigest()[:16]
 
 
 def _safe_commit(db):
@@ -146,6 +205,18 @@ def _safe_commit(db):
             logging.exception('MCP rollback after failed commit also failed')
 
 
+def _recent_duplicate(ctx, tool, summary):
+    Call = ctx.appmod.McpToolCall
+    return (Call.query.filter_by(user_id=ctx.user.id, tool=tool.name, args_summary=summary, ok=True)
+            .filter(Call.created_at >= datetime.utcnow() - DEDUPE_WINDOW)
+            .order_by(Call.created_at.desc()).first())
+
+
+def _hhmm(ctx, dt_utc):
+    zone = ctx.appmod._zone_for(_settings(ctx))
+    return dt_utc.replace(tzinfo=timezone.utc).astimezone(zone).strftime('%H:%M')
+
+
 def call_tool(ctx, tool, args):
     started = time.monotonic()
     appmod = ctx.appmod
@@ -155,8 +226,20 @@ def call_tool(ctx, tool, args):
     role = ctx.user.role
     rolled_back = False
     ok, error = True, None
-    if not any(r in tool.roles for r in ctx.roles):
+    confirmed = tool.dedupe and args.get('confirm_duplicate') is True
+    if tool.dedupe:
+        args = {k: v for k, v in args.items() if k != 'confirm_duplicate'}
+    summary = _summarize(args)
+    if not _has_role(ctx, tool):
         ok, error = False, f"Your role ({role}) can't use {tool.name}."
+    elif tool.writes and not writes_enabled(ctx):
+        ok, error = False, WRITES_OFF
+    elif tool.dedupe and not confirmed:
+        duplicate = _recent_duplicate(ctx, tool, summary)
+        if duplicate is not None:
+            ok, error = False, (f"This exact change was already made at {_hhmm(ctx, duplicate.created_at)}. "
+                                "Call again with confirm_duplicate: true if you really want it twice.")
+    if not ok:
         out = _tool_error(error)
     else:
         try:
@@ -166,6 +249,15 @@ def call_tool(ctx, tool, args):
         except ToolError as e:
             ok, error = False, str(e)
             out = _tool_error(error)
+            if tool.writes:
+                # A write tool may have staged changes (directly or via an
+                # endpoint that then refused); nothing of a refused write may
+                # ride along with the audit commit. Harmless if already committed.
+                try:
+                    db.session.rollback()
+                except Exception:
+                    logging.exception('MCP rollback failed')
+                rolled_back = True
         except Exception:
             logging.exception('MCP tool %s failed', tool.name)
             try:
@@ -174,14 +266,16 @@ def call_tool(ctx, tool, args):
                 logging.exception('MCP rollback failed')
             rolled_back = True
             ok, error = False, 'internal error'
-            out = _tool_error('Something went wrong reading this data. Try again or narrow the request.')
+            out = _tool_error(
+                'Something went wrong saving this. Check in ServiceBills whether it was saved before trying again.'
+                if tool.writes else 'Something went wrong reading this data. Try again or narrow the request.')
     try:
         if rolled_back:   # the rollback also discarded last_used_at set in resolve_context
             appmod.McpGrant.query.filter_by(id=grant_id).update(
                 {'last_used_at': datetime.utcnow()}, synchronize_session=False)
         db.session.add(appmod.McpToolCall(
             tenant_id=tenant_id, user_id=user_id, grant_id=grant_id, tool=tool.name,
-            args_summary=_summarize(args), ok=ok, error=(error or None) and error[:300],
+            args_summary=summary, wrote=bool(tool.writes), ok=ok, error=(error or None) and error[:300],
             duration_ms=int((time.monotonic() - started) * 1000)))
     except Exception:
         logging.exception('MCP audit write failed')
@@ -207,11 +301,13 @@ def handle_message(ctx, msg):
         version = requested if requested in SUPPORTED_VERSIONS else SUPPORTED_VERSIONS[0]
         return _result(msg_id, {'protocolVersion': version,
                                 'capabilities': {'tools': {'listChanged': False}},
-                                'serverInfo': SERVER_INFO, 'instructions': INSTRUCTIONS})
+                                'serverInfo': SERVER_INFO,
+                                'instructions': INSTRUCTIONS_WRITE if writes_enabled(ctx) else INSTRUCTIONS})
     if method == 'ping':
         return _result(msg_id, {})
     if method == 'tools/list':
-        visible = [t for t in TOOLS.values() if not t.module or modules.is_enabled(ctx.tenant, t.module)]
+        writes_on = writes_enabled(ctx)
+        visible = [t for t in TOOLS.values() if _visible(ctx, t, writes_on)]
         return _result(msg_id, {'tools': [_describe(t) for t in visible]})
     if method == 'tools/call':
         name = params.get('name')

@@ -124,7 +124,51 @@ def enum_arg(args, key, choices, default):
     return v
 
 
-def call_api(ctx, path, params=None):
+def amount_arg(args, key, required=True, allow_zero=False):
+    """Positive money amount with at most 2 decimals (0 allowed with allow_zero)."""
+    v = args.get(key)
+    if v is None or v == '':
+        if required:
+            raise ToolError(f"'{key}' is required.")
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        raise ToolError(f"'{key}' must be a number.")
+    try:
+        n = float(v)
+    except ValueError:
+        raise ToolError(f"'{key}' must be a number.")
+    if not (0 <= n < 1e9) or (n == 0 and not allow_zero):
+        raise ToolError(f"'{key}' must be greater than zero.")
+    if round(n, 2) != n:
+        raise ToolError(f"'{key}' can have at most 2 decimals.")
+    return n
+
+
+_INTERNAL = re.compile(r'traceback|exception|psycopg|sqlalchemy|integrityerror|\bsql\b|errno|'
+                       r'object has no attribute|unsupported operand|not subscriptable', re.I)
+
+
+def safe_message(data):
+    """An endpoint's own error sentence, or None when it might be internal text
+    (str(exception) is returned by several endpoints' catch-alls)."""
+    if not isinstance(data, dict):
+        return None
+    for key in ('message', 'msg', 'error'):
+        v = data.get(key)
+        if not isinstance(v, str):
+            continue
+        v = v.strip()
+        if (0 < len(v) < 200 and '\n' not in v and not _INTERNAL.search(v)
+                and not re.fullmatch(r"'[\w.]+'", v)):
+            return v
+    return None
+
+
+_WRITE_5XX = ('ServiceBills hit an error ({code}). '
+              'Check in ServiceBills whether it was saved before trying again.')
+
+
+def call_api(ctx, path, params=None, method='GET', json=None):
     """GET one of this app's own JSON endpoints in-process as ctx.user.
 
     A short-lived JWT with the same claims /api/login issues (role and tenant
@@ -137,32 +181,51 @@ def call_api(ctx, path, params=None):
     The inner request shares flask.g with the outer /mcp request; that is
     fine because its JWT claims are for the same user. Sentry's request scope
     is relabelled to the inner path while it runs (errors raised inside show
-    the wrapped endpoint, not /mcp)."""
+    the wrapped endpoint, not /mcp).
+
+    method/json make the same in-process call for a write; the endpoint
+    commits its own work. A write answered with >= 400 is rolled back here so
+    any half-applied ORM changes are not committed with the audit row."""
     app = ctx.appmod.app
+    writing = method != 'GET'
     token = create_access_token(identity=ctx.user.username,
                                 additional_claims={'role': ctx.user.role, 'tenant_id': ctx.user.tenant_id},
                                 expires_delta=timedelta(minutes=5))
     query = {k: v for k, v in (params or {}).items() if v is not None}
+    verb = 'save' if writing else 'load'
     try:
-        with app.test_request_context(path, method='GET', query_string=query,
+        with app.test_request_context(path, method=method, query_string=query, json=json,
                                       headers={'Authorization': f'Bearer {token}'}):
             resp = app.full_dispatch_request()
     except Exception:
         ctx.appmod.db.session.rollback()
-        raise ToolError("ServiceBills couldn't load this (500).")
+        if writing:
+            raise ToolError(_WRITE_5XX.format(code=500))
+        raise ToolError(f"ServiceBills couldn't {verb} this (500).")
     data = resp.get_json(silent=True)
-    if resp.status_code >= 400:
-        if resp.status_code >= 500:
-            # the endpoint's message can be str(exception); never pass it on
-            raise ToolError(f"ServiceBills couldn't load this ({resp.status_code}).")
-        # Only `msg` from 403/404 is ours to relay (permission/not-found
+    code = resp.status_code
+    if code >= 400:
+        if writing:
+            # An endpoint may have changed ORM objects before deciding to
+            # return 4xx/5xx; the web app discards that at teardown, but this
+            # session is shared with /mcp and committed after the audit row.
+            ctx.appmod.db.session.rollback()
+        if code >= 500:
+            if writing:
+                # Endpoints can commit and then fail later (profit recalc,
+                # staged renew), so "nothing changed" would be a guess.
+                raise ToolError(_WRITE_5XX.format(code=code))
+            raise ToolError(f"ServiceBills couldn't {verb} this ({code}).")
+        if writing:
+            raise ToolError(safe_message(data) or f"ServiceBills rejected this change ({code}).")
+        # Reads: only `msg` from 403/404 is ours to relay (permission/not-found
         # wording); a 400 catch-all or an `error` key can carry str(exception).
         msg = data.get('msg') if isinstance(data, dict) and isinstance(data.get('msg'), str) else None
-        if resp.status_code == 403:
+        if code == 403:
             raise ToolError(msg or "You don't have access to this in ServiceBills.")
-        if resp.status_code == 404 and msg:
+        if code == 404 and msg:
             raise ToolError(f"ServiceBills couldn't load this (404): {msg}.")
-        raise ToolError(f"ServiceBills couldn't load this ({resp.status_code}).")
+        raise ToolError(f"ServiceBills couldn't load this ({code}).")
     return data
 
 
