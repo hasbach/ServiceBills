@@ -11,6 +11,7 @@ export default function AIConnectorCard() {
     const [data, setData] = useState(null);
     const [error, setError] = useState('');
     const [copied, setCopied] = useState(false);
+    const [saving, setSaving] = useState(false);
 
     const copiedTimer = useRef(null);
     useEffect(() => () => clearTimeout(copiedTimer.current), []);
@@ -37,11 +38,14 @@ export default function AIConnectorCard() {
     };
 
     const setWrites = async (on) => {
+        setSaving(true);
         try {
             const res = await axios.put('/api/mcp/settings', { writes_enabled: on }, auth());
             setData(d => ({ ...d, writes_enabled: res.data.writes_enabled }));
         } catch (err) {
             setError(err.response?.data?.msg || 'Could not change this setting.');
+        } finally {
+            setSaving(false);
         }
     };
 
@@ -81,7 +85,7 @@ export default function AIConnectorCard() {
             </Typography>
             <FormControlLabel
                 sx={{ mb: 1 }}
-                control={<Switch checked={!!data.writes_enabled} disabled={!data.is_admin}
+                control={<Switch checked={!!data.writes_enabled} disabled={!data.is_admin || !data.enabled || saving}
                                  onChange={e => setWrites(e.target.checked)} />}
                 label="Allow the AI to make changes" />
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>

@@ -116,3 +116,23 @@ test('non-admins see the setting but cannot change it', async () => {
     expect(toggle).toBeChecked();
     expect(toggle).toBeDisabled();
 });
+
+test('the switch is disabled when the AI connector module is off', async () => {
+    axios.get.mockResolvedValue({ data: { ...LIST, enabled: false, grants: [] } });
+    render(<AIConnectorCard />);
+    const toggle = await screen.findByRole('checkbox', { name: /allow the ai to make changes/i });
+    expect(toggle).toBeDisabled();
+});
+
+test('the switch is disabled while the change is saving', async () => {
+    axios.get.mockResolvedValue({ data: LIST });
+    let resolvePut;
+    axios.put.mockReturnValue(new Promise(r => { resolvePut = r; }));
+    render(<AIConnectorCard />);
+    const toggle = await screen.findByRole('checkbox', { name: /allow the ai to make changes/i });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toBeDisabled());
+    await act(async () => { resolvePut({ data: { writes_enabled: true } }); });
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+    expect(toggle).toBeChecked();
+});
