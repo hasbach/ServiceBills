@@ -6,9 +6,9 @@ call_api(), so role checks, the day-close lock, balance log, upstream sync and
 WhatsApp sends run exactly as for a click in the web app. Nothing here writes
 business data directly. Registered at import time (app.py imports this module
 after mcp_tools)."""
-from mcp_server import ALL_STAFF, DESK, FINANCE, PAYMENTS, Tool, ToolError, register_tool
+from mcp_server import ALL_STAFF, COLLECT, DESK, FINANCE, PAYMENTS, Tool, ToolError, register_tool
 from mcp_tools import (MAX_ROWS, _customer_row, _payment_row, amount_arg, bool_arg, call_api,
-                       date_arg, day, int_arg, scoped, str_arg, today)
+                       date_arg, day, enum_arg, int_arg, scoped, str_arg, today)
 
 REASON = {'type': 'string', 'description': 'Why this is being undone (required, kept in the record/audit)'}
 CUSTOMER_ID = {'type': 'integer', 'description': 'From search_customers'}
@@ -193,3 +193,92 @@ register_tool(Tool(
     description="Restore a customer's internet on the business's own network (Mikrotik).",
     input_schema={'type': 'object', 'required': ['customer_id'], 'properties': {'customer_id': CUSTOMER_ID}},
     handler=_subscription_action('POST', 'network-unsuspend'), roles=FINANCE, module='network', writes=True))
+
+
+# --- customer money ---------------------------------------------------------------
+
+PAYMENT_ID = {'type': 'integer', 'description': 'From find_payments'}
+
+
+def _pid(args):
+    return int_arg(args, 'payment_id', lo=1, required=True)
+
+
+def receive_payment(ctx, args):
+    cid = _cid(args)
+    finance = any(r in ('admin', 'finance') for r in ctx.roles)
+    body = {'amount': amount_arg(args, 'amount'),
+            'method': enum_arg(args, 'method', ('cash', 'whish_transfer'), 'cash'),
+            'action': enum_arg(args, 'action', ('pay', 'collect'), 'pay' if finance else 'collect')}
+    ref = str_arg(args, 'reference', max_len=64)
+    if ref:
+        body['reference'] = ref
+    resp = call_api(ctx, f'/api/customers/{cid}/receive-payment', method='POST', json=body)
+    return _done(resp, customer=_customer_after(ctx, cid))
+
+
+def confirm_collected(ctx, args):
+    cid = _cid(args)
+    resp = call_api(ctx, f'/api/customers/{cid}/confirm-collected', method='POST', json={})
+    return _done(resp, customer=_customer_after(ctx, cid))
+
+
+def revert_payment(ctx, args):
+    pid = _pid(args)
+    resp = call_api(ctx, f'/api/payments/{pid}/revert', method='PUT', json={'reason': _reason(args)})
+    return _done(resp, payment_id=pid)
+
+
+def refund_payment(ctx, args):
+    pid = _pid(args)
+    body = {'amount': amount_arg(args, 'amount'), 'reason': _reason(args)}
+    resp = call_api(ctx, f'/api/payments/{pid}/refund', method='POST', json=body)
+    return _done(resp, payment_id=pid)
+
+
+def mark_payment_gratis(ctx, args):
+    pid = _pid(args)
+    resp = call_api(ctx, f'/api/payments/{pid}/mark_gratis', method='PUT',
+                    json={'note': str_arg(args, 'note', max_len=200)})
+    return _done(resp, payment_id=pid)
+
+
+register_tool(Tool(
+    name='receive_payment', title='Receive payment',
+    description=("Take money from a customer against what they owe (oldest bills first; extra becomes credit). "
+                 "action 'pay' (admin/finance, default for them) confirms it as received; 'collect' (collector/"
+                 "cashier, their default) records it as collected, awaiting confirmation. Confirm the amount with "
+                 "the user first."),
+    input_schema={'type': 'object', 'required': ['customer_id', 'amount'], 'properties': {
+        'customer_id': CUSTOMER_ID, 'amount': {'type': 'number', 'exclusiveMinimum': 0},
+        'method': {'type': 'string', 'enum': ['cash', 'whish_transfer'], 'default': 'cash'},
+        'action': {'type': 'string', 'enum': ['pay', 'collect']},
+        'reference': {'type': 'string', 'description': 'Transfer reference, optional'}}},
+    handler=receive_payment, roles=COLLECT, writes=True, dedupe=True))
+
+register_tool(Tool(
+    name='confirm_collected', title='Confirm collected money',
+    description="Confirm as received everything a collector collected from this customer that awaits confirmation.",
+    input_schema={'type': 'object', 'required': ['customer_id'], 'properties': {'customer_id': CUSTOMER_ID}},
+    handler=confirm_collected, roles=FINANCE, writes=True))
+
+register_tool(Tool(
+    name='revert_payment', title='Revert payment',
+    description='Undo a payment that was marked paid by mistake (the bill becomes unpaid again). Find the id with find_payments.',
+    input_schema={'type': 'object', 'required': ['payment_id', 'reason'],
+                  'properties': {'payment_id': PAYMENT_ID, 'reason': REASON}},
+    handler=revert_payment, roles=FINANCE, writes=True, destructive=True))
+
+register_tool(Tool(
+    name='refund_payment', title='Refund payment',
+    description='Give money back on a paid payment (full or part, not more than the payment). Find the id with find_payments.',
+    input_schema={'type': 'object', 'required': ['payment_id', 'amount', 'reason'], 'properties': {
+        'payment_id': PAYMENT_ID, 'amount': {'type': 'number', 'exclusiveMinimum': 0}, 'reason': REASON}},
+    handler=refund_payment, roles=FINANCE, writes=True, destructive=True, dedupe=True))
+
+register_tool(Tool(
+    name='mark_payment_gratis', title='Mark bill free',
+    description='Mark an unpaid bill as free of charge (gratis), e.g. compensation for an outage.',
+    input_schema={'type': 'object', 'required': ['payment_id'], 'properties': {
+        'payment_id': PAYMENT_ID, 'note': {'type': 'string'}}},
+    handler=mark_payment_gratis, roles=FINANCE, writes=True))
