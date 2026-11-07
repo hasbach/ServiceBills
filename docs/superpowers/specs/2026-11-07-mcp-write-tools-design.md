@@ -35,7 +35,10 @@ arguments (default `GET`, no body — existing callers unchanged). A write tool:
 1. validates its arguments with the existing `*_arg` helpers plus a new
    `amount_arg` (positive number, at most 2 decimals);
 2. resolves and tenant-checks any ids it was given (`scoped(ctx, Model)`), so a
-   wrong id gives "Customer 123 not found" rather than an endpoint 404;
+   wrong id gives "Customer 123 not found" rather than an endpoint 404. As
+   built, only `find_payments` and `create_ticket` pre-check; the other tools
+   relay the endpoint's own not-found message (the endpoint is tenant-scoped
+   either way);
 3. calls the endpoint with `call_api(ctx, path, method=..., json=...)`;
 4. returns a short confirmation built from the endpoint's response and/or a
    fresh read of the changed record (id, name, new expiry, amount, balance).
@@ -154,8 +157,14 @@ planning and put into each tool's JSON schema as `enum`.
   `Exception`, `psycopg2`/`sqlalchemy` text; otherwise "ServiceBills rejected
   this change (400)." The read path keeps today's stricter behaviour.
 - 403/404: as today (relay the permission / not-found wording).
-- 5xx or exception: roll back, generic "ServiceBills couldn't save this (500).
-  Nothing was changed." The endpoint either committed or it did not.
+- Any write answered with 4xx/5xx, or a `ToolError` from a write tool, rolls
+  back the shared session before the audit row is written, so ORM changes an
+  endpoint made before it refused are never committed with the audit.
+- 5xx or exception: roll back, generic "ServiceBills hit an error (500). Check
+  in ServiceBills whether it was saved before trying again." Some endpoints
+  commit and then fail later (profit recalculation, staged renew), so the AI
+  must not be told nothing changed; a failed call is not counted by the
+  double-submit guard, so this wording is what stops a blind retry.
 - Argument errors are raised before any call, so a bad input never reaches the
   endpoint.
 

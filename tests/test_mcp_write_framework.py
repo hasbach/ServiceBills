@@ -137,3 +137,43 @@ def test_amount_arg():
             amount_arg({"a": bad}, "a")
     with pytest.raises(ToolError):
         amount_arg({}, "a")
+
+
+def test_dedupe_long_args_do_not_collide(client, fake_tools):
+    # args_summary is capped at 500 chars and keys are sorted, so a long text
+    # field sorting before the distinguishing one ('memo' < 'n', like 'notes'
+    # < 'subscription_plan_id' on update_customer) would push it past the cut;
+    # without the hash tail these two would look identical.
+    import app as appmod
+    hdr = _admin(client)
+    enable_writes("wf_admin")
+    tok, _, _ = connect(client, hdr)
+    notes = "x" * 600
+    assert tool_data(call_tool(client, tok, "zz_write", {"memo": notes, "n": 1}))["ok"] is True
+    assert tool_data(call_tool(client, tok, "zz_write", {"memo": notes, "n": 2}))["ok"] is True
+    assert "already made" in tool_error_text(call_tool(client, tok, "zz_write", {"memo": notes, "n": 2}))
+    summaries = [r.args_summary for r in appmod.McpToolCall.query.filter_by(tool="zz_write").all()]
+    assert all(len(s) <= 500 for s in summaries) and summaries[0] != summaries[1]
+    assert summaries[0].startswith('{"memo": "xxx')
+    assert mcp_server._summarize({"n": 1}) == '{"n": 1}'
+
+
+def test_write_5xx_does_not_claim_nothing_changed(client, monkeypatch):
+    import app as appmod
+    hdr = _admin(client)
+    enable_writes("wf_admin")
+    tok, _, _ = connect(client, hdr)
+
+    def boom(*a, **k):
+        raise RuntimeError("secret internal detail")
+    monkeypatch.setitem(appmod.app.view_functions, "update_customer", boom)
+    text = tool_error_text(call_tool(client, tok, "update_customer", {"customer_id": 1, "notes": "x"}))
+    assert text == ("ServiceBills hit an error (500). "
+                    "Check in ServiceBills whether it was saved before trying again.")
+
+    def soft_503(*a, **k):
+        return appmod.jsonify({"error": "secret internal detail"}), 503
+    monkeypatch.setitem(appmod.app.view_functions, "update_customer", soft_503)
+    text = tool_error_text(call_tool(client, tok, "update_customer", {"customer_id": 1, "notes": "y"}))
+    assert "hit an error (503)" in text and "whether it was saved" in text
+    assert "Nothing was changed" not in text and "secret" not in text

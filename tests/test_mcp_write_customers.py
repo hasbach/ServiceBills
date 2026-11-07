@@ -79,3 +79,56 @@ def test_employee_cannot_see_or_use_desk_tools(client):
     names = {t["name"] for t in mcp(client, tok, "tools/list").get_json()["result"]["tools"]}
     assert "create_customer" not in names and "create_ticket" in names
     assert "role (employee)" in tool_error_text(call_tool(client, tok, "renew_subscription", {"customer_id": 1}))
+
+
+def _audit_rows(appmod, tool):
+    appmod.db.session.expire_all()
+    return appmod.McpToolCall.query.filter_by(tool=tool).order_by(appmod.McpToolCall.id).all()
+
+
+def test_rejected_update_rolls_back_earlier_field_changes(client):
+    # The endpoint sets name before it finds the plan doesn't exist and returns
+    # 404; the shared session must not carry "CHANGED" into the audit commit.
+    import app as appmod
+    _, plan, tok = _setup(client)
+    cid = tool_data(call_tool(client, tok, "create_customer", {
+        "name": "Orig", "phone": "03123456", "subscription_plan_id": plan}))["customer"]["id"]
+    msg = tool_error_text(call_tool(client, tok, "update_customer",
+                                    {"customer_id": cid, "name": "CHANGED", "subscription_plan_id": 999999}))
+    assert "not found" in msg.lower()
+    appmod.db.session.expire_all()
+    assert appmod.db.session.get(appmod.Customer, cid).name == "Orig"
+    rows = _audit_rows(appmod, "update_customer")
+    assert rows and rows[-1].ok is False and rows[-1].wrote is True
+
+
+def test_rejected_reseller_move_leaves_balances_alone(client):
+    # update_customer moves debt between resellers before it validates
+    # cpe_mac_address; a bad MAC must undo the move, not commit half of it.
+    import app as appmod
+    hdr, plan, tok = _setup(client)
+    ra = client.post("/api/resellers", headers=hdr,
+                     json={"name": "Res A", "phone": "70000001", "type": "type1"}).get_json()["reseller"]["id"]
+    rb = client.post("/api/resellers", headers=hdr,
+                     json={"name": "Res B", "phone": "70000002", "type": "type1"}).get_json()["reseller"]["id"]
+    cid = tool_data(call_tool(client, tok, "create_customer", {
+        "name": "Mover", "phone": "03123457", "subscription_plan_id": plan}))["customer"]["id"]
+    # Independent -> A: the customer's open debt becomes A's, so A has a
+    # non-zero balance tied to this customer that a move to B would shift.
+    tool_data(call_tool(client, tok, "update_customer", {"customer_id": cid, "reseller_id": ra}))
+    appmod.db.session.expire_all()
+    a_before = float(appmod.db.session.get(appmod.Reseller, ra).balance)
+    b_before = float(appmod.db.session.get(appmod.Reseller, rb).balance)
+    assert a_before != 0.0
+    rp_before = appmod.ResellerPayment.query.count()
+
+    msg = tool_error_text(call_tool(client, tok, "update_customer", {
+        "customer_id": cid, "reseller_id": rb, "cpe_mac_address": "not-a-mac"}))
+    assert "mac" in msg.lower()
+    appmod.db.session.expire_all()
+    assert appmod.db.session.get(appmod.Customer, cid).reseller_id == ra
+    assert float(appmod.db.session.get(appmod.Reseller, ra).balance) == a_before
+    assert float(appmod.db.session.get(appmod.Reseller, rb).balance) == b_before
+    assert appmod.ResellerPayment.query.count() == rp_before
+    rows = _audit_rows(appmod, "update_customer")
+    assert rows[-1].ok is False and "mac" in (rows[-1].error or "").lower()

@@ -18,7 +18,7 @@
 - `update_customer` never sends `balance` or `is_subscription_active`.
 - Every ⚠ (destructive) tool requires a `reason` argument.
 - Dedupe window: 2 minutes, same user + tool + args summary (without `confirm_duplicate`), `ok = true`.
-- Write error text: 400/402/403/404/409 relay the endpoint's `message`/`msg`/`error` only if it is a plain sentence (< 200 chars, no newline, no traceback/exception/SQL text, not a bare `'key'`); otherwise `ServiceBills rejected this change (<code>).`. 5xx: `ServiceBills couldn't save this (<code>). Nothing was changed.`
+- Write error text: 400/402/403/404/409 relay the endpoint's `message`/`msg`/`error` only if it is a plain sentence (< 200 chars, no newline, no traceback/exception/SQL text, not a bare `'key'`); otherwise `ServiceBills rejected this change (<code>).`. 5xx (and an exception, as 500): `ServiceBills hit an error (<code>). Check in ServiceBills whether it was saved before trying again.` Any write answered with >= 400 is rolled back before the audit row is written.
 - Writes-off message, verbatim: `Changes through the AI are turned off for this business. An admin can turn them on in Settings → AI connector.`
 - New Alembic revision id `cc1af4ef875c`, `down_revision = '9af8c7a2648e'`; after adding it `flask db heads` must show exactly one head. ALTERs on Postgres use the lock_timeout + savepoint retry pattern (copy from `migrations/versions/18c24f5699dc_cs_agent_tool_secret.py`).
 - Run backend tests with `python -m pytest <files> -q` from the repo root; frontend with `cd frontend && npx react-scripts test --watchAll=false <pattern>`.

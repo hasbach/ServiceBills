@@ -158,7 +158,8 @@ register_tool(Tool(
     name='update_customer', title='Edit customer',
     description=('Change an existing customer: contact details, sector, plan, reseller, upstream/PPPoE '
                  'usernames, router MAC, discount, notes, WhatsApp notifications. Only the fields you pass '
-                 'change. Balance cannot be edited here.'),
+                 'change. Balance cannot be edited here. Changing reseller_id moves the customer\'s '
+                 'balance/debt to the new reseller; confirm with the user first.'),
     input_schema={'type': 'object', 'required': ['customer_id'], 'properties': {
         'customer_id': CUSTOMER_ID, **_CUSTOMER_PROPS,
         'whatsapp_notifications_enabled': {'type': 'boolean'}}},
@@ -179,7 +180,8 @@ register_tool(Tool(
 
 register_tool(Tool(
     name='cancel_subscription', title='Cancel subscription',
-    description='Cancel (deactivate) a customer\'s subscription. Undo with activate_subscription.',
+    description=('Cancel (deactivate) a customer\'s subscription. Undo with activate_subscription. '
+                 'The reason is kept in the AI audit log.'),
     input_schema={'type': 'object', 'required': ['customer_id', 'reason'],
                   'properties': {'customer_id': CUSTOMER_ID, 'reason': REASON}},
     handler=_subscription_action('PUT', 'cancel_subscription', needs_reason=True), roles=DESK, writes=True, destructive=True))

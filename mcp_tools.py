@@ -164,6 +164,10 @@ def safe_message(data):
     return None
 
 
+_WRITE_5XX = ('ServiceBills hit an error ({code}). '
+              'Check in ServiceBills whether it was saved before trying again.')
+
+
 def call_api(ctx, path, params=None, method='GET', json=None):
     """GET one of this app's own JSON endpoints in-process as ctx.user.
 
@@ -180,7 +184,8 @@ def call_api(ctx, path, params=None, method='GET', json=None):
     the wrapped endpoint, not /mcp).
 
     method/json make the same in-process call for a write; the endpoint
-    commits its own work."""
+    commits its own work. A write answered with >= 400 is rolled back here so
+    any half-applied ORM changes are not committed with the audit row."""
     app = ctx.appmod.app
     writing = method != 'GET'
     token = create_access_token(identity=ctx.user.username,
@@ -194,14 +199,23 @@ def call_api(ctx, path, params=None, method='GET', json=None):
             resp = app.full_dispatch_request()
     except Exception:
         ctx.appmod.db.session.rollback()
-        raise ToolError(f"ServiceBills couldn't {verb} this (500)."
-                        + (' Nothing was changed.' if writing else ''))
+        if writing:
+            raise ToolError(_WRITE_5XX.format(code=500))
+        raise ToolError(f"ServiceBills couldn't {verb} this (500).")
     data = resp.get_json(silent=True)
     code = resp.status_code
     if code >= 400:
+        if writing:
+            # An endpoint may have changed ORM objects before deciding to
+            # return 4xx/5xx; the web app discards that at teardown, but this
+            # session is shared with /mcp and committed after the audit row.
+            ctx.appmod.db.session.rollback()
         if code >= 500:
-            raise ToolError(f"ServiceBills couldn't {verb} this ({code})."
-                            + (' Nothing was changed.' if writing else ''))
+            if writing:
+                # Endpoints can commit and then fail later (profit recalc,
+                # staged renew), so "nothing changed" would be a guess.
+                raise ToolError(_WRITE_5XX.format(code=code))
+            raise ToolError(f"ServiceBills couldn't {verb} this ({code}).")
         if writing:
             raise ToolError(safe_message(data) or f"ServiceBills rejected this change ({code}).")
         # Reads: only `msg` from 403/404 is ours to relay (permission/not-found

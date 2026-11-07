@@ -7,6 +7,7 @@ mcp_tools.py.
 Auth is an OAuth access token issued by mcp_oauth.py. Every request re-reads
 the user, tenant and module from the DB, so a revoke, demotion, suspension or
 module switch-off applies on the very next call."""
+import hashlib
 import json
 import logging
 import time
@@ -182,7 +183,13 @@ def resolve_context(appmod):
 
 
 def _summarize(args):
-    return json.dumps(args, ensure_ascii=False, default=str, sort_keys=True)[:500]
+    """Human-readable args for the audit row, also the dedupe key. Past 500
+    chars the tail is replaced by a hash of the full JSON so two calls that
+    differ only after the cut (long notes) never look identical."""
+    full = json.dumps(args, ensure_ascii=False, default=str, sort_keys=True)
+    if len(full) <= 500:
+        return full
+    return full[:483] + '#' + hashlib.sha256(full.encode('utf-8')).hexdigest()[:16]
 
 
 def _safe_commit(db):
@@ -242,6 +249,15 @@ def call_tool(ctx, tool, args):
         except ToolError as e:
             ok, error = False, str(e)
             out = _tool_error(error)
+            if tool.writes:
+                # A write tool may have staged changes (directly or via an
+                # endpoint that then refused); nothing of a refused write may
+                # ride along with the audit commit. Harmless if already committed.
+                try:
+                    db.session.rollback()
+                except Exception:
+                    logging.exception('MCP rollback failed')
+                rolled_back = True
         except Exception:
             logging.exception('MCP tool %s failed', tool.name)
             try:
