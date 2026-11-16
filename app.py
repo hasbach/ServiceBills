@@ -2914,6 +2914,28 @@ def apply_customer_balance_to_unpaid_payments(customer):
 
 
 
+def _balance_delta_on_delete(payment):
+    """What removing `payment` does to its customer's balance: exactly the
+    opposite of everything the row did to it while it existed.
+
+    - bill, unpaid: creating it debited the balance      -> credit it back
+    - bill, settled from credit: only the debit happened
+      (the settlement never touched the balance)         -> credit it back
+    - bill, paid in cash or gratis: debit + credit = 0   -> nothing
+    - prepayment, paid: it credited the balance          -> debit it
+    - refund, paid: it debited the balance               -> credit it back
+    - prepayment / refund, unpaid (i.e. reverted): the
+      revert already undid its effect                    -> nothing"""
+    amount = float(payment.amount)
+    if payment.is_refund:
+        return amount if payment.paid else 0.0
+    if payment.pre_payment:
+        return -amount if payment.paid else 0.0
+    if not payment.paid or payment.settled_from_credit:
+        return amount
+    return 0.0
+
+
 def has_pending_payment(customer_id, billing_date, tenant_id):
     """
     Check if a pending payment already exists for the customer for the given billing date.
@@ -6013,16 +6035,7 @@ def delete_payment(payment_id):
             return jsonify({'message': 'Customer not found for this payment!'}), 404
 
         # Reverse the balance effect of this payment
-        if payment.paid:
-            # If the payment was paid, removing it means reducing the customer's balance
-            if getattr(payment, 'is_refund', False):
-                customer.balance += payment.amount
-            else:
-                customer.balance -= payment.amount
-        elif not getattr(payment, 'is_refund', False):
-            # If the payment was unpaid, removing it means increasing the customer's balance (less owed)
-            # (an unpaid refund is a reverted one -- its balance effect is already undone)
-            customer.balance += payment.amount
+        customer.balance += _balance_delta_on_delete(payment)
 
         _detach_payment_dependents(payment)
 
@@ -6889,6 +6902,14 @@ def revert_payment(payment_id):
     if not payment.paid:
         return jsonify({'message': 'Payment is not marked as paid.'}), 400
 
+    if payment.settled_from_credit:
+        # No money was collected for this bill -- it was matched to credit the
+        # customer already had, and that never moved the balance. Debiting it
+        # here (as below) would take the amount off the customer twice.
+        return jsonify({'message': "This bill was paid from the customer's own credit, so there is no "
+                                   "collection to revert. Delete the bill to cancel the charge and "
+                                   "return the credit."}), 400
+
     closed = _assert_day_open(_payment_flow_day(payment))
     if closed:
         return closed
@@ -7130,13 +7151,7 @@ def bulk_delete_payments():
             if not customer:
                 failed.append({'id': payment.id, 'error': 'Customer not found for this payment'})
                 continue
-            if payment.paid:
-                if getattr(payment, 'is_refund', False):
-                    customer.balance += payment.amount
-                else:
-                    customer.balance -= payment.amount
-            elif not getattr(payment, 'is_refund', False):  # unpaid refund = reverted, nothing to undo
-                customer.balance += payment.amount
+            customer.balance += _balance_delta_on_delete(payment)
             _detach_payment_dependents(payment)
             db.session.delete(payment)
             db.session.commit()
