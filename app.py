@@ -12133,6 +12133,138 @@ def get_daily_cash_report():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+def _logged_manual_adjustments(column):
+    """{party_id: net change} of the BalanceLog rows that are direct edits or
+    opening balances (no ledger row behind them) for one party column."""
+    rows = db.session.query(
+        column, func.sum(BalanceLog.balance_after - BalanceLog.balance_before)
+    ).filter(
+        BalanceLog.tenant_id == current_tenant_id(), column.isnot(None),
+        BalanceLog.reason.in_(('Balance edited manually', 'Opening balance')),
+    ).group_by(column).all()
+    return {pid: float(total or 0) for pid, total in rows}
+
+
+def _balance_mismatches(parties, expected, manual):
+    """Rows for every party whose stored balance differs from what its history
+    explains. `unexplained` leaves out the manual edits the balance log knows
+    about (edits made before the log existed still show up here)."""
+    out = []
+    for p in parties:
+        stored = float(p.balance or 0)
+        from_history = round(expected.get(p.id, 0.0), 4)
+        difference = round(stored - from_history, 4)
+        if abs(difference) <= _MONEY_EPS:
+            continue
+        logged = round(manual.get(p.id, 0.0), 4)
+        out.append({
+            'id': p.id, 'name': p.name,
+            'stored_balance': stored,
+            'balance_from_history': from_history,
+            'difference': difference,
+            'manual_edits_logged': logged,
+            'unexplained': round(difference - logged, 4),
+        })
+    out.sort(key=lambda r: -abs(r['unexplained']))
+    return out
+
+
+@app.route('/api/reports/reconciliation', methods=['GET'])
+@admin_required()
+def get_reconciliation_report():
+    """READ-ONLY health check (finance roadmap step 0): recompute every
+    customer, reseller, supplier and employee balance from its own history and
+    list the ones that disagree with the stored balance, plus payments refunded
+    for more than was received and bills marked paid with no money behind them.
+    Changes nothing -- it measures, and guards against regressions."""
+    tid = current_tenant_id()
+
+    # Customers: what each kind of row does to the balance (see
+    # _balance_delta_on_delete for the same rules read the other way round).
+    amount = Payment.amount
+    effect = db.case(
+        (Payment.is_refund.is_(True), db.case((Payment.paid.is_(True), -amount), else_=0)),
+        (Payment.pre_payment.is_(True), db.case((Payment.paid.is_(True), amount), else_=0)),
+        (db.or_(Payment.paid.isnot(True), Payment.settled_from_credit.is_(True)), -amount),
+        else_=0,
+    )
+    customer_expected = {cid: float(total or 0) for cid, total in db.session.query(
+        Payment.customer_id, func.sum(effect)).filter(Payment.tenant_id == tid).group_by(Payment.customer_id).all()}
+    # A reseller's customers are billed to the reseller: no bills, no balance.
+    customers = tenant_query(Customer).all()
+
+    # Resellers: charges add to what they owe; collections and discounts reduce it.
+    reseller_effect = db.case((ResellerPayment.type == 'credit_added', ResellerPayment.amount),
+                              else_=-ResellerPayment.amount)
+    reseller_expected = {rid: float(total or 0) for rid, total in db.session.query(
+        ResellerPayment.reseller_id, func.sum(reseller_effect)
+    ).filter(ResellerPayment.tenant_id == tid).group_by(ResellerPayment.reseller_id).all()}
+
+    # Suppliers: credit purchases add to what is owed; payments reduce it.
+    supplier_expected = {sid: float(total or 0) for sid, total in db.session.query(
+        Expense.supplier_id, func.sum(Expense.amount)
+    ).filter(Expense.tenant_id == tid, Expense.is_credit.is_(True), Expense.supplier_id.isnot(None)
+             ).group_by(Expense.supplier_id).all()}
+    for sid, total in db.session.query(SupplierPayment.supplier_id, func.sum(SupplierPayment.amount)).filter(
+            SupplierPayment.tenant_id == tid).group_by(SupplierPayment.supplier_id).all():
+        supplier_expected[sid] = supplier_expected.get(sid, 0.0) - float(total or 0)
+
+    # Employees: salary and bonus add to what is owed, deductions and payments reduce it.
+    charge_effect = db.case((SalaryCharge.type == 'deduction', -SalaryCharge.amount), else_=SalaryCharge.amount)
+    employee_expected = {eid: float(total or 0) for eid, total in db.session.query(
+        SalaryCharge.employee_id, func.sum(charge_effect)
+    ).filter(SalaryCharge.tenant_id == tid).group_by(SalaryCharge.employee_id).all()}
+    for model, col, when in ((Expense, Expense.employee_id, Expense.is_credit.isnot(True)),
+                             (SalaryPayment, SalaryPayment.employee_id, db.true())):
+        for eid, total in db.session.query(col, func.sum(model.amount)).filter(
+                model.tenant_id == tid, col.isnot(None), when).group_by(col).all():
+            employee_expected[eid] = employee_expected.get(eid, 0.0) - float(total or 0)
+
+    # Payments given back for more than was received (refund rows name their
+    # original in the server-written reason).
+    refunded = {reason: float(total or 0) for reason, total in db.session.query(
+        Payment.reason, func.sum(Payment.amount)
+    ).filter(Payment.tenant_id == tid, Payment.is_refund.is_(True), Payment.paid.is_(True)
+             ).group_by(Payment.reason).all()}
+    over_refunded = []
+    if refunded:
+        ids = [int(r.rsplit('#', 1)[1]) for r in refunded if r and r.rsplit('#', 1)[-1].isdigit()]
+        for p in tenant_query(Payment).filter(Payment.id.in_(ids)).all() if ids else []:
+            total = refunded.get(_refund_reason_for(p.id), 0.0)
+            if total > float(p.amount) + _MONEY_EPS:
+                over_refunded.append({'payment_id': p.id, 'customer_id': p.customer_id,
+                                      'amount': float(p.amount), 'refunded': round(total, 4)})
+
+    # Bills counted as income although nothing was collected (what moving a
+    # customer onto a reseller used to leave behind).
+    paid_without_money = [
+        {'payment_id': p.id, 'customer_id': p.customer_id, 'amount': float(p.amount),
+         'date': p.date.strftime('%Y-%m-%d') if p.date else None}
+        for p in tenant_query(Payment).filter(
+            Payment.paid.is_(True), Payment.is_gratis.isnot(True), Payment.is_refund.isnot(True),
+            Payment.settled_from_credit.isnot(True), Payment.pre_payment.isnot(True),
+            Payment.paid_at.is_(None), Payment.collected_at.is_(None), Payment.collected_amount == 0,
+        ).order_by(Payment.id).all()]
+
+    sections = {
+        'customers': _balance_mismatches(customers, customer_expected,
+                                         _logged_manual_adjustments(BalanceLog.customer_id)),
+        'resellers': _balance_mismatches(tenant_query(Reseller).all(), reseller_expected,
+                                         _logged_manual_adjustments(BalanceLog.reseller_id)),
+        'suppliers': _balance_mismatches(tenant_query(Supplier).all(), supplier_expected,
+                                         _logged_manual_adjustments(BalanceLog.supplier_id)),
+        # Employee balances have no balance log, so manual edits can't be told apart.
+        'employees': _balance_mismatches(tenant_query(Employee).all(), employee_expected, {}),
+        'over_refunded_payments': over_refunded,
+        'paid_without_money': paid_without_money,
+    }
+    return jsonify({
+        'summary': {name: len(rows) for name, rows in sections.items()},
+        'checked': {'customers': len(customers)},
+        **sections,
+    }), 200
+
+
 @app.route('/api/reports/financial', methods=['GET'])
 @jwt_required()
 def get_financial_report():
