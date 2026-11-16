@@ -5980,7 +5980,11 @@ def _payment_totals(filtered_query):
         (db.and_(is_collected, not_paid), got, None),
         (db.and_(not_collected, not_paid), due, None),
         (not_paid, due, None),
-        (paid_cond, db.case((is_refund, -due), else_=due), db.and_(paid_cond, not_refund)),
+        # Amount = money received: a bill paid out of the customer's credit is
+        # counted as a paid bill but adds nothing (the prepayment behind it is
+        # already in this total).
+        (paid_cond, db.case((is_refund, -due), (Payment.settled_from_credit.is_(True), 0), else_=due),
+         db.and_(paid_cond, not_refund)),
     ):
         columns.extend(bucket(cond, value, counted))
 
@@ -6060,32 +6064,83 @@ def month_key(column):
     return func.strftime('%Y-%m', column)
 
 
+# --- One definition of revenue ------------------------------------------------
+# Every figure called revenue / income / sales comes from the helpers below, so
+# the dashboard, the reports and the Payments page cannot drift apart again:
+#   - money counts when it was received (paid_at; the bill date only for old
+#     rows that have no paid_at), on the business's own calendar -- a payment
+#     taken at 01:00 Beirut time on the 1st belongs to the new month, not to
+#     the previous one as its UTC timestamp says;
+#   - prepayments count when received; a bill later paid out of that credit is
+#     NOT counted again; gratis bills bring no money; a refund subtracts, in
+#     the month it was paid out.
+
+def _customer_income_conditions():
+    return (Payment.paid.is_(True), Payment.is_gratis.isnot(True), Payment.settled_from_credit.isnot(True))
+
+
+def _report_days(start_str, end_str):
+    """(start_day, end_day) business-local dates from a report's query strings.
+    Accepts 'YYYY-MM-DD' or the full ISO instant a browser's toISOString()
+    sends (taken as the business-local day that instant falls on). Either may
+    be missing -> None."""
+    def one(raw):
+        if not raw:
+            return None
+        if len(raw) == 10:
+            return datetime.strptime(raw, '%Y-%m-%d').date()
+        dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return _inst_day(dt)
+    return one(start_str), one(end_str)
+
+
+def _instant_bounds(start_day, end_day):
+    """Naive-UTC [from, until) covering business-local days start_day..end_day
+    inclusive, for columns that hold real instants (paid_at, collected_at...)."""
+    zone = _tenant_zone()
+    return (_local_day_start_utc(zone, start_day) if start_day else None,
+            _local_day_start_utc(zone, end_day + timedelta(days=1)) if end_day else None)
+
+
+def _local_month(dt):
+    """Business-local 'YYYY-MM' of a stored timestamp (a midnight value is a
+    typed calendar date and is taken as the date it names)."""
+    return _cal_day(dt).strftime('%Y-%m')
+
+
+def _customer_income_query(start_day=None, end_day=None):
+    """The Payment rows that are customer income between two business-local
+    days (inclusive; either may be None)."""
+    when = func.coalesce(Payment.paid_at, Payment.date)
+    q = tenant_query(Payment).filter(*_customer_income_conditions())
+    since, until = _instant_bounds(start_day, end_day)
+    if since is not None:
+        q = q.filter(when >= since)
+    if until is not None:
+        q = q.filter(when < until)
+    return q
+
+
+def _customer_income_by_month(start_day=None, end_day=None):
+    """{'YYYY-MM': net customer income}, months on the business calendar."""
+    out = {}
+    rows = _customer_income_query(start_day, end_day).with_entities(
+        Payment.paid_at, Payment.date, Payment.amount, Payment.is_refund, Payment.fx_rate_to_reporting)
+    for paid_at, billed, amount, is_refund, rate in rows:
+        value = float(amount) * float(rate or 1)
+        month = _local_month(paid_at or billed)
+        out[month] = out.get(month, 0.0) + (-value if is_refund else value)
+    return out
+
+
 # New Report Routes
 @app.route('/api/reports/total-sales', methods=['GET'])
 @jwt_required()
 def get_total_sales():
-    # Converted into the tenant's reporting_currency using each payment's own
-    # LOCKED rate (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md)
-    # -- a no-op multiply-by-1 for an opted-out (single-currency) tenant.
-    total_sales = db.session.query(
-        month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(_signed_payment_amount() * Payment.fx_rate_to_reporting).label('total_sales')
-    ).filter(
-        Payment.tenant_id == current_tenant_id(),
-        Payment.paid == True,
-        Payment.is_gratis == False,
-        # Prepayments count as revenue -- see
-        # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-        # Refunds are included, as negative amounts (see _signed_payment_amount).
-        # A bill paid from existing credit isn't new money: the prepayment that
-        # created the credit was already counted.
-        Payment.settled_from_credit.isnot(True),
-    ).group_by('month').all()
-
-    return jsonify([{
-        'month': sale.month,
-        'value': float(sale.total_sales or 0.0)
-    } for sale in total_sales])
+    total_sales = _customer_income_by_month()
+    return jsonify([{'month': month, 'value': total_sales[month]} for month in sorted(total_sales)])
 
 @app.route('/api/reports/unpaid-payments', methods=['GET'])
 @jwt_required()
@@ -7580,17 +7635,22 @@ def delete_receipt(receipt_id):
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-def _ledger_total_by_month(model, entry_type, start=None, end=None):
+def _ledger_total_by_month(model, entry_type, start_day=None, end_day=None):
     """{'YYYY-MM': total} of one kind of ResellerPayment / UpstreamProviderPayment
-    row for the current tenant, optionally within [start, end]."""
-    q = db.session.query(
-        month_key(model.date).label('month'), func.sum(model.amount).label('total')
-    ).filter(model.tenant_id == current_tenant_id(), model.type == entry_type)
-    if start is not None:
-        q = q.filter(model.date >= start)
-    if end is not None:
-        q = q.filter(model.date <= end)
-    return {row.month: float(row.total or 0) for row in q.group_by('month').all()}
+    row for the current tenant, optionally between two business-local days
+    (inclusive). Months are on the business calendar, like customer income."""
+    q = db.session.query(model.date, model.amount).filter(
+        model.tenant_id == current_tenant_id(), model.type == entry_type)
+    since, until = _instant_bounds(start_day, end_day)
+    if since is not None:
+        q = q.filter(model.date >= since)
+    if until is not None:
+        q = q.filter(model.date < until)
+    out = {}
+    for when, amount in q:
+        month = _local_month(when)
+        out[month] = out.get(month, 0.0) + float(amount or 0)
+    return out
 
 
 def _reseller_income_by_month(start=None, end=None):
@@ -7659,23 +7719,8 @@ def get_expenses_total():
 @app.route('/api/reports/monthly-revenue', methods=['GET'])
 @jwt_required()
 def get_monthly_revenue():
-    # Get total sales (paid only). Converted into the tenant's reporting_currency
-    # using each payment's own locked rate (no-op for an opted-out tenant) -- see
-    # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
-    sales_query = db.session.query(
-        month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(_signed_payment_amount() * Payment.fx_rate_to_reporting).label('total_sales')
-    ).filter(
-        Payment.tenant_id == current_tenant_id(),
-        Payment.paid == True,
-        Payment.is_gratis == False,
-        # Prepayments count as revenue -- see
-        # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-        # Refunds are included, as negative amounts (see _signed_payment_amount).
-        # A bill paid from existing credit isn't new money: the prepayment that
-        # created the credit was already counted.
-        Payment.settled_from_credit.isnot(True),
-    ).group_by('month').all()
+    # Customer income -- the one shared definition (see _customer_income_by_month).
+    sales_data = _customer_income_by_month()
 
     # Get expenses (exclude credit purchases)
     expenses_query = db.session.query(
@@ -7695,7 +7740,6 @@ def get_monthly_revenue():
         func.sum(SalaryPayment.amount).label('total_sal')
     ).filter(SalaryPayment.tenant_id == current_tenant_id()).group_by('month').all()
 
-    sales_data = {item.month: (item.total_sales or 0.0) for item in sales_query}
     expenses_data = {item.month: (item.total_expenses or 0.0) for item in expenses_query}
     sp_data = {item.month: (item.total_sp or 0.0) for item in sp_query}
     sal_data = {item.month: (item.total_sal or 0.0) for item in sal_query}
@@ -9342,22 +9386,14 @@ def get_dashboard_metrics():
     total_customers = tenant_query(Customer).count()
     active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).count()
 
-    # Prepayments count as revenue -- see
-    # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-    revenue_query = tenant_query(Payment).filter_by(paid=True).filter(
-        Payment.settled_from_credit.isnot(True),  # credit already counted
-        Payment.is_gratis.isnot(True),  # forgiven: no money came in
-    )
-    if start_date:
-        revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
-    if end_date:
-        revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) <= end_date)
-    # A refund row gives money back: subtract it.
-    customer_revenue = sum(-p.amount if p.is_refund else p.amount for p in revenue_query.all())
+    # Income: the one shared definition (see _customer_income_by_month), with
+    # the chosen days taken on the business's own calendar.
+    start_day, end_day = _report_days(start_date_str, end_date_str)
+    customer_revenue = sum(_customer_income_by_month(start_day, end_day).values())
     # Resellers' customers are billed to the reseller, so what resellers pay in
     # is income too; upstream top-ups are the cost of the service resold.
-    reseller_revenue = sum(_reseller_income_by_month(start_date, end_date).values())
-    upstream_expenses = sum(_upstream_cost_by_month(start_date, end_date).values())
+    reseller_revenue = sum(_reseller_income_by_month(start_day, end_day).values())
+    upstream_expenses = sum(_upstream_cost_by_month(start_day, end_day).values())
     total_revenue = float(customer_revenue) + reseller_revenue
 
     # employee_id set = a payroll payment, regardless of what the category is named.
@@ -10592,23 +10628,13 @@ def get_revenue_report():
         start_date_str = request.args.get('start_date')
         end_date_str = request.args.get('end_date')
 
-        # Frontend sends full ISO-8601 datetimes (toISOString()), not plain
-        # 'YYYY-MM-DD' -- parse the same way get_financial_report does.
-        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if start_date_str else None
-        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if end_date_str else None
-
-        # Revenue = when the payment was actually paid, not when it was billed/due.
-        # Refunds are included and subtracted (see _signed_payment_amount).
-        query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False,
-                                             Payment.settled_from_credit.isnot(True)).options(  # credit already counted
+        # The one shared definition of customer income (see
+        # _customer_income_by_month): counted when paid, whole business-local
+        # days from start to end inclusive.
+        start_day, end_day = _report_days(start_date_str, end_date_str)
+        payments = _customer_income_query(start_day, end_day).options(
             db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
-        )
-        if start_date:
-            query = query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
-        if end_date:
-            query = query.filter(func.coalesce(Payment.paid_at, Payment.date) <= end_date)
-
-        payments = query.all()
+        ).all()
 
         def signed(p):
             return -p.amount if p.is_refund else p.amount
@@ -11362,22 +11388,20 @@ def get_collector_progress():
         if not start_date_str or not end_date_str:
             return jsonify({'error': 'start_date and end_date are required'}), 400
 
-        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-        end_date = end_date.replace(hour=23, minute=59, second=59)
-
-        # Converted into the tenant's reporting_currency using each payment's own
-        # locked rate (no-op for an opted-out tenant) -- see
-        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
+        # Whole business-local days. What a collector brought in is the amount
+        # actually collected (a partial collection is less than the bill), and
+        # a refund row is never a collection.
+        since, until = _instant_bounds(*_report_days(start_date_str, end_date_str))
+        collected = func.coalesce(Payment.collected_amount, Payment.amount)
         collector_query = db.session.query(
             User.username,
-            func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_amount'),
+            func.sum(collected * Payment.fx_rate_to_reporting).label('total_amount'),
             func.count(Payment.id).label('total_payments')
-        ).join(Payment, Payment.collected_by_id == User.id)\
-         .filter(
+        ).join(Payment, Payment.collected_by_id == User.id)         .filter(
              Payment.tenant_id == current_tenant_id(),
-             Payment.collected_at >= start_date,
-             Payment.collected_at <= end_date
+             Payment.is_refund.isnot(True),
+             Payment.collected_at >= since,
+             Payment.collected_at < until
          ).group_by(User.username).all()
 
         results = []
@@ -12269,31 +12293,16 @@ def get_financial_report():
         if not start_date_str or not end_date_str:
             return jsonify({'error': 'start_date and end_date are required'}), 400
 
-        # Basic parsing stripping 'Z' if present
-        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-        end_date = end_date.replace(hour=23, minute=59, second=59)
+        # Whole business-local days, start to end inclusive. The typed-date
+        # columns below (expense / supplier-payment dates) are filtered on the
+        # same calendar days.
+        start_day, end_day = _report_days(start_date_str, end_date_str)
+        start_date = datetime.combine(start_day, datetime.min.time())
+        end_date = datetime.combine(end_day, datetime.min.time()).replace(hour=23, minute=59, second=59)
 
-        # 1. Income: Payments marked as paid. Fall back to date if paid_at is null.
-        # Converted into the tenant's reporting_currency using each payment's own
-        # LOCKED rate (fx_rate_to_reporting) -- not a live/current rate -- so a
-        # report over a date range spanning an FX-rate update always reflects
-        # what those payments were actually worth when they happened. For an
-        # opted-out (single-currency) tenant, fx_rate_to_reporting is always
-        # exactly 1, so this is a no-op multiply-by-1. See
-        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
-        income_query = db.session.query(
-            month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-            func.sum(_signed_payment_amount() * Payment.fx_rate_to_reporting).label('total')
-        ).filter(
-            Payment.tenant_id == current_tenant_id(),
-            Payment.paid == True,
-            Payment.is_gratis == False,
-            # Refunds count as negative income in the month they were paid out.
-            Payment.settled_from_credit.isnot(True),  # the prepayment behind it was already counted
-            func.coalesce(Payment.paid_at, Payment.date) >= start_date,
-            func.coalesce(Payment.paid_at, Payment.date) <= end_date
-        ).group_by('month').all()
+        # 1. Income: the one shared definition (see _customer_income_by_month).
+        income_query = [SimpleNamespace(month=month, total=total)
+                        for month, total in _customer_income_by_month(start_day, end_day).items()]
 
         # 2. Expenses (direct non-credit, not a payroll payment). employee_id
         # being set is what identifies a payroll expense -- not the category
@@ -12345,7 +12354,7 @@ def get_financial_report():
         # 5. Logged estimated profit -- lazily backfill the current month if it's
         # in range and hasn't been computed yet (no event/daily-job tick reached
         # it yet), so the current month is never blank.
-        current_month = datetime.utcnow().strftime('%Y-%m')
+        current_month = _tenant_today().strftime('%Y-%m')
         start_month = start_date.strftime('%Y-%m')
         end_month = end_date.strftime('%Y-%m')
         if start_month <= current_month <= end_month:
@@ -12355,8 +12364,8 @@ def get_financial_report():
                 recalculate_estimated_profit(current_tenant_id())
 
         # 4b. Reseller collections (income) and upstream top-ups (cost).
-        reseller_income = _reseller_income_by_month(start_date, end_date)
-        upstream_cost = _upstream_cost_by_month(start_date, end_date)
+        reseller_income = _reseller_income_by_month(start_day, end_day)
+        upstream_cost = _upstream_cost_by_month(start_day, end_day)
 
         estimate_query = MonthlyProfitEstimate.query.filter(
             MonthlyProfitEstimate.tenant_id == current_tenant_id(),
