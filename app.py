@@ -3780,6 +3780,11 @@ def generate_missing_payments(tenant_id):
         # Get all active customers
         customers = Customer.query.filter_by(tenant_id=tenant_id, is_subscription_active=True).all()
 
+        # Customers who were ever billed through a reseller (see the cursor
+        # logic below for why this matters once they are independent again).
+        once_reseller_billed = {cid for (cid,) in db.session.query(ResellerPayment.customer_id).filter(
+            ResellerPayment.tenant_id == tenant_id, ResellerPayment.customer_id.isnot(None)).distinct()}
+
         for customer in customers:
             # Get the subscription plan for the customer
             subscription_plan = SubscriptionPlan.query.filter_by(tenant_id=tenant_id, id=customer.subscription_plan_id).first()
@@ -3828,6 +3833,18 @@ def generate_missing_payments(tenant_id):
                     Payment.is_refund.isnot(True)
                 ).order_by(Payment.date.desc()).first()
                 last_payment_date = last_payment.date if last_payment else customer.subscription_start_date
+                # A customer who left a reseller has cycles that were billed
+                # to that reseller and so have no Payment row. Without this the
+                # cursor falls back to their last own bill (or the start date)
+                # and bills every one of those cycles again, to the customer.
+                # subscription_expiry_date is the next not-yet-billed cycle.
+                if customer.id in once_reseller_billed and customer.subscription_expiry_date:
+                    step = {'monthly': relativedelta(months=1), 'yearly': relativedelta(years=1)}.get(
+                        subscription_plan.billing_cycle)
+                    if step is not None:
+                        billed_through = customer.subscription_expiry_date - step
+                        if billed_through > last_payment_date.replace(tzinfo=None):
+                            last_payment_date = billed_through
 
             # Calculate the next billing date based on the billing cycle
             # Use relativedelta for more accurate month/year increments
@@ -5157,73 +5174,36 @@ def update_customer(customer_id):
             old_reseller_id = customer.reseller_id
             
             if old_reseller_id != new_reseller_id:
-                net_debt = 0.0
-                
-                # 1. Reverse accumulated debt/credit from OLD reseller (if any)
-                if old_reseller_id:
-                    old_reseller = tenant_query(Reseller).filter_by(id=old_reseller_id).first()
-                    if old_reseller:
-                        # customer_id match, not description string matching: a prior rename
-                        # (or a name that happens to be a substring of another customer's) could
-                        # never be matched reliably by text search. Rows predating this column
-                        # (customer_id NULL) are not included; audit those historical rows manually.
-                        rps = tenant_query(ResellerPayment).filter_by(
-                            reseller_id=old_reseller_id, customer_id=customer.id
-                        ).all()
-                        for rp in rps:
-                            if rp.type == 'credit_added':
-                                net_debt += rp.amount
-                            elif rp.type == 'payment_collected':
-                                net_debt -= rp.amount
-
-                        old_reseller.balance -= net_debt
-                        if net_debt > 0:
-                            db.session.add(ResellerPayment(
-                                reseller_id=old_reseller.id, customer_id=customer.id, amount=net_debt, type='payment_collected',
-                                description=f"Reversed accumulated debt for customer {customer.name} (moved)"
-                            ))
-                        elif net_debt < 0:
-                            db.session.add(ResellerPayment(
-                                reseller_id=old_reseller.id, customer_id=customer.id, amount=abs(net_debt), type='credit_added',
-                                description=f"Reversed accumulated credit for customer {customer.name} (moved)"
-                            ))
-                else:
-                    # Coming from Independent: net debt is simply their current balance
-                    net_debt = -customer.balance
-                    customer.balance = 0.0
-                    unpaid_payments = tenant_query(Payment).filter_by(customer_id=customer.id, paid=False).all()
-                    for p in unpaid_payments:
-                        p.paid = True
-                        p.collected = True
-                        p.collected_amount = 0
-                
-                # 2. Apply this net debt to the NEW destination
-                if new_reseller_id:
+                # Leaving a reseller moves no money: the charges already billed
+                # to that reseller were for months the customer was theirs, so
+                # they stay there; only future cycles go to the new owner (the
+                # scheduler resumes from subscription_expiry_date, see
+                # generate_missing_payments). The old code reversed the
+                # customer's whole billing history off the reseller, including
+                # months the reseller had already paid for.
+                if not old_reseller_id and new_reseller_id:
+                    # Joining a reseller from independent: the reseller takes
+                    # over the customer's unpaid bills. They are cancelled on
+                    # the customer (not marked paid -- no money came in, so it
+                    # is not revenue until the reseller pays) and the same
+                    # total is charged to the reseller. Bills a collector
+                    # already holds cash for stay with the customer until that
+                    # collection is confirmed; any credit stays the customer's.
                     new_reseller = tenant_query(Reseller).filter_by(id=new_reseller_id).first()
-                    if new_reseller:
-                        new_reseller.balance += net_debt
-                        if net_debt > 0:
-                            db.session.add(ResellerPayment(
-                                reseller_id=new_reseller.id, customer_id=customer.id, amount=net_debt, type='credit_added',
-                                description=f"Assumed debt from customer {customer.name}"
-                            ))
-                        elif net_debt < 0:
-                            db.session.add(ResellerPayment(
-                                reseller_id=new_reseller.id, customer_id=customer.id, amount=abs(net_debt), type='payment_collected',
-                                description=f"Assumed credit from customer {customer.name}"
-                            ))
-                else:
-                    # Going to Independent: put debt back on customer
-                    customer.balance -= net_debt
-                    if net_debt > 0:
-                        debt_payment = Payment(
-                            customer_id=customer.id, amount=net_debt, paid=False,
-                            date=datetime.now(timezone.utc), pre_payment=False,
-                            reason="Assumed accumulated debt from previous reseller"
-                        )
-                        db.session.add(debt_payment)
-                        _maybe_create_customer_payment_link(debt_payment, customer)
-                        apply_customer_balance_to_unpaid_payments(customer)
+                    bills = _open_bills(customer, uncollected_only=True) if new_reseller else []
+                    taken_over = round(sum(float(b.amount) for b in bills), 4)
+                    for bill in bills:
+                        customer.balance += float(bill.amount)
+                        _detach_payment_dependents(bill)
+                        db.session.delete(bill)
+                    if taken_over > 0:
+                        new_reseller.balance += taken_over
+                        count = f"{len(bills)} unpaid bill{'s' if len(bills) != 1 else ''}"
+                        db.session.add(ResellerPayment(
+                            reseller_id=new_reseller.id, customer_id=customer.id, amount=taken_over,
+                            type='credit_added',
+                            description=f"Took over {count} of customer {customer.name}"
+                        ))
 
             customer.reseller_id = new_reseller_id
 
