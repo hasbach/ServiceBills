@@ -3821,6 +3821,11 @@ def generate_missing_payments(tenant_id):
                     tenant_id=tenant_id,
                     customer_id=customer.id,
                     pre_payment=False
+                ).filter(
+                    # A refund row is dated the day the money went back, not a
+                    # billing date: anchoring on it moved the customer's cycle
+                    # to the refund day and skipped the bill in between.
+                    Payment.is_refund.isnot(True)
                 ).order_by(Payment.date.desc()).first()
                 last_payment_date = last_payment.date if last_payment else customer.subscription_start_date
 
@@ -11059,7 +11064,7 @@ def add_expense():
             if not employee:
                 return jsonify({'error': 'Employee not found.'}), 400
 
-        amount = float(data['amount'])
+        amount = _parse_positive_amount(data['amount'], 'Amount')
         description = data.get('description') or ''
         if employee and not description:
             description = f'Salary paid to {employee.name}'
@@ -11122,7 +11127,7 @@ def update_expense(expense_id):
                 return jsonify({'error': f"Category '{data['category']}' not found."}), 400
             expense.category_id = category.id
 
-        new_amount = float(data.get('amount', expense.amount))
+        new_amount = _parse_positive_amount(data.get('amount', expense.amount), 'Amount')
         new_is_credit = data.get('is_credit', expense.is_credit)
         raw_supplier_id = data.get('supplier_id', expense.supplier_id)
         new_supplier_id = int(raw_supplier_id) if raw_supplier_id not in (None, '') else None
@@ -12482,8 +12487,9 @@ def add_reseller_credit(reseller_id):
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -12515,8 +12521,9 @@ def apply_reseller_discount(reseller_id):
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -12548,8 +12555,9 @@ def collect_reseller_payment(reseller_id):
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     closed = _assert_day_open(_tenant_today())
@@ -12697,8 +12705,9 @@ def topup_upstream_provider(provider_id):
     if not provider:
         return jsonify({'message': 'Upstream provider not found!'}), 404
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     closed = _assert_day_open(_tenant_today())
@@ -12739,8 +12748,9 @@ def record_upstream_renewal_cost(provider_id):
     if not customer:
         return jsonify({'message': 'Customer not found!'}), 404
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -15686,8 +15696,9 @@ def record_supplier_payment(supplier_id):
     if not supplier:
         return jsonify({'message': 'Supplier not found!'}), 404
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -15990,8 +16001,9 @@ def add_employee_charge(employee_id):
     if charge_type not in ('salary', 'bonus', 'deduction'):
         return jsonify({'error': "type must be 'salary', 'bonus', or 'deduction'"}), 400
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -16113,8 +16125,9 @@ def record_employee_payment(employee_id):
     if not employee:
         return jsonify({'message': 'Employee not found!'}), 404
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
