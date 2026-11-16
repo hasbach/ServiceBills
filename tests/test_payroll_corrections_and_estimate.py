@@ -15,8 +15,15 @@ def _login(client, username, password="pw"):
 
 
 def _employee(client, hdr, salary=200, hire="2026-01-01", name="Emp"):
-    return client.post("/api/employees", headers=hdr,
-                       json={"name": name, "monthly_salary": salary, "hire_date": hire}).get_json()["id"]
+    """An employee who has been in the system since their hire date. (One added
+    today with a past hire date gets no back-pay -- see
+    test_salary_accrual_no_backpay.py -- so that stamp is cleared here.)"""
+    eid = client.post("/api/employees", headers=hdr,
+                      json={"name": name, "monthly_salary": salary, "hire_date": hire}).get_json()["id"]
+    with appmod.app.app_context():
+        appmod.db.session.get(appmod.Employee, eid).accrual_start = None
+        appmod.db.session.commit()
+    return eid
 
 
 def _balance(client, hdr, eid):

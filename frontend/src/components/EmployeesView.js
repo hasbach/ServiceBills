@@ -263,7 +263,8 @@ function EmployeesView() {
                             onChange={(ev) => setEmployeeForm({ ...employeeForm, monthly_salary: ev.target.value })} required />
                         <TextField fullWidth margin="dense" label="Hire Date" type="date" InputLabelProps={{ shrink: true }}
                             value={employeeForm.hire_date}
-                            onChange={(ev) => setEmployeeForm({ ...employeeForm, hire_date: ev.target.value })} />
+                            onChange={(ev) => setEmployeeForm({ ...employeeForm, hire_date: ev.target.value })}
+                            helperText="Sets the day of the month salary is added. Past months are not added automatically: enter anything already owed as a salary entry." />
                         <TextField fullWidth margin="dense" label="Notes" multiline rows={3}
                             value={employeeForm.notes}
                             onChange={(ev) => setEmployeeForm({ ...employeeForm, notes: ev.target.value })} />

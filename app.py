@@ -1274,6 +1274,11 @@ class Employee(db.Model):
     name = db.Column(db.String(100), nullable=False)
     monthly_salary = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
     hire_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    # Salary is accrued only for cycles ending after this moment. Stamped when
+    # the employee is added or reactivated, so neither creates salary owed for
+    # months already past (anything owed from before is entered by hand).
+    # NULL (rows older than this column) = accrue from the last salary charge.
+    accrual_start = db.Column(db.DateTime, nullable=True)
     active = db.Column(db.Boolean, default=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
@@ -3927,7 +3932,13 @@ def generate_missing_salary_charges(tenant_id):
             next_charge_date = last_date + relativedelta(months=1)
 
             while next_charge_date <= datetime.utcnow():
-                if employee.monthly_salary > 0:
+                period = (next_charge_date - relativedelta(months=1)).strftime('%Y-%m')
+                # Cycles that ended before the employee was added / reactivated
+                # are not back-paid, and a month that already has a salary
+                # charge (e.g. entered by hand) is never charged twice.
+                before_start = employee.accrual_start is not None and next_charge_date <= employee.accrual_start
+                if employee.monthly_salary > 0 and not before_start and not SalaryCharge.query.filter_by(
+                        tenant_id=tenant_id, employee_id=employee.id, type='salary', period=period).first():
                     new_charge = SalaryCharge(
                         tenant_id=tenant_id,
                         employee_id=employee.id,
@@ -3936,7 +3947,7 @@ def generate_missing_salary_charges(tenant_id):
                         # Accrued at the END of the month worked (hired Oct 1
                         # -> charged Nov 1), so the period is the month the
                         # salary is for, not the month the charge lands in.
-                        period=(next_charge_date - relativedelta(months=1)).strftime('%Y-%m'),
+                        period=period,
                         date=next_charge_date,
                         reason='Monthly salary accrual'
                     )
@@ -16027,6 +16038,7 @@ def add_employee():
             name=data['name'],
             monthly_salary=float(data.get('monthly_salary', 0) or 0),
             hire_date=datetime.strptime(data['hire_date'], '%Y-%m-%d') if data.get('hire_date') else datetime.utcnow(),
+            accrual_start=datetime.utcnow(),  # no back-pay for a hire date in the past
             active=data.get('active', True),
             user_id=user_id,
             notes=data.get('notes', '')
@@ -16061,7 +16073,11 @@ def update_employee(employee_id):
         employee.monthly_salary = float(data.get('monthly_salary', employee.monthly_salary))
         if data.get('hire_date'):
             employee.hire_date = datetime.strptime(data['hire_date'], '%Y-%m-%d')
+        was_active = bool(employee.active)
         employee.active = data.get('active', employee.active)
+        if employee.active and not was_active:
+            # Reactivated: the months spent inactive are not owed.
+            employee.accrual_start = datetime.utcnow()
         employee.notes = data.get('notes', employee.notes)
         if 'balance' in data and data['balance'] is not None and data['balance'] != '':
             employee.balance = float(data['balance'])
@@ -16144,6 +16160,12 @@ def add_employee_charge(employee_id):
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
 
+def _is_latest_salary_charge(charge):
+    latest = tenant_query(SalaryCharge).filter_by(employee_id=charge.employee_id, type='salary') \
+        .order_by(SalaryCharge.date.desc(), SalaryCharge.id.desc()).first()
+    return bool(latest and latest.id == charge.id)
+
+
 def _charge_balance_effect(charge_type, amount):
     """What a charge does to Employee.balance: salary/bonus add, deduction subtracts."""
     return -float(amount) if charge_type == 'deduction' else float(amount)
@@ -16172,6 +16194,10 @@ def update_employee_charge(employee_id, charge_id):
         return jsonify({'error': 'Amount must be positive (a salary charge may be 0 to void that month).'}), 400
     if 'period' in data and data['period'] and not re.fullmatch(r'\d{4}-\d{2}', str(data['period'])):
         return jsonify({'error': 'period must be YYYY-MM'}), 400
+    if charge.type == 'salary' and new_type != 'salary' and _is_latest_salary_charge(charge):
+        # Same reason the latest salary charge can't be deleted (see below).
+        return jsonify({'error': "This is the latest salary charge; the monthly accrual would recreate it. "
+                                 "Edit its amount to 0 instead, or deactivate the employee."}), 400
     try:
         employee.balance = (float(employee.balance or 0)
                             - _charge_balance_effect(charge.type, charge.amount)
