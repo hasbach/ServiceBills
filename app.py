@@ -7584,6 +7584,32 @@ def delete_receipt(receipt_id):
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+def _ledger_total_by_month(model, entry_type, start=None, end=None):
+    """{'YYYY-MM': total} of one kind of ResellerPayment / UpstreamProviderPayment
+    row for the current tenant, optionally within [start, end]."""
+    q = db.session.query(
+        month_key(model.date).label('month'), func.sum(model.amount).label('total')
+    ).filter(model.tenant_id == current_tenant_id(), model.type == entry_type)
+    if start is not None:
+        q = q.filter(model.date >= start)
+    if end is not None:
+        q = q.filter(model.date <= end)
+    return {row.month: float(row.total or 0) for row in q.group_by('month').all()}
+
+
+def _reseller_income_by_month(start=None, end=None):
+    """Money resellers actually paid in. A reseller's customers are billed to
+    the reseller's account, not as customer payments, so this is the only place
+    that income shows up; like customer income it counts when it is received."""
+    return _ledger_total_by_month(ResellerPayment, 'payment_received', start, end)
+
+
+def _upstream_cost_by_month(start=None, end=None):
+    """Money paid out to upstream providers (balance top-ups) -- the cost of
+    the service being resold. Counted when paid, like every other expense."""
+    return _ledger_total_by_month(UpstreamProviderPayment, 'balance_topup', start, end)
+
+
 @app.route('/api/reports/expenses-total', methods=['GET'])
 @jwt_required()
 def get_expenses_total():
@@ -7615,17 +7641,22 @@ def get_expenses_total():
         func.sum(SalaryPayment.amount).label('total_sal')
     ).filter(SalaryPayment.tenant_id == current_tenant_id()).group_by('month').all()}
 
-    all_months = sorted(set(exp_data.keys()) | set(payroll_exp_data.keys()) | set(sp_data.keys()) | set(sal_data.keys()))
+    upstream_data = _upstream_cost_by_month()
+
+    all_months = sorted(set(exp_data.keys()) | set(payroll_exp_data.keys()) | set(sp_data.keys())
+                        | set(sal_data.keys()) | set(upstream_data.keys()))
 
     return jsonify([{
         'month': m,
         'value': float(exp_data.get(m, 0.0) or 0.0) + float(payroll_exp_data.get(m, 0.0) or 0.0)
-                 + float(sp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0),
+                 + float(sp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0)
+                 + upstream_data.get(m, 0.0),
         # Breakdown of the same total by source -- computed above either way,
         # previously discarded once summed into `value`.
         'manual': float(exp_data.get(m, 0.0) or 0.0),
         'supplier': float(sp_data.get(m, 0.0) or 0.0),
-        'payroll': float(payroll_exp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0)
+        'payroll': float(payroll_exp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0),
+        'upstream': upstream_data.get(m, 0.0),
     } for m in all_months])
 
 
@@ -7672,14 +7703,18 @@ def get_monthly_revenue():
     expenses_data = {item.month: (item.total_expenses or 0.0) for item in expenses_query}
     sp_data = {item.month: (item.total_sp or 0.0) for item in sp_query}
     sal_data = {item.month: (item.total_sal or 0.0) for item in sal_query}
+    reseller_data = _reseller_income_by_month()
+    upstream_data = _upstream_cost_by_month()
 
     # Merge months
-    all_months = sorted(set(sales_data.keys()) | set(expenses_data.keys()) | set(sp_data.keys()) | set(sal_data.keys()))
+    all_months = sorted(set(sales_data.keys()) | set(expenses_data.keys()) | set(sp_data.keys())
+                        | set(sal_data.keys()) | set(reseller_data.keys()) | set(upstream_data.keys()))
 
     result = []
     for month in all_months:
-        sales = float(sales_data.get(month, 0.0) or 0.0)
-        expenses = float(expenses_data.get(month, 0.0) or 0.0) + float(sp_data.get(month, 0.0) or 0.0) + float(sal_data.get(month, 0.0) or 0.0)
+        sales = float(sales_data.get(month, 0.0) or 0.0) + reseller_data.get(month, 0.0)
+        expenses = (float(expenses_data.get(month, 0.0) or 0.0) + float(sp_data.get(month, 0.0) or 0.0)
+                    + float(sal_data.get(month, 0.0) or 0.0) + upstream_data.get(month, 0.0))
         result.append({
             'month': month,
             'value': float(sales - expenses)
@@ -9322,7 +9357,12 @@ def get_dashboard_metrics():
     if end_date:
         revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) <= end_date)
     # A refund row gives money back: subtract it.
-    total_revenue = sum(-p.amount if p.is_refund else p.amount for p in revenue_query.all())
+    customer_revenue = sum(-p.amount if p.is_refund else p.amount for p in revenue_query.all())
+    # Resellers' customers are billed to the reseller, so what resellers pay in
+    # is income too; upstream top-ups are the cost of the service resold.
+    reseller_revenue = sum(_reseller_income_by_month(start_date, end_date).values())
+    upstream_expenses = sum(_upstream_cost_by_month(start_date, end_date).values())
+    total_revenue = float(customer_revenue) + reseller_revenue
 
     # employee_id set = a payroll payment, regardless of what the category is named.
     manual_query = tenant_query(Expense).filter_by(is_credit=False).filter(Expense.employee_id.is_(None))
@@ -9345,7 +9385,7 @@ def get_dashboard_metrics():
     supplier_expenses = sum(sp.amount for sp in supplier_query.all())
     payroll_expenses = (sum(exp.amount for exp in payroll_exp_query.all())
                          + sum(sal.amount for sal in legacy_payroll_query.all()))
-    total_expenses = manual_expenses + supplier_expenses + payroll_expenses
+    total_expenses = manual_expenses + supplier_expenses + payroll_expenses + upstream_expenses
     # Outstanding balance should be the sum of negative balances (customers who owe money)
     outstanding_balance = sum(c.balance for c in tenant_query(Customer).filter(Customer.balance < 0).all())
     subscriptions_breakdown_query = db.session.query(
@@ -9369,6 +9409,9 @@ def get_dashboard_metrics():
         'manualExpenses': float(manual_expenses),
         'supplierExpenses': float(supplier_expenses),
         'payrollExpenses': float(payroll_expenses),
+        'upstreamExpenses': float(upstream_expenses),
+        'customerRevenue': float(customer_revenue),
+        'resellerRevenue': float(reseller_revenue),
         'outstandingBalance': float(outstanding_balance),
         'subscriptionsBreakdown': subscriptions_breakdown
     })
@@ -12183,6 +12226,10 @@ def get_financial_report():
             ).first():
                 recalculate_estimated_profit(current_tenant_id())
 
+        # 4b. Reseller collections (income) and upstream top-ups (cost).
+        reseller_income = _reseller_income_by_month(start_date, end_date)
+        upstream_cost = _upstream_cost_by_month(start_date, end_date)
+
         estimate_query = MonthlyProfitEstimate.query.filter(
             MonthlyProfitEstimate.tenant_id == current_tenant_id(),
             MonthlyProfitEstimate.month >= start_month,
@@ -12196,6 +12243,7 @@ def get_financial_report():
             [row.month for row in income_query] + [row.month for row in expense_query]
             + [row.month for row in payroll_expense_query]
             + [row.month for row in sp_query] + [row.month for row in sal_query]
+            + list(reseller_income.keys()) + list(upstream_cost.keys())
             + list(estimate_data.keys())
         )
 
@@ -12203,11 +12251,21 @@ def get_financial_report():
             'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0,
             # Same total as `expenses`, split by source -- previously computed
             # here and immediately discarded once summed together.
-            'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0
+            'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0,
+            'expenses_upstream': 0.0, 'income_customers': 0.0, 'income_resellers': 0.0
         } for m in months_set}
+
+        for m, total in reseller_income.items():
+            monthly_data_dict[m]['income'] += total
+            monthly_data_dict[m]['income_resellers'] += total
+
+        for m, total in upstream_cost.items():
+            monthly_data_dict[m]['expenses'] += total
+            monthly_data_dict[m]['expenses_upstream'] += total
 
         for row in income_query:
             monthly_data_dict[row.month]['income'] += float(row.total or 0)
+            monthly_data_dict[row.month]['income_customers'] += float(row.total or 0)
 
         for row in expense_query:
             monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
@@ -12231,6 +12289,9 @@ def get_financial_report():
         total_expenses_manual = 0.0
         total_expenses_supplier = 0.0
         total_expenses_payroll = 0.0
+        total_expenses_upstream = 0.0
+        total_income_customers = 0.0
+        total_income_resellers = 0.0
         total_estimated_profit = 0.0
         total_estimated_payroll = 0.0
         total_variance = 0.0
@@ -12251,6 +12312,9 @@ def get_financial_report():
             total_expenses_manual += data['expenses_manual']
             total_expenses_supplier += data['expenses_supplier']
             total_expenses_payroll += data['expenses_payroll']
+            total_expenses_upstream += data['expenses_upstream']
+            total_income_customers += data['income_customers']
+            total_income_resellers += data['income_resellers']
             if estimated_profit is not None:
                 total_estimated_profit += estimated_profit
                 total_estimated_payroll += data['estimated_payroll'] or 0.0
@@ -12270,6 +12334,9 @@ def get_financial_report():
                 'expenses_manual': total_expenses_manual,
                 'expenses_supplier': total_expenses_supplier,
                 'expenses_payroll': total_expenses_payroll,
+                'expenses_upstream': total_expenses_upstream,
+                'income_customers': total_income_customers,
+                'income_resellers': total_income_resellers,
                 'profit': total_profit,
                 'estimated_profit': total_estimated_profit,
                 'estimated_payroll': total_estimated_payroll,
