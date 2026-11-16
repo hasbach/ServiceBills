@@ -2919,6 +2919,48 @@ def apply_customer_balance_to_unpaid_payments(customer):
 
 
 
+def reopen_bills_no_longer_covered_by_credit(customer, withdrawn):
+    """The mirror of apply_customer_balance_to_unpaid_payments: when credit is
+    taken away (a prepayment reverted, deleted or refunded) after it already
+    settled bills, those bills are no longer paid by anything. Without this
+    they stayed marked "paid from credit" while the customer owed the money
+    with no open bill to collect it against.
+
+    Reopens the newest credit-settled bills until the customer's credit
+    (balance + open bills) is no longer negative, then lets the normal
+    settlement re-pay whatever part the remaining credit still covers. Like
+    the settlement itself it never moves the balance. `withdrawn` is the credit
+    just taken away: never more than that is reopened, so a shortfall the
+    customer already had for some other reason (a refund on a cash bill, an
+    old manual edit) does not start reopening bills. Caller commits."""
+    shortfall = -(float(customer.balance or 0) + sum(float(b.amount) for b in _open_bills(customer)))
+    shortfall = min(shortfall, float(withdrawn or 0))
+    if shortfall <= _MONEY_EPS:
+        return
+    settled = Payment.query.filter_by(
+        tenant_id=customer.tenant_id, customer_id=customer.id, paid=True, settled_from_credit=True
+    ).filter(Payment.pre_payment.isnot(True), Payment.is_refund.isnot(True)
+             ).order_by(Payment.date.desc(), Payment.id.desc()).all()
+    for bill in settled:
+        if shortfall <= _MONEY_EPS:
+            break
+        bill.paid = False
+        bill.paid_at = None
+        bill.settled_from_credit = False
+        shortfall -= float(bill.amount)
+        logging.info(f"Reopened bill {bill.id} for customer {customer.id}: its credit was withdrawn.")
+    db.session.flush()
+    apply_customer_balance_to_unpaid_payments(customer)
+
+
+def _credit_withdrawn_by_removing(payment):
+    """Credit that reverting or deleting `payment` takes away from its
+    customer: a received prepayment's amount, nothing for any other row."""
+    if payment.pre_payment and payment.paid and not payment.is_refund:
+        return float(payment.amount)
+    return 0.0
+
+
 def _balance_delta_on_delete(payment):
     """What removing `payment` does to its customer's balance: exactly the
     opposite of everything the row did to it while it existed.
@@ -6038,9 +6080,12 @@ def delete_payment(payment_id):
         customer.balance += _balance_delta_on_delete(payment)
 
         _detach_payment_dependents(payment)
+        withdrawn = _credit_withdrawn_by_removing(payment)
 
         # Delete the payment
         db.session.delete(payment)
+        db.session.flush()
+        reopen_bills_no_longer_covered_by_credit(customer, withdrawn)
         db.session.commit()
 
         return jsonify({
@@ -6985,6 +7030,7 @@ def revert_payment(payment_id):
         # reverting always debits it back, regardless of which one it was.
         # A refund is the mirror image: issuing it debited the balance, so
         # undoing it credits the amount back.
+        withdrawn = _credit_withdrawn_by_removing(payment)
         if payment.is_refund:
             customer.balance += payment.amount
         else:
@@ -7009,6 +7055,8 @@ def revert_payment(payment_id):
         payment.reverted_by_id = current_user.id
         payment.revert_reason = reason
 
+        db.session.flush()
+        reopen_bills_no_longer_covered_by_credit(customer, withdrawn)
         db.session.commit()
 
         return jsonify({
@@ -7136,6 +7184,10 @@ def refund_payment(payment_id):
         # paid (which credits the balance).
         customer.balance -= refund_amount
 
+        db.session.flush()
+        # Refunding a prepayment takes back credit that may already have paid bills.
+        if payment.pre_payment:
+            reopen_bills_no_longer_covered_by_credit(customer, refund_amount)
         db.session.commit()
 
         return jsonify({
@@ -7244,7 +7296,10 @@ def bulk_delete_payments():
                 continue
             customer.balance += _balance_delta_on_delete(payment)
             _detach_payment_dependents(payment)
+            withdrawn = _credit_withdrawn_by_removing(payment)
             db.session.delete(payment)
+            db.session.flush()
+            reopen_bills_no_longer_covered_by_credit(customer, withdrawn)
             db.session.commit()
             succeeded.append(payment.id)
         except Exception as e:
