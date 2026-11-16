@@ -6310,6 +6310,11 @@ def mark_payment_as_paid(payment_id):
         if action == 'collect':
             if not is_collector:
                 return jsonify({'message': 'Unauthorized to collect payments.'}), 403
+            if payment.paid:
+                # Re-collecting would restamp collected_at = now (moving the
+                # money to today in the cash flow, out of a possibly closed
+                # day) and overwrite who collected it and how.
+                return jsonify({'message': 'This payment is already paid.'}), 400
             closed = _assert_day_open(_tenant_today())  # collecting stamps collected_at = now
             if closed:
                 return closed
@@ -6967,6 +6972,25 @@ def revert_payment(payment_id):
         return jsonify({'error': str(e)}), 500
 
 
+def _refund_reason_for(payment_id):
+    return f'Refund for payment #{payment_id}'
+
+
+def _refunded_total(payment):
+    """How much of `payment` has already been given back: its refund rows
+    still in effect (a reverted refund is paid=False and no longer counts).
+    Refund rows carry no foreign key to their original; the server-written
+    reason is the link."""
+    total = db.session.query(func.coalesce(func.sum(Payment.amount), 0)).filter(
+        Payment.tenant_id == payment.tenant_id,
+        Payment.customer_id == payment.customer_id,
+        Payment.is_refund.is_(True),
+        Payment.paid.is_(True),
+        Payment.reason == _refund_reason_for(payment.id),
+    ).scalar()
+    return round(float(total or 0), 4)
+
+
 @app.route('/api/payments/<int:payment_id>/refund', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
@@ -6987,6 +7011,14 @@ def refund_payment(payment_id):
 
     if not payment.paid:
         return jsonify({'message': 'Only a paid payment can be refunded.'}), 400
+    # Only money that actually came in can go back out.
+    if payment.is_refund:
+        return jsonify({'message': 'A refund cannot itself be refunded. Revert it instead.'}), 400
+    if payment.is_gratis:
+        return jsonify({'message': 'A gratis bill cannot be refunded: no money was received for it.'}), 400
+    if payment.settled_from_credit:
+        return jsonify({'message': "This bill was paid from the customer's credit. "
+                                   "Refund the payment that created the credit instead."}), 400
 
     data = request.json or {}
     reason = (data.get('reason') or '').strip()
@@ -7000,6 +7032,14 @@ def refund_payment(payment_id):
 
     if refund_amount > payment.amount:
         return jsonify({'message': 'Refund amount cannot exceed the original payment amount.'}), 400
+    # ...nor, across several refunds, what is left of it.
+    already_refunded = _refunded_total(payment)
+    refundable = round(float(payment.amount) - already_refunded, 4)
+    if refundable <= _MONEY_EPS:
+        return jsonify({'message': 'This payment has already been refunded in full.'}), 400
+    if refund_amount > refundable + _MONEY_EPS:
+        return jsonify({'message': f'Only {refundable:g} of this payment is left to refund '
+                                   f'({already_refunded:g} was already refunded).'}), 400
 
     closed = _assert_day_open(_tenant_today())  # the refund row is dated now
     if closed:
@@ -7027,7 +7067,7 @@ def refund_payment(payment_id):
             # Same currency and locked rate as the money being given back.
             currency=payment.currency,
             fx_rate_to_reporting=payment.fx_rate_to_reporting,
-            reason=f'Refund for payment #{payment.id}',
+            reason=_refund_reason_for(payment.id),
             date=now,
             paid=True,
             paid_at=now,
@@ -11444,9 +11484,15 @@ def _assert_day_open(*days):
 def _payment_flow_day(p):
     """The cash-flow day of a customer payment row, or None when the row isn't
     money moving (unpaid, gratis, reverted, settled from credit)."""
-    if not p.paid or p.is_gratis or p.reverted_at is not None or p.settled_from_credit:
+    if not p.paid or p.is_gratis or p.settled_from_credit:
         return None
-    return _inst_day(p.collected_at or p.paid_at)
+    when = p.collected_at or p.paid_at
+    # reverted_at is never cleared, so a bill reverted and then paid again
+    # still carries it; only a revert stamped after the current collection is
+    # in effect (same rule as _payment_not_reverted, which the cash flow uses).
+    if p.reverted_at is not None and (when is None or p.reverted_at >= when):
+        return None
+    return _inst_day(when)
 
 
 def _locked_payment_day(payments):
