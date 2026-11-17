@@ -3560,11 +3560,15 @@ def _ledger_note_manual(obj, party_type, delta_balance, memo):
     safety net then posts the change as unexplained)."""
     tid = None
     try:
-        if getattr(obj, 'id', None) is None:
-            db.session.flush()  # a new party: needs its id and tenant
-        tid = obj.tenant_id
+        tid = getattr(obj, 'tenant_id', None)
+        if tid is None:
+            tid = current_tenant_id()
+        # Decide before any flush: a tenant without books must not pay for
+        # (or be broken by) an extra flush here.
         if tid is None or not _books_started(tid):
             return
+        if getattr(obj, 'id', None) is None:
+            db.session.flush()  # a new party: needs its id
         _, today = _ledger_context(tid)
         lines = _books.balance_delta_to_lines(party_type, obj.id, delta_balance, today)
         if lines:

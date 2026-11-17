@@ -72,6 +72,25 @@ def test_new_reseller_opening_balance_posts_correction(app, client):
     assert _books_party_balance("reseller", rid) == _stored_balance(Reseller, rid) == 60
 
 
+def test_new_reseller_on_tenant_without_books_does_not_flush_early(app, client, monkeypatch):
+    a = make_tenant(client, "Books", "lc2b")
+    tid = _tid()
+    # The helper decides "no books" before touching the session at all.
+    with flask_app.app_context():
+        r = Reseller(tenant_id=tid, name="Nobooks", phone="70000001")
+        flushed = []
+        monkeypatch.setattr(db.session, "flush", lambda *a, **k: flushed.append(1))
+        appmod._ledger_note_manual(r, "reseller", 60, "opening")
+        monkeypatch.undo()
+        assert flushed == []
+    # And the route itself still works and posts nothing.
+    resp = client.post("/api/resellers", headers=a,
+                       json={"name": "Rami", "phone": "70000000", "type": "type1", "balance": 60})
+    assert resp.status_code in (200, 201), resp.get_data(as_text=True)
+    with flask_app.app_context():
+        assert JournalEntry.query.filter_by(tenant_id=tid).count() == 0
+
+
 def test_new_upstream_opening_balance_posts_correction(app, client):
     a = make_tenant(client, "Books", "lc3")
     tid = _tid()
