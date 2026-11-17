@@ -39,6 +39,7 @@ function EmployeesView() {
 
     const [historyDialog, setHistoryDialog] = useState({ open: false, employee: null, history: [] });
     const [fixBalanceInput, setFixBalanceInput] = useState('');
+    const [fixBalanceReason, setFixBalanceReason] = useState('');
     const [historyLoading, setHistoryLoading] = useState(false);
     // Correcting a salary/bonus/deduction entry: { charge_id, type, amount, period, reason }
     const [editCharge, setEditCharge] = useState(null);
@@ -138,7 +139,8 @@ function EmployeesView() {
     const handleFixBalance = async () => {
         if (!historyDialog.employee) return;
         try {
-            const res = await apiService.fixEmployeeBalance(historyDialog.employee.id, { balance: fixBalanceInput });
+            const res = await apiService.fixEmployeeBalance(historyDialog.employee.id, { balance: fixBalanceInput, balance_reason: fixBalanceReason });
+            setFixBalanceReason('');
             setSnackbar({ open: true, message: 'Balance updated successfully.', severity: 'success' });
             setHistoryDialog({ ...historyDialog, employee: res.data.employee });
             loadEmployees();
@@ -368,7 +370,15 @@ function EmployeesView() {
                                     onChange={(e) => setFixBalanceInput(e.target.value)}
                                     sx={{ width: 180 }}
                                 />
-                                <Button variant="contained" size="small" onClick={handleFixBalance}>
+                                <TextField
+                                    size="small"
+                                    label="Reason (required)"
+                                    value={fixBalanceReason}
+                                    onChange={(e) => setFixBalanceReason(e.target.value)}
+                                    inputProps={{ maxLength: 250 }}
+                                    sx={{ minWidth: 240, flex: 1 }}
+                                />
+                                <Button variant="contained" size="small" onClick={handleFixBalance} disabled={!fixBalanceReason.trim()}>
                                     Set Balance
                                 </Button>
                             </Box>

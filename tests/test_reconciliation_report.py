@@ -85,7 +85,7 @@ def test_manual_edit_is_shown_as_explained(app, client):
     assert _report(client, a)["summary"]["customers"] == 0
     with flask_app.app_context():
         balance = float(db.session.get(Customer, cid).balance)
-    r = client.put(f"/api/customers/{cid}", headers=a, json={"balance": balance + 40})
+    r = client.put(f"/api/customers/{cid}", headers=a, json={"balance": balance + 40, "balance_reason": "test"})
     assert r.status_code == 200, r.get_data(as_text=True)
 
     row = _report(client, a)["customers"][0]

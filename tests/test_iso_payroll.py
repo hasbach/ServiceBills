@@ -199,7 +199,7 @@ def test_employee_history_and_fix_balance(client):
     types = {h["type"] for h in body["history"]}
     assert types == {"salary", "payment"}
 
-    r2 = client.put(f"/api/employees/{emp_id}/fix-balance", headers=a, json={"balance": 50})
+    r2 = client.put(f"/api/employees/{emp_id}/fix-balance", headers=a, json={"balance": 50, "balance_reason": "test"})
     assert r2.status_code == 200
     assert r2.get_json()["employee"]["balance"] == 50.0
 

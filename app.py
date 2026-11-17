@@ -38,7 +38,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import and_, func, extract
+from sqlalchemy import and_, or_, func, extract
 from werkzeug.utils import secure_filename
 import atexit
 import click
@@ -2885,6 +2885,47 @@ def _maybe_create_customer_payment_link(payment, customer):
         return None
 
 
+
+class BalanceReasonRequired(Exception):
+    """A balance was typed over by hand without saying why."""
+    def __init__(self):
+        super().__init__('A reason is required to change the balance by hand.')
+
+
+def _adjust_balance(obj, party_type, raw_new, data):
+    """Set obj.balance to a hand-typed value as a dated adjustment: the change
+    needs a reason ('balance_reason'), which is kept in the party's balance
+    log and in Finance > History. A value equal to the current balance is not
+    a change and needs nothing. Raises BalanceReasonRequired / ValueError."""
+    new = float(raw_new)
+    if not math.isfinite(new):
+        raise ValueError('Balance must be a number.')
+    old = float(obj.balance or 0)
+    if abs(new - old) < 0.005:
+        return False
+    reason = str((data or {}).get('balance_reason') or '').strip()[:250]
+    if not reason:
+        raise BalanceReasonRequired()
+    _note_balance_reason(obj, f'Adjustment: {reason}')
+    obj.balance = new
+    try:
+        who = get_jwt_identity()
+    except Exception:
+        who = None
+    db.session.add(AuditLog(
+        tenant_id=obj.tenant_id, entity='balance_adjustment', entity_id=None, action='update',
+        party_type=party_type, party_id=obj.id, amount=round(new - old, 4),
+        changes=json.dumps({'balance': [round(old, 4), round(new, 4)]}),
+        note=reason, changed_by=str(who)[:100] if who else None))
+    return True
+
+
+@app.errorhandler(BalanceReasonRequired)
+def _balance_reason_required(_e):
+    db.session.rollback()
+    return jsonify({'error': str(_e), 'message': str(_e), 'code': 'balance_reason_required'}), 400
+
+
 # Schema is owned by Alembic (flask db upgrade). No import-time create_all or
 # home-grown ALTERs. Tests build their own schema via tests/conftest.py.
 
@@ -5403,7 +5444,7 @@ def update_customer(customer_id):
             else:
                 customer.cost_override = None
         if 'balance' in data:
-            customer.balance = float(data['balance'])
+            _adjust_balance(customer, 'customer', data['balance'], data)
         if 'reseller_id' in data:
             new_reseller_id = data['reseller_id'] if data['reseller_id'] != "" else None
             old_reseller_id = customer.reseller_id
@@ -5579,6 +5620,8 @@ def update_customer(customer_id):
             return jsonify({'error': _cpe_mac_conflict_message(cpe_mac_address, customer_id)}), 409
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+    except BalanceReasonRequired:
+        raise  # -> 400 from the app-wide handler
     except Exception as e:
         db.session.rollback()
         traceback.print_exc()
@@ -12392,7 +12435,8 @@ def _logged_manual_adjustments(column):
         column, func.sum(BalanceLog.balance_after - BalanceLog.balance_before)
     ).filter(
         BalanceLog.tenant_id == current_tenant_id(), column.isnot(None),
-        BalanceLog.reason.in_(('Balance edited manually', 'Opening balance')),
+        or_(BalanceLog.reason.in_(('Balance edited manually', 'Opening balance', 'Fixed credit balance set')),
+            BalanceLog.reason.like('Adjustment: %')),
     ).group_by(column).all()
     return {pid: float(total or 0) for pid, total in rows}
 
@@ -12909,7 +12953,7 @@ def update_reseller(reseller_id):
         reseller.phone = data.get('phone', reseller.phone)
         reseller.type = data.get('type', reseller.type)
         if 'balance' in data:
-            reseller.balance = float(data['balance'])
+            _adjust_balance(reseller, 'reseller', data['balance'], data)
         db.session.commit()
         return jsonify({'message': 'Reseller updated successfully!', 'reseller': reseller.to_dict()}), 200
     except Exception as e:
@@ -13090,7 +13134,7 @@ def update_upstream_provider(provider_id):
         if 'status' in data:
             provider.status = data['status']
         if 'balance' in data:
-            provider.balance = float(data['balance'])
+            _adjust_balance(provider, 'upstream', data['balance'], data)
         db.session.commit()
         return jsonify({'message': 'Upstream provider updated successfully!', 'provider': provider.to_dict()}), 200
     except Exception as e:
@@ -16090,7 +16134,7 @@ def update_supplier(supplier_id):
     supplier.address = data.get('address', supplier.address)
     supplier.notes = data.get('notes', supplier.notes)
     if 'balance' in data and data['balance'] is not None and data['balance'] != '':
-        supplier.balance = float(data['balance'])
+        _adjust_balance(supplier, 'supplier', data['balance'], data)
 
     db.session.commit()
     return jsonify(supplier.to_dict()), 200
@@ -16320,8 +16364,7 @@ def fix_supplier_balance(supplier_id):
     if 'balance' not in data:
         return jsonify({'error': 'New balance is required'}), 400
 
-    _note_balance_reason(supplier, 'Fixed credit balance set')
-    supplier.balance = float(data['balance'])
+    _adjust_balance(supplier, 'supplier', data['balance'], data)
     db.session.commit()
     return jsonify({'message': 'Supplier balance fixed successfully!', 'supplier': supplier.to_dict()}), 200
 
@@ -16395,7 +16438,7 @@ def update_employee(employee_id):
             employee.accrual_start = datetime.utcnow()
         employee.notes = data.get('notes', employee.notes)
         if 'balance' in data and data['balance'] is not None and data['balance'] != '':
-            employee.balance = float(data['balance'])
+            _adjust_balance(employee, 'employee', data['balance'], data)
 
         db.session.commit()
         recalculate_estimated_profit(current_tenant_id())  # salary/active/hire date feed the estimate
@@ -16695,7 +16738,7 @@ def fix_employee_balance(employee_id):
     if 'balance' not in data:
         return jsonify({'error': 'New balance is required'}), 400
 
-    employee.balance = float(data['balance'])
+    _adjust_balance(employee, 'employee', data['balance'], data)
     db.session.commit()
     return jsonify({'message': 'Employee balance fixed successfully!', 'employee': employee.to_dict()}), 200
 

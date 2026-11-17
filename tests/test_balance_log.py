@@ -23,7 +23,7 @@ def _supplier_log(client, hdr, sid):
 def test_supplier_payment_logs_before_and_after(app, client):
     a = make_tenant(client, "Biz A", "alice")
     sid = _supplier(client, a)
-    client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": -100})
+    client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": -100, "balance_reason": "test"})
     r = client.post(f"/api/suppliers/{sid}/payments", headers=a,
                     json={"amount": 50, "payment_method": "Cash", "reference_note": "Inv 7"})
     assert r.status_code == 201
@@ -32,7 +32,7 @@ def test_supplier_payment_logs_before_and_after(app, client):
     assert len(logs) == 2
     pay, fix = logs  # newest first
     assert (fix["balance_before"], fix["balance_after"]) == (0, -100)
-    assert fix["reason"] == "Fixed credit balance set"
+    assert fix["reason"] == "Adjustment: test"
     assert (pay["balance_before"], pay["balance_after"], pay["change"]) == (-100, -150, -50)
     assert pay["reason"] == "Payment recorded (Cash): Inv 7"
     assert pay["changed_by"] == "alice"
@@ -41,7 +41,7 @@ def test_supplier_payment_logs_before_and_after(app, client):
 def test_supplier_payment_edit_and_delete_logged(app, client):
     a = make_tenant(client, "Biz A", "alice")
     sid = _supplier(client, a)
-    client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": 300})
+    client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": 300, "balance_reason": "test"})
     pid = client.post(f"/api/suppliers/{sid}/payments", headers=a, json={"amount": 100}).get_json()["payment"]["id"]
     client.put(f"/api/suppliers/{sid}/payments/{pid}", headers=a, json={"amount": 80})
     client.delete(f"/api/suppliers/{sid}/payments/{pid}", headers=a)
@@ -82,9 +82,9 @@ def test_credit_purchase_edit_is_one_net_row(app, client):
 def test_manual_supplier_edit_logged(app, client):
     a = make_tenant(client, "Biz A", "alice")
     sid = _supplier(client, a)
-    client.put(f"/api/suppliers/{sid}", headers=a, json={"balance": 25})
+    client.put(f"/api/suppliers/{sid}", headers=a, json={"balance": 25, "balance_reason": "test"})
     (log,) = _supplier_log(client, a, sid)
-    assert (log["balance_before"], log["balance_after"], log["reason"]) == (0, 25, "Balance edited manually")
+    assert (log["balance_before"], log["balance_after"], log["reason"]) == (0, 25, "Adjustment: test")
 
 
 def test_reseller_credit_and_payment_logged(app, client):
@@ -114,7 +114,7 @@ def test_balance_log_is_tenant_scoped(app, client):
     a = make_tenant(client, "Biz A", "alice")
     b = make_tenant(client, "Biz B", "bob")
     sid = _supplier(client, a)
-    client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": 10})
+    client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": 10, "balance_reason": "test"})
     assert client.get(f"/api/suppliers/{sid}/balance-log", headers=b).status_code == 404
 
 
@@ -137,7 +137,7 @@ def test_deleting_credit_purchase_reverts_supplier_balance(app, client):
 def test_cash_expense_delete_leaves_supplier_alone(app, client):
     a = make_tenant(client, "Biz A", "alice")
     sid = _supplier(client, a)
-    client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": 10})
+    client.put(f"/api/suppliers/{sid}/fix-balance", headers=a, json={"balance": 10, "balance_reason": "test"})
     client.post("/api/expense_categories", headers=a, json={"name": "Stock"})
     eid = client.post("/api/expenses", headers=a, json={
         "category": "Stock", "amount": 40, "description": "Paid cash", "date": "2026-10-01",

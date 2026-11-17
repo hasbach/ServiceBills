@@ -16,10 +16,11 @@ const ENTITY_LABELS = {
     reseller_payment: 'Reseller entry',
     upstream_payment: 'Upstream entry',
     day_close: 'Day close',
+    balance_adjustment: 'Balance adjustment',
 };
 
 const FIELD_LABELS = {
-    amount: 'Amount', paid: 'Paid', paid_at: 'Paid at', collected: 'Collected', collected_at: 'Collected at',
+    amount: 'Amount', balance: 'Balance', paid: 'Paid', paid_at: 'Paid at', collected: 'Collected', collected_at: 'Collected at',
     collected_amount: 'Collected amount', collected_via: 'Channel', paid_via: 'Channel', date: 'Date',
     reason: 'Reason', description: 'Description', note: 'Note', is_gratis: 'Gratis', gratis_note: 'Gratis note',
     reverted_at: 'Reverted at', revert_reason: 'Revert reason', is_refund: 'Refund', refund_reason: 'Refund reason',
@@ -37,7 +38,7 @@ const KEY_FIELDS = ['amount', 'date', 'day', 'payment_date', 'type', 'period', '
 const HIDDEN_FIELDS = new Set(['currency', 'fx_rate_to_reporting', 'customer_id', 'supplier_id', 'employee_id',
     'reseller_id', 'upstream_provider_id', 'created_by_id', 'closed_by_id', 'collected_by_id', 'received_by_id',
     'reverted_by_id', 'refunded_by_id', 'created_at', 'closed_at']);
-const MONEY_FIELDS = new Set(['amount', 'collected_amount', 'expected_cash', 'counted_cash', 'expected_whish', 'counted_whish']);
+const MONEY_FIELDS = new Set(['amount', 'balance', 'collected_amount', 'expected_cash', 'counted_cash', 'expected_whish', 'counted_whish']);
 
 const money = (v) => `${v < 0 ? '-' : ''}$${Math.abs(Number(v)).toFixed(2)}`;
 
@@ -57,6 +58,7 @@ function actionChip(row) {
             ? <Chip size="small" color="warning" label="Reopened" />
             : <Chip size="small" color="success" label="Closed" />;
     }
+    if (row.entity === 'balance_adjustment') return <Chip size="small" color="warning" variant="outlined" label="Adjusted" />;
     if (row.action === 'create') return <Chip size="small" color="success" variant="outlined" label="Created" />;
     if (row.action === 'delete') return <Chip size="small" color="error" label="Deleted" />;
     return <Chip size="small" color="info" variant="outlined" label="Edited" />;
@@ -175,7 +177,7 @@ function AuditLogView() {
                                     </TableCell>
                                     <TableCell>
                                         <Changes row={r} />
-                                        {r.note && <Typography variant="body2" sx={{ mt: 0.5 }}><b>{r.entity === 'day_close' ? 'Why reopened' : 'Why deleted'}:</b> {r.note}</Typography>}
+                                        {r.note && <Typography variant="body2" sx={{ mt: 0.5 }}><b>{r.entity === 'balance_adjustment' ? 'Reason' : (r.entity === 'day_close' ? 'Why reopened' : 'Why deleted')}:</b> {r.note}</Typography>}
                                     </TableCell>
                                 </TableRow>
                             ))}
