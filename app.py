@@ -2799,6 +2799,54 @@ def _log_balance_changes(session, flush_context, instances):
 
 
 _BALANCE_HOLDERS = (Customer, Reseller, Supplier, Employee, UpstreamProvider)
+# balance holder -> its party type in the books (ledger.PARTY_ACCOUNT)
+_LEDGER_PARTY_TYPES = {Customer: 'customer', Reseller: 'reseller', Supplier: 'supplier',
+                       Employee: 'employee', UpstreamProvider: 'upstream'}
+
+
+def _is_sql_expression(v):
+    return hasattr(v, '__clause_element__') or hasattr(v, '_is_clause_element')
+
+
+@_sa_event.listens_for(db.session, "before_flush")
+def _capture_balance_deltas(session, flush_context, instances):
+    """Books safety net, part 1: add up each party's stored-balance change in
+    this transaction (session.info['ledger_party_delta'], stored-balance
+    units), for tenants whose books have started. Registered before
+    _balance_changes_as_increments, which turns the plain values this reads
+    into SQL expressions. New parties are counted after their flush
+    (_capture_new_party_balances), once they have an id."""
+    for obj in list(session.dirty):
+        party_type = _LEDGER_PARTY_TYPES.get(type(obj))
+        if party_type is None:
+            continue
+        try:
+            state = db.inspect(obj)
+            hist = state.attrs.balance.history
+            if not hist.has_changes() or not hist.added:
+                continue
+            new = hist.added[0]
+            if new is None or _is_sql_expression(new):
+                continue
+            pk = state.identity[0] if state.identity else None
+            if pk is None:
+                continue
+            with session.no_autoflush:
+                tid = obj.tenant_id
+                if tid is None or not _books_started(tid):
+                    continue
+                if hist.deleted:
+                    old = hist.deleted[0]
+                else:  # overwritten without being read: the row still has the old value
+                    old = session.execute(db.select(type(obj).balance).where(type(obj).id == pk)).scalar()
+            delta = float(new) - float(old or 0)
+            if abs(delta) < 1e-9:
+                continue
+            deltas = session.info.setdefault('ledger_party_delta', {})
+            key = (tid, party_type, pk)
+            deltas[key] = round(deltas.get(key, 0.0) + delta, 4)
+        except Exception:
+            logging.exception("books: could not read a %s balance change", type(obj).__name__)
 
 
 @_sa_event.listens_for(db.session, "before_flush")
@@ -2987,7 +3035,11 @@ _LEDGER_MODELS = {
 }
 # Per-transaction caches in session.info; dropped on commit / rollback.
 _LEDGER_CACHE_KEYS = ('ledger_started', 'ledger_ctx', 'ledger_accounts', 'ledger_entries',
-                      'ledger_party_posted', 'ledger_savepoints')
+                      'ledger_party_posted', 'ledger_savepoints', 'ledger_party_delta',
+                      'ledger_party_explained', 'ledger_deleting_customers')
+# Per-transaction state a rolled-back savepoint must put back as it was.
+_LEDGER_SAVEPOINT_KEYS = ('ledger_party_posted', 'ledger_party_delta',
+                          'ledger_party_explained', 'ledger_deleting_customers')
 _LEDGER_EPS = 0.00005
 
 
@@ -3345,6 +3397,11 @@ def _post_ledger_work(work, todo, problems):
         if change == 'dirty' and not any(state.attrs[a.key].history.has_changes()
                                          for a in state.mapper.column_attrs):
             continue
+        if (change == 'deleted' and kind == 'payment' and state.dict.get('customer_id')
+                in session.info.get('ledger_deleting_customers', ())):
+            # Cascade of a customer delete: the money stays in the books;
+            # _ledger_write_off_customer moves the leftover balance instead.
+            continue
         todo.append((obj, kind, change, tid, oid))
     if not todo:
         if problems:
@@ -3415,6 +3472,11 @@ def _post_ledger_work(work, todo, problems):
 @_sa_event.listens_for(db.session, "after_commit")
 @_sa_event.listens_for(db.session, "after_rollback")
 def _drop_ledger_caches(session):
+    if session.in_nested_transaction():
+        # These events fire for savepoints too. A released savepoint keeps its
+        # rows, so every cache is still right; a rolled-back one is handled
+        # by _drop_ledger_caches_after_savepoint.
+        return
     for key in _LEDGER_CACHE_KEYS:
         session.info.pop(key, None)
 
@@ -3426,20 +3488,163 @@ def _drop_ledger_caches_after_savepoint(session, previous_transaction):
     if previous_transaction.nested:
         session.info.pop('ledger_accounts', None)
         session.info.pop('ledger_entries', None)
-        # Its party totals went with its lines (task 4's safety net reads
-        # these): back to what they were when the savepoint began.
-        saved = session.info.get('ledger_savepoints', {}).pop(id(previous_transaction), None)
-        if saved is None:
-            session.info.pop('ledger_party_posted', None)
-        else:
-            session.info['ledger_party_posted'] = saved
+        # Its party totals and balance changes went with it: back to what
+        # they were when the savepoint began.
+        saved = session.info.get('ledger_savepoints', {}).pop(id(previous_transaction), None) or {}
+        for key in _LEDGER_SAVEPOINT_KEYS:
+            if saved.get(key):
+                session.info[key] = saved[key]
+            else:
+                session.info.pop(key, None)
 
 
 @_sa_event.listens_for(db.session, "after_transaction_create")
 def _ledger_savepoint_snapshot(session, transaction):
     if transaction.nested:
-        session.info.setdefault('ledger_savepoints', {})[id(transaction)] = dict(
-            session.info.get('ledger_party_posted', {}))
+        session.info.setdefault('ledger_savepoints', {})[id(transaction)] = {
+            key: type(session.info[key])(session.info[key])
+            for key in _LEDGER_SAVEPOINT_KEYS if session.info.get(key)}
+
+
+@_sa_event.listens_for(db.session, "after_flush")
+def _capture_new_party_balances(session, flush_context):
+    """Safety net, part 1 for parties created in this flush: their whole
+    starting balance is a change (now that they have an id)."""
+    for obj in session.new:
+        party_type = _LEDGER_PARTY_TYPES.get(type(obj))
+        if party_type is None:
+            continue
+        try:
+            state = db.inspect(obj)
+            value = state.dict.get('balance')
+            tid = state.dict.get('tenant_id')
+            pk = state.identity[0] if state.identity else state.dict.get('id')
+            if value is None or _is_sql_expression(value) or tid is None or pk is None:
+                continue
+            if abs(float(value)) < 1e-9 or not _books_started(tid):
+                continue
+            deltas = session.info.setdefault('ledger_party_delta', {})
+            key = (tid, party_type, pk)
+            deltas[key] = round(deltas.get(key, 0.0) + float(value), 4)
+        except Exception:
+            logging.exception("books: could not read a new %s balance", type(obj).__name__)
+
+
+def _ledger_problem(tenant_id, source_type, source_id, error):
+    """Best effort: record a books failure without breaking the caller."""
+    try:
+        db.session.execute(LedgerProblem.__table__.insert(), [{
+            'tenant_id': tenant_id, 'source_type': source_type[:30], 'source_id': source_id,
+            'error': str(error)[:2000], 'created_at': datetime.utcnow()}])
+    except Exception:
+        logging.exception("books: could not record a problem")
+
+
+def _ledger_note_manual(obj, party_type, delta_balance, memo):
+    """Post a stored-balance change that has no record behind it (a hand-typed
+    balance, an opening balance, restored credit) as a `correction` against
+    Balance corrections, dated today. Its party total lands in
+    ledger_party_posted, so the safety net sees the change as explained.
+    Never raises: a failure is logged and kept as a LedgerProblem (and the
+    safety net then posts the change as unexplained)."""
+    tid = None
+    try:
+        if getattr(obj, 'id', None) is None:
+            db.session.flush()  # a new party: needs its id and tenant
+        tid = obj.tenant_id
+        if tid is None or not _books_started(tid):
+            return
+        _, today = _ledger_context(tid)
+        lines = _books.balance_delta_to_lines(party_type, obj.id, delta_balance, today)
+        if lines:
+            _post_lines(tid, lines, 'correction', memo)
+    except Exception as e:
+        logging.exception("books: could not post a %s balance change", party_type)
+        if tid is not None:
+            _ledger_problem(tid, f'balance_{party_type}', getattr(obj, 'id', None),
+                            f"{type(e).__name__}: {e}")
+
+
+def _ledger_write_off_customer(customer):
+    """Customer delete: move the customer's books balance (what they still
+    owed, or their credit) to Balance corrections in one entry. Their bills,
+    receipts and refunds stay posted (_post_ledger skips the cascade)."""
+    tid = customer.tenant_id
+    try:
+        if tid is None or not _books_started(tid):
+            return
+        db.session.flush()  # anything still pending for this customer posts first
+        key = (tid, 'customer', customer.id)
+        with db.session.no_autoflush:
+            total = db.session.execute(
+                db.select(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0))
+                .where(JournalLine.tenant_id == tid, JournalLine.party_type == 'customer',
+                       JournalLine.party_id == customer.id)).scalar()
+        balance = _books.party_balance_from_books('customer', float(total or 0))
+        _, today = _ledger_context(tid)
+        lines = _books.balance_delta_to_lines('customer', customer.id, -balance, today)
+        if lines:
+            _post_lines(tid, lines, 'correction', f"Customer deleted: {customer.name}")
+        # The stored balance leaves with the row; nothing left to explain.
+        db.session.info.setdefault('ledger_party_explained', set()).add(key)
+    except Exception as e:
+        logging.exception("books: could not write off deleted customer %s", customer.id)
+        if tid is not None:
+            _ledger_problem(tid, 'customer_delete', customer.id, f"{type(e).__name__}: {e}")
+
+
+@_sa_event.listens_for(db.session, "before_commit")
+def _ledger_safety_net(session):
+    """Safety net, part 2: within the transaction now committing, any stored
+    balance change the posted party lines do not account for is posted to
+    Balance corrections as an `unexplained` entry, so the books always agree
+    with the stored balances and an unmapped path shows on the Books check.
+    Never raises into the commit (the flush below is the commit's own)."""
+    if session.in_nested_transaction():
+        return  # a savepoint release; the outer commit checks the whole transaction
+    if (not session.info.get('ledger_party_delta') and not session.info.get('ledger_party_posted')
+            and not (session.new or session.dirty or session.deleted)):
+        return
+    # before_commit runs before the commit's final flush: flush now so every
+    # change and its lines are counted.
+    session.flush()
+    deltas = session.info.pop('ledger_party_delta', None) or {}
+    posted = session.info.pop('ledger_party_posted', None) or {}
+    explained = session.info.pop('ledger_party_explained', None) or set()
+    try:
+        by_tenant = {}
+        for key in set(deltas) | set(posted):
+            if key in explained:
+                continue
+            tid, party_type, party_id = key
+            unexplained = round(deltas.get(key, 0.0)
+                                - _books.party_balance_from_books(party_type, posted.get(key, 0.0)), 4)
+            if abs(unexplained) >= 0.005:
+                by_tenant.setdefault(tid, []).append((party_type, party_id, unexplained))
+        if not by_tenant:
+            return
+        where = (request.endpoint if has_request_context() else None) or 'background'
+        memo = f"Unexplained balance change ({where})"
+        who = _ledger_who()
+        for tid, found in by_tenant.items():
+            try:
+                _, today = _ledger_context(tid)
+                items = [(memo, None, _books.balance_delta_to_lines(pt, pid, amount, today))
+                         for pt, pid, amount in sorted(found)]
+                _post_line_groups(tid, 'unexplained', items, who=who)
+                logging.warning("books: tenant %s, unexplained balance change(s) %s at %s",
+                                tid, found, where)
+            except Exception as e:
+                logging.exception("books: could not post unexplained balance changes for tenant %s", tid)
+                for pt, pid, amount in found:
+                    _ledger_problem(tid, f'balance_{pt}', pid,
+                                    f"unexplained {amount:+.4f} not posted: {type(e).__name__}: {e}")
+    except Exception:
+        logging.exception("books: safety net failed")
+    finally:
+        # Posting above refills these; this transaction is done with them.
+        session.info.pop('ledger_party_posted', None)
+        session.info.pop('ledger_party_delta', None)
 
 
 def _maybe_create_customer_payment_link(payment, customer):
@@ -3529,6 +3734,7 @@ def _adjust_balance(obj, party_type, raw_new, data):
         raise BalanceReasonRequired()
     _note_balance_reason(obj, f'Adjustment: {reason}')
     obj.balance = new
+    _ledger_note_manual(obj, party_type, new - old, f'Adjustment: {reason}')
     try:
         who = get_jwt_identity()
     except Exception:
@@ -6364,6 +6570,11 @@ def _delete_customer_core(customer):
     # DELETE that the constraint would reject).
     WhatsAppConversation.query.filter_by(customer_id=customer.id).update(
         {'customer_id': None}, synchronize_session=False)
+    # Books: the customer's bills and receipts stay posted (money really
+    # received must not leave the books); their leftover balance is written
+    # off to Balance corrections, and the cascade below is not reversed.
+    _ledger_write_off_customer(customer)
+    db.session.info.setdefault('ledger_deleting_customers', set()).add(customer.id)
     db.session.delete(customer)
 
 
@@ -7826,6 +8037,8 @@ def resolve_credit_review(customer_id):
         if action == 'restore':
             _note_balance_reason(customer, f"Correction: credit lost to auto-settlement restored (${total:.2f})")
             customer.balance = float(customer.balance or 0) + total
+            _ledger_note_manual(customer, 'customer', total,
+                                f"Credit lost to auto-settlement restored (${total:.2f})")
             db.session.flush()
             apply_customer_balance_to_unpaid_payments(customer)
         db.session.commit()
@@ -13703,6 +13916,9 @@ def create_reseller():
             balance=float(data.get('balance', 0.0))
         )
         db.session.add(new_reseller)
+        if new_reseller.balance:
+            _ledger_note_manual(new_reseller, 'reseller', new_reseller.balance,
+                                f"Opening balance: reseller {new_reseller.name}")
         db.session.commit()
         return jsonify({'message': 'Reseller created successfully!', 'reseller': new_reseller.to_dict()}), 201
     except Exception as e:
@@ -13877,6 +14093,9 @@ def create_upstream_provider():
             status=data.get('status', 'active'),
         )
         db.session.add(provider)
+        if provider.balance:
+            _ledger_note_manual(provider, 'upstream', provider.balance,
+                                f"Opening balance: upstream provider {provider.name}")
         db.session.commit()
         return jsonify({'message': 'Upstream provider created successfully!', 'provider': provider.to_dict()}), 201
     except Exception as e:

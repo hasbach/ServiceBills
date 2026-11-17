@@ -406,8 +406,11 @@ def test_posting_error_does_not_block_payment(app, client, monkeypatch):
         problem = LedgerProblem.query.filter_by(tenant_id=tid).one()
         assert problem.source_type == "payment" and problem.source_id == pid
         assert "mapping bug" in problem.error
-        assert JournalLine.query.filter_by(tenant_id=tid).count() == 0
+        assert JournalLine.query.filter_by(tenant_id=tid, source_type="payment").count() == 0
+        # The gap shows: the safety net (task 4) posts the balance change unexplained.
+        assert [e.kind for e in JournalEntry.query.filter_by(tenant_id=tid)] == ["unexplained"]
     assert _stored_balance(Customer, cid) == -25
+    _assert_customer_matches(tid, cid)
 
 
 def test_pre_books_bill_paid_later_posts_only_the_receipt(app, client):
