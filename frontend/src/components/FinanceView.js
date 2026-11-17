@@ -7,6 +7,7 @@ import SuppliersView from './SuppliersView.js';
 import ResellerManagementView from './ResellerManagementView.js';
 import ExpensesView from './ExpensesView.js';
 import AuditLogView from './AuditLogView.js';
+import BooksView from './BooksView.js';
 
 export const FINANCE_TABS = [
   { key: 'cash-flow', label: 'Cash Flow', roles: ['admin', 'finance'], render: () => <CashFlowRegister /> },
@@ -15,6 +16,7 @@ export const FINANCE_TABS = [
   { key: 'resellers', label: 'Resellers', roles: ['admin', 'finance'], render: () => <ResellerManagementView /> },
   { key: 'expenses', label: 'Expenses', roles: ['admin'], render: () => <ExpensesView /> },
   { key: 'history', label: 'History', roles: ['admin'], render: () => <AuditLogView /> },
+  { key: 'books', label: 'Books', roles: ['admin'], render: () => <BooksView /> },
 ];
 
 function FinanceView({ initialTab }) {

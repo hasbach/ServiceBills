@@ -171,6 +171,9 @@ const rawApiService = {
     deleteResellerEntry: (id, entryId, reason) => api.delete(`/resellers/${id}/entries/${entryId}`, { data: { reason } }),
     getResellerBalanceLog: (id) => api.get(`/resellers/${id}/balance-log`),
     getAuditLog: (params) => api.get('/audit-log', { params }),
+    fetchBooksAccounts: (asOf) => api.get('/books/accounts', { params: asOf ? { as_of: asOf } : {} }),
+    fetchBooksJournal: (params) => api.get('/books/journal', { params }),
+    fetchBooksCheck: () => api.get('/books/check'),
 
     // Upstream Provider API methods (Concept A -- bridged RADIUS subresellers;
     // see docs/superpowers/specs/2026-08-12-network-enforcement-design.md)

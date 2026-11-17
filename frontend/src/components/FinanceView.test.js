@@ -12,14 +12,15 @@ jest.mock('./EmployeesView.js', () => () => <div>EmployeesView-mock</div>);
 jest.mock('./SuppliersView.js', () => () => <div>SuppliersView-mock</div>);
 jest.mock('./ResellerManagementView.js', () => () => <div>ResellerManagementView-mock</div>);
 jest.mock('./ExpensesView.js', () => () => <div>ExpensesView-mock</div>);
+jest.mock('./BooksView.js', () => () => <div>BooksView-mock</div>);
 
 const tabNames = () => screen.getAllByRole('tab').map((t) => t.textContent);
 
 describe('FinanceView', () => {
-    it('shows all six tabs to admin', () => {
+    it('shows all seven tabs to admin', () => {
         mockRole = 'admin';
         render(<FinanceView />);
-        expect(tabNames()).toEqual(['Cash Flow', 'Payroll', 'Suppliers', 'Resellers', 'Expenses', 'History']);
+        expect(tabNames()).toEqual(['Cash Flow', 'Payroll', 'Suppliers', 'Resellers', 'Expenses', 'History', 'Books']);
         expect(screen.getByText('CashFlowRegister-mock')).toBeInTheDocument();
     });
 
