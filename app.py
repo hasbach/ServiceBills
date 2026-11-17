@@ -5985,9 +5985,321 @@ def start_books_route():
     return jsonify(_ledger_state_json(state)), 200
 
 
+# Cash-basis profit (spec "What 'the books and the reports agree' means"):
+# which side of a money line's entry an account is on. Income side: the
+# customer / reseller control accounts plus the accounts a bill or discount
+# pairs them with, so a bill booked in the same entry as its receipt nets to
+# nothing inside the side (the posting rule nets per account, so the receipt's
+# counter-line may already have been merged into the bill's). Cost side
+# likewise: a payable and the expense it pays for. Everything else (Cash /
+# Whish transfers, money_in, opening, over_short, corrections) is neither.
+_BOOKS_INCOME_SIDE = frozenset(('customers', 'resellers', 'income_subscriptions', 'income_resellers',
+                                'discounts'))
+_BOOKS_COST_SIDE = frozenset(('upstream', 'suppliers', 'salaries'))
+
+
+def _books_profit_side(key):
+    if key in _BOOKS_INCOME_SIDE:
+        return 'income'
+    if key in _BOOKS_COST_SIDE or key.startswith('expense:') or key.startswith('cost_'):
+        return 'cost'
+    return None
+
+
+def _month_bounds(month):
+    """('YYYY-MM') -> (first day, last day)."""
+    first = datetime.strptime(month, '%Y-%m').date()
+    nxt = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return first, nxt - timedelta(days=1)
+
+
+def _books_cash_basis_profit(tenant_id, month, from_day=None):
+    """Cash-basis profit of `month` ('YYYY-MM') worked out from the books:
+    for every Cash / Whish line in the month (from `from_day` on, when given)
+    follow its entry's other lines -- per record, i.e. per (entry, source) --
+    and count money against the income side as income, against the cost side
+    as cost; transfers, money_in, opening and over_short are neither. Opening
+    entries are skipped. Returns income - cost. Reads only."""
+    first, last = _month_bounds(month)
+    if from_day is not None and from_day > first:
+        first = from_day
+    if first > last:
+        return 0.0
+    keys = dict(db.session.execute(db.select(LedgerAccount.id, LedgerAccount.key)
+                                   .where(LedgerAccount.tenant_id == tenant_id)).all())
+    money_ids = [aid for aid, key in keys.items() if key in ('cash', 'whish')]
+    if not money_ids:
+        return 0.0
+    with_money = (db.select(JournalLine.entry_id).distinct()
+                  .where(JournalLine.tenant_id == tenant_id, JournalLine.account_id.in_(money_ids),
+                         JournalLine.entry_date >= first, JournalLine.entry_date <= last))
+    rows = db.session.execute(
+        db.select(JournalLine.entry_id, JournalLine.source_type, JournalLine.source_id, JournalLine.account_id,
+                  func.sum(JournalLine.debit - JournalLine.credit))
+        .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
+        .where(JournalLine.tenant_id == tenant_id, JournalEntry.kind != 'opening',
+               JournalLine.entry_id.in_(with_money))
+        .group_by(JournalLine.entry_id, JournalLine.source_type, JournalLine.source_id,
+                  JournalLine.account_id)).all()
+    groups = {}
+    for entry_id, stype, sid, account_id, net in rows:
+        g = groups.setdefault((entry_id, stype, sid), {'money': 0.0, 'income': 0.0, 'cost': 0.0})
+        key = keys.get(account_id, '')
+        side = 'money' if key in ('cash', 'whish') else _books_profit_side(key)
+        if side:
+            g[side] += float(net or 0)
+    profit = 0.0
+    for g in groups.values():
+        if abs(g['money']) >= _LEDGER_EPS:
+            # Money in against the income side credits it (-), money out to
+            # the cost side debits it (+): profit = -(income + cost).
+            profit -= g['income'] + g['cost']
+    return round(profit, 4)
+
+
+def _books_utc_stamp(dt):
+    return dt.strftime('%Y-%m-%dT%H:%M:%SZ') if dt else None
+
+
 def run_books_check(tenant_id):
-    """The nightly books check (spec "Nightly check"). Stub until task 6."""
-    return {}
+    """The nightly books check (spec "Nightly check" and "What 'the books
+    and the reports agree' means"). Compares the books with the stored party
+    balances, the Cash Flow page's closing Cash / Whish for today and the
+    Finance page's monthly profit; stores the result as JSON in
+    LedgerState.last_check (keeping start_books' cash_opening_unknown flag)
+    and returns it. Writes nothing else: no journal line, no balance, no
+    estimate. A tenant whose books have not started gets {}.
+
+    Profit months run from start_day's month to the current month. The first
+    month is compared from the day AFTER start_day on both sides: records
+    from earlier on start_day are inside the opening entry (not posted), so
+    the books cannot cover start_day the way the report does."""
+    session = db.session
+    with session.no_autoflush:
+        state = session.get(LedgerState, tenant_id)
+        if state is None:
+            return {}
+        settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).order_by(BusinessSettings.id).first()
+        today = _ledger_start_day(settings)
+        accounts = dict(session.execute(db.select(LedgerAccount.key, LedgerAccount.id)
+                                        .where(LedgerAccount.tenant_id == tenant_id)).all())
+
+        unbalanced = [eid for (eid,) in session.execute(
+            db.select(JournalLine.entry_id).where(JournalLine.tenant_id == tenant_id)
+            .group_by(JournalLine.entry_id)
+            .having(func.abs(func.sum(JournalLine.debit - JournalLine.credit)) >= 0.005)
+            .order_by(JournalLine.entry_id)).all()]
+
+        books_party = {(pt, pid): float(total or 0) for pt, pid, total in session.execute(
+            db.select(JournalLine.party_type, JournalLine.party_id,
+                      func.sum(JournalLine.debit - JournalLine.credit))
+            .where(JournalLine.tenant_id == tenant_id, JournalLine.party_type.isnot(None))
+            .group_by(JournalLine.party_type, JournalLine.party_id)).all()}
+        mismatches = []
+        for model, party_type in _LEDGER_PARTY_TYPES.items():
+            seen = set()
+            for pid, name, balance in session.execute(
+                    db.select(model.id, model.name, model.balance)
+                    .where(model.tenant_id == tenant_id).order_by(model.id)).all():
+                seen.add(pid)
+                stored = round(float(balance or 0), 2)
+                books = round(_books.party_balance_from_books(party_type, books_party.get((party_type, pid), 0.0)), 2)
+                if abs(stored - books) >= 0.005:
+                    mismatches.append({'party_type': party_type, 'party_id': pid, 'name': name,
+                                       'stored': stored, 'books': books})
+            # Lines for a party whose row is gone (a deleted customer's are
+            # moved to Balance corrections, so these should net to 0).
+            for (pt, pid), total in sorted(books_party.items(), key=lambda kv: kv[0][1] or 0):
+                if pt != party_type or pid in seen:
+                    continue
+                books = round(_books.party_balance_from_books(party_type, total), 2)
+                if abs(books) >= 0.005:
+                    mismatches.append({'party_type': party_type, 'party_id': pid, 'name': None,
+                                       'stored': 0.0, 'books': books})
+
+        def books_money(key):
+            if key not in accounts:
+                return 0.0
+            total = session.execute(db.select(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0))
+                                    .where(JournalLine.tenant_id == tenant_id,
+                                           JournalLine.account_id == accounts[key],
+                                           JournalLine.entry_date <= today)).scalar()
+            return round(float(total or 0), 2)
+
+        with _acting_as_tenant(tenant_id):
+            flow = _cash_flow_for_day(today, settings)
+            first_day = state.start_day + timedelta(days=1)
+            _, last_day = _month_bounds(today.strftime('%Y-%m'))
+            reports = _financial_report_months(first_day, last_day) if first_day <= last_day else {}
+
+        def flow_end(key):
+            value = flow.get(key)
+            return None if value is None else round(float(value), 2)
+
+        months = []
+        month = state.start_day.strftime('%Y-%m')
+        while month <= today.strftime('%Y-%m'):
+            m_first, m_last = _month_bounds(month)
+            if first_day <= m_last:
+                frm = max(m_first, first_day)
+                months.append({
+                    'month': month,
+                    'from': frm.isoformat(),
+                    'partial': frm > m_first,
+                    'books_cash_basis': round(_books_cash_basis_profit(tenant_id, month, frm), 2),
+                    'reports': round(float((reports.get(month) or {}).get('profit') or 0), 2),
+                })
+            month = (m_last + timedelta(days=1)).strftime('%Y-%m')
+
+        result = {
+            'checked_at': _books_utc_stamp(datetime.utcnow()),
+            'unbalanced_entries': unbalanced,
+            'party_mismatches': mismatches,
+            'cash': {'books': books_money('cash'), 'cash_flow': flow_end('cash_end')},
+            'whish': {'books': books_money('whish'), 'cash_flow': flow_end('whish_end')},
+            'unexplained_count': session.execute(db.select(func.count(JournalEntry.id)).where(
+                JournalEntry.tenant_id == tenant_id, JournalEntry.kind == 'unexplained')).scalar() or 0,
+            'problem_count': session.execute(db.select(func.count(LedgerProblem.id)).where(
+                LedgerProblem.tenant_id == tenant_id)).scalar() or 0,
+            'profit_by_month': months,
+        }
+    try:
+        previous = json.loads(state.last_check) if state.last_check else {}
+    except ValueError:
+        previous = {}
+    stored = dict(result)
+    if isinstance(previous, dict) and 'cash_opening_unknown' in previous:
+        stored['cash_opening_unknown'] = previous['cash_opening_unknown']
+    state.last_check = json.dumps(stored)
+    state.last_check_at = datetime.utcnow()
+    session.flush()
+    return result
+
+
+def _books_day_arg(name):
+    raw = request.args.get(name)
+    if not raw:
+        return None
+    return datetime.strptime(raw, '%Y-%m-%d').date()  # ValueError -> 400 by the caller
+
+
+@app.route('/api/books/accounts', methods=['GET'])
+@jwt_required()
+@admin_required()
+def books_accounts():
+    """Trial balance as of a day (default today): every account with its
+    debit and credit totals over lines dated on or before it, and balance on
+    its natural side (asset / expense: debit - credit; else credit - debit)."""
+    tenant_id = current_tenant_id()
+    try:
+        as_of = _books_day_arg('as_of') or _tenant_today()
+    except ValueError:
+        return jsonify({'error': 'Use as_of as YYYY-MM-DD.'}), 400
+    sums = {aid: (float(dr or 0), float(cr or 0)) for aid, dr, cr in db.session.execute(
+        db.select(JournalLine.account_id, func.sum(JournalLine.debit), func.sum(JournalLine.credit))
+        .where(JournalLine.tenant_id == tenant_id, JournalLine.entry_date <= as_of)
+        .group_by(JournalLine.account_id)).all()}
+    out, total_dr, total_cr = [], 0.0, 0.0
+    for acc in LedgerAccount.query.filter_by(tenant_id=tenant_id).order_by(LedgerAccount.number, LedgerAccount.id):
+        dr, cr = sums.get(acc.id, (0.0, 0.0))
+        dr, cr = round(dr, 4), round(cr, 4)
+        total_dr += dr
+        total_cr += cr
+        balance = dr - cr if acc.type in ('asset', 'expense') else cr - dr
+        out.append({'key': acc.key, 'number': acc.number, 'name': acc.name, 'type': acc.type,
+                    'debit': dr, 'credit': cr, 'balance': round(balance, 4)})
+    return jsonify({'as_of': as_of.isoformat(), 'accounts': out,
+                    'totals': {'debit': round(total_dr, 4), 'credit': round(total_cr, 4)}}), 200
+
+
+@app.route('/api/books/journal', methods=['GET'])
+@jwt_required()
+@admin_required()
+def books_journal():
+    """Journal entries, newest first, each with all its lines. Filters:
+    start_date / end_date (entry date, inclusive), account (key), party_type
+    + party_id (entries with at least one matching line). Paged."""
+    tenant_id = current_tenant_id()
+    try:
+        start = _books_day_arg('start_date')
+        end = _books_day_arg('end_date')
+        page = max(int(request.args.get('page') or 1), 1)
+        per_page = min(max(int(request.args.get('per_page') or 50), 1), 200)
+        party_id = request.args.get('party_id')
+        party_id = int(party_id) if party_id not in (None, '') else None
+    except ValueError:
+        return jsonify({'error': 'Bad filter: dates are YYYY-MM-DD, page / per_page / party_id are numbers.'}), 400
+    account = request.args.get('account')
+    party_type = request.args.get('party_type')
+
+    q = db.select(JournalEntry).where(JournalEntry.tenant_id == tenant_id)
+    if start:
+        q = q.where(JournalEntry.entry_date >= start)
+    if end:
+        q = q.where(JournalEntry.entry_date <= end)
+    if account or party_type or party_id is not None:
+        lines = db.select(JournalLine.entry_id).where(JournalLine.tenant_id == tenant_id)
+        if account:
+            account_id = db.session.execute(db.select(LedgerAccount.id).where(
+                LedgerAccount.tenant_id == tenant_id, LedgerAccount.key == account)).scalar()
+            if account_id is None:
+                return jsonify({'items': [], 'total': 0}), 200
+            lines = lines.where(JournalLine.account_id == account_id)
+        if party_type:
+            lines = lines.where(JournalLine.party_type == party_type)
+        if party_id is not None:
+            lines = lines.where(JournalLine.party_id == party_id)
+        q = q.where(JournalEntry.id.in_(lines))
+    total = db.session.execute(db.select(func.count()).select_from(q.subquery())).scalar() or 0
+    entries = db.session.execute(q.order_by(JournalEntry.entry_date.desc(), JournalEntry.id.desc())
+                                 .offset((page - 1) * per_page).limit(per_page)).scalars().all()
+
+    ids = [e.id for e in entries]
+    by_entry = {eid: [] for eid in ids}
+    party_ids = {}
+    if ids:
+        for line, key in db.session.execute(
+                db.select(JournalLine, LedgerAccount.key)
+                .join(LedgerAccount, LedgerAccount.id == JournalLine.account_id)
+                .where(JournalLine.tenant_id == tenant_id, JournalLine.entry_id.in_(ids))
+                .order_by(JournalLine.id)).all():
+            by_entry[line.entry_id].append((line, key))
+            if line.party_type and line.party_id is not None:
+                party_ids.setdefault(line.party_type, set()).add(line.party_id)
+    # One query per party type for the whole page.
+    models = {pt: model for model, pt in _LEDGER_PARTY_TYPES.items()}
+    names = {}
+    for pt, pids in party_ids.items():
+        model = models.get(pt)
+        if model is None:
+            continue
+        for pid, name in db.session.execute(db.select(model.id, model.name).where(
+                model.tenant_id == tenant_id, model.id.in_(pids))).all():
+            names[(pt, pid)] = name
+
+    items = [{
+        'id': e.id, 'date': e.entry_date.isoformat(), 'kind': e.kind, 'memo': e.memo,
+        'created_by': e.created_by,
+        'lines': [{'account': key, 'party_type': l.party_type, 'party_id': l.party_id,
+                   'party_name': names.get((l.party_type, l.party_id)),
+                   'debit': round(float(l.debit or 0), 4), 'credit': round(float(l.credit or 0), 4),
+                   'source_type': l.source_type, 'source_id': l.source_id}
+                  for l, key in by_entry[e.id]],
+    } for e in entries]
+    return jsonify({'items': items, 'total': total}), 200
+
+
+@app.route('/api/books/check', methods=['GET'])
+@jwt_required()
+@admin_required()
+def books_check():
+    """When the books started and the last nightly check's result."""
+    state = db.session.get(LedgerState, current_tenant_id())
+    if state is None:
+        return jsonify({'started_at': None, 'start_day': None, 'last_check': None}), 200
+    full = _ledger_state_json(state)
+    return jsonify({'started_at': full['started_at'], 'start_day': full['start_day'],
+                    'last_check': full['last_check']}), 200
 
 
 def ledger_nightly():
@@ -13818,6 +14130,120 @@ def get_reconciliation_report():
     }), 200
 
 
+def _financial_report_months(start_day, end_day):
+    """{'YYYY-MM': {...}} -- the Finance page's cash-basis monthly income,
+    expenses and profit (with the per-source split) for the current tenant,
+    between two business-local days inclusive. Shared by the
+    /api/reports/financial route and the books check (run_books_check), so
+    the check compares against exactly the figure the page shows. Reads only.
+    """
+    start_date = datetime.combine(start_day, datetime.min.time())
+    end_date = datetime.combine(end_day, datetime.min.time()).replace(hour=23, minute=59, second=59)
+
+    # 1. Income: the one shared definition (see _customer_income_by_month).
+    income_query = [SimpleNamespace(month=month, total=total)
+                    for month, total in _customer_income_by_month(start_day, end_day).items()]
+
+    # 2. Expenses (direct non-credit, not a payroll payment). employee_id
+    # being set is what identifies a payroll expense -- not the category
+    # name -- so this keeps working even if "Payroll" gets renamed.
+    expense_query = db.session.query(
+        month_key(Expense.date).label('month'),
+        func.sum(Expense.amount).label('total')
+    ).filter(
+        Expense.tenant_id == current_tenant_id(),
+        Expense.is_credit == False,
+        Expense.employee_id.is_(None),
+        Expense.date >= start_date,
+        Expense.date <= end_date
+    ).group_by('month').all()
+
+    # 2b. Payroll payments recorded as Expense rows (see record_employee_payment)
+    payroll_expense_query = db.session.query(
+        month_key(Expense.date).label('month'),
+        func.sum(Expense.amount).label('total')
+    ).filter(
+        Expense.tenant_id == current_tenant_id(),
+        Expense.is_credit == False,
+        Expense.employee_id.isnot(None),
+        Expense.date >= start_date,
+        Expense.date <= end_date
+    ).group_by('month').all()
+
+    # 3. Supplier cash payments
+    sp_query = db.session.query(
+        month_key(SupplierPayment.payment_date).label('month'),
+        func.sum(SupplierPayment.amount).label('total')
+    ).filter(
+        SupplierPayment.tenant_id == current_tenant_id(),
+        SupplierPayment.payment_date >= start_date,
+        SupplierPayment.payment_date <= end_date
+    ).group_by('month').all()
+
+    # 4. Legacy salary payments predating Expense-based payroll -- still
+    # counted so historical months don't lose their payroll expense.
+    sal_query = db.session.query(
+        month_key(SalaryPayment.payment_date).label('month'),
+        func.sum(SalaryPayment.amount).label('total')
+    ).filter(
+        SalaryPayment.tenant_id == current_tenant_id(),
+        SalaryPayment.payment_date >= start_date,
+        SalaryPayment.payment_date <= end_date
+    ).group_by('month').all()
+
+    # 4b. Reseller collections (income) and upstream top-ups (cost).
+    reseller_income = _reseller_income_by_month(start_day, end_day)
+    upstream_cost = _upstream_cost_by_month(start_day, end_day)
+
+    # Combine results
+    months_set = set(
+        [row.month for row in income_query] + [row.month for row in expense_query]
+        + [row.month for row in payroll_expense_query]
+        + [row.month for row in sp_query] + [row.month for row in sal_query]
+        + list(reseller_income.keys()) + list(upstream_cost.keys())
+    )
+
+    monthly_data_dict = {m: {
+        'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0,
+        # Same total as `expenses`, split by source -- previously computed
+        # here and immediately discarded once summed together.
+        'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0,
+        'expenses_upstream': 0.0, 'income_customers': 0.0, 'income_resellers': 0.0
+    } for m in months_set}
+
+    for m, total in reseller_income.items():
+        monthly_data_dict[m]['income'] += total
+        monthly_data_dict[m]['income_resellers'] += total
+
+    for m, total in upstream_cost.items():
+        monthly_data_dict[m]['expenses'] += total
+        monthly_data_dict[m]['expenses_upstream'] += total
+
+    for row in income_query:
+        monthly_data_dict[row.month]['income'] += float(row.total or 0)
+        monthly_data_dict[row.month]['income_customers'] += float(row.total or 0)
+
+    for row in expense_query:
+        monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+        monthly_data_dict[row.month]['expenses_manual'] += float(row.total or 0)
+
+    for row in sp_query:
+        monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+        monthly_data_dict[row.month]['expenses_supplier'] += float(row.total or 0)
+
+    for row in payroll_expense_query:
+        monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+        monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
+
+    for row in sal_query:
+        monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+        monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
+
+    for data in monthly_data_dict.values():
+        data['profit'] = data['income'] - data['expenses']
+    return monthly_data_dict
+
+
 @app.route('/api/reports/financial', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
@@ -13839,56 +14265,8 @@ def get_financial_report():
         start_date = datetime.combine(start_day, datetime.min.time())
         end_date = datetime.combine(end_day, datetime.min.time()).replace(hour=23, minute=59, second=59)
 
-        # 1. Income: the one shared definition (see _customer_income_by_month).
-        income_query = [SimpleNamespace(month=month, total=total)
-                        for month, total in _customer_income_by_month(start_day, end_day).items()]
-
-        # 2. Expenses (direct non-credit, not a payroll payment). employee_id
-        # being set is what identifies a payroll expense -- not the category
-        # name -- so this keeps working even if "Payroll" gets renamed.
-        expense_query = db.session.query(
-            month_key(Expense.date).label('month'),
-            func.sum(Expense.amount).label('total')
-        ).filter(
-            Expense.tenant_id == current_tenant_id(),
-            Expense.is_credit == False,
-            Expense.employee_id.is_(None),
-            Expense.date >= start_date,
-            Expense.date <= end_date
-        ).group_by('month').all()
-
-        # 2b. Payroll payments recorded as Expense rows (see record_employee_payment)
-        payroll_expense_query = db.session.query(
-            month_key(Expense.date).label('month'),
-            func.sum(Expense.amount).label('total')
-        ).filter(
-            Expense.tenant_id == current_tenant_id(),
-            Expense.is_credit == False,
-            Expense.employee_id.isnot(None),
-            Expense.date >= start_date,
-            Expense.date <= end_date
-        ).group_by('month').all()
-
-        # 3. Supplier cash payments
-        sp_query = db.session.query(
-            month_key(SupplierPayment.payment_date).label('month'),
-            func.sum(SupplierPayment.amount).label('total')
-        ).filter(
-            SupplierPayment.tenant_id == current_tenant_id(),
-            SupplierPayment.payment_date >= start_date,
-            SupplierPayment.payment_date <= end_date
-        ).group_by('month').all()
-
-        # 4. Legacy salary payments predating Expense-based payroll -- still
-        # counted so historical months don't lose their payroll expense.
-        sal_query = db.session.query(
-            month_key(SalaryPayment.payment_date).label('month'),
-            func.sum(SalaryPayment.amount).label('total')
-        ).filter(
-            SalaryPayment.tenant_id == current_tenant_id(),
-            SalaryPayment.payment_date >= start_date,
-            SalaryPayment.payment_date <= end_date
-        ).group_by('month').all()
+        # 1-4b. Income, expenses and profit per month: the one shared definition.
+        monthly_data_dict = _financial_report_months(start_day, end_day)
 
         # 5. Logged estimated profit -- lazily backfill the current month if it's
         # in range and hasn't been computed yet (no event/daily-job tick reached
@@ -13902,10 +14280,6 @@ def get_financial_report():
             ).first():
                 recalculate_estimated_profit(current_tenant_id())
 
-        # 4b. Reseller collections (income) and upstream top-ups (cost).
-        reseller_income = _reseller_income_by_month(start_day, end_day)
-        upstream_cost = _upstream_cost_by_month(start_day, end_day)
-
         estimate_query = MonthlyProfitEstimate.query.filter(
             MonthlyProfitEstimate.tenant_id == current_tenant_id(),
             MonthlyProfitEstimate.month >= start_month,
@@ -13914,50 +14288,12 @@ def get_financial_report():
         estimate_data = {e.month: e.estimated_profit for e in estimate_query}
         estimate_payroll_data = {e.month: float(e.estimated_payroll or 0) for e in estimate_query}
 
-        # Combine results
-        months_set = set(
-            [row.month for row in income_query] + [row.month for row in expense_query]
-            + [row.month for row in payroll_expense_query]
-            + [row.month for row in sp_query] + [row.month for row in sal_query]
-            + list(reseller_income.keys()) + list(upstream_cost.keys())
-            + list(estimate_data.keys())
-        )
-
-        monthly_data_dict = {m: {
-            'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0,
-            # Same total as `expenses`, split by source -- previously computed
-            # here and immediately discarded once summed together.
-            'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0,
-            'expenses_upstream': 0.0, 'income_customers': 0.0, 'income_resellers': 0.0
-        } for m in months_set}
-
-        for m, total in reseller_income.items():
-            monthly_data_dict[m]['income'] += total
-            monthly_data_dict[m]['income_resellers'] += total
-
-        for m, total in upstream_cost.items():
-            monthly_data_dict[m]['expenses'] += total
-            monthly_data_dict[m]['expenses_upstream'] += total
-
-        for row in income_query:
-            monthly_data_dict[row.month]['income'] += float(row.total or 0)
-            monthly_data_dict[row.month]['income_customers'] += float(row.total or 0)
-
-        for row in expense_query:
-            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
-            monthly_data_dict[row.month]['expenses_manual'] += float(row.total or 0)
-
-        for row in sp_query:
-            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
-            monthly_data_dict[row.month]['expenses_supplier'] += float(row.total or 0)
-
-        for row in payroll_expense_query:
-            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
-            monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
-
-        for row in sal_query:
-            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
-            monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
+        for m in estimate_data:
+            monthly_data_dict.setdefault(m, {
+                'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0,
+                'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0,
+                'expenses_upstream': 0.0, 'income_customers': 0.0, 'income_resellers': 0.0})
+        months_set = set(monthly_data_dict)
 
         monthly_data = []
         total_income = 0.0
