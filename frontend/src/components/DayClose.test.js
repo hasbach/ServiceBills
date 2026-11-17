@@ -89,14 +89,14 @@ describe('Closed / locked day', () => {
             locked_through: today,
         });
         mockDelete.mockResolvedValue({ data: {} });
-        window.confirm = jest.fn(() => true);
+        window.prompt = jest.fn(() => 'miscounted');
         render(<CashFlowRegister />);
         expect(await screen.findByText(/Day closed by maya/)).toBeInTheDocument();
         expect(screen.getByText(/Changed after close: Cash \+3.00/)).toBeInTheDocument();
         expect(screen.getByText(/short on coins/)).toBeInTheDocument();
         expect(screen.queryByRole('button', { name: 'Close day' })).toBeNull();
         fireEvent.click(screen.getByRole('button', { name: 'Reopen' }));
-        await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('/day-closes/7'));
+        await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('/day-closes/7', { data: { reason: 'miscounted' } }));
     });
 
     it('hides Reopen for non-admins and for a close that is not the latest', async () => {

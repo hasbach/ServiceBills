@@ -15,6 +15,7 @@ import {
     History as HistoryIcon,
     TrendingUp as BonusIcon
 } from '@mui/icons-material';
+import { askDeleteReason } from '../utils/deleteReason.js';
 import { useAppContext } from '../context/AppContext';
 
 const emptyEmployeeForm = { name: '', monthly_salary: '', hire_date: '', active: true, notes: '' };
@@ -164,9 +165,10 @@ function EmployeesView() {
 
     const handleDeleteCharge = async (h) => {
         if (!historyDialog.employee) return;
-        if (!window.confirm(`Delete this ${h.title.toLowerCase()} of $${Math.abs(h.amount).toFixed(2)}? The balance owed is adjusted to match.`)) return;
+        const reason = askDeleteReason(`Delete this ${h.title.toLowerCase()} of $${Math.abs(h.amount).toFixed(2)}? The balance owed is adjusted to match.`);
+        if (!reason) return;
         try {
-            await apiService.deleteEmployeeCharge(historyDialog.employee.id, h.charge_id);
+            await apiService.deleteEmployeeCharge(historyDialog.employee.id, h.charge_id, reason);
             setSnackbar({ open: true, message: 'Entry deleted.', severity: 'success' });
             handleOpenHistory(historyDialog.employee);
             loadEmployees();

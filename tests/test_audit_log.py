@@ -141,3 +141,24 @@ def test_log_is_admin_only_and_tenant_scoped(app, client):
     b = make_tenant(client, "Biz B", "al10")
     assert _log(client, b)["total"] == 0
     assert _log(client, a)["total"] >= 1
+
+
+def test_the_reason_given_for_a_delete_is_kept(app, client):
+    a = make_tenant(client, "B", "al11")
+    eid = _entry(client, a).get_json()["id"]
+    r = client.delete(f"/api/cash-entries/{eid}", headers=a, json={"reason": "  entered twice  "})
+    assert r.status_code == 200
+    gone = _log(client, a, entity="cash_entry", action="delete")["items"][0]
+    assert gone["note"] == "entered twice"
+    assert _log(client, a, entity="cash_entry", action="create")["items"][0]["note"] is None
+
+    cid = _customer(client, a)
+    ids = [_bill(client, a, cid, 25), _bill(client, a, cid, 30)]
+    r = client.post("/api/payments/bulk_delete", headers=a, json={"payment_ids": ids, "reason": "wrong customer"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    notes = [i["note"] for i in _log(client, a, entity="payment", action="delete")["items"]]
+    assert notes[:2] == ["wrong customer", "wrong customer"]
+
+    tid = _transfer(client, a).get_json()["id"]
+    assert client.delete(f"/api/account-transfers/{tid}?reason=typo", headers=a).status_code == 200
+    assert _log(client, a, entity="account_transfer", action="delete")["items"][0]["note"] == "typo"

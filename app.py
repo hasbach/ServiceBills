@@ -1109,6 +1109,8 @@ class AuditLog(db.Model):
     party_id = db.Column(db.Integer, nullable=True)
     amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
     changes = db.Column(db.Text, nullable=False)
+    # Why: the reason the user typed when deleting a record or reopening a day.
+    note = db.Column(db.String(300), nullable=True)
     changed_by = db.Column(db.String(100), nullable=True)  # None = system (scheduler, webhook)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
@@ -1122,6 +1124,7 @@ class AuditLog(db.Model):
             'party_id': self.party_id,
             'amount': float(self.amount) if self.amount is not None else None,
             'changes': json.loads(self.changes or '{}'),
+            'note': self.note,
             'changed_by': self.changed_by,
             # UTC, marked as such so the browser shows local time.
             'date': self.created_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -2769,6 +2772,18 @@ def _audit_row(obj, action):
     }
 
 
+def _audit_delete_reason():
+    """The reason the caller gave for deleting records in this request
+    ('reason' in the JSON body or the query string), if any."""
+    if not has_request_context():
+        return None
+    body = request.get_json(silent=True) if request.is_json else None
+    raw = (body or {}).get('reason') if isinstance(body, dict) else None
+    raw = raw or request.args.get('reason')
+    raw = (str(raw).strip() if raw else '')
+    return raw[:300] or None
+
+
 @_sa_event.listens_for(db.session, "after_flush")
 def _write_audit_log(session, flush_context):
     """Record every create / edit / delete of a financial record made by this
@@ -2794,9 +2809,11 @@ def _write_audit_log(session, flush_context):
         who = get_jwt_identity()
     except Exception:
         who = None  # scheduler / webhook / no JWT in context
+    reason = _audit_delete_reason() if any(r['action'] == 'delete' for r in rows) else None
     tenant = None
     for row in rows:
         row['changed_by'] = str(who)[:100] if who else None
+        row['note'] = reason if row['action'] == 'delete' else None
         if row['tenant_id'] is None:
             if tenant is None:
                 tenant = current_tenant_id()

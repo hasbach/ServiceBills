@@ -13,6 +13,7 @@ import {
     AccountBalance as BalanceIcon,
     History as HistoryIcon
 } from '@mui/icons-material';
+import { askDeleteReason } from '../utils/deleteReason.js';
 import { useAppContext } from '../context/AppContext';
 import BalanceLogTable from './BalanceLogTable';
 
@@ -141,9 +142,10 @@ function SuppliersView() {
 
     const handleDeletePayment = async (h) => {
         if (!historyDialog.supplier) return;
-        if (!window.confirm(`Delete this payment of $${Math.abs(h.amount).toFixed(2)}? The amount will be added back to the balance owed.`)) return;
+        const reason = askDeleteReason(`Delete this payment of $${Math.abs(h.amount).toFixed(2)}? The amount will be added back to the balance owed.`);
+        if (!reason) return;
         try {
-            await apiService.deleteSupplierPayment(historyDialog.supplier.id, h.payment_id);
+            await apiService.deleteSupplierPayment(historyDialog.supplier.id, h.payment_id, reason);
             setSnackbar({ open: true, message: 'Payment deleted.', severity: 'success' });
             handleOpenHistory(historyDialog.supplier);
             loadSuppliers();

@@ -38,6 +38,7 @@ def upgrade():
         sa.Column('party_id', sa.Integer(), nullable=True),
         sa.Column('amount', sa.Numeric(precision=18, scale=4, asdecimal=False), nullable=True),
         sa.Column('changes', sa.Text(), nullable=False),
+        sa.Column('note', sa.String(length=300), nullable=True),
         sa.Column('changed_by', sa.String(length=100), nullable=True),
         sa.Column('created_at', sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(['tenant_id'], ['tenant.id']),

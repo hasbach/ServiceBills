@@ -225,7 +225,7 @@ const rawApiService = {
     fixSupplierBalance: (id, data) => api.put(`/suppliers/${id}/fix-balance`, data),
     getSupplierBalanceLog: (id) => api.get(`/suppliers/${id}/balance-log`),
     updateSupplierPayment: (supplierId, paymentId, data) => api.put(`/suppliers/${supplierId}/payments/${paymentId}`, data),
-    deleteSupplierPayment: (supplierId, paymentId) => api.delete(`/suppliers/${supplierId}/payments/${paymentId}`),
+    deleteSupplierPayment: (supplierId, paymentId, reason) => api.delete(`/suppliers/${supplierId}/payments/${paymentId}`, { data: { reason } }),
 
     // Employee / Payroll API methods
     fetchEmployees: () => api.get('/employees'),
@@ -235,7 +235,7 @@ const rawApiService = {
     fetchEmployeeCharges: (id) => api.get(`/employees/${id}/charges`),
     addEmployeeCharge: (id, data) => api.post(`/employees/${id}/charges`, data),
     updateEmployeeCharge: (id, chargeId, data) => api.put(`/employees/${id}/charges/${chargeId}`, data),
-    deleteEmployeeCharge: (id, chargeId) => api.delete(`/employees/${id}/charges/${chargeId}`),
+    deleteEmployeeCharge: (id, chargeId, reason) => api.delete(`/employees/${id}/charges/${chargeId}`, { data: { reason } }),
     fetchEmployeePayments: (id) => api.get(`/employees/${id}/payments`),
     recordEmployeePayment: (id, data) => api.post(`/employees/${id}/payments`, data),
     fetchEmployeeHistory: (id) => api.get(`/employees/${id}/history`),
@@ -270,7 +270,7 @@ const rawApiService = {
     updateSubscriptionPlan: (planId, planData) => api.put(`/subscription_plans/${planId}`, planData),
     deleteSubscriptionPlan: (planId) => api.delete(`/subscription_plans/${planId}`),
     fetchPayments: (customerId, status, startDate, endDate, searchQuery, collectedBy, collectedDate, sort_by = 'billed_date', sort_desc = 'true', paidDateStart, paidDateEnd) => api.get(`/payments`, { params: { customer_id: customerId, status: status, start_date: startDate, end_date: endDate, search_query: searchQuery, collected_by: collectedBy, collected_date: collectedDate, sort_by: sort_by, sort_desc: sort_desc, paid_date_start: paidDateStart, paid_date_end: paidDateEnd } }),
-    deletePayment: (paymentId) => api.delete(`/payments/${paymentId}`),
+    deletePayment: (paymentId, reason) => api.delete(`/payments/${paymentId}`, { data: { reason } }),
     markPaymentAsPaid: (paymentId, data = {}) => api.put(`/payments/${paymentId}/mark_paid`, data),
     // One amount across a customer's bills (oldest first) -- action 'pay' or 'collect'.
     receiveCustomerPayment: (customerId, data) => api.post(`/customers/${customerId}/receive-payment`, data),
@@ -287,7 +287,7 @@ const rawApiService = {
     deleteCustomer: (customerId) => api.delete(`/customers/${customerId}`),
     // Bulk actions: one HTTP request for a whole selection instead of one per row.
     bulkMarkPaymentsPaid: (paymentIds) => api.post('/payments/bulk_mark_paid', { payment_ids: paymentIds }),
-    bulkDeletePayments: (paymentIds) => api.post('/payments/bulk_delete', { payment_ids: paymentIds }),
+    bulkDeletePayments: (paymentIds, reason) => api.post('/payments/bulk_delete', { payment_ids: paymentIds, reason }),
     bulkRenewSubscriptions: (customerIds) => api.post('/customers/bulk_renew_subscription', { customer_ids: customerIds }),
     bulkCancelSubscriptions: (customerIds) => api.post('/customers/bulk_cancel_subscription', { customer_ids: customerIds }),
     bulkDeleteCustomers: (customerIds) => api.post('/customers/bulk_delete', { customer_ids: customerIds }),
@@ -331,7 +331,7 @@ const rawApiService = {
     fetchExpenses: (startDate, endDate) => api.get(`/expenses`, { params: { start_date: startDate, end_date: endDate } }),
     addExpense: (expenseData) => api.post(`/expenses`, expenseData),
     updateExpense: (expenseId, expenseData) => api.put(`/expenses/${expenseId}`, expenseData),
-    deleteExpense: (expenseId) => api.delete(`/expenses/${expenseId}`),
+    deleteExpense: (expenseId, reason) => api.delete(`/expenses/${expenseId}`, { data: { reason } }),
 
     fetchExpenseCategories: () => api.get('/expense_categories'),
     addExpenseCategory: (categoryData) => api.post('/expense_categories', categoryData),

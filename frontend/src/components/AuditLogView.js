@@ -173,7 +173,10 @@ function AuditLogView() {
                                             {[r.party_name, r.amount != null ? money(r.amount) : null].filter(Boolean).join(' · ')}
                                         </Typography>
                                     </TableCell>
-                                    <TableCell><Changes row={r} /></TableCell>
+                                    <TableCell>
+                                        <Changes row={r} />
+                                        {r.note && <Typography variant="body2" sx={{ mt: 0.5 }}><b>{r.entity === 'day_close' ? 'Why reopened' : 'Why deleted'}:</b> {r.note}</Typography>}
+                                    </TableCell>
                                 </TableRow>
                             ))}
                             {!loading && items.length === 0 && (

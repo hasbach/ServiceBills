@@ -37,6 +37,7 @@ import {
     FolderOpen as FolderOpenIcon,
     Lock as LockIcon
 } from '@mui/icons-material';
+import { askDeleteReason } from '../utils/deleteReason.js';
 import { useAppContext } from '../context/AppContext.js';
 import ExpenseForm from './ExpenseForm.js';
 
@@ -275,10 +276,11 @@ const ExpensesView = () => {
     const handleFormSave      = useCallback(() => { fetchExpenses(); handleFormClose(); }, [fetchExpenses, handleFormClose]);
 
     const handleDeleteExpense = async (expenseId) => {
-        if (!window.confirm('Delete this expense? This action cannot be undone.')) return;
+        const reason = askDeleteReason('Delete this expense? It stays readable in Finance > History.');
+        if (!reason) return;
         setLoading(true);
         try {
-            await apiService.deleteExpense(expenseId);
+            await apiService.deleteExpense(expenseId, reason);
             setSnackbar({ open: true, message: 'Expense deleted successfully!', severity: 'success' });
             fetchExpenses();
         } catch (error) {
