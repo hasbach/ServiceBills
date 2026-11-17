@@ -3228,6 +3228,22 @@ def _date_start_lines(start, desired, fallback_day):
     return out
 
 
+def _ledger_all_still_desired(already, desired):
+    """True when every line already in the books for a record is matched
+    one-to-one by a desired line (same account, party, day and amount): the
+    change only adds lines (a bill getting paid, even on its own bill day),
+    so it is an event; otherwise it changes history and is a correction."""
+    free = list(desired)
+    for l in already:
+        match = next((d for d in free if (d.account_key, d.party_type, d.party_id, d.day)
+                      == (l.account_key, l.party_type, l.party_id, l.day)
+                      and abs(d.amount - l.amount) < _LEDGER_EPS), None)
+        if match is None:
+            return False
+        free.remove(match)
+    return True
+
+
 def _ledger_record_values(obj):
     """The record's loaded column values; a SQL expression among them (e.g. a
     balance rewritten as `balance + delta`) cannot be read as a number here."""
@@ -3256,17 +3272,20 @@ def _post_ledger(session, flush_context):
                 work.append((obj, kind, change))
     if not work:
         return
-    todo = []
+    todo, problems = [], []
     try:
-        _post_ledger_work(work, todo)
+        _post_ledger_work(work, todo, problems)
     except Exception as e:
-        # Never let the books break the user's own change; flag what was pending.
+        # Never let the books break the user's own change; flag what was
+        # pending, keeping the specific errors already collected per record.
         logging.exception("books: posting failed for a flush")
         try:
             now = datetime.utcnow()
-            rows = [{'tenant_id': tid, 'source_type': kind, 'source_id': oid,
-                     'error': f"{type(e).__name__}: {e}"[:2000], 'created_at': now}
-                    for _, kind, _, tid, oid in todo]
+            rows = list(problems)
+            flagged = {(r['source_type'], r['source_id']) for r in rows}
+            rows += [{'tenant_id': tid, 'source_type': kind, 'source_id': oid,
+                      'error': f"{type(e).__name__}: {e}"[:2000], 'created_at': now}
+                     for _, kind, _, tid, oid in todo if (kind, oid) not in flagged]
             if rows:
                 session.execute(LedgerProblem.__table__.insert(), rows)
         except Exception:
@@ -3304,9 +3323,8 @@ def _ledger_record_tenant(obj, state):
     return tid
 
 
-def _post_ledger_work(work, todo):
+def _post_ledger_work(work, todo, problems):
     session = db.session
-    problems = []
     for obj, kind, change in work:
         state = db.inspect(obj)
         oid = state.dict.get('id')
@@ -3331,6 +3349,7 @@ def _post_ledger_work(work, todo):
     if not todo:
         if problems:
             session.execute(LedgerProblem.__table__.insert(), problems)
+            problems.clear()
         return
 
     # One "already posted" lookup per kind for the changed and deleted records;
@@ -3368,12 +3387,7 @@ def _post_ledger_work(work, todo):
                 _ledger_account_id(tid, l.account_key)  # creates a new expense account; raises if missing
             # An event when every key is new (a bill, a bill getting paid);
             # a correction when it changes or removes something already posted.
-            want_net, have_net = {}, {}
-            for src, net in ((desired, want_net), (posted + start_lines, have_net)):
-                for l in src:
-                    k = (l.account_key, l.party_type, l.party_id, l.day)
-                    net[k] = net.get(k, 0.0) + l.amount
-            is_event = all(abs(want_net.get(k, 0.0) - v) < _LEDGER_EPS for k, v in have_net.items())
+            is_event = _ledger_all_still_desired(posted + start_lines, desired)
             entry_kind = 'event' if is_event else 'correction'
             groups.setdefault((tid, entry_kind), []).append(
                 (_ledger_memo(kind, values, change, is_event), (kind, oid), lines))
@@ -3395,6 +3409,7 @@ def _post_ledger_work(work, todo):
                                  'created_at': datetime.utcnow()})
     if problems:
         session.execute(LedgerProblem.__table__.insert(), problems)
+        problems.clear()
 
 
 @_sa_event.listens_for(db.session, "after_commit")

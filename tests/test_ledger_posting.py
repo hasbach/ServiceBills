@@ -501,3 +501,76 @@ def test_listener_failure_flags_every_pending_record(app, client, monkeypatch):
         assert problem.source_type == "payment" and problem.source_id == pid
         assert "lookup down" in problem.error
     assert _account(tid, "cash") == 0
+
+
+def _entries(tid):
+    with flask_app.app_context():
+        return [(e.kind, e.memo) for e in JournalEntry.query.filter_by(tenant_id=tid).order_by(JournalEntry.id)]
+
+
+def test_bill_paid_on_its_own_bill_day_is_an_event(app, client):
+    a, tid, cid = _started_customer(client, "lp22")
+    pid = _bill(client, a, cid, 25, _today().isoformat())
+    _pay(client, a, pid)
+    entries = _entries(tid)
+    assert [k for k, _ in entries] == ["event", "event"]
+    assert entries[1][1].startswith("Payment received")
+    _assert_customer_matches(tid, cid)
+
+
+def test_gratis_on_its_own_bill_day_is_an_event(app, client):
+    a, tid, cid = _started_customer(client, "lp23")
+    pid = _bill(client, a, cid, 25, _today().isoformat())
+    r = client.put(f"/api/payments/{pid}/mark_gratis", headers=a, json={"note": "goodwill"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    entries = _entries(tid)
+    assert [k for k, _ in entries] == ["event", "event"]
+    assert entries[1][1].startswith("Bill forgiven")
+    assert _account(tid, "discounts") == 25
+    _assert_customer_matches(tid, cid)
+
+
+def test_changes_to_posted_lines_are_corrections_even_on_the_bill_day(app, client):
+    a, tid, cid = _started_customer(client, "lp24")
+    pid = _bill(client, a, cid, 25, _today().isoformat())
+    _pay(client, a, pid)
+    r = client.put(f"/api/payments/{pid}/method", headers=a, json={"method": "whish_transfer"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    r = client.put(f"/api/payments/{pid}/revert", headers=a, json={"reason": "wrong"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    _pay(client, a, pid)
+    assert client.delete(f"/api/payments/{pid}", headers=a).status_code == 200
+    kinds = [k for k, _ in _entries(tid)]
+    assert kinds[:2] == ["event", "event"]
+    assert kinds[2:] and set(kinds[2:]) == {"correction"}
+    _assert_customer_matches(tid, cid)
+
+
+def test_listener_failure_keeps_the_specific_record_errors(app, client, monkeypatch):
+    """A record that failed on its own keeps its own error when the posting
+    step for the rest of the flush fails afterwards."""
+    import app as appmod
+    a, tid, cid = _started_customer(client, "lp25")
+    real = ledger.desired_lines
+
+    def lines(kind, rec, local_day):
+        if float(rec.amount) == 25:
+            raise RuntimeError("mapping bug")
+        return real(kind, rec, local_day)
+
+    def guard_breaks():
+        raise RuntimeError("guard")
+    monkeypatch.setattr(ledger, "desired_lines", lines)
+    monkeypatch.setattr(appmod, "_ledger_who", guard_breaks)
+    with flask_app.app_context():
+        db.session.add_all([
+            Payment(tenant_id=tid, customer_id=cid, amount=25, reason="a", date=datetime(2026, 9, 1)),
+            Payment(tenant_id=tid, customer_id=cid, amount=30, reason="b", date=datetime(2026, 9, 1)),
+        ])
+        db.session.commit()
+        by_amount = {}
+        for prob in LedgerProblem.query.filter_by(tenant_id=tid):
+            by_amount[float(db.session.get(Payment, prob.source_id).amount)] = prob.error
+    assert "mapping bug" in by_amount[25]
+    assert "guard" in by_amount[30]
+    assert _account(tid, "customers") == 0
