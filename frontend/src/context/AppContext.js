@@ -160,6 +160,7 @@ const rawApiService = {
     collectResellerPayment: (id, data) => api.post(`/resellers/${id}/collect_payment`, data),
     getResellerHistory: (id) => api.get(`/resellers/${id}/history`),
     getResellerBalanceLog: (id) => api.get(`/resellers/${id}/balance-log`),
+    getAuditLog: (params) => api.get('/audit-log', { params }),
 
     // Upstream Provider API methods (Concept A -- bridged RADIUS subresellers;
     // see docs/superpowers/specs/2026-08-12-network-enforcement-design.md)

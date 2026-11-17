@@ -1083,6 +1083,51 @@ class BalanceLog(db.Model):
             'date': self.created_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
         }
 
+
+class AuditLog(db.Model):
+    """One row per create / edit / delete of a financial record: who, when,
+    and what changed. Written by the _write_audit_log after_flush listener,
+    so every code path (routes, scheduler, AI connector) is covered without
+    each call site having to remember. Never edited or deleted by the app.
+
+    `changes` is JSON: for 'update' {field: [old, new]}; for 'create' and
+    'delete' the record's full values, so a deleted record can still be read
+    here. entity_id / party_id are plain integers, not foreign keys: the row
+    they name may be gone, and the log must outlive it."""
+    __table_args__ = (
+        db.Index('ix_audit_log_tenant_created', 'tenant_id', 'created_at'),
+        db.Index('ix_audit_log_tenant_entity', 'tenant_id', 'entity', 'entity_id'),
+        db.Index('ix_audit_log_tenant_party', 'tenant_id', 'party_type', 'party_id'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False)
+    entity = db.Column(db.String(40), nullable=False)
+    entity_id = db.Column(db.Integer, nullable=True)
+    action = db.Column(db.String(10), nullable=False)  # 'create' | 'update' | 'delete'
+    # Whose account the record belongs to, for "history of this customer".
+    party_type = db.Column(db.String(20), nullable=True)  # customer | reseller | supplier | employee | upstream
+    party_id = db.Column(db.Integer, nullable=True)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=True)
+    changes = db.Column(db.Text, nullable=False)
+    changed_by = db.Column(db.String(100), nullable=True)  # None = system (scheduler, webhook)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'entity': self.entity,
+            'entity_id': self.entity_id,
+            'action': self.action,
+            'party_type': self.party_type,
+            'party_id': self.party_id,
+            'amount': float(self.amount) if self.amount is not None else None,
+            'changes': json.loads(self.changes or '{}'),
+            'changed_by': self.changed_by,
+            # UTC, marked as such so the browser shows local time.
+            'date': self.created_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }
+
+
 class ExpenseCategory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -2431,7 +2476,7 @@ TENANT_OWNED_MODELS = (
     UpstreamProvider, UpstreamProviderPayment,
     ExchangeRate, NetworkDevice, NetworkAgent, NetworkAgentJob, NetworkWriteAudit,
     CustomerPaymentLink, CustomerWhishPaymentAttempt, NetworkNode,
-    WhatsAppConversation, WhatsAppMessage, BalanceLog, WhatsAppConnectionEvent,
+    WhatsAppConversation, WhatsAppMessage, BalanceLog, AuditLog, WhatsAppConnectionEvent,
     McpGrant, McpRotatedRefresh, McpToolCall,
 )
 
@@ -2637,6 +2682,126 @@ def _log_balance_changes(session, flush_context, instances):
 @_sa_event.listens_for(db.session, "after_rollback")
 def _drop_pending_ledger(session):
     session.info.pop('_ledger_pending', None)
+
+
+# --- Audit log ---------------------------------------------------------------
+from decimal import Decimal as _Decimal
+from datetime import date as _date_type
+
+# model -> (entity name, the column holding the amount, (party type, party column))
+_AUDITED_MODELS = {
+    Payment: ('payment', 'amount', ('customer', 'customer_id')),
+    Expense: ('expense', 'amount', None),
+    SupplierPayment: ('supplier_payment', 'amount', ('supplier', 'supplier_id')),
+    SalaryCharge: ('salary_charge', 'amount', ('employee', 'employee_id')),
+    SalaryPayment: ('salary_payment', 'amount', ('employee', 'employee_id')),
+    CashEntry: ('cash_entry', 'amount', None),
+    AccountTransfer: ('account_transfer', 'amount', None),
+    ResellerPayment: ('reseller_payment', 'amount', ('reseller', 'reseller_id')),
+    UpstreamProviderPayment: ('upstream_payment', 'amount', ('upstream', 'upstream_provider_id')),
+    DayClose: ('day_close', None, None),
+}
+_AUDIT_SKIP_FIELDS = {'id', 'tenant_id'}
+
+
+def _audit_value(v):
+    """A column value as something JSON can hold."""
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, float):
+        return round(v, 4)
+    if isinstance(v, _Decimal):
+        return round(float(v), 4)
+    if isinstance(v, datetime):
+        return v.strftime('%Y-%m-%dT%H:%M:%S')
+    if isinstance(v, _date_type):
+        return v.isoformat()
+    return str(v)
+
+
+def _audit_row(obj, action):
+    """The audit_log row for one object of this flush, or None when nothing
+    worth recording changed. Reads only values already loaded (state.dict):
+    touching an expired attribute of a deleted row would raise."""
+    entity, amount_col, party = _AUDITED_MODELS[type(obj)]
+    state = db.inspect(obj)
+    loaded = state.dict
+    keys = [a.key for a in state.mapper.column_attrs if a.key not in _AUDIT_SKIP_FIELDS]
+    if action == 'update':
+        changes = {}
+        for key in keys:
+            hist = state.attrs[key].history
+            if not hist.has_changes():
+                continue
+            old = _audit_value(hist.deleted[0]) if hist.deleted else None
+            new = _audit_value(loaded.get(key))
+            if old != new:
+                changes[key] = [old, new]
+        if not changes:
+            return None
+    else:
+        changes = {k: _audit_value(loaded[k]) for k in keys if k in loaded}
+    entity_id = loaded.get('id')
+    if entity_id is None and state.identity:
+        entity_id = state.identity[0]
+    party_type, party_id = None, None
+    if entity == 'expense':
+        # An expense belongs to a supplier, an employee (payroll) or nobody.
+        if loaded.get('employee_id') is not None:
+            party_type, party_id = 'employee', loaded.get('employee_id')
+        elif loaded.get('supplier_id') is not None:
+            party_type, party_id = 'supplier', loaded.get('supplier_id')
+    elif party:
+        party_type, party_id = party[0], loaded.get(party[1])
+        if party_id is None:
+            party_type = None
+    amount = loaded.get(amount_col) if amount_col else None
+    return {
+        'tenant_id': loaded.get('tenant_id'),
+        'entity': entity,
+        'entity_id': entity_id,
+        'action': action,
+        'party_type': party_type,
+        'party_id': party_id,
+        'amount': float(amount) if amount is not None else None,
+        'changes': json.dumps(changes, default=str),
+        'created_at': datetime.utcnow(),
+    }
+
+
+@_sa_event.listens_for(db.session, "after_flush")
+def _write_audit_log(session, flush_context):
+    """Record every create / edit / delete of a financial record made by this
+    flush. after_flush: new rows have their ids, and the old values of edited
+    columns are still readable. Inserted on the same transaction, so the log
+    row exists exactly when the change does."""
+    groups = (('create', session.new), ('update', session.dirty), ('delete', session.deleted))
+    rows = []
+    for action, objects in groups:
+        for obj in objects:
+            if type(obj) not in _AUDITED_MODELS:
+                continue
+            try:
+                row = _audit_row(obj, action)
+            except Exception:
+                logging.exception("audit log: could not describe a %s %s", type(obj).__name__, action)
+                continue
+            if row:
+                rows.append(row)
+    if not rows:
+        return
+    try:
+        who = get_jwt_identity()
+    except Exception:
+        who = None  # scheduler / webhook / no JWT in context
+    tenant = None
+    for row in rows:
+        row['changed_by'] = str(who)[:100] if who else None
+        if row['tenant_id'] is None:
+            if tenant is None:
+                tenant = current_tenant_id()
+            row['tenant_id'] = tenant
+    session.execute(AuditLog.__table__.insert(), rows)
 
 
 def _maybe_create_customer_payment_link(payment, customer):
@@ -3657,7 +3822,7 @@ _TENANT_DELETE_ORDER = [
     # and only fails against production Postgres.
     NetworkWriteAudit,
     UpgradeRequest, BillingPaymentAttempt, PlatformPayment, PaymentReminder, GeneratedReceipt, AddonPurchase, TicketLog, SupportTicket,
-    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment, BalanceLog,
+    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment, BalanceLog, AuditLog,
     # WhatsAppMessage holds an FK to whatsapp_conversation, and
     # WhatsAppConversation holds an FK to customer, so both must be deleted
     # before Customer -- message before conversation -- or a tenant delete
@@ -12595,6 +12760,75 @@ def get_reseller_balance_log(reseller_id):
     logs = tenant_query(BalanceLog).filter_by(reseller_id=reseller_id).order_by(
         BalanceLog.created_at.desc(), BalanceLog.id.desc()).all()
     return jsonify([l.to_dict() for l in logs]), 200
+
+
+_AUDIT_PARTY_MODELS = {
+    'customer': Customer, 'reseller': Reseller, 'supplier': Supplier,
+    'employee': Employee, 'upstream': UpstreamProvider,
+}
+
+
+@app.route('/api/audit-log', methods=['GET'])
+@jwt_required()
+@admin_required()
+def get_audit_log():
+    """History of every financial create / edit / delete (admin only), newest
+    first. Filters: entity, entity_id, action, user, party_type + party_id,
+    start_date / end_date (business-local days, inclusive). Paged."""
+    q = tenant_query(AuditLog)
+    entity = request.args.get('entity')
+    if entity:
+        q = q.filter(AuditLog.entity == entity)
+    entity_id = request.args.get('entity_id', type=int)
+    if entity_id is not None:
+        q = q.filter(AuditLog.entity_id == entity_id)
+    action = request.args.get('action')
+    if action:
+        q = q.filter(AuditLog.action == action)
+    user = (request.args.get('user') or '').strip()
+    if user == 'system':
+        q = q.filter(AuditLog.changed_by.is_(None))
+    elif user:
+        q = q.filter(AuditLog.changed_by == user)
+    party_type = request.args.get('party_type')
+    party_id = request.args.get('party_id', type=int)
+    if party_type and party_id is not None:
+        q = q.filter(AuditLog.party_type == party_type, AuditLog.party_id == party_id)
+    try:
+        start_day, end_day = _report_days(request.args.get('start_date'), request.args.get('end_date'))
+    except ValueError:
+        return jsonify({'error': 'Invalid date.'}), 400
+    since, until = _instant_bounds(start_day, end_day)
+    if since is not None:
+        q = q.filter(AuditLog.created_at >= since)
+    if until is not None:
+        q = q.filter(AuditLog.created_at < until)
+
+    page = max(request.args.get('page', 1, type=int) or 1, 1)
+    per_page = min(max(request.args.get('per_page', 50, type=int) or 50, 1), 200)
+    total = q.count()
+    rows = q.order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).offset(
+        (page - 1) * per_page).limit(per_page).all()
+
+    # Names of the accounts the rows belong to, one query per party type.
+    wanted = {}
+    for r in rows:
+        if r.party_type in _AUDIT_PARTY_MODELS and r.party_id is not None:
+            wanted.setdefault(r.party_type, set()).add(r.party_id)
+    names = {}
+    for ptype, ids in wanted.items():
+        model = _AUDIT_PARTY_MODELS[ptype]
+        for pid, name in tenant_query(model).filter(model.id.in_(ids)).with_entities(model.id, model.name):
+            names[(ptype, pid)] = name
+    items = []
+    for r in rows:
+        d = r.to_dict()
+        d['party_name'] = names.get((r.party_type, r.party_id))
+        items.append(d)
+    users = [u for (u,) in tenant_query(AuditLog).with_entities(AuditLog.changed_by).distinct() if u]
+    return jsonify({'items': items, 'total': total, 'page': page, 'per_page': per_page,
+                    'users': sorted(users)}), 200
+
 
 @app.route('/api/customer-form-options', methods=['GET'])
 @jwt_required()
