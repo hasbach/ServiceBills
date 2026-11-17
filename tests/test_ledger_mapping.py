@@ -27,6 +27,10 @@ def L(key, ptype, pid, amount, day):
 
 def check(lines):
     assert round(sum(l.amount for l in lines), 6) == 0
+    per_day = {}
+    for l in lines:
+        per_day[l.day] = per_day.get(l.day, 0) + l.amount
+    assert all(abs(v) < 0.00005 for v in per_day.values()), per_day
     return lines
 
 
@@ -260,11 +264,11 @@ def test_diff_removal_dated_today():
     got = check(diff_lines(BILL, already, TODAY, False))
     assert sorted((l.account_key, l.amount, l.day) for l in got) == [
         ('cash', -25, TODAY), ('customers', 25, TODAY)]
-    # growth keeps the desired day
+    # growth of an existing line is a correction dated today
     bigger = [L('customers', 'customer', 7, 35, D1), L('income_subscriptions', None, None, -35, D1)]
     got = check(diff_lines(bigger, BILL, TODAY, False))
     assert sorted((l.account_key, l.amount, l.day) for l in got) == [
-        ('customers', 10, D1), ('income_subscriptions', -10, D1)]
+        ('customers', 10, TODAY), ('income_subscriptions', -10, TODAY)]
 
 
 def test_diff_profit_to_opening_only_for_accounts_already_posted():
@@ -316,3 +320,50 @@ def test_chart_and_account_types():
     assert account_type('cash') == 'asset' and account_type('suppliers') == 'liability'
     assert account_type('opening') == 'equity' and account_type('income_resellers') == 'income'
     assert money_account('whish_transfer') == 'whish' and money_account(None) == 'cash'
+
+
+PAID = lambda **kw: desired_lines('payment', pay(paid=True, paid_at=T5, **kw), local_day)
+
+
+def test_diff_method_change_cash_to_whish_balances_per_day_dated_today():
+    already = PAID()
+    desired = PAID(collected_via='whish')
+    got = check(diff_lines(desired, already, TODAY, False))
+    assert sorted((l.account_key, l.amount, l.day) for l in got) == [
+        ('cash', -25, TODAY), ('whish', 25, TODAY)]
+
+
+def test_diff_expense_recategorised_balances_per_day():
+    already = desired_lines('expense', exp(category_id=3), local_day)
+    desired = desired_lines('expense', exp(category_id=4), local_day)
+    got = check(diff_lines(desired, already, TODAY, False))
+    assert sorted((l.account_key, l.amount, l.day) for l in got) == [
+        ('expense:3', -60, TODAY), ('expense:4', 60, TODAY)]
+
+
+def test_diff_amount_increase_on_existing_record_dated_today():
+    already = PAID()
+    desired = desired_lines('payment', pay(amount=30, paid=True, paid_at=T5), local_day)
+    got = check(diff_lines(desired, already, TODAY, False))
+    assert got and {l.day for l in got} == {TODAY}
+    # customers +5 (bill day) and -5 (receipt day) net out once both are dated today
+    assert sorted((l.account_key, l.amount) for l in got) == [
+        ('cash', 5), ('income_subscriptions', -5)]
+
+
+def test_diff_payment_arriving_keeps_receipt_day():
+    got = check(diff_lines(PAID(), BILL, TODAY, False))
+    assert sorted((l.account_key, l.amount, l.day) for l in got) == [
+        ('cash', 25, D5), ('customers', -25, D5)]
+
+
+def test_paid_without_timestamps_falls_back_to_bill_day():
+    got = lines_of('payment', pay(paid=True))
+    assert got == BILL + [L('cash', None, None, 25, D1),
+                          L('customers', 'customer', 7, -25, D1)]
+
+
+def test_unpaid_gratis_lines():
+    got = lines_of('payment', pay(is_gratis=True))
+    assert got == BILL + [L('discounts', None, None, 25, D1),
+                          L('customers', 'customer', 7, -25, D1)]

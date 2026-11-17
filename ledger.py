@@ -88,25 +88,25 @@ def _payment_lines(p, local_day):
     lines = []
     money = money_account(p.collected_via)
     receipt_when = p.collected_at or p.paid_at
-    receipt_day = local_day(receipt_when, False) if receipt_when else None
+    bill_day = local_day(p.date, True)
+    receipt_day = local_day(receipt_when, False) if receipt_when else bill_day
     live = bool(p.paid) and _not_reverted(p)
 
     if p.pre_payment:
-        if live and receipt_day:
+        if live:
             lines += _pair(money, None, None, 'customers', *cust, amount, receipt_day)
         return lines
     if p.is_refund:
-        if live and receipt_day:
+        if live:
             lines += _pair('customers', *cust, money, None, None, abs(amount), receipt_day)
         return lines
 
-    bill_day = local_day(p.date, True)
     lines += _pair('customers', *cust, 'income_subscriptions', None, None, amount, bill_day)
     if p.is_gratis:
         if _not_reverted(p):
             lines += _pair('discounts', None, None, 'customers', *cust, amount,
-                           receipt_day or bill_day)
-    elif live and not p.settled_from_credit and receipt_day:
+                           receipt_day)
+    elif live and not p.settled_from_credit:
         lines += _pair(money, None, None, 'customers', *cust, amount, receipt_day)
     return lines
 
@@ -208,10 +208,21 @@ def desired_lines(kind, rec, local_day):
 def diff_lines(desired, already, today, profit_to_opening):
     """Lines to post so that `already` becomes `desired`.
 
-    Nets by (account, party, day): a line that grew keeps its natural day,
-    one that shrank or disappeared is dated `today`. With `profit_to_opening`,
-    income/expense lines for an account the record already posted to go to
-    'opening' (prior-period adjustment)."""
+    Netting is keyed by (account, party type, party id, day). Dating: a key
+    absent from `already` is a genuinely new event and keeps its natural day;
+    a key already posted whose amount changes (grows or shrinks) or that is
+    removed is dated `today` (corrections are dated the day they happen). The
+    output must balance per day, because the caller books one entry per day:
+    if any day's lines do not sum to 0 (e.g. a method change posts the new
+    side on its natural day and takes the old side out today), all output
+    lines are re-dated to `today`.
+
+    With `profit_to_opening`, income/expense lines for an account the record
+    already posted to go to 'opening' (prior-period adjustment). Only accounts
+    already posted are redirected, so a gratis made today on an old bill stays
+    a current discount, and recategorising a pre-books expense posts the new
+    category in the current period (the old category's reversal goes to
+    opening)."""
     def net(lines):
         out = {}
         for l in lines:
@@ -228,15 +239,26 @@ def diff_lines(desired, already, today, profit_to_opening):
         if abs(delta) < _EPS:
             continue
         key, ptype, pid, day = k
-        if not (k in want and delta * want[k] > 0):  # grew in its own direction
+        if k in have:
             day = today
         if (profit_to_opening and key in posted_accounts
                 and account_type(key) in PROFIT_TYPES):
             key, ptype, pid = 'opening', None, None
         mk = (key, ptype, pid, day)
         merged[mk] = merged.get(mk, 0.0) + delta
-    return [Line(k[0], k[1], k[2], round(v, 4), k[3])
-            for k, v in merged.items() if abs(v) >= _EPS]
+    out = [Line(k[0], k[1], k[2], round(v, 4), k[3])
+           for k, v in merged.items() if abs(v) >= _EPS]
+    per_day = {}
+    for l in out:
+        per_day[l.day] = per_day.get(l.day, 0.0) + l.amount
+    if any(abs(v) >= _EPS for v in per_day.values()):
+        remerged = {}
+        for l in out:
+            k = (l.account_key, l.party_type, l.party_id)
+            remerged[k] = remerged.get(k, 0.0) + l.amount
+        out = [Line(k[0], k[1], k[2], round(v, 4), today)
+               for k, v in remerged.items() if abs(v) >= _EPS]
+    return out
 
 
 def party_balance_from_books(party_type, debit_minus_credit):
