@@ -268,11 +268,12 @@ def party_balance_from_books(party_type, debit_minus_credit):
     return -debit_minus_credit
 
 
-def balance_delta_to_lines(party_type, party_id, delta_balance, day):
-    """Lines for a stored-balance change with no record behind it."""
+def balance_delta_to_lines(party_type, party_id, delta_balance, day, against='corrections'):
+    """Lines for a stored-balance change with no record behind it, against
+    `against` (Balance corrections; Opening balances for the opening entry)."""
     delta = _amt(delta_balance)
     if not delta:
         return []
     dc = _amt(party_balance_from_books(party_type, delta))  # sign flip is its own inverse
     return [Line(PARTY_ACCOUNT[party_type], party_type, party_id, dc, day),
-            Line('corrections', None, None, -dc, day)]
+            Line(against, None, None, -dc, day)]

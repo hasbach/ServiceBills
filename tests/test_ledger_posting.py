@@ -19,7 +19,7 @@ from app import (
     app as flask_app, db, Tenant, Customer, Payment, Supplier, Employee, Reseller,
     UpstreamProvider, UpstreamProviderPayment, SubscriptionPlan, LedgerAccount,
     JournalEntry, JournalLine, LedgerState, LedgerProblem, generate_missing_payments,
-    _mark_payment_fully_paid)
+    _mark_payment_fully_paid, start_books)
 
 
 # --- helpers -------------------------------------------------------------------
@@ -34,13 +34,10 @@ def _tid():
 
 
 def _start_books_for_test(tenant_id):
-    """Stand-in for start_books (task 5): the chart and the started marker,
-    no opening entry and no starting-point lines."""
+    """Start the tenant's books with the real start_books (kept as a helper:
+    other test files import it)."""
     with flask_app.app_context():
-        for key, number, name, type_, party_type in ledger.CHART:
-            db.session.add(LedgerAccount(tenant_id=tenant_id, key=key, number=number,
-                                         name=name, type=type_, party_type=party_type))
-        db.session.add(LedgerState(tenant_id=tenant_id, start_day=_today()))
+        start_books(tenant_id)
         db.session.commit()
 
 
@@ -414,37 +411,52 @@ def test_posting_error_does_not_block_payment(app, client, monkeypatch):
 
 
 def test_pre_books_bill_paid_later_posts_only_the_receipt(app, client):
-    """A bill older than the books has starting-point lines (no date); paying
-    it posts the receipt only, not its income a second time."""
+    """A bill older than the books has starting-point lines; paying it posts
+    the receipt only, not its income a second time."""
     a = make_tenant(client, "Books", "lp18")
     cid = _customer(client, a)
     pid = _bill(client, a, cid, 25, "2026-09-01")
     tid = _tid()
-    _start_books_for_test(tid)
-    with flask_app.app_context():
-        from app import LedgerStartLine
-        db.session.add_all([
-            LedgerStartLine(tenant_id=tid, source_type="payment", source_id=pid,
-                            account_key="customers", party_type="customer", party_id=cid, amount=25),
-            LedgerStartLine(tenant_id=tid, source_type="payment", source_id=pid,
-                            account_key="income_subscriptions", amount=-25),
-        ])
-        db.session.commit()
+    _start_books_for_test(tid)                      # opening: customers +25 / opening -25
     _pay(client, a, pid)
     assert _account_by_day(tid, "cash") == {_today(): 25}
-    assert _account_by_day(tid, "customers") == {_today(): -25}
+    assert _account_by_day(tid, "customers") == {}  # +25 opening, -25 receipt, both today
     assert _account(tid, "income_subscriptions") == 0
-    assert _account(tid, "opening") == 0
-    _assert_balanced(tid)
+    assert _account(tid, "opening") == -25
+    _assert_customer_matches(tid, cid)
 
     # Deleting it later: the income side goes to Opening balances.
     r = client.put(f"/api/payments/{pid}/revert", headers=a, json={"reason": "x"})
     assert r.status_code == 200, r.get_data(as_text=True)
     assert client.delete(f"/api/payments/{pid}", headers=a).status_code == 200
     assert _account(tid, "income_subscriptions") == 0
-    assert _account(tid, "opening") == 25           # prior-period income reversed
-    assert _account(tid, "customers") == -25
-    _assert_balanced(tid)
+    assert _account(tid, "opening") == 0            # prior-period income reversed
+    assert _account(tid, "customers") == 0
+    assert _account(tid, "cash") == 0               # the receipt was reverted
+    _assert_customer_matches(tid, cid)
+
+
+def test_start_lines_without_a_day_are_matched(app, client):
+    """Starting-point rows written without a day (day NULL) are dated by
+    matching the record's desired lines, so an unchanged record diffs to
+    nothing and paying it posts only the receipt."""
+    a = make_tenant(client, "Books", "lp18b")
+    cid = _customer(client, a)
+    pid = _bill(client, a, cid, 25, "2026-09-01")
+    tid = _tid()
+    _start_books_for_test(tid)
+    with flask_app.app_context():
+        from app import LedgerStartLine
+        rows = LedgerStartLine.query.filter_by(tenant_id=tid, source_type="payment", source_id=pid).all()
+        assert len(rows) == 2
+        for row in rows:
+            row.day = None
+        db.session.commit()
+    _pay(client, a, pid)
+    assert _account_by_day(tid, "cash") == {_today(): 25}
+    assert _account(tid, "income_subscriptions") == 0
+    assert _account(tid, "opening") == -25
+    _assert_customer_matches(tid, cid)
 
 
 def test_expired_record_is_still_posted(app, client):

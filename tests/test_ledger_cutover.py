@@ -248,3 +248,249 @@ def test_safety_net_failure_does_not_block_commit(app, client, monkeypatch):
     assert _stored_balance(Customer, cid) == -7
     with flask_app.app_context():
         assert appmod.LedgerProblem.query.filter_by(tenant_id=tid).count() >= 1
+
+
+# --- starting the books (task 5) -------------------------------------------------
+# Spec: "Starting the books (cut-over)", "Fixing records from before the books
+# started".
+
+import json as _json
+from datetime import date as _date, timedelta as _timedelta, timezone as _timezone
+
+from tests.test_ledger_posting import _today, _account_by_day
+from tests.test_expenses_payroll_supplier import _make_category, _make_expense
+from app import LedgerState, LedgerStartLine, BusinessSettings
+
+
+def _start(client, hdr):
+    r = client.post("/api/books/start", headers=hdr)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return r.get_json()
+
+
+def _opening_entries(tid):
+    with flask_app.app_context():
+        return JournalEntry.query.filter_by(tenant_id=tid, kind="opening").all()
+
+
+def _state_check(tid):
+    with flask_app.app_context():
+        return _json.loads(db.session.get(LedgerState, tid).last_check or "{}")
+
+
+def _set_cash_opening(client, hdr, amount, whish=None, days_ago=10):
+    body = {"date": (_today() - _timedelta(days=days_ago)).isoformat(), "amount": amount}
+    if whish is not None:
+        body["whish_amount"] = whish
+    r = client.put("/api/reports/cash-opening", headers=hdr, json=body)
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+
+def test_start_books_opening_matches_stored_balances(app, client):
+    a = make_tenant(client, "Books", "lc20")
+    tid = _tid()
+    owes = _customer(client, a, "Owes")
+    _bill(client, a, owes, 40)                       # owes 40
+    credit = _customer(client, a, "Credit")
+    _prepay(client, a, credit, 15)                   # 15 credit, 15 cash today
+    sid = _make_supplier(client, a)
+    assert client.put(f"/api/suppliers/{sid}", headers=a, json={"balance": 70, "balance_reason": "old invoice"}).status_code == 200
+    r = client.post("/api/resellers", headers=a,
+                    json={"name": "Rami", "phone": "70000000", "type": "type1", "balance": 60})
+    rid = (r.get_json().get("reseller") or r.get_json())["id"]
+    r = client.post("/api/upstream-providers", headers=a, json={"name": "Up", "balance": 80})
+    up = (r.get_json().get("provider") or r.get_json())["id"]
+    _set_cash_opening(client, a, 100, whish=20)
+
+    state = _start(client, a)
+    assert state["start_day"] == _today().isoformat()
+
+    for pt, model, pk, want in (("customer", Customer, owes, -40), ("customer", Customer, credit, 15),
+                                ("supplier", Supplier, sid, 70), ("reseller", Reseller, rid, 60),
+                                ("upstream", UpstreamProvider, up, 80)):
+        assert _stored_balance(model, pk) == want
+        assert _books_party_balance(pt, pk) == want
+    # Cash/Whish = the Cash Flow running balance at the start: the opening
+    # plus what already moved (the 15 prepay collected today).
+    assert _account(tid, "cash") == 115
+    assert _account(tid, "whish") == 20
+    entries = _opening_entries(tid)
+    assert len(entries) == 1 and entries[0].entry_date == _today()
+    assert state["opening_entry_id"] == entries[0].id
+    _assert_balanced(tid)
+    assert _kinds(tid) == ["opening"]              # nothing unexplained
+    assert not _state_check(tid).get("cash_opening_unknown")
+    with flask_app.app_context():
+        # The starting point: one row per line, each with its own day.
+        rows = LedgerStartLine.query.filter_by(tenant_id=tid, source_type="payment").all()
+        assert sorted((r.account_key, r.amount, r.day) for r in rows) == sorted([
+            ("customers", 40, _date(2026, 9, 1)), ("income_subscriptions", -40, _date(2026, 9, 1)),
+            ("cash", 15, _today()), ("customers", -15, _today())])
+
+
+def test_start_books_is_idempotent(app, client):
+    a = make_tenant(client, "Books", "lc21")
+    tid = _tid()
+    cid = _customer(client, a)
+    _bill(client, a, cid, 25)
+    first = _start(client, a)
+    with flask_app.app_context():
+        lines = LedgerStartLine.query.filter_by(tenant_id=tid).count()
+        accounts = appmod.LedgerAccount.query.filter_by(tenant_id=tid).count()
+    second = _start(client, a)
+    assert second == first
+    with flask_app.app_context():
+        assert appmod.start_books(tid).started_at is not None
+        db.session.commit()
+        assert LedgerStartLine.query.filter_by(tenant_id=tid).count() == lines
+        assert appmod.LedgerAccount.query.filter_by(tenant_id=tid).count() == accounts
+    assert len(_opening_entries(tid)) == 1
+    _assert_customer_matches(tid, cid)
+
+
+def test_start_books_admin_only(app, client):
+    a = make_tenant(client, "Books", "lc22")
+    tid = _tid()
+    client.post("/api/users", headers=a, json={"username": "lc22fin", "password": "pw", "role": "finance"})
+    tok = client.post("/api/login", json={"username": "lc22fin", "password": "pw"}).get_json()["access_token"]
+    r = client.post("/api/books/start", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 403
+    with flask_app.app_context():
+        assert db.session.get(LedgerState, tid) is None
+
+
+def test_old_open_bill_paid_after_start_posts_only_the_receipt(app, client):
+    a = make_tenant(client, "Books", "lc23")
+    tid = _tid()
+    cid = _customer(client, a)
+    pid = _bill(client, a, cid, 25)
+    _start(client, a)
+    opening, income = _account(tid, "opening"), _account(tid, "income_subscriptions")
+    assert (opening, income) == (-25, 0)
+    _pay(client, a, pid)
+    assert _account(tid, "cash") == 25
+    assert _account(tid, "income_subscriptions") == 0       # not booked a second time
+    assert _account(tid, "opening") == opening
+    assert _kinds(tid) == ["event", "opening"]
+    _assert_customer_matches(tid, cid)
+
+
+def test_old_bill_deleted_after_start_moves_income_to_opening(app, client):
+    a = make_tenant(client, "Books", "lc24")
+    tid = _tid()
+    cid = _customer(client, a)
+    pid = _bill(client, a, cid, 25)
+    _start(client, a)
+    assert client.delete(f"/api/payments/{pid}", headers=a).status_code == 200
+    assert _stored_balance(Customer, cid) == 0
+    assert _account(tid, "income_subscriptions") == 0       # this period's income untouched
+    assert _account(tid, "opening") == 0                    # -25 opening, +25 prior-period fix
+    assert "unexplained" not in _kinds(tid)
+    _assert_customer_matches(tid, cid)
+
+
+def test_old_expense_edited_after_start_moves_expense_to_opening(app, client):
+    a = make_tenant(client, "Books", "lc25")
+    tid = _tid()
+    cat = _make_category(client, a, "Tools")
+    eid = _make_expense(client, a, cat, amount=30, date="2026-06-15")["id"]
+    _set_cash_opening(client, a, 100, days_ago=200)
+    _start(client, a)
+    cash, opening = _account(tid, "cash"), _account(tid, "opening")
+    r = client.put(f"/api/expenses/{eid}", headers=a, json={"amount": 40})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    with flask_app.app_context():
+        cat_id = appmod.ExpenseCategory.query.filter_by(tenant_id=tid, name="Tools").one().id
+    assert _account(tid, f"expense:{cat_id}") == 0          # not this period's expense
+    assert _account(tid, "opening") == opening + 10
+    assert _account(tid, "cash") == cash - 10
+    _assert_balanced(tid)
+
+
+def test_old_bill_made_gratis_after_start_posts_discount_normally(app, client):
+    a = make_tenant(client, "Books", "lc26")
+    tid = _tid()
+    cid = _customer(client, a)
+    pid = _bill(client, a, cid, 25)
+    _start(client, a)
+    opening = _account(tid, "opening")
+    r = client.put(f"/api/payments/{pid}/mark_gratis", headers=a, json={"note": "goodwill"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert _account(tid, "discounts") == 25
+    assert _account(tid, "opening") == opening
+    assert _account(tid, "income_subscriptions") == 0
+    _assert_customer_matches(tid, cid)
+
+
+def test_cash_opening_unknown_flag_when_no_opening_set(app, client):
+    a = make_tenant(client, "Books", "lc27")
+    tid = _tid()
+    cid = _customer(client, a)
+    _prepay(client, a, cid, 15)
+    _start(client, a)
+    assert _account(tid, "cash") == 0
+    assert _account(tid, "whish") == 0
+    assert _state_check(tid)["cash_opening_unknown"] is True
+    _assert_customer_matches(tid, cid)
+    assert "unexplained" not in _kinds(tid)
+
+
+def test_start_day_is_the_tenants_own_local_day(app, client):
+    make_tenant(client, "Books", "lc28")
+    tid = _tid()
+    with flask_app.app_context():
+        s = BusinessSettings.query.filter_by(tenant_id=tid).first()
+        if s is None:
+            s = BusinessSettings(tenant_id=tid, business_name="B", address="", mobile="")
+            db.session.add(s)
+        s.timezone = "Pacific/Kiritimati"                  # UTC+14
+        db.session.commit()
+        state = appmod.start_books(tid, now=datetime(2026, 11, 17, 12, 0, tzinfo=_timezone.utc))
+        db.session.commit()
+        assert state.start_day == _date(2026, 11, 18)
+
+
+def test_ledger_nightly_starts_unstarted_tenants(app, client, monkeypatch):
+    make_tenant(client, "Books A", "lc29")
+    first = _tid()
+    a2 = make_tenant(client, "Books B", "lc30")
+    second = _tid()
+    cid = _customer(client, a2)
+    _bill(client, a2, cid, 25)
+    _set_cash_opening(client, a2, 50)     # read with no request: as that tenant
+    with flask_app.app_context():
+        appmod.start_books(first)
+        db.session.commit()
+    checked = []
+    monkeypatch.setattr(appmod, "run_books_check", lambda tid: checked.append(tid) or {})
+    appmod.ledger_nightly()
+    with flask_app.app_context():
+        assert db.session.get(LedgerState, second) is not None
+    assert first in checked and second not in checked
+    _assert_customer_matches(second, cid)
+    assert _account(second, "cash") == 50
+    assert _kinds(second) == ["opening"]
+
+
+def test_ledger_nightly_one_tenant_failing_does_not_stop_others(app, client, monkeypatch):
+    make_tenant(client, "Books A", "lc31")
+    bad = _tid()
+    make_tenant(client, "Books B", "lc32")
+    good = _tid()
+    real = appmod.start_books
+
+    def flaky(tid, now=None):
+        if tid == bad:
+            raise RuntimeError("boom")
+        return real(tid, now)
+    monkeypatch.setattr(appmod, "start_books", flaky)
+    appmod.ledger_nightly()
+    with flask_app.app_context():
+        assert db.session.get(LedgerState, bad) is None
+        assert db.session.get(LedgerState, good) is not None
+
+
+def test_ledger_nightly_is_scheduled(app):
+    assert appmod.SCHEDULE["ledger_nightly"] == "0 3 * * *"
+    assert "ledger_nightly" in appmod._SCHEDULED_JOBS
+    assert "ledger_nightly" in appmod.onprem_schedule()

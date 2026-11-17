@@ -21,6 +21,7 @@ except ImportError:
     AI_REPLY_GREENLET_POOL = None
 
 import re
+import contextlib
 import difflib
 import modules
 import hmac
@@ -1196,7 +1197,9 @@ class JournalLine(db.Model):
 
 class LedgerStartLine(db.Model):
     """What a source record contributed to the opening balances when the
-    books were started: amount is signed (+debit / -credit)."""
+    books were started, one row per desired line (unnetted): amount is signed
+    (+debit / -credit), day is that line's own day. day is NULL only on rows
+    written without one; those are dated by matching (_date_start_lines)."""
     __table_args__ = (
         db.Index('ix_ledger_start_line_source', 'source_type', 'source_id'),
     )
@@ -1208,6 +1211,7 @@ class LedgerStartLine(db.Model):
     party_type = db.Column(db.String(20), nullable=True)
     party_id = db.Column(db.Integer, nullable=True)
     amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    day = db.Column(db.Date, nullable=True)
 
 
 class LedgerState(db.Model):
@@ -3233,7 +3237,7 @@ def _ledger_memo(kind, d, change, is_event=False):
 
 
 def _ledger_already(tenant_id, kind, ids):
-    """{source_id: ([posted Line], [(account_key, party_type, party_id, amount)] start lines)}
+    """{source_id: ([posted Line], [(account_key, party_type, party_id, amount, day)] start lines)}
     for the non-new records of one kind. Two queries per kind per flush."""
     out = {i: ([], []) for i in ids}
     ids = list(ids)
@@ -3252,22 +3256,27 @@ def _ledger_already(tenant_id, kind, ids):
                                                round(float(dr or 0) - float(cr or 0), 4), day))
             rows = db.session.execute(
                 db.select(LedgerStartLine.source_id, LedgerStartLine.account_key,
-                          LedgerStartLine.party_type, LedgerStartLine.party_id, LedgerStartLine.amount)
+                          LedgerStartLine.party_type, LedgerStartLine.party_id, LedgerStartLine.amount,
+                          LedgerStartLine.day)
                 .where(LedgerStartLine.tenant_id == tenant_id, LedgerStartLine.source_type == kind,
                        LedgerStartLine.source_id.in_(chunk))).all()
-            for sid, key, ptype, pid, amount in rows:
-                out[sid][1].append((key, ptype, pid, round(float(amount or 0), 4)))
+            for sid, key, ptype, pid, amount, day in rows:
+                out[sid][1].append((key, ptype, pid, round(float(amount or 0), 4), day))
     return out
 
 
 def _date_start_lines(start, desired, fallback_day):
-    """Starting-point lines carry no date. Give each the day of the desired
-    line it stands for: the same account/party and amount first, else the
-    same account/party, else `fallback_day` -- so an unchanged record that
-    predates the books diffs to nothing."""
+    """Starting-point lines as Lines. start_books stores each with the day of
+    the line it stands for, which is used as is. A row without a day is given
+    the day of the desired line it stands for: the same account/party and
+    amount first, else the same account/party, else `fallback_day` -- so an
+    unchanged record that predates the books diffs to nothing."""
     free = list(desired)
     out = []
-    for key, ptype, pid, amount in start:
+    for key, ptype, pid, amount, day in start:
+        if day is not None:
+            out.append(_books.Line(key, ptype, pid, amount, day))
+            continue
         match = next((l for l in free if (l.account_key, l.party_type, l.party_id) == (key, ptype, pid)
                       and abs(l.amount - amount) < _LEDGER_EPS), None)
         if match is not None:
@@ -5739,6 +5748,208 @@ def whatsapp_connection_health_with_context():
         wa_connect.run_health_checks(sys.modules[__name__])
 
 
+@contextlib.contextmanager
+def _acting_as_tenant(tenant_id):
+    """Run tenant_query()-based code (the Cash Flow report) for `tenant_id`
+    outside that tenant's own request -- the nightly job has no JWT. Inside a
+    request already carrying that tenant's token nothing changes; otherwise a
+    short-lived token for it is attached to a throwaway request context that
+    reuses the current app context, so the DB session is shared (the same
+    pattern as mcp_tools.call_api)."""
+    try:
+        same = has_request_context() and get_jwt().get('tenant_id') == tenant_id
+    except Exception:
+        same = False
+    if same:
+        yield
+        return
+    token = create_access_token(identity='books', additional_claims={'role': 'system', 'tenant_id': tenant_id},
+                                expires_delta=timedelta(minutes=5))
+    with app.test_request_context('/', headers={'Authorization': f'Bearer {token}'}):
+        verify_jwt_in_request()
+        yield
+
+
+def _ledger_start_day(settings, now=None):
+    """The tenant's own local date of `now` (naive = UTC), never the request's."""
+    zone = _zone_for(settings)
+    if now is None:
+        return datetime.now(zone).date()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(zone).date()
+
+
+def _ledger_write_starting_point(tenant_id):
+    """The starting point: every existing record's desired lines in its
+    current state, one LedgerStartLine per line (unnetted, with its day).
+    Loaded in id-ordered chunks so a large tenant does not hold every record
+    at once."""
+    local_day, _ = _ledger_context(tenant_id)
+    session = db.session
+    table = LedgerStartLine.__table__
+    known = set(session.identity_map.keys())  # the caller's own objects stay attached
+    for model, kind in _LEDGER_MODELS.items():
+        last = 0
+        while True:
+            with session.no_autoflush:
+                chunk = (model.query.filter(model.tenant_id == tenant_id, model.id > last)
+                         .order_by(model.id).limit(1000).all())
+            if not chunk:
+                break
+            rows = []
+            for rec in chunk:
+                for l in _books.desired_lines(kind, rec, local_day):
+                    rows.append({'tenant_id': tenant_id, 'source_type': kind, 'source_id': rec.id,
+                                 'account_key': l.account_key, 'party_type': l.party_type,
+                                 'party_id': l.party_id, 'amount': round(float(l.amount), 4),
+                                 'day': l.day})
+            last = chunk[-1].id
+            if rows:
+                session.execute(table.insert(), rows)
+            for rec in chunk:
+                if db.inspect(rec).identity_key not in known:
+                    session.expunge(rec)
+
+
+def start_books(tenant_id, now=None):
+    """Start the tenant's books (spec "Starting the books (cut-over)"), in the
+    caller's transaction -- the caller commits. Idempotent: an already started
+    tenant's LedgerState is returned untouched.
+
+    1. the chart of accounts;
+    2. the opening entry, dated start_day (the tenant's own local date of
+       `now`): every party's non-zero stored balance and Cash / Whish at the
+       Cash Flow running balance, each against Opening balances. Cash / Whish
+       are the Cash Flow page's closing figures for start_day itself, i.e.
+       the day before's close plus what already moved today: every record
+       existing now is in the starting point, so a movement earlier on the
+       start day must already be inside the opening (else the books' Cash
+       would trail the Cash Flow page by it for good). No opening balance on
+       that page: 0, and last_check['cash_opening_unknown'] = True;
+    3. the starting point (LedgerStartLine rows) for every existing record;
+    4. the LedgerState row.
+
+    The opening entry's party lines are not counted by the safety net: they
+    restate balances, they do not change them."""
+    session = db.session
+    state = session.get(LedgerState, tenant_id)
+    if state is not None:
+        return state
+    with session.no_autoflush:
+        settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).order_by(BusinessSettings.id).first()
+    start_day = _ledger_start_day(settings, now)
+
+    # 4 first: a second start racing this one blocks on the primary key.
+    state = LedgerState(tenant_id=tenant_id, start_day=start_day, started_at=datetime.utcnow())
+    session.add(state)
+    session.flush()
+
+    # 1. Chart of accounts (only what is missing).
+    with session.no_autoflush:
+        have = set(session.execute(db.select(LedgerAccount.key)
+                                   .where(LedgerAccount.tenant_id == tenant_id)).scalars())
+    rows = [{'tenant_id': tenant_id, 'key': key, 'number': number, 'name': name, 'type': type_,
+             'party_type': party_type}
+            for key, number, name, type_, party_type in _books.CHART if key not in have]
+    if rows:
+        session.execute(LedgerAccount.__table__.insert(), rows)
+    # Caches that saw this tenant as not started / without accounts are stale now.
+    session.info.setdefault('ledger_started', {})[tenant_id] = state
+    session.info.get('ledger_accounts', {}).pop(tenant_id, None)
+
+    # 2. Opening entry.
+    items = []
+    for model, party_type in _LEDGER_PARTY_TYPES.items():
+        with session.no_autoflush:
+            parties = session.execute(
+                db.select(model.id, model.balance).where(model.tenant_id == tenant_id)
+                .order_by(model.id)).all()
+        for pid, balance in parties:
+            balance = round(float(balance or 0), 4)
+            if abs(balance) >= 0.005:
+                items.append(('Opening balances', None,
+                              _books.balance_delta_to_lines(party_type, pid, balance, start_day,
+                                                            against='opening')))
+    with _acting_as_tenant(tenant_id):
+        flow = _cash_flow_for_day(start_day, settings)
+    unknown = flow.get('cash_end') is None
+    for key, value in (('cash', flow.get('cash_end')), ('whish', flow.get('whish_end'))):
+        amount = round(float(value or 0), 4)
+        if abs(amount) >= _LEDGER_EPS:
+            items.append(('Opening balances', None, [
+                _books.Line(key, None, None, amount, start_day),
+                _books.Line('opening', None, None, -amount, start_day)]))
+    if items:
+        posted = session.info.get('ledger_party_posted')
+        before = dict(posted) if posted else None
+        _post_line_groups(tenant_id, 'opening', items, who=_ledger_who())
+        # Restating a balance is not a change of it: keep these lines out of
+        # what the safety net compares with this transaction's balance changes.
+        if before:
+            session.info['ledger_party_posted'] = before
+        else:
+            session.info.pop('ledger_party_posted', None)
+        state.opening_entry_id = session.info['ledger_entries'][(tenant_id, 'opening', start_day)]['id']
+    if unknown:
+        state.last_check = json.dumps({'cash_opening_unknown': True})
+
+    # 3. Starting point.
+    _ledger_write_starting_point(tenant_id)
+    session.flush()
+    return state
+
+
+def _ledger_state_json(state):
+    check = None
+    if state.last_check:
+        try:
+            check = json.loads(state.last_check)
+        except ValueError:
+            check = None
+    return {
+        'tenant_id': state.tenant_id,
+        'started_at': state.started_at.strftime('%Y-%m-%dT%H:%M:%SZ') if state.started_at else None,
+        'start_day': state.start_day.isoformat() if state.start_day else None,
+        'opening_entry_id': state.opening_entry_id,
+        'last_check_at': state.last_check_at.strftime('%Y-%m-%dT%H:%M:%SZ') if state.last_check_at else None,
+        'last_check': check,
+    }
+
+
+@app.route('/api/books/start', methods=['POST'])
+@jwt_required()
+@admin_required()
+def start_books_route():
+    """Start this business's books now (admin). Idempotent."""
+    state = start_books(current_tenant_id())
+    db.session.commit()
+    return jsonify(_ledger_state_json(state)), 200
+
+
+def run_books_check(tenant_id):
+    """The nightly books check (spec "Nightly check"). Stub until task 6."""
+    return {}
+
+
+def ledger_nightly():
+    """Nightly (after the other nightly jobs): start the books of every
+    business that has not started them, else run its books check. Each
+    tenant in its own try + commit, so one failing does not stop the rest."""
+    with app.app_context():
+        tenant_ids = [t for (t,) in db.session.execute(db.select(Tenant.id).order_by(Tenant.id)).all()]
+        for tid in tenant_ids:
+            try:
+                if db.session.get(LedgerState, tid) is None:
+                    start_books(tid)
+                else:
+                    run_books_check(tid)
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logging.exception("books: nightly run failed for tenant %s", tid)
+
+
 _SCHEDULED_JOBS = {
     "generate_missing_payments": generate_missing_payments_with_context,
     "generate_missing_salary_charges": generate_missing_salary_charges_with_context,
@@ -5754,6 +5965,8 @@ _SCHEDULED_JOBS = {
     "check_pro_plan_expirations": check_pro_plan_expirations_with_context,
     "refresh_agent_mode_network_status": refresh_agent_mode_network_status_with_context,
     "whatsapp_connection_health": whatsapp_connection_health_with_context,
+    # The books (roadmap 1C): starts unstarted businesses, else checks them.
+    "ledger_nightly": ledger_nightly,
 }
 
 
@@ -5777,6 +5990,7 @@ SCHEDULE = {
     "check_pro_plan_expirations": "50 2 * * *",
     "refresh_agent_mode_network_status": "*/15 * * * *",
     "whatsapp_connection_health": "5 * * * *",
+    "ledger_nightly": "0 3 * * *",
 }
 ONPREM_EXTRA_SCHEDULE = {"refresh_license": "0 3 * * *"}
 

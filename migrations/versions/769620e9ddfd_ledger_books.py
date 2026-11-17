@@ -102,6 +102,8 @@ def upgrade():
             sa.Column('party_type', sa.String(length=20), nullable=True),
             sa.Column('party_id', sa.Integer(), nullable=True),
             sa.Column('amount', _money(), nullable=False),
+            # The day of the line it stands for (NULL: matched by account/party).
+            sa.Column('day', sa.Date(), nullable=True),
             sa.ForeignKeyConstraint(['tenant_id'], ['tenant.id']),
             sa.PrimaryKeyConstraint('id'),
         )
