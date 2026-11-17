@@ -337,7 +337,6 @@ const rawApiService = {
     fetchReceiptLogs: (searchQuery, printed_filter = 'false', sort_by = 'billing_date', sort_desc = 'true') => api.get('/receipts/with-current-balance', { params: { search_query: searchQuery, printed: printed_filter, sort_by: sort_by, sort_desc: sort_desc } }),
     generateReceipts: (data) => api.post('/receipts/generate', data),
     logReceiptPrint: (data) => api.post('/receipts/log_print', data),
-    deleteReceipt: (receiptId) => api.delete(`/receipts/${receiptId}`),
 
     // New Expense API methods
     fetchExpenses: (startDate, endDate) => api.get(`/expenses`, { params: { start_date: startDate, end_date: endDate } }),
