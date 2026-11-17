@@ -104,9 +104,12 @@ function PaymentTotalsBar({ totals, loading }) {
 }
 
 // Revenue helpers — kept outside component so they are never recreated.
-// A refund row gives money back, so it subtracts; a gratis (forgiven) bill is
-// marked paid but brought no money in, so it adds nothing.
-const revenueAmount = (p) => (p.is_gratis ? 0 : (p.is_refund ? -1 : 1) * (parseFloat(p.amount) || 0));
+// Same definition of revenue as the dashboard and the reports: a refund row
+// gives money back, so it subtracts; a gratis (forgiven) bill brought no money
+// in; a bill paid out of the customer's credit adds nothing either -- the
+// prepayment that created the credit is already counted.
+const revenueAmount = (p) => ((p.is_gratis || p.settled_from_credit)
+    ? 0 : (p.is_refund ? -1 : 1) * (parseFloat(p.amount) || 0));
 
 const getTotalRevenue = (payments) => {
     if (!Array.isArray(payments)) return 0;
@@ -120,7 +123,9 @@ const getCurrentMonthRevenue = (payments) => {
     const m = now.getMonth();
     return payments.reduce((sum, p) => {
         if (!p.paid) return sum;
-        const d = new Date(p.date);
+        // Money counts in the month it was received, not the month it was billed.
+        // (paid_at arrives as 'YYYY-MM-DD HH:MM:SS' in UTC.)
+        const d = new Date(p.paid_at ? `${p.paid_at.replace(' ', 'T')}Z` : p.date);
         return (d.getFullYear() === y && d.getMonth() === m) ? sum + revenueAmount(p) : sum;
     }, 0);
 };

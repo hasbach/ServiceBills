@@ -1274,6 +1274,11 @@ class Employee(db.Model):
     name = db.Column(db.String(100), nullable=False)
     monthly_salary = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0.0)
     hire_date = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    # Salary is accrued only for cycles ending after this moment. Stamped when
+    # the employee is added or reactivated, so neither creates salary owed for
+    # months already past (anything owed from before is entered by hand).
+    # NULL (rows older than this column) = accrue from the last salary charge.
+    accrual_start = db.Column(db.DateTime, nullable=True)
     active = db.Column(db.Boolean, default=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     balance = db.Column(db.Numeric(18, 4, asdecimal=False), default=0.0)
@@ -2914,6 +2919,70 @@ def apply_customer_balance_to_unpaid_payments(customer):
 
 
 
+def reopen_bills_no_longer_covered_by_credit(customer, withdrawn):
+    """The mirror of apply_customer_balance_to_unpaid_payments: when credit is
+    taken away (a prepayment reverted, deleted or refunded) after it already
+    settled bills, those bills are no longer paid by anything. Without this
+    they stayed marked "paid from credit" while the customer owed the money
+    with no open bill to collect it against.
+
+    Reopens the newest credit-settled bills until the customer's credit
+    (balance + open bills) is no longer negative, then lets the normal
+    settlement re-pay whatever part the remaining credit still covers. Like
+    the settlement itself it never moves the balance. `withdrawn` is the credit
+    just taken away: never more than that is reopened, so a shortfall the
+    customer already had for some other reason (a refund on a cash bill, an
+    old manual edit) does not start reopening bills. Caller commits."""
+    shortfall = -(float(customer.balance or 0) + sum(float(b.amount) for b in _open_bills(customer)))
+    shortfall = min(shortfall, float(withdrawn or 0))
+    if shortfall <= _MONEY_EPS:
+        return
+    settled = Payment.query.filter_by(
+        tenant_id=customer.tenant_id, customer_id=customer.id, paid=True, settled_from_credit=True
+    ).filter(Payment.pre_payment.isnot(True), Payment.is_refund.isnot(True)
+             ).order_by(Payment.date.desc(), Payment.id.desc()).all()
+    for bill in settled:
+        if shortfall <= _MONEY_EPS:
+            break
+        bill.paid = False
+        bill.paid_at = None
+        bill.settled_from_credit = False
+        shortfall -= float(bill.amount)
+        logging.info(f"Reopened bill {bill.id} for customer {customer.id}: its credit was withdrawn.")
+    db.session.flush()
+    apply_customer_balance_to_unpaid_payments(customer)
+
+
+def _credit_withdrawn_by_removing(payment):
+    """Credit that reverting or deleting `payment` takes away from its
+    customer: a received prepayment's amount, nothing for any other row."""
+    if payment.pre_payment and payment.paid and not payment.is_refund:
+        return float(payment.amount)
+    return 0.0
+
+
+def _balance_delta_on_delete(payment):
+    """What removing `payment` does to its customer's balance: exactly the
+    opposite of everything the row did to it while it existed.
+
+    - bill, unpaid: creating it debited the balance      -> credit it back
+    - bill, settled from credit: only the debit happened
+      (the settlement never touched the balance)         -> credit it back
+    - bill, paid in cash or gratis: debit + credit = 0   -> nothing
+    - prepayment, paid: it credited the balance          -> debit it
+    - refund, paid: it debited the balance               -> credit it back
+    - prepayment / refund, unpaid (i.e. reverted): the
+      revert already undid its effect                    -> nothing"""
+    amount = float(payment.amount)
+    if payment.is_refund:
+        return amount if payment.paid else 0.0
+    if payment.pre_payment:
+        return -amount if payment.paid else 0.0
+    if not payment.paid or payment.settled_from_credit:
+        return amount
+    return 0.0
+
+
 def has_pending_payment(customer_id, billing_date, tenant_id):
     """
     Check if a pending payment already exists for the customer for the given billing date.
@@ -3758,6 +3827,11 @@ def generate_missing_payments(tenant_id):
         # Get all active customers
         customers = Customer.query.filter_by(tenant_id=tenant_id, is_subscription_active=True).all()
 
+        # Customers who were ever billed through a reseller (see the cursor
+        # logic below for why this matters once they are independent again).
+        once_reseller_billed = {cid for (cid,) in db.session.query(ResellerPayment.customer_id).filter(
+            ResellerPayment.tenant_id == tenant_id, ResellerPayment.customer_id.isnot(None)).distinct()}
+
         for customer in customers:
             # Get the subscription plan for the customer
             subscription_plan = SubscriptionPlan.query.filter_by(tenant_id=tenant_id, id=customer.subscription_plan_id).first()
@@ -3799,8 +3873,25 @@ def generate_missing_payments(tenant_id):
                     tenant_id=tenant_id,
                     customer_id=customer.id,
                     pre_payment=False
+                ).filter(
+                    # A refund row is dated the day the money went back, not a
+                    # billing date: anchoring on it moved the customer's cycle
+                    # to the refund day and skipped the bill in between.
+                    Payment.is_refund.isnot(True)
                 ).order_by(Payment.date.desc()).first()
                 last_payment_date = last_payment.date if last_payment else customer.subscription_start_date
+                # A customer who left a reseller has cycles that were billed
+                # to that reseller and so have no Payment row. Without this the
+                # cursor falls back to their last own bill (or the start date)
+                # and bills every one of those cycles again, to the customer.
+                # subscription_expiry_date is the next not-yet-billed cycle.
+                if customer.id in once_reseller_billed and customer.subscription_expiry_date:
+                    step = {'monthly': relativedelta(months=1), 'yearly': relativedelta(years=1)}.get(
+                        subscription_plan.billing_cycle)
+                    if step is not None:
+                        billed_through = customer.subscription_expiry_date - step
+                        if billed_through > last_payment_date.replace(tzinfo=None):
+                            last_payment_date = billed_through
 
             # Calculate the next billing date based on the billing cycle
             # Use relativedelta for more accurate month/year increments
@@ -3883,7 +3974,13 @@ def generate_missing_salary_charges(tenant_id):
             next_charge_date = last_date + relativedelta(months=1)
 
             while next_charge_date <= datetime.utcnow():
-                if employee.monthly_salary > 0:
+                period = (next_charge_date - relativedelta(months=1)).strftime('%Y-%m')
+                # Cycles that ended before the employee was added / reactivated
+                # are not back-paid, and a month that already has a salary
+                # charge (e.g. entered by hand) is never charged twice.
+                before_start = employee.accrual_start is not None and next_charge_date <= employee.accrual_start
+                if employee.monthly_salary > 0 and not before_start and not SalaryCharge.query.filter_by(
+                        tenant_id=tenant_id, employee_id=employee.id, type='salary', period=period).first():
                     new_charge = SalaryCharge(
                         tenant_id=tenant_id,
                         employee_id=employee.id,
@@ -3892,7 +3989,7 @@ def generate_missing_salary_charges(tenant_id):
                         # Accrued at the END of the month worked (hired Oct 1
                         # -> charged Nov 1), so the period is the month the
                         # salary is for, not the month the charge lands in.
-                        period=(next_charge_date - relativedelta(months=1)).strftime('%Y-%m'),
+                        period=period,
                         date=next_charge_date,
                         reason='Monthly salary accrual'
                     )
@@ -5130,73 +5227,36 @@ def update_customer(customer_id):
             old_reseller_id = customer.reseller_id
             
             if old_reseller_id != new_reseller_id:
-                net_debt = 0.0
-                
-                # 1. Reverse accumulated debt/credit from OLD reseller (if any)
-                if old_reseller_id:
-                    old_reseller = tenant_query(Reseller).filter_by(id=old_reseller_id).first()
-                    if old_reseller:
-                        # customer_id match, not description string matching: a prior rename
-                        # (or a name that happens to be a substring of another customer's) could
-                        # never be matched reliably by text search. Rows predating this column
-                        # (customer_id NULL) are not included; audit those historical rows manually.
-                        rps = tenant_query(ResellerPayment).filter_by(
-                            reseller_id=old_reseller_id, customer_id=customer.id
-                        ).all()
-                        for rp in rps:
-                            if rp.type == 'credit_added':
-                                net_debt += rp.amount
-                            elif rp.type == 'payment_collected':
-                                net_debt -= rp.amount
-
-                        old_reseller.balance -= net_debt
-                        if net_debt > 0:
-                            db.session.add(ResellerPayment(
-                                reseller_id=old_reseller.id, customer_id=customer.id, amount=net_debt, type='payment_collected',
-                                description=f"Reversed accumulated debt for customer {customer.name} (moved)"
-                            ))
-                        elif net_debt < 0:
-                            db.session.add(ResellerPayment(
-                                reseller_id=old_reseller.id, customer_id=customer.id, amount=abs(net_debt), type='credit_added',
-                                description=f"Reversed accumulated credit for customer {customer.name} (moved)"
-                            ))
-                else:
-                    # Coming from Independent: net debt is simply their current balance
-                    net_debt = -customer.balance
-                    customer.balance = 0.0
-                    unpaid_payments = tenant_query(Payment).filter_by(customer_id=customer.id, paid=False).all()
-                    for p in unpaid_payments:
-                        p.paid = True
-                        p.collected = True
-                        p.collected_amount = 0
-                
-                # 2. Apply this net debt to the NEW destination
-                if new_reseller_id:
+                # Leaving a reseller moves no money: the charges already billed
+                # to that reseller were for months the customer was theirs, so
+                # they stay there; only future cycles go to the new owner (the
+                # scheduler resumes from subscription_expiry_date, see
+                # generate_missing_payments). The old code reversed the
+                # customer's whole billing history off the reseller, including
+                # months the reseller had already paid for.
+                if not old_reseller_id and new_reseller_id:
+                    # Joining a reseller from independent: the reseller takes
+                    # over the customer's unpaid bills. They are cancelled on
+                    # the customer (not marked paid -- no money came in, so it
+                    # is not revenue until the reseller pays) and the same
+                    # total is charged to the reseller. Bills a collector
+                    # already holds cash for stay with the customer until that
+                    # collection is confirmed; any credit stays the customer's.
                     new_reseller = tenant_query(Reseller).filter_by(id=new_reseller_id).first()
-                    if new_reseller:
-                        new_reseller.balance += net_debt
-                        if net_debt > 0:
-                            db.session.add(ResellerPayment(
-                                reseller_id=new_reseller.id, customer_id=customer.id, amount=net_debt, type='credit_added',
-                                description=f"Assumed debt from customer {customer.name}"
-                            ))
-                        elif net_debt < 0:
-                            db.session.add(ResellerPayment(
-                                reseller_id=new_reseller.id, customer_id=customer.id, amount=abs(net_debt), type='payment_collected',
-                                description=f"Assumed credit from customer {customer.name}"
-                            ))
-                else:
-                    # Going to Independent: put debt back on customer
-                    customer.balance -= net_debt
-                    if net_debt > 0:
-                        debt_payment = Payment(
-                            customer_id=customer.id, amount=net_debt, paid=False,
-                            date=datetime.now(timezone.utc), pre_payment=False,
-                            reason="Assumed accumulated debt from previous reseller"
-                        )
-                        db.session.add(debt_payment)
-                        _maybe_create_customer_payment_link(debt_payment, customer)
-                        apply_customer_balance_to_unpaid_payments(customer)
+                    bills = _open_bills(customer, uncollected_only=True) if new_reseller else []
+                    taken_over = round(sum(float(b.amount) for b in bills), 4)
+                    for bill in bills:
+                        customer.balance += float(bill.amount)
+                        _detach_payment_dependents(bill)
+                        db.session.delete(bill)
+                    if taken_over > 0:
+                        new_reseller.balance += taken_over
+                        count = f"{len(bills)} unpaid bill{'s' if len(bills) != 1 else ''}"
+                        db.session.add(ResellerPayment(
+                            reseller_id=new_reseller.id, customer_id=customer.id, amount=taken_over,
+                            type='credit_added',
+                            description=f"Took over {count} of customer {customer.name}"
+                        ))
 
             customer.reseller_id = new_reseller_id
 
@@ -5962,7 +6022,11 @@ def _payment_totals(filtered_query):
         (db.and_(is_collected, not_paid), got, None),
         (db.and_(not_collected, not_paid), due, None),
         (not_paid, due, None),
-        (paid_cond, db.case((is_refund, -due), else_=due), db.and_(paid_cond, not_refund)),
+        # Amount = money received: a bill paid out of the customer's credit is
+        # counted as a paid bill but adds nothing (the prepayment behind it is
+        # already in this total).
+        (paid_cond, db.case((is_refund, -due), (Payment.settled_from_credit.is_(True), 0), else_=due),
+         db.and_(paid_cond, not_refund)),
     ):
         columns.extend(bucket(cond, value, counted))
 
@@ -6013,21 +6077,15 @@ def delete_payment(payment_id):
             return jsonify({'message': 'Customer not found for this payment!'}), 404
 
         # Reverse the balance effect of this payment
-        if payment.paid:
-            # If the payment was paid, removing it means reducing the customer's balance
-            if getattr(payment, 'is_refund', False):
-                customer.balance += payment.amount
-            else:
-                customer.balance -= payment.amount
-        elif not getattr(payment, 'is_refund', False):
-            # If the payment was unpaid, removing it means increasing the customer's balance (less owed)
-            # (an unpaid refund is a reverted one -- its balance effect is already undone)
-            customer.balance += payment.amount
+        customer.balance += _balance_delta_on_delete(payment)
 
         _detach_payment_dependents(payment)
+        withdrawn = _credit_withdrawn_by_removing(payment)
 
         # Delete the payment
         db.session.delete(payment)
+        db.session.flush()
+        reopen_bills_no_longer_covered_by_credit(customer, withdrawn)
         db.session.commit()
 
         return jsonify({
@@ -6051,32 +6109,83 @@ def month_key(column):
     return func.strftime('%Y-%m', column)
 
 
+# --- One definition of revenue ------------------------------------------------
+# Every figure called revenue / income / sales comes from the helpers below, so
+# the dashboard, the reports and the Payments page cannot drift apart again:
+#   - money counts when it was received (paid_at; the bill date only for old
+#     rows that have no paid_at), on the business's own calendar -- a payment
+#     taken at 01:00 Beirut time on the 1st belongs to the new month, not to
+#     the previous one as its UTC timestamp says;
+#   - prepayments count when received; a bill later paid out of that credit is
+#     NOT counted again; gratis bills bring no money; a refund subtracts, in
+#     the month it was paid out.
+
+def _customer_income_conditions():
+    return (Payment.paid.is_(True), Payment.is_gratis.isnot(True), Payment.settled_from_credit.isnot(True))
+
+
+def _report_days(start_str, end_str):
+    """(start_day, end_day) business-local dates from a report's query strings.
+    Accepts 'YYYY-MM-DD' or the full ISO instant a browser's toISOString()
+    sends (taken as the business-local day that instant falls on). Either may
+    be missing -> None."""
+    def one(raw):
+        if not raw:
+            return None
+        if len(raw) == 10:
+            return datetime.strptime(raw, '%Y-%m-%d').date()
+        dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return _inst_day(dt)
+    return one(start_str), one(end_str)
+
+
+def _instant_bounds(start_day, end_day):
+    """Naive-UTC [from, until) covering business-local days start_day..end_day
+    inclusive, for columns that hold real instants (paid_at, collected_at...)."""
+    zone = _tenant_zone()
+    return (_local_day_start_utc(zone, start_day) if start_day else None,
+            _local_day_start_utc(zone, end_day + timedelta(days=1)) if end_day else None)
+
+
+def _local_month(dt):
+    """Business-local 'YYYY-MM' of a stored timestamp (a midnight value is a
+    typed calendar date and is taken as the date it names)."""
+    return _cal_day(dt).strftime('%Y-%m')
+
+
+def _customer_income_query(start_day=None, end_day=None):
+    """The Payment rows that are customer income between two business-local
+    days (inclusive; either may be None)."""
+    when = func.coalesce(Payment.paid_at, Payment.date)
+    q = tenant_query(Payment).filter(*_customer_income_conditions())
+    since, until = _instant_bounds(start_day, end_day)
+    if since is not None:
+        q = q.filter(when >= since)
+    if until is not None:
+        q = q.filter(when < until)
+    return q
+
+
+def _customer_income_by_month(start_day=None, end_day=None):
+    """{'YYYY-MM': net customer income}, months on the business calendar."""
+    out = {}
+    rows = _customer_income_query(start_day, end_day).with_entities(
+        Payment.paid_at, Payment.date, Payment.amount, Payment.is_refund, Payment.fx_rate_to_reporting)
+    for paid_at, billed, amount, is_refund, rate in rows:
+        value = float(amount) * float(rate or 1)
+        month = _local_month(paid_at or billed)
+        out[month] = out.get(month, 0.0) + (-value if is_refund else value)
+    return out
+
+
 # New Report Routes
 @app.route('/api/reports/total-sales', methods=['GET'])
 @jwt_required()
 def get_total_sales():
-    # Converted into the tenant's reporting_currency using each payment's own
-    # LOCKED rate (see docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md)
-    # -- a no-op multiply-by-1 for an opted-out (single-currency) tenant.
-    total_sales = db.session.query(
-        month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(_signed_payment_amount() * Payment.fx_rate_to_reporting).label('total_sales')
-    ).filter(
-        Payment.tenant_id == current_tenant_id(),
-        Payment.paid == True,
-        Payment.is_gratis == False,
-        # Prepayments count as revenue -- see
-        # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-        # Refunds are included, as negative amounts (see _signed_payment_amount).
-        # A bill paid from existing credit isn't new money: the prepayment that
-        # created the credit was already counted.
-        Payment.settled_from_credit.isnot(True),
-    ).group_by('month').all()
-
-    return jsonify([{
-        'month': sale.month,
-        'value': float(sale.total_sales or 0.0)
-    } for sale in total_sales])
+    total_sales = _customer_income_by_month()
+    return jsonify([{'month': month, 'value': total_sales[month]} for month in sorted(total_sales)])
 
 @app.route('/api/reports/unpaid-payments', methods=['GET'])
 @jwt_required()
@@ -6297,6 +6406,11 @@ def mark_payment_as_paid(payment_id):
         if action == 'collect':
             if not is_collector:
                 return jsonify({'message': 'Unauthorized to collect payments.'}), 403
+            if payment.paid:
+                # Re-collecting would restamp collected_at = now (moving the
+                # money to today in the cash flow, out of a possibly closed
+                # day) and overwrite who collected it and how.
+                return jsonify({'message': 'This payment is already paid.'}), 400
             closed = _assert_day_open(_tenant_today())  # collecting stamps collected_at = now
             if closed:
                 return closed
@@ -6889,6 +7003,14 @@ def revert_payment(payment_id):
     if not payment.paid:
         return jsonify({'message': 'Payment is not marked as paid.'}), 400
 
+    if payment.settled_from_credit:
+        # No money was collected for this bill -- it was matched to credit the
+        # customer already had, and that never moved the balance. Debiting it
+        # here (as below) would take the amount off the customer twice.
+        return jsonify({'message': "This bill was paid from the customer's own credit, so there is no "
+                                   "collection to revert. Delete the bill to cancel the charge and "
+                                   "return the credit."}), 400
+
     closed = _assert_day_open(_payment_flow_day(payment))
     if closed:
         return closed
@@ -6908,6 +7030,7 @@ def revert_payment(payment_id):
         # reverting always debits it back, regardless of which one it was.
         # A refund is the mirror image: issuing it debited the balance, so
         # undoing it credits the amount back.
+        withdrawn = _credit_withdrawn_by_removing(payment)
         if payment.is_refund:
             customer.balance += payment.amount
         else:
@@ -6932,6 +7055,8 @@ def revert_payment(payment_id):
         payment.reverted_by_id = current_user.id
         payment.revert_reason = reason
 
+        db.session.flush()
+        reopen_bills_no_longer_covered_by_credit(customer, withdrawn)
         db.session.commit()
 
         return jsonify({
@@ -6944,6 +7069,25 @@ def revert_payment(payment_id):
         db.session.rollback()
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+def _refund_reason_for(payment_id):
+    return f'Refund for payment #{payment_id}'
+
+
+def _refunded_total(payment):
+    """How much of `payment` has already been given back: its refund rows
+    still in effect (a reverted refund is paid=False and no longer counts).
+    Refund rows carry no foreign key to their original; the server-written
+    reason is the link."""
+    total = db.session.query(func.coalesce(func.sum(Payment.amount), 0)).filter(
+        Payment.tenant_id == payment.tenant_id,
+        Payment.customer_id == payment.customer_id,
+        Payment.is_refund.is_(True),
+        Payment.paid.is_(True),
+        Payment.reason == _refund_reason_for(payment.id),
+    ).scalar()
+    return round(float(total or 0), 4)
 
 
 @app.route('/api/payments/<int:payment_id>/refund', methods=['POST'])
@@ -6966,6 +7110,14 @@ def refund_payment(payment_id):
 
     if not payment.paid:
         return jsonify({'message': 'Only a paid payment can be refunded.'}), 400
+    # Only money that actually came in can go back out.
+    if payment.is_refund:
+        return jsonify({'message': 'A refund cannot itself be refunded. Revert it instead.'}), 400
+    if payment.is_gratis:
+        return jsonify({'message': 'A gratis bill cannot be refunded: no money was received for it.'}), 400
+    if payment.settled_from_credit:
+        return jsonify({'message': "This bill was paid from the customer's credit. "
+                                   "Refund the payment that created the credit instead."}), 400
 
     data = request.json or {}
     reason = (data.get('reason') or '').strip()
@@ -6979,6 +7131,14 @@ def refund_payment(payment_id):
 
     if refund_amount > payment.amount:
         return jsonify({'message': 'Refund amount cannot exceed the original payment amount.'}), 400
+    # ...nor, across several refunds, what is left of it.
+    already_refunded = _refunded_total(payment)
+    refundable = round(float(payment.amount) - already_refunded, 4)
+    if refundable <= _MONEY_EPS:
+        return jsonify({'message': 'This payment has already been refunded in full.'}), 400
+    if refund_amount > refundable + _MONEY_EPS:
+        return jsonify({'message': f'Only {refundable:g} of this payment is left to refund '
+                                   f'({already_refunded:g} was already refunded).'}), 400
 
     closed = _assert_day_open(_tenant_today())  # the refund row is dated now
     if closed:
@@ -7006,7 +7166,7 @@ def refund_payment(payment_id):
             # Same currency and locked rate as the money being given back.
             currency=payment.currency,
             fx_rate_to_reporting=payment.fx_rate_to_reporting,
-            reason=f'Refund for payment #{payment.id}',
+            reason=_refund_reason_for(payment.id),
             date=now,
             paid=True,
             paid_at=now,
@@ -7024,6 +7184,10 @@ def refund_payment(payment_id):
         # paid (which credits the balance).
         customer.balance -= refund_amount
 
+        db.session.flush()
+        # Refunding a prepayment takes back credit that may already have paid bills.
+        if payment.pre_payment:
+            reopen_bills_no_longer_covered_by_credit(customer, refund_amount)
         db.session.commit()
 
         return jsonify({
@@ -7130,15 +7294,12 @@ def bulk_delete_payments():
             if not customer:
                 failed.append({'id': payment.id, 'error': 'Customer not found for this payment'})
                 continue
-            if payment.paid:
-                if getattr(payment, 'is_refund', False):
-                    customer.balance += payment.amount
-                else:
-                    customer.balance -= payment.amount
-            elif not getattr(payment, 'is_refund', False):  # unpaid refund = reverted, nothing to undo
-                customer.balance += payment.amount
+            customer.balance += _balance_delta_on_delete(payment)
             _detach_payment_dependents(payment)
+            withdrawn = _credit_withdrawn_by_removing(payment)
             db.session.delete(payment)
+            db.session.flush()
+            reopen_bills_no_longer_covered_by_credit(customer, withdrawn)
             db.session.commit()
             succeeded.append(payment.id)
         except Exception as e:
@@ -7529,6 +7690,37 @@ def delete_receipt(receipt_id):
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+def _ledger_total_by_month(model, entry_type, start_day=None, end_day=None):
+    """{'YYYY-MM': total} of one kind of ResellerPayment / UpstreamProviderPayment
+    row for the current tenant, optionally between two business-local days
+    (inclusive). Months are on the business calendar, like customer income."""
+    q = db.session.query(model.date, model.amount).filter(
+        model.tenant_id == current_tenant_id(), model.type == entry_type)
+    since, until = _instant_bounds(start_day, end_day)
+    if since is not None:
+        q = q.filter(model.date >= since)
+    if until is not None:
+        q = q.filter(model.date < until)
+    out = {}
+    for when, amount in q:
+        month = _local_month(when)
+        out[month] = out.get(month, 0.0) + float(amount or 0)
+    return out
+
+
+def _reseller_income_by_month(start=None, end=None):
+    """Money resellers actually paid in. A reseller's customers are billed to
+    the reseller's account, not as customer payments, so this is the only place
+    that income shows up; like customer income it counts when it is received."""
+    return _ledger_total_by_month(ResellerPayment, 'payment_received', start, end)
+
+
+def _upstream_cost_by_month(start=None, end=None):
+    """Money paid out to upstream providers (balance top-ups) -- the cost of
+    the service being resold. Counted when paid, like every other expense."""
+    return _ledger_total_by_month(UpstreamProviderPayment, 'balance_topup', start, end)
+
+
 @app.route('/api/reports/expenses-total', methods=['GET'])
 @jwt_required()
 def get_expenses_total():
@@ -7560,40 +7752,30 @@ def get_expenses_total():
         func.sum(SalaryPayment.amount).label('total_sal')
     ).filter(SalaryPayment.tenant_id == current_tenant_id()).group_by('month').all()}
 
-    all_months = sorted(set(exp_data.keys()) | set(payroll_exp_data.keys()) | set(sp_data.keys()) | set(sal_data.keys()))
+    upstream_data = _upstream_cost_by_month()
+
+    all_months = sorted(set(exp_data.keys()) | set(payroll_exp_data.keys()) | set(sp_data.keys())
+                        | set(sal_data.keys()) | set(upstream_data.keys()))
 
     return jsonify([{
         'month': m,
         'value': float(exp_data.get(m, 0.0) or 0.0) + float(payroll_exp_data.get(m, 0.0) or 0.0)
-                 + float(sp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0),
+                 + float(sp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0)
+                 + upstream_data.get(m, 0.0),
         # Breakdown of the same total by source -- computed above either way,
         # previously discarded once summed into `value`.
         'manual': float(exp_data.get(m, 0.0) or 0.0),
         'supplier': float(sp_data.get(m, 0.0) or 0.0),
-        'payroll': float(payroll_exp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0)
+        'payroll': float(payroll_exp_data.get(m, 0.0) or 0.0) + float(sal_data.get(m, 0.0) or 0.0),
+        'upstream': upstream_data.get(m, 0.0),
     } for m in all_months])
 
 
 @app.route('/api/reports/monthly-revenue', methods=['GET'])
 @jwt_required()
 def get_monthly_revenue():
-    # Get total sales (paid only). Converted into the tenant's reporting_currency
-    # using each payment's own locked rate (no-op for an opted-out tenant) -- see
-    # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
-    sales_query = db.session.query(
-        month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-        func.sum(_signed_payment_amount() * Payment.fx_rate_to_reporting).label('total_sales')
-    ).filter(
-        Payment.tenant_id == current_tenant_id(),
-        Payment.paid == True,
-        Payment.is_gratis == False,
-        # Prepayments count as revenue -- see
-        # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-        # Refunds are included, as negative amounts (see _signed_payment_amount).
-        # A bill paid from existing credit isn't new money: the prepayment that
-        # created the credit was already counted.
-        Payment.settled_from_credit.isnot(True),
-    ).group_by('month').all()
+    # Customer income -- the one shared definition (see _customer_income_by_month).
+    sales_data = _customer_income_by_month()
 
     # Get expenses (exclude credit purchases)
     expenses_query = db.session.query(
@@ -7613,18 +7795,21 @@ def get_monthly_revenue():
         func.sum(SalaryPayment.amount).label('total_sal')
     ).filter(SalaryPayment.tenant_id == current_tenant_id()).group_by('month').all()
 
-    sales_data = {item.month: (item.total_sales or 0.0) for item in sales_query}
     expenses_data = {item.month: (item.total_expenses or 0.0) for item in expenses_query}
     sp_data = {item.month: (item.total_sp or 0.0) for item in sp_query}
     sal_data = {item.month: (item.total_sal or 0.0) for item in sal_query}
+    reseller_data = _reseller_income_by_month()
+    upstream_data = _upstream_cost_by_month()
 
     # Merge months
-    all_months = sorted(set(sales_data.keys()) | set(expenses_data.keys()) | set(sp_data.keys()) | set(sal_data.keys()))
+    all_months = sorted(set(sales_data.keys()) | set(expenses_data.keys()) | set(sp_data.keys())
+                        | set(sal_data.keys()) | set(reseller_data.keys()) | set(upstream_data.keys()))
 
     result = []
     for month in all_months:
-        sales = float(sales_data.get(month, 0.0) or 0.0)
-        expenses = float(expenses_data.get(month, 0.0) or 0.0) + float(sp_data.get(month, 0.0) or 0.0) + float(sal_data.get(month, 0.0) or 0.0)
+        sales = float(sales_data.get(month, 0.0) or 0.0) + reseller_data.get(month, 0.0)
+        expenses = (float(expenses_data.get(month, 0.0) or 0.0) + float(sp_data.get(month, 0.0) or 0.0)
+                    + float(sal_data.get(month, 0.0) or 0.0) + upstream_data.get(month, 0.0))
         result.append({
             'month': month,
             'value': float(sales - expenses)
@@ -9256,18 +9441,15 @@ def get_dashboard_metrics():
     total_customers = tenant_query(Customer).count()
     active_customers = tenant_query(Customer).filter_by(is_subscription_active=True).count()
 
-    # Prepayments count as revenue -- see
-    # docs/superpowers/plans/2026-08-27-tenant-whish-customer-payments.md, Task 21.
-    revenue_query = tenant_query(Payment).filter_by(paid=True).filter(
-        Payment.settled_from_credit.isnot(True),  # credit already counted
-        Payment.is_gratis.isnot(True),  # forgiven: no money came in
-    )
-    if start_date:
-        revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
-    if end_date:
-        revenue_query = revenue_query.filter(func.coalesce(Payment.paid_at, Payment.date) <= end_date)
-    # A refund row gives money back: subtract it.
-    total_revenue = sum(-p.amount if p.is_refund else p.amount for p in revenue_query.all())
+    # Income: the one shared definition (see _customer_income_by_month), with
+    # the chosen days taken on the business's own calendar.
+    start_day, end_day = _report_days(start_date_str, end_date_str)
+    customer_revenue = sum(_customer_income_by_month(start_day, end_day).values())
+    # Resellers' customers are billed to the reseller, so what resellers pay in
+    # is income too; upstream top-ups are the cost of the service resold.
+    reseller_revenue = sum(_reseller_income_by_month(start_day, end_day).values())
+    upstream_expenses = sum(_upstream_cost_by_month(start_day, end_day).values())
+    total_revenue = float(customer_revenue) + reseller_revenue
 
     # employee_id set = a payroll payment, regardless of what the category is named.
     manual_query = tenant_query(Expense).filter_by(is_credit=False).filter(Expense.employee_id.is_(None))
@@ -9290,7 +9472,7 @@ def get_dashboard_metrics():
     supplier_expenses = sum(sp.amount for sp in supplier_query.all())
     payroll_expenses = (sum(exp.amount for exp in payroll_exp_query.all())
                          + sum(sal.amount for sal in legacy_payroll_query.all()))
-    total_expenses = manual_expenses + supplier_expenses + payroll_expenses
+    total_expenses = manual_expenses + supplier_expenses + payroll_expenses + upstream_expenses
     # Outstanding balance should be the sum of negative balances (customers who owe money)
     outstanding_balance = sum(c.balance for c in tenant_query(Customer).filter(Customer.balance < 0).all())
     subscriptions_breakdown_query = db.session.query(
@@ -9314,6 +9496,9 @@ def get_dashboard_metrics():
         'manualExpenses': float(manual_expenses),
         'supplierExpenses': float(supplier_expenses),
         'payrollExpenses': float(payroll_expenses),
+        'upstreamExpenses': float(upstream_expenses),
+        'customerRevenue': float(customer_revenue),
+        'resellerRevenue': float(reseller_revenue),
         'outstandingBalance': float(outstanding_balance),
         'subscriptionsBreakdown': subscriptions_breakdown
     })
@@ -10498,23 +10683,13 @@ def get_revenue_report():
         start_date_str = request.args.get('start_date')
         end_date_str = request.args.get('end_date')
 
-        # Frontend sends full ISO-8601 datetimes (toISOString()), not plain
-        # 'YYYY-MM-DD' -- parse the same way get_financial_report does.
-        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if start_date_str else None
-        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None) if end_date_str else None
-
-        # Revenue = when the payment was actually paid, not when it was billed/due.
-        # Refunds are included and subtracted (see _signed_payment_amount).
-        query = tenant_query(Payment).filter(Payment.paid == True, Payment.is_gratis == False,
-                                             Payment.settled_from_credit.isnot(True)).options(  # credit already counted
+        # The one shared definition of customer income (see
+        # _customer_income_by_month): counted when paid, whole business-local
+        # days from start to end inclusive.
+        start_day, end_day = _report_days(start_date_str, end_date_str)
+        payments = _customer_income_query(start_day, end_day).options(
             db.joinedload(Payment.customer).joinedload(Customer.subscription_plan)
-        )
-        if start_date:
-            query = query.filter(func.coalesce(Payment.paid_at, Payment.date) >= start_date)
-        if end_date:
-            query = query.filter(func.coalesce(Payment.paid_at, Payment.date) <= end_date)
-
-        payments = query.all()
+        ).all()
 
         def signed(p):
             return -p.amount if p.is_refund else p.amount
@@ -10961,7 +11136,7 @@ def add_expense():
             if not employee:
                 return jsonify({'error': 'Employee not found.'}), 400
 
-        amount = float(data['amount'])
+        amount = _parse_positive_amount(data['amount'], 'Amount')
         description = data.get('description') or ''
         if employee and not description:
             description = f'Salary paid to {employee.name}'
@@ -11024,7 +11199,7 @@ def update_expense(expense_id):
                 return jsonify({'error': f"Category '{data['category']}' not found."}), 400
             expense.category_id = category.id
 
-        new_amount = float(data.get('amount', expense.amount))
+        new_amount = _parse_positive_amount(data.get('amount', expense.amount), 'Amount')
         new_is_credit = data.get('is_credit', expense.is_credit)
         raw_supplier_id = data.get('supplier_id', expense.supplier_id)
         new_supplier_id = int(raw_supplier_id) if raw_supplier_id not in (None, '') else None
@@ -11268,22 +11443,20 @@ def get_collector_progress():
         if not start_date_str or not end_date_str:
             return jsonify({'error': 'start_date and end_date are required'}), 400
 
-        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-        end_date = end_date.replace(hour=23, minute=59, second=59)
-
-        # Converted into the tenant's reporting_currency using each payment's own
-        # locked rate (no-op for an opted-out tenant) -- see
-        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
+        # Whole business-local days. What a collector brought in is the amount
+        # actually collected (a partial collection is less than the bill), and
+        # a refund row is never a collection.
+        since, until = _instant_bounds(*_report_days(start_date_str, end_date_str))
+        collected = func.coalesce(Payment.collected_amount, Payment.amount)
         collector_query = db.session.query(
             User.username,
-            func.sum(Payment.amount * Payment.fx_rate_to_reporting).label('total_amount'),
+            func.sum(collected * Payment.fx_rate_to_reporting).label('total_amount'),
             func.count(Payment.id).label('total_payments')
-        ).join(Payment, Payment.collected_by_id == User.id)\
-         .filter(
+        ).join(Payment, Payment.collected_by_id == User.id)         .filter(
              Payment.tenant_id == current_tenant_id(),
-             Payment.collected_at >= start_date,
-             Payment.collected_at <= end_date
+             Payment.is_refund.isnot(True),
+             Payment.collected_at >= since,
+             Payment.collected_at < until
          ).group_by(User.username).all()
 
         results = []
@@ -11429,9 +11602,15 @@ def _assert_day_open(*days):
 def _payment_flow_day(p):
     """The cash-flow day of a customer payment row, or None when the row isn't
     money moving (unpaid, gratis, reverted, settled from credit)."""
-    if not p.paid or p.is_gratis or p.reverted_at is not None or p.settled_from_credit:
+    if not p.paid or p.is_gratis or p.settled_from_credit:
         return None
-    return _inst_day(p.collected_at or p.paid_at)
+    when = p.collected_at or p.paid_at
+    # reverted_at is never cleared, so a bill reverted and then paid again
+    # still carries it; only a revert stamped after the current collection is
+    # in effect (same rule as _payment_not_reverted, which the cash flow uses).
+    if p.reverted_at is not None and (when is None or p.reverted_at >= when):
+        return None
+    return _inst_day(when)
 
 
 def _locked_payment_day(payments):
@@ -12024,6 +12203,138 @@ def get_daily_cash_report():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+def _logged_manual_adjustments(column):
+    """{party_id: net change} of the BalanceLog rows that are direct edits or
+    opening balances (no ledger row behind them) for one party column."""
+    rows = db.session.query(
+        column, func.sum(BalanceLog.balance_after - BalanceLog.balance_before)
+    ).filter(
+        BalanceLog.tenant_id == current_tenant_id(), column.isnot(None),
+        BalanceLog.reason.in_(('Balance edited manually', 'Opening balance')),
+    ).group_by(column).all()
+    return {pid: float(total or 0) for pid, total in rows}
+
+
+def _balance_mismatches(parties, expected, manual):
+    """Rows for every party whose stored balance differs from what its history
+    explains. `unexplained` leaves out the manual edits the balance log knows
+    about (edits made before the log existed still show up here)."""
+    out = []
+    for p in parties:
+        stored = float(p.balance or 0)
+        from_history = round(expected.get(p.id, 0.0), 4)
+        difference = round(stored - from_history, 4)
+        if abs(difference) <= _MONEY_EPS:
+            continue
+        logged = round(manual.get(p.id, 0.0), 4)
+        out.append({
+            'id': p.id, 'name': p.name,
+            'stored_balance': stored,
+            'balance_from_history': from_history,
+            'difference': difference,
+            'manual_edits_logged': logged,
+            'unexplained': round(difference - logged, 4),
+        })
+    out.sort(key=lambda r: -abs(r['unexplained']))
+    return out
+
+
+@app.route('/api/reports/reconciliation', methods=['GET'])
+@admin_required()
+def get_reconciliation_report():
+    """READ-ONLY health check (finance roadmap step 0): recompute every
+    customer, reseller, supplier and employee balance from its own history and
+    list the ones that disagree with the stored balance, plus payments refunded
+    for more than was received and bills marked paid with no money behind them.
+    Changes nothing -- it measures, and guards against regressions."""
+    tid = current_tenant_id()
+
+    # Customers: what each kind of row does to the balance (see
+    # _balance_delta_on_delete for the same rules read the other way round).
+    amount = Payment.amount
+    effect = db.case(
+        (Payment.is_refund.is_(True), db.case((Payment.paid.is_(True), -amount), else_=0)),
+        (Payment.pre_payment.is_(True), db.case((Payment.paid.is_(True), amount), else_=0)),
+        (db.or_(Payment.paid.isnot(True), Payment.settled_from_credit.is_(True)), -amount),
+        else_=0,
+    )
+    customer_expected = {cid: float(total or 0) for cid, total in db.session.query(
+        Payment.customer_id, func.sum(effect)).filter(Payment.tenant_id == tid).group_by(Payment.customer_id).all()}
+    # A reseller's customers are billed to the reseller: no bills, no balance.
+    customers = tenant_query(Customer).all()
+
+    # Resellers: charges add to what they owe; collections and discounts reduce it.
+    reseller_effect = db.case((ResellerPayment.type == 'credit_added', ResellerPayment.amount),
+                              else_=-ResellerPayment.amount)
+    reseller_expected = {rid: float(total or 0) for rid, total in db.session.query(
+        ResellerPayment.reseller_id, func.sum(reseller_effect)
+    ).filter(ResellerPayment.tenant_id == tid).group_by(ResellerPayment.reseller_id).all()}
+
+    # Suppliers: credit purchases add to what is owed; payments reduce it.
+    supplier_expected = {sid: float(total or 0) for sid, total in db.session.query(
+        Expense.supplier_id, func.sum(Expense.amount)
+    ).filter(Expense.tenant_id == tid, Expense.is_credit.is_(True), Expense.supplier_id.isnot(None)
+             ).group_by(Expense.supplier_id).all()}
+    for sid, total in db.session.query(SupplierPayment.supplier_id, func.sum(SupplierPayment.amount)).filter(
+            SupplierPayment.tenant_id == tid).group_by(SupplierPayment.supplier_id).all():
+        supplier_expected[sid] = supplier_expected.get(sid, 0.0) - float(total or 0)
+
+    # Employees: salary and bonus add to what is owed, deductions and payments reduce it.
+    charge_effect = db.case((SalaryCharge.type == 'deduction', -SalaryCharge.amount), else_=SalaryCharge.amount)
+    employee_expected = {eid: float(total or 0) for eid, total in db.session.query(
+        SalaryCharge.employee_id, func.sum(charge_effect)
+    ).filter(SalaryCharge.tenant_id == tid).group_by(SalaryCharge.employee_id).all()}
+    for model, col, when in ((Expense, Expense.employee_id, Expense.is_credit.isnot(True)),
+                             (SalaryPayment, SalaryPayment.employee_id, db.true())):
+        for eid, total in db.session.query(col, func.sum(model.amount)).filter(
+                model.tenant_id == tid, col.isnot(None), when).group_by(col).all():
+            employee_expected[eid] = employee_expected.get(eid, 0.0) - float(total or 0)
+
+    # Payments given back for more than was received (refund rows name their
+    # original in the server-written reason).
+    refunded = {reason: float(total or 0) for reason, total in db.session.query(
+        Payment.reason, func.sum(Payment.amount)
+    ).filter(Payment.tenant_id == tid, Payment.is_refund.is_(True), Payment.paid.is_(True)
+             ).group_by(Payment.reason).all()}
+    over_refunded = []
+    if refunded:
+        ids = [int(r.rsplit('#', 1)[1]) for r in refunded if r and r.rsplit('#', 1)[-1].isdigit()]
+        for p in tenant_query(Payment).filter(Payment.id.in_(ids)).all() if ids else []:
+            total = refunded.get(_refund_reason_for(p.id), 0.0)
+            if total > float(p.amount) + _MONEY_EPS:
+                over_refunded.append({'payment_id': p.id, 'customer_id': p.customer_id,
+                                      'amount': float(p.amount), 'refunded': round(total, 4)})
+
+    # Bills counted as income although nothing was collected (what moving a
+    # customer onto a reseller used to leave behind).
+    paid_without_money = [
+        {'payment_id': p.id, 'customer_id': p.customer_id, 'amount': float(p.amount),
+         'date': p.date.strftime('%Y-%m-%d') if p.date else None}
+        for p in tenant_query(Payment).filter(
+            Payment.paid.is_(True), Payment.is_gratis.isnot(True), Payment.is_refund.isnot(True),
+            Payment.settled_from_credit.isnot(True), Payment.pre_payment.isnot(True),
+            Payment.paid_at.is_(None), Payment.collected_at.is_(None), Payment.collected_amount == 0,
+        ).order_by(Payment.id).all()]
+
+    sections = {
+        'customers': _balance_mismatches(customers, customer_expected,
+                                         _logged_manual_adjustments(BalanceLog.customer_id)),
+        'resellers': _balance_mismatches(tenant_query(Reseller).all(), reseller_expected,
+                                         _logged_manual_adjustments(BalanceLog.reseller_id)),
+        'suppliers': _balance_mismatches(tenant_query(Supplier).all(), supplier_expected,
+                                         _logged_manual_adjustments(BalanceLog.supplier_id)),
+        # Employee balances have no balance log, so manual edits can't be told apart.
+        'employees': _balance_mismatches(tenant_query(Employee).all(), employee_expected, {}),
+        'over_refunded_payments': over_refunded,
+        'paid_without_money': paid_without_money,
+    }
+    return jsonify({
+        'summary': {name: len(rows) for name, rows in sections.items()},
+        'checked': {'customers': len(customers)},
+        **sections,
+    }), 200
+
+
 @app.route('/api/reports/financial', methods=['GET'])
 @jwt_required()
 def get_financial_report():
@@ -12037,31 +12348,16 @@ def get_financial_report():
         if not start_date_str or not end_date_str:
             return jsonify({'error': 'start_date and end_date are required'}), 400
 
-        # Basic parsing stripping 'Z' if present
-        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-        end_date = end_date.replace(hour=23, minute=59, second=59)
+        # Whole business-local days, start to end inclusive. The typed-date
+        # columns below (expense / supplier-payment dates) are filtered on the
+        # same calendar days.
+        start_day, end_day = _report_days(start_date_str, end_date_str)
+        start_date = datetime.combine(start_day, datetime.min.time())
+        end_date = datetime.combine(end_day, datetime.min.time()).replace(hour=23, minute=59, second=59)
 
-        # 1. Income: Payments marked as paid. Fall back to date if paid_at is null.
-        # Converted into the tenant's reporting_currency using each payment's own
-        # LOCKED rate (fx_rate_to_reporting) -- not a live/current rate -- so a
-        # report over a date range spanning an FX-rate update always reflects
-        # what those payments were actually worth when they happened. For an
-        # opted-out (single-currency) tenant, fx_rate_to_reporting is always
-        # exactly 1, so this is a no-op multiply-by-1. See
-        # docs/superpowers/specs/2026-08-27-multi-currency-accounting-design.md.
-        income_query = db.session.query(
-            month_key(func.coalesce(Payment.paid_at, Payment.date)).label('month'),
-            func.sum(_signed_payment_amount() * Payment.fx_rate_to_reporting).label('total')
-        ).filter(
-            Payment.tenant_id == current_tenant_id(),
-            Payment.paid == True,
-            Payment.is_gratis == False,
-            # Refunds count as negative income in the month they were paid out.
-            Payment.settled_from_credit.isnot(True),  # the prepayment behind it was already counted
-            func.coalesce(Payment.paid_at, Payment.date) >= start_date,
-            func.coalesce(Payment.paid_at, Payment.date) <= end_date
-        ).group_by('month').all()
+        # 1. Income: the one shared definition (see _customer_income_by_month).
+        income_query = [SimpleNamespace(month=month, total=total)
+                        for month, total in _customer_income_by_month(start_day, end_day).items()]
 
         # 2. Expenses (direct non-credit, not a payroll payment). employee_id
         # being set is what identifies a payroll expense -- not the category
@@ -12113,7 +12409,7 @@ def get_financial_report():
         # 5. Logged estimated profit -- lazily backfill the current month if it's
         # in range and hasn't been computed yet (no event/daily-job tick reached
         # it yet), so the current month is never blank.
-        current_month = datetime.utcnow().strftime('%Y-%m')
+        current_month = _tenant_today().strftime('%Y-%m')
         start_month = start_date.strftime('%Y-%m')
         end_month = end_date.strftime('%Y-%m')
         if start_month <= current_month <= end_month:
@@ -12121,6 +12417,10 @@ def get_financial_report():
                 tenant_id=current_tenant_id(), month=current_month
             ).first():
                 recalculate_estimated_profit(current_tenant_id())
+
+        # 4b. Reseller collections (income) and upstream top-ups (cost).
+        reseller_income = _reseller_income_by_month(start_day, end_day)
+        upstream_cost = _upstream_cost_by_month(start_day, end_day)
 
         estimate_query = MonthlyProfitEstimate.query.filter(
             MonthlyProfitEstimate.tenant_id == current_tenant_id(),
@@ -12135,6 +12435,7 @@ def get_financial_report():
             [row.month for row in income_query] + [row.month for row in expense_query]
             + [row.month for row in payroll_expense_query]
             + [row.month for row in sp_query] + [row.month for row in sal_query]
+            + list(reseller_income.keys()) + list(upstream_cost.keys())
             + list(estimate_data.keys())
         )
 
@@ -12142,11 +12443,21 @@ def get_financial_report():
             'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0,
             # Same total as `expenses`, split by source -- previously computed
             # here and immediately discarded once summed together.
-            'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0
+            'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0,
+            'expenses_upstream': 0.0, 'income_customers': 0.0, 'income_resellers': 0.0
         } for m in months_set}
+
+        for m, total in reseller_income.items():
+            monthly_data_dict[m]['income'] += total
+            monthly_data_dict[m]['income_resellers'] += total
+
+        for m, total in upstream_cost.items():
+            monthly_data_dict[m]['expenses'] += total
+            monthly_data_dict[m]['expenses_upstream'] += total
 
         for row in income_query:
             monthly_data_dict[row.month]['income'] += float(row.total or 0)
+            monthly_data_dict[row.month]['income_customers'] += float(row.total or 0)
 
         for row in expense_query:
             monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
@@ -12170,6 +12481,9 @@ def get_financial_report():
         total_expenses_manual = 0.0
         total_expenses_supplier = 0.0
         total_expenses_payroll = 0.0
+        total_expenses_upstream = 0.0
+        total_income_customers = 0.0
+        total_income_resellers = 0.0
         total_estimated_profit = 0.0
         total_estimated_payroll = 0.0
         total_variance = 0.0
@@ -12190,6 +12504,9 @@ def get_financial_report():
             total_expenses_manual += data['expenses_manual']
             total_expenses_supplier += data['expenses_supplier']
             total_expenses_payroll += data['expenses_payroll']
+            total_expenses_upstream += data['expenses_upstream']
+            total_income_customers += data['income_customers']
+            total_income_resellers += data['income_resellers']
             if estimated_profit is not None:
                 total_estimated_profit += estimated_profit
                 total_estimated_payroll += data['estimated_payroll'] or 0.0
@@ -12209,6 +12526,9 @@ def get_financial_report():
                 'expenses_manual': total_expenses_manual,
                 'expenses_supplier': total_expenses_supplier,
                 'expenses_payroll': total_expenses_payroll,
+                'expenses_upstream': total_expenses_upstream,
+                'income_customers': total_income_customers,
+                'income_resellers': total_income_resellers,
                 'profit': total_profit,
                 'estimated_profit': total_estimated_profit,
                 'estimated_payroll': total_estimated_payroll,
@@ -12354,8 +12674,9 @@ def add_reseller_credit(reseller_id):
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -12387,8 +12708,9 @@ def apply_reseller_discount(reseller_id):
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -12420,8 +12742,9 @@ def collect_reseller_payment(reseller_id):
     if not reseller:
         return jsonify({'message': 'Reseller not found!'}), 404
     
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     closed = _assert_day_open(_tenant_today())
@@ -12569,8 +12892,9 @@ def topup_upstream_provider(provider_id):
     if not provider:
         return jsonify({'message': 'Upstream provider not found!'}), 404
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     closed = _assert_day_open(_tenant_today())
@@ -12611,8 +12935,9 @@ def record_upstream_renewal_cost(provider_id):
     if not customer:
         return jsonify({'message': 'Customer not found!'}), 404
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -15558,8 +15883,9 @@ def record_supplier_payment(supplier_id):
     if not supplier:
         return jsonify({'message': 'Supplier not found!'}), 404
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -15776,6 +16102,7 @@ def add_employee():
             name=data['name'],
             monthly_salary=float(data.get('monthly_salary', 0) or 0),
             hire_date=datetime.strptime(data['hire_date'], '%Y-%m-%d') if data.get('hire_date') else datetime.utcnow(),
+            accrual_start=datetime.utcnow(),  # no back-pay for a hire date in the past
             active=data.get('active', True),
             user_id=user_id,
             notes=data.get('notes', '')
@@ -15810,7 +16137,11 @@ def update_employee(employee_id):
         employee.monthly_salary = float(data.get('monthly_salary', employee.monthly_salary))
         if data.get('hire_date'):
             employee.hire_date = datetime.strptime(data['hire_date'], '%Y-%m-%d')
+        was_active = bool(employee.active)
         employee.active = data.get('active', employee.active)
+        if employee.active and not was_active:
+            # Reactivated: the months spent inactive are not owed.
+            employee.accrual_start = datetime.utcnow()
         employee.notes = data.get('notes', employee.notes)
         if 'balance' in data and data['balance'] is not None and data['balance'] != '':
             employee.balance = float(data['balance'])
@@ -15862,8 +16193,9 @@ def add_employee_charge(employee_id):
     if charge_type not in ('salary', 'bonus', 'deduction'):
         return jsonify({'error': "type must be 'salary', 'bonus', or 'deduction'"}), 400
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:
@@ -15891,6 +16223,12 @@ def add_employee_charge(employee_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
+
+def _is_latest_salary_charge(charge):
+    latest = tenant_query(SalaryCharge).filter_by(employee_id=charge.employee_id, type='salary') \
+        .order_by(SalaryCharge.date.desc(), SalaryCharge.id.desc()).first()
+    return bool(latest and latest.id == charge.id)
+
 
 def _charge_balance_effect(charge_type, amount):
     """What a charge does to Employee.balance: salary/bonus add, deduction subtracts."""
@@ -15920,6 +16258,10 @@ def update_employee_charge(employee_id, charge_id):
         return jsonify({'error': 'Amount must be positive (a salary charge may be 0 to void that month).'}), 400
     if 'period' in data and data['period'] and not re.fullmatch(r'\d{4}-\d{2}', str(data['period'])):
         return jsonify({'error': 'period must be YYYY-MM'}), 400
+    if charge.type == 'salary' and new_type != 'salary' and _is_latest_salary_charge(charge):
+        # Same reason the latest salary charge can't be deleted (see below).
+        return jsonify({'error': "This is the latest salary charge; the monthly accrual would recreate it. "
+                                 "Edit its amount to 0 instead, or deactivate the employee."}), 400
     try:
         employee.balance = (float(employee.balance or 0)
                             - _charge_balance_effect(charge.type, charge.amount)
@@ -15985,8 +16327,9 @@ def record_employee_payment(employee_id):
     if not employee:
         return jsonify({'message': 'Employee not found!'}), 404
 
-    amount = float(data.get('amount', 0))
-    if amount <= 0:
+    try:
+        amount = _parse_positive_amount(data.get('amount'), 'Amount')
+    except ValueError:  # missing, not a number, NaN/inf, zero or negative
         return jsonify({'error': 'Amount must be positive'}), 400
 
     try:

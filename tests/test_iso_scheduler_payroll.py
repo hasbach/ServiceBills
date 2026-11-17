@@ -16,6 +16,10 @@ def test_salary_accrual_runs_without_request_and_is_tenant_scoped(app, client):
         a_tid = appmod.Tenant.query.filter_by(slug="biz-a").first().id
         b_tid = appmod.Tenant.query.filter_by(slug="biz-b").first().id
         b_before = appmod.SalaryCharge.query.filter_by(tenant_id=b_tid).count()
+        # As if both had been in the system since their hire date (an employee
+        # added today with a past hire date gets no back-pay).
+        appmod.Employee.query.update({"accrual_start": None})
+        appmod.db.session.commit()
 
         # The scheduler body runs with NO request context.
         appmod.generate_missing_salary_charges(a_tid)
@@ -67,7 +71,10 @@ def test_salary_accrual_runs_without_request_and_is_tenant_scoped(app, client):
             .first()
         )
         assert last_charge_b is not None
-        last_charge_b.date = last_charge_b.date - relativedelta(months=2)
+        # Remove the newest month so it is due again. (Back-dating it instead
+        # would leave that month's charge in place, and a month that already
+        # has a salary charge is never charged twice.)
+        appmod.db.session.delete(last_charge_b)
         appmod.db.session.commit()
 
         charges_before_b = appmod.SalaryCharge.query.filter_by(tenant_id=b_tid).count()

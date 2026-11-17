@@ -41,9 +41,10 @@ import { apiService } from '../context/AppContext.js';
 
 const EnhancedReportsView = () => {
   const [startDate, setStartDate] = useState(() => {
+    // From the 1st of the month six months back: the report is monthly, and a
+    // first month cut off part-way looked like a bad month next to its estimate.
     const d = new Date();
-    d.setMonth(d.getMonth() - 6);
-    return d;
+    return new Date(d.getFullYear(), d.getMonth() - 6, 1);
   });
   const [endDate, setEndDate] = useState(new Date());
   const [reportType, setReportType] = useState('financial');

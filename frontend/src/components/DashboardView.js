@@ -148,6 +148,17 @@ const DashboardView = () => {
                 <MetricCard title="Manual Expenses" value={metrics?.manualExpenses} format={(v) => `$${v.toFixed(2)}`} />
                 <MetricCard title="Supplier Payments" value={metrics?.supplierExpenses} format={(v) => `$${v.toFixed(2)}`} />
                 <MetricCard title="Payroll" value={metrics?.payrollExpenses} format={(v) => `$${v.toFixed(2)}`} />
+                <MetricCard title="Upstream Top-ups" value={metrics?.upstreamExpenses} format={(v) => `$${v.toFixed(2)}`} />
+            </Grid>
+
+            {/* Total Revenue above is the sum of these two. */}
+            <Divider sx={{ my: 4 }} />
+            <Typography variant="h6" sx={{ mb: 2, color: 'text.secondary' }}>
+                Revenue by Source
+            </Typography>
+            <Grid container spacing={3}>
+                <MetricCard title="Customer Payments" value={metrics?.customerRevenue} format={(v) => `$${v.toFixed(2)}`} />
+                <MetricCard title="Reseller Collections" value={metrics?.resellerRevenue} format={(v) => `$${v.toFixed(2)}`} />
             </Grid>
 
             {/* --- ADDED: New section for the subscription breakdown --- */}
