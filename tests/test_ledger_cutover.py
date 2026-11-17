@@ -594,3 +594,24 @@ def test_start_route_returns_existing_state_on_a_concurrent_start(app, client, m
         raise IntegrityError("INSERT INTO ledger_state", {}, Exception("duplicate key"))
     monkeypatch.setattr(appmod, "start_books", racing)
     assert _start(client, a) == first
+
+
+def test_ledger_nightly_starts_books_through_the_fresh_transaction_guard(app, client, monkeypatch, caplog):
+    """With the Postgres isolation path on (SQLite accepts SERIALIZABLE), the
+    nightly job must reach start_books with no transaction open."""
+    make_tenant(client, "Books A", "lc50")
+    started = _tid()
+    a2 = make_tenant(client, "Books B", "lc51")
+    fresh = _tid()
+    cid = _customer(client, a2)
+    _bill(client, a2, cid, 25)
+    with flask_app.app_context():
+        appmod.start_books(started)
+        db.session.commit()
+    monkeypatch.setattr(appmod, "_start_books_isolation", lambda name: {"isolation_level": "SERIALIZABLE"})
+    with caplog.at_level("ERROR"):
+        appmod.ledger_nightly()
+    assert "nightly run failed" not in caplog.text
+    with flask_app.app_context():
+        assert db.session.get(LedgerState, fresh) is not None
+    _assert_customer_matches(fresh, cid)

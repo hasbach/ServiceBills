@@ -5876,7 +5876,7 @@ def start_books(tenant_id, now=None):
     session = db.session
     options = _start_books_isolation(db.engine.dialect.name)
     if options:
-        if session().in_transaction():  # scoped_session does not proxy it
+        if session().in_transaction():  # the real Session: db.session raised AttributeError here
             raise RuntimeError("start_books needs a fresh transaction: commit or roll back first")
         session.connection(execution_options=options)
     state = session.get(LedgerState, tenant_id)
@@ -6000,6 +6000,9 @@ def ledger_nightly():
         for tid in tenant_ids:
             try:
                 if db.session.get(LedgerState, tid) is None:
+                    # That read opened a transaction; start_books must begin
+                    # its own (its snapshot), so end this one first.
+                    db.session.rollback()
                     start_books(tid)
                 else:
                     run_books_check(tid)
