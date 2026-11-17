@@ -42,6 +42,11 @@ PARTY_ACCOUNT = {
 
 _EPS = 0.00005
 
+# account_key of the zero-amount starting-point row of a record that had no
+# lines when the books started: never posted, only says "this record is older
+# than the books".
+START_MARKER = '_marker'
+
 
 def account_type(key):
     if key.startswith('expense:'):
@@ -232,6 +237,9 @@ def diff_lines(desired, already, today, profit_to_opening):
 
     want, have = net(desired), net(already)
     posted_accounts = {l.account_key for l in already}
+    # A record that had no lines at all when the books started: every profit
+    # line it gains later is a fix to history.
+    all_profit_to_opening = START_MARKER in posted_accounts
     desired_groups = {k[:3] for k in want}
     merged = {}
     for k in list(want) + [k for k in have if k not in want]:
@@ -239,9 +247,11 @@ def diff_lines(desired, already, today, profit_to_opening):
         if abs(delta) < _EPS:
             continue
         key, ptype, pid, day = k
-        if k in have:
+        if k in have or all_profit_to_opening:
+            # A change to something already posted -- or anything a record from
+            # before the books gains later -- is dated the day it happens.
             day = today
-        if (profit_to_opening and key in posted_accounts
+        if (profit_to_opening and (key in posted_accounts or all_profit_to_opening)
                 and account_type(key) in PROFIT_TYPES):
             key, ptype, pid = 'opening', None, None
         mk = (key, ptype, pid, day)

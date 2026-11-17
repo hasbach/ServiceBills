@@ -367,3 +367,15 @@ def test_unpaid_gratis_lines():
     got = lines_of('payment', pay(is_gratis=True))
     assert got == BILL + [L('discounts', None, None, 25, D1),
                           L('customers', 'customer', 7, -25, D1)]
+
+
+def test_diff_lines_marker_sends_all_profit_to_opening_and_posts_nothing_itself():
+    from ledger import diff_lines, START_MARKER
+    d = date(2026, 1, 5)
+    today = date(2026, 11, 17)
+    marker = [Line(START_MARKER, None, None, 0.0, today)]
+    assert diff_lines([], marker, today, True) == []
+    desired = [Line('cash', None, None, -10.0, d), Line('over_short', None, None, 10.0, d)]
+    out = diff_lines(desired, marker, today, True)
+    # dated the day it is found, not the old record's own day
+    assert sorted(out) == sorted([Line('cash', None, None, -10.0, today), Line('opening', None, None, 10.0, today)])

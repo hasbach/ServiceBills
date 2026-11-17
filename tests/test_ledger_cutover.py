@@ -258,8 +258,9 @@ import json as _json
 from datetime import date as _date, timedelta as _timedelta, timezone as _timezone
 
 from tests.test_ledger_posting import _today, _account_by_day
-from tests.test_expenses_payroll_supplier import _make_category, _make_expense
-from app import LedgerState, LedgerStartLine, BusinessSettings
+from tests.test_expenses_payroll_supplier import _make_category, _make_expense, _make_employee
+from sqlalchemy.exc import IntegrityError
+from app import LedgerState, LedgerStartLine, BusinessSettings, Employee, DayClose, Tenant
 
 
 def _start(client, hdr):
@@ -300,6 +301,10 @@ def test_start_books_opening_matches_stored_balances(app, client):
     rid = (r.get_json().get("reseller") or r.get_json())["id"]
     r = client.post("/api/upstream-providers", headers=a, json={"name": "Up", "balance": 80})
     up = (r.get_json().get("provider") or r.get_json())["id"]
+    emp = _make_employee(client, a)
+    with flask_app.app_context():                   # salary owed, before the books exist
+        db.session.get(Employee, emp).balance = 300
+        db.session.commit()
     _set_cash_opening(client, a, 100, whish=20)
 
     state = _start(client, a)
@@ -307,7 +312,8 @@ def test_start_books_opening_matches_stored_balances(app, client):
 
     for pt, model, pk, want in (("customer", Customer, owes, -40), ("customer", Customer, credit, 15),
                                 ("supplier", Supplier, sid, 70), ("reseller", Reseller, rid, 60),
-                                ("upstream", UpstreamProvider, up, 80)):
+                                ("upstream", UpstreamProvider, up, 80),
+                                ("employee", Employee, emp, 300)):
         assert _stored_balance(model, pk) == want
         assert _books_party_balance(pt, pk) == want
     # Cash/Whish = the Cash Flow running balance at the start: the opening
@@ -494,3 +500,97 @@ def test_ledger_nightly_is_scheduled(app):
     assert appmod.SCHEDULE["ledger_nightly"] == "0 3 * * *"
     assert "ledger_nightly" in appmod._SCHEDULED_JOBS
     assert "ledger_nightly" in appmod.onprem_schedule()
+
+
+# --- fix round 1 ---------------------------------------------------------------
+
+def test_future_dated_money_is_in_the_cash_opening(app, client):
+    """A record that exists at the start but moves money on a later day is in
+    the starting point (never posted); the Cash Flow page counts it on its own
+    day, so the opening must already include it."""
+    a = make_tenant(client, "Books", "lc40")
+    tid = _tid()
+    cat = _make_category(client, a, "Tools")
+    tomorrow = _today() + _timedelta(days=1)
+    _make_expense(client, a, cat, amount=30, date=tomorrow.isoformat())
+    _set_cash_opening(client, a, 100)
+    _start(client, a)
+    assert _account(tid, "cash") == 70
+    with flask_app.app_context():
+        settings = BusinessSettings.query.filter_by(tenant_id=tid).first()
+        with appmod._acting_as_tenant(tid):
+            assert appmod._cash_flow_for_day(tomorrow, settings)["cash_end"] == 70
+    _assert_balanced(tid)
+
+
+def test_old_record_with_no_lines_gets_a_marker_and_its_edit_goes_to_opening(app, client):
+    a = make_tenant(client, "Books", "lc41")
+    tid = _tid()
+    old = _today() - _timedelta(days=30)
+    with flask_app.app_context():
+        dc = DayClose(tenant_id=tid, day=old, expected_cash=100, counted_cash=100,
+                      expected_whish=0, counted_whish=0)
+        db.session.add(dc)
+        db.session.commit()
+        dcid = dc.id
+    _start(client, a)
+    with flask_app.app_context():
+        rows = LedgerStartLine.query.filter_by(tenant_id=tid, source_type="day_close", source_id=dcid).all()
+        assert [(r.account_key, r.amount, r.day) for r in rows] == [("_marker", 0, _today())]
+    cash, opening = _account(tid, "cash"), _account(tid, "opening")
+    with flask_app.app_context():
+        db.session.get(DayClose, dcid).counted_cash = 90       # 10 short, found later
+        db.session.commit()
+    assert _account(tid, "over_short") == 0                     # not this period's
+    assert _account(tid, "opening") == opening + 10
+    assert _account(tid, "cash") == cash - 10
+    assert "_marker" not in _account_keys(tid)
+    _assert_balanced(tid)
+
+
+def _account_keys(tid):
+    with flask_app.app_context():
+        return {k for (k,) in db.session.query(appmod.LedgerAccount.key).filter_by(tenant_id=tid)}
+
+
+def test_start_books_isolation_is_repeatable_read_on_postgres_only():
+    assert appmod._start_books_isolation("postgresql") == {"isolation_level": "REPEATABLE READ"}
+    assert appmod._start_books_isolation("sqlite") is None
+
+
+def test_start_books_requests_its_isolation_on_a_fresh_transaction(app, client, monkeypatch):
+    """SQLite cannot show a concurrent commit between the reads, so this checks
+    the mechanism: the options go to the session's first connection of a
+    fresh transaction, and an open transaction is refused."""
+    make_tenant(client, "Books", "lc42")
+    tid = _tid()
+    monkeypatch.setattr(appmod, "_start_books_isolation", lambda name: {"isolation_level": "SERIALIZABLE"})
+    seen = []
+    real = db.session.connection
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("execution_options"))
+        return real(*args, **kwargs)
+    with flask_app.app_context():
+        db.session.commit()
+        db.session.get(Tenant, tid)                  # a transaction is now open
+        with pytest.raises(RuntimeError):
+            appmod.start_books(tid)
+        db.session.rollback()
+        monkeypatch.setattr(db.session, "connection", spy)
+        appmod.start_books(tid)
+        db.session.commit()
+    assert seen and seen[0] == {"isolation_level": "SERIALIZABLE"}
+    with flask_app.app_context():
+        assert db.session.get(LedgerState, tid) is not None
+
+
+def test_start_route_returns_existing_state_on_a_concurrent_start(app, client, monkeypatch):
+    a = make_tenant(client, "Books", "lc43")
+    tid = _tid()
+    first = _start(client, a)
+
+    def racing(tenant_id, now=None):
+        raise IntegrityError("INSERT INTO ledger_state", {}, Exception("duplicate key"))
+    monkeypatch.setattr(appmod, "start_books", racing)
+    assert _start(client, a) == first

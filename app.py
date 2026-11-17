@@ -3296,6 +3296,8 @@ def _ledger_all_still_desired(already, desired):
     so it is an event; otherwise it changes history and is a correction."""
     free = list(desired)
     for l in already:
+        if l.account_key == _books.START_MARKER:
+            continue
         match = next((d for d in free if (d.account_key, d.party_type, d.party_id, d.day)
                       == (l.account_key, l.party_type, l.party_id, l.day)
                       and abs(d.amount - l.amount) < _LEDGER_EPS), None)
@@ -5780,11 +5782,18 @@ def _ledger_start_day(settings, now=None):
     return now.astimezone(zone).date()
 
 
-def _ledger_write_starting_point(tenant_id):
+def _ledger_write_starting_point(tenant_id, start_day):
     """The starting point: every existing record's desired lines in its
-    current state, one LedgerStartLine per line (unnetted, with its day).
-    Loaded in id-ordered chunks so a large tenant does not hold every record
-    at once."""
+    current state, one LedgerStartLine per line (unnetted, with its day). A
+    record with no lines at all (an unpaid prepayment, a zero amount, a day
+    close with no difference) gets one zero-amount marker row
+    (ledger.START_MARKER), so a later edit still counts as fixing a record
+    from before the books. Loaded in id-ordered chunks so a large tenant does
+    not hold every record at once.
+
+    Returns {'cash': x, 'whish': y}: the Cash / Whish lines dated after
+    start_day (records that exist now but move money on a later day)."""
+    future = {'cash': 0.0, 'whish': 0.0}
     local_day, _ = _ledger_context(tenant_id)
     session = db.session
     table = LedgerStartLine.__table__
@@ -5799,17 +5808,37 @@ def _ledger_write_starting_point(tenant_id):
                 break
             rows = []
             for rec in chunk:
-                for l in _books.desired_lines(kind, rec, local_day):
+                lines = _books.desired_lines(kind, rec, local_day)
+                if not lines:
+                    rows.append({'tenant_id': tenant_id, 'source_type': kind, 'source_id': rec.id,
+                                 'account_key': _books.START_MARKER, 'party_type': None,
+                                 'party_id': None, 'amount': 0.0, 'day': start_day})
+                for l in lines:
                     rows.append({'tenant_id': tenant_id, 'source_type': kind, 'source_id': rec.id,
                                  'account_key': l.account_key, 'party_type': l.party_type,
                                  'party_id': l.party_id, 'amount': round(float(l.amount), 4),
                                  'day': l.day})
+                    if l.account_key in future and l.day is not None and l.day > start_day:
+                        future[l.account_key] += float(l.amount)
             last = chunk[-1].id
             if rows:
                 session.execute(table.insert(), rows)
             for rec in chunk:
                 if db.inspect(rec).identity_key not in known:
                     session.expunge(rec)
+    return {k: round(v, 4) for k, v in future.items()}
+
+
+def _start_books_isolation(dialect_name):
+    """Execution options for start_books' transaction: one REPEATABLE READ
+    snapshot on Postgres, so the party balances, the Cash Flow figures and
+    the starting-point records are all read as of the same moment (under
+    READ COMMITTED a write committed between those reads would land in one
+    and not the other -- a silent, permanent drift). SQLite runs one writer
+    at a time anyway: nothing to set."""
+    if dialect_name == 'postgresql':
+        return {'isolation_level': 'REPEATABLE READ'}
+    return None
 
 
 def start_books(tenant_id, now=None):
@@ -5831,8 +5860,25 @@ def start_books(tenant_id, now=None):
     4. the LedgerState row.
 
     The opening entry's party lines are not counted by the safety net: they
-    restate balances, they do not change them."""
+    restate balances, they do not change them.
+
+    Consistency: on Postgres the whole start is one REPEATABLE READ snapshot
+    (_start_books_isolation), so it must begin a fresh transaction -- the
+    caller commits or rolls back first (the route and ledger_nightly do);
+    with a transaction already open it raises RuntimeError. The isolation
+    level is the connection's for this transaction only: SQLAlchemy resets
+    it when the connection goes back to the pool at commit / rollback. A
+    snapshot still cannot see another transaction that is in flight across
+    the start and commits after it: its balance change is in neither the
+    opening nor the starting point, and its records post nothing (they were
+    new before the books started). The nightly check (task 6) is what
+    reports such a gap."""
     session = db.session
+    options = _start_books_isolation(db.engine.dialect.name)
+    if options:
+        if session().in_transaction():  # scoped_session does not proxy it
+            raise RuntimeError("start_books needs a fresh transaction: commit or roll back first")
+        session.connection(execution_options=options)
     state = session.get(LedgerState, tenant_id)
     if state is not None:
         return state
@@ -5858,6 +5904,9 @@ def start_books(tenant_id, now=None):
     session.info.setdefault('ledger_started', {})[tenant_id] = state
     session.info.get('ledger_accounts', {}).pop(tenant_id, None)
 
+    # 3. Starting point (before the opening: Cash / Whish need its future-dated lines).
+    future = _ledger_write_starting_point(tenant_id, start_day)
+
     # 2. Opening entry.
     items = []
     for model, party_type in _LEDGER_PARTY_TYPES.items():
@@ -5873,9 +5922,12 @@ def start_books(tenant_id, now=None):
                                                             against='opening')))
     with _acting_as_tenant(tenant_id):
         flow = _cash_flow_for_day(start_day, settings)
-    unknown = flow.get('cash_end') is None
+    unknown = flow.get('cash_end') is None or flow.get('whish_end') is None
     for key, value in (('cash', flow.get('cash_end')), ('whish', flow.get('whish_end'))):
-        amount = round(float(value or 0), 4)
+        # Money a record moves after start_day is in the starting point (never
+        # posted) but reaches the Cash Flow page only on its own day: include
+        # it now, or the books would trail that page from then on.
+        amount = round(float(value or 0) + future[key], 4)
         if abs(amount) >= _LEDGER_EPS:
             items.append(('Opening balances', None, [
                 _books.Line(key, None, None, amount, start_day),
@@ -5893,9 +5945,6 @@ def start_books(tenant_id, now=None):
         state.opening_entry_id = session.info['ledger_entries'][(tenant_id, 'opening', start_day)]['id']
     if unknown:
         state.last_check = json.dumps({'cash_opening_unknown': True})
-
-    # 3. Starting point.
-    _ledger_write_starting_point(tenant_id)
     session.flush()
     return state
 
@@ -5921,9 +5970,18 @@ def _ledger_state_json(state):
 @jwt_required()
 @admin_required()
 def start_books_route():
-    """Start this business's books now (admin). Idempotent."""
-    state = start_books(current_tenant_id())
-    db.session.commit()
+    """Start this business's books now (admin). Idempotent; a start racing
+    another (the nightly job) returns the state the winner created."""
+    tenant_id = current_tenant_id()
+    db.session.commit()  # start_books needs a fresh transaction (its snapshot)
+    try:
+        state = start_books(tenant_id)
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        state = db.session.get(LedgerState, tenant_id)
+        if state is None:
+            raise
     return jsonify(_ledger_state_json(state)), 200
 
 
@@ -5938,6 +5996,7 @@ def ledger_nightly():
     tenant in its own try + commit, so one failing does not stop the rest."""
     with app.app_context():
         tenant_ids = [t for (t,) in db.session.execute(db.select(Tenant.id).order_by(Tenant.id)).all()]
+        db.session.commit()  # each start_books begins its own transaction
         for tid in tenant_ids:
             try:
                 if db.session.get(LedgerState, tid) is None:
