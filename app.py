@@ -2966,6 +2966,392 @@ def _write_audit_log(session, flush_context):
     session.execute(AuditLog.__table__.insert(), rows)
 
 
+# --- Books (double-entry ledger, roadmap 1C) ---------------------------------
+# Spec: docs/superpowers/specs/2026-11-17-ledger-design.md. The pure mapping
+# lives in ledger.py; _post_ledger (after_flush) compares what each financial
+# record should have contributed with what is already in the books for it and
+# posts the difference. Only for tenants whose books have started.
+import ledger as _books
+
+_LEDGER_MODELS = {
+    Payment: 'payment',
+    ResellerPayment: 'reseller_payment',
+    UpstreamProviderPayment: 'upstream_payment',
+    SupplierPayment: 'supplier_payment',
+    Expense: 'expense',
+    SalaryCharge: 'salary_charge',
+    SalaryPayment: 'salary_payment',
+    CashEntry: 'cash_entry',
+    AccountTransfer: 'account_transfer',
+    DayClose: 'day_close',
+}
+# Per-transaction caches in session.info; dropped on commit / rollback.
+_LEDGER_CACHE_KEYS = ('ledger_started', 'ledger_ctx', 'ledger_accounts', 'ledger_entries',
+                      'ledger_party_posted')
+_LEDGER_EPS = 0.00005
+
+
+def _books_started(tenant_id):
+    """The tenant's LedgerState, or None when its books have not started.
+    One lookup per tenant per transaction."""
+    cache = db.session.info.setdefault('ledger_started', {})
+    if tenant_id not in cache:
+        with db.session.no_autoflush:
+            cache[tenant_id] = db.session.get(LedgerState, tenant_id)
+    return cache[tenant_id]
+
+
+def _ledger_context(tenant_id):
+    """(local_day(dt, calendar), today) on the record tenant's own calendar --
+    never the request's tenant: the Whish callback and the scheduler have none."""
+    cache = db.session.info.setdefault('ledger_ctx', {})
+    ctx = cache.get(tenant_id)
+    if ctx is None:
+        with db.session.no_autoflush:
+            tz = db.session.execute(
+                db.select(BusinessSettings.timezone).where(BusinessSettings.tenant_id == tenant_id)
+                .order_by(BusinessSettings.id)).scalars().first()
+        settings = SimpleNamespace(timezone=tz)
+
+        def local_day(dt, calendar=False):
+            return _local_day(settings, dt, calendar)
+
+        ctx = cache[tenant_id] = (local_day, datetime.now(_zone_for(settings)).date())
+    return ctx
+
+
+def _ledger_account_id(tenant_id, key, name_hint=None):
+    """Id of the tenant's account `key`. An `expense:<category id>` account is
+    created on first use, named after its category."""
+    accounts = db.session.info.setdefault('ledger_accounts', {})
+    by_key = accounts.get(tenant_id)
+    if by_key is None:
+        with db.session.no_autoflush:
+            by_key = dict(db.session.execute(
+                db.select(LedgerAccount.key, LedgerAccount.id).where(LedgerAccount.tenant_id == tenant_id)).all())
+        accounts[tenant_id] = by_key
+    if key in by_key:
+        return by_key[key]
+    if not key.startswith('expense:'):
+        raise LookupError(f"books: tenant {tenant_id} has no '{key}' account")
+    with db.session.no_autoflush:
+        if name_hint is None:
+            cat_id = key.split(':', 1)[1]
+            if cat_id.isdigit():
+                name_hint = db.session.execute(db.select(ExpenseCategory.name).where(
+                    ExpenseCategory.id == int(cat_id), ExpenseCategory.tenant_id == tenant_id)).scalar()
+            name_hint = name_hint or 'Uncategorised expenses'
+        top = db.session.execute(db.select(func.max(LedgerAccount.number)).where(
+            LedgerAccount.tenant_id == tenant_id, LedgerAccount.number >= 6000,
+            LedgerAccount.number < 7000)).scalar()
+        values = dict(tenant_id=tenant_id, key=key, number=(top + 1) if top else 6000,
+                      name=str(name_hint)[:120], type='expense', party_type=None)
+        if db.engine.dialect.name == 'postgresql':
+            from sqlalchemy.dialects.postgresql import insert as _dialect_insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as _dialect_insert
+        # Two requests may create the same category account at once.
+        db.session.execute(_dialect_insert(LedgerAccount.__table__).values(**values)
+                           .on_conflict_do_nothing(index_elements=['tenant_id', 'key']))
+        by_key[key] = db.session.execute(db.select(LedgerAccount.id).where(
+            LedgerAccount.tenant_id == tenant_id, LedgerAccount.key == key)).scalar()
+    return by_key[key]
+
+
+def _ledger_who():
+    try:
+        who = get_jwt_identity()
+    except Exception:
+        who = None  # scheduler / webhook / no JWT in context
+    return str(who)[:100] if who else None
+
+
+def _post_line_groups(tenant_id, kind, items, who=None):
+    """Write `items` -- [(memo, (source_type, source_id) | None, [Line])] --
+    as one JournalEntry per day plus its lines. Within a transaction an entry
+    of the same tenant, kind and day is reused, so a bulk run (the nightly
+    billing autoflushes once per customer) still books one entry per date.
+    Raises ValueError, before writing anything, if a day does not balance."""
+    by_day = {}
+    for memo, source, lines in items:
+        for l in lines:
+            by_day.setdefault(l.day, []).append((memo, source, l))
+    for day, rows in by_day.items():
+        total = sum(l.amount for _, _, l in rows)
+        if abs(total) >= _LEDGER_EPS:
+            raise ValueError(f"books: {kind} entry for {day} does not balance ({total:+.4f})")
+    account_ids = {l.account_key: _ledger_account_id(tenant_id, l.account_key)
+                   for rows in by_day.values() for _, _, l in rows}
+    session = db.session
+    entries = session.info.setdefault('ledger_entries', {})
+    posted = session.info.setdefault('ledger_party_posted', {})
+    line_rows = []
+    now = datetime.utcnow()
+    for day in sorted(by_day):
+        rows = by_day[day]
+        sources = {s for _, s, _ in rows}
+        entry = entries.get((tenant_id, kind, day))
+        if entry is None:
+            base = rows[0][0] or ''
+            memo = base if len(sources) == 1 else f"{base} (+{len(sources) - 1} more)"
+            result = session.execute(JournalEntry.__table__.insert().values(
+                tenant_id=tenant_id, entry_date=day, kind=kind, memo=memo[:300],
+                created_by=who, created_at=now))
+            entry = entries[(tenant_id, kind, day)] = {
+                'id': result.inserted_primary_key[0], 'memo': base, 'sources': set(sources),
+                'multi': len(sources) > 1}
+        else:
+            entry['sources'] |= sources
+            if not entry['multi'] and len(entry['sources']) > 1:
+                # Inserted earlier in this same transaction: say it now covers more.
+                entry['multi'] = True
+                session.execute(JournalEntry.__table__.update().where(
+                    JournalEntry.__table__.c.id == entry['id']).values(
+                    memo=f"{entry['memo']} (+ more)"[:300]))
+        for _, source, l in rows:
+            amount = round(float(l.amount), 4)
+            line_rows.append({
+                'tenant_id': tenant_id, 'entry_id': entry['id'],
+                'account_id': account_ids[l.account_key],
+                'party_type': l.party_type, 'party_id': l.party_id,
+                'debit': amount if amount > 0 else 0.0,
+                'credit': -amount if amount < 0 else 0.0,
+                'source_type': source[0] if source else None,
+                'source_id': source[1] if source else None,
+                'entry_date': day,
+            })
+            if l.party_type:
+                key = (tenant_id, l.party_type, l.party_id)
+                posted[key] = round(posted.get(key, 0.0) + amount, 4)
+    if line_rows:
+        session.execute(JournalLine.__table__.insert(), line_rows)
+
+
+def _post_lines(tenant_id, lines, kind, memo, source=None):
+    """Post `lines` (ledger.Line) as one entry per day. See _post_line_groups."""
+    _post_line_groups(tenant_id, kind, [(memo, source, list(lines))], who=_ledger_who())
+
+
+def _ledger_memo(kind, d, change):
+    """A short description of the record, from its loaded values `d`."""
+    def money(v):
+        try:
+            return f"{float(v):.2f}"
+        except (TypeError, ValueError):
+            return ''
+    if kind == 'payment':
+        if d.get('is_refund'):
+            text = 'Refund'
+        elif d.get('pre_payment'):
+            text = 'Payment received'
+        elif d.get('reason'):
+            text = f"Bill: {d.get('reason')}"
+        else:
+            text = 'Subscription bill'
+    elif kind == 'reseller_payment':
+        label = _RESELLER_ENTRY_LABELS.get(d.get('type'), d.get('type') or 'Reseller entry')
+        desc = (d.get('description') or '').strip()
+        text = label if not desc or desc.lower() == label.lower() else f"{label}: {desc}"
+    elif kind == 'upstream_payment':
+        text = {'balance_topup': 'Upstream top-up', 'renewal_cost': 'Upstream renewal cost'}.get(
+            d.get('type'), 'Upstream entry')
+    elif kind == 'supplier_payment':
+        text = 'Supplier payment'
+    elif kind == 'expense':
+        text = f"Expense: {d.get('description') or ''}".strip()
+    elif kind == 'salary_charge':
+        text = f"Payroll {d.get('type') or 'charge'}"
+    elif kind == 'salary_payment':
+        text = 'Salary payment'
+    elif kind == 'cash_entry':
+        text = f"Money put in: {d.get('reason') or ''}".strip()
+    elif kind == 'account_transfer':
+        text = f"Transfer {d.get('from_account')} -> {d.get('to_account')}"
+    elif kind == 'day_close':
+        text = f"Day close {d.get('day')}"
+    else:
+        text = kind
+    if change == 'deleted':
+        return f"Deleted: {text} ({money(d.get('amount'))})" if d.get('amount') is not None else f"Deleted: {text}"
+    if change == 'dirty':
+        return f"Changed: {text}"
+    return text
+
+
+def _ledger_already(tenant_id, kind, ids):
+    """{source_id: ([posted Line], [(account_key, party_type, party_id, amount)] start lines)}
+    for the non-new records of one kind. Two queries per kind per flush."""
+    out = {i: ([], []) for i in ids}
+    ids = list(ids)
+    with db.session.no_autoflush:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            rows = db.session.execute(
+                db.select(JournalLine.source_id, LedgerAccount.key, JournalLine.party_type,
+                          JournalLine.party_id, JournalLine.debit, JournalLine.credit,
+                          JournalLine.entry_date)
+                .join(LedgerAccount, LedgerAccount.id == JournalLine.account_id)
+                .where(JournalLine.tenant_id == tenant_id, JournalLine.source_type == kind,
+                       JournalLine.source_id.in_(chunk))).all()
+            for sid, key, ptype, pid, dr, cr, day in rows:
+                out[sid][0].append(_books.Line(key, ptype, pid,
+                                               round(float(dr or 0) - float(cr or 0), 4), day))
+            rows = db.session.execute(
+                db.select(LedgerStartLine.source_id, LedgerStartLine.account_key,
+                          LedgerStartLine.party_type, LedgerStartLine.party_id, LedgerStartLine.amount)
+                .where(LedgerStartLine.tenant_id == tenant_id, LedgerStartLine.source_type == kind,
+                       LedgerStartLine.source_id.in_(chunk))).all()
+            for sid, key, ptype, pid, amount in rows:
+                out[sid][1].append((key, ptype, pid, round(float(amount or 0), 4)))
+    return out
+
+
+def _date_start_lines(start, desired, fallback_day):
+    """Starting-point lines carry no date. Give each the day of the desired
+    line it stands for: the same account/party and amount first, else the
+    same account/party, else `fallback_day` -- so an unchanged record that
+    predates the books diffs to nothing."""
+    free = list(desired)
+    out = []
+    for key, ptype, pid, amount in start:
+        match = next((l for l in free if (l.account_key, l.party_type, l.party_id) == (key, ptype, pid)
+                      and abs(l.amount - amount) < _LEDGER_EPS), None)
+        if match is not None:
+            free.remove(match)
+            day = match.day
+        else:
+            same = next((l for l in desired if (l.account_key, l.party_type, l.party_id) == (key, ptype, pid)), None)
+            day = same.day if same is not None else fallback_day
+        out.append(_books.Line(key, ptype, pid, amount, day))
+    return out
+
+
+def _ledger_record_values(obj):
+    """The record's loaded column values; a SQL expression among them (e.g. a
+    balance rewritten as `balance + delta`) cannot be read as a number here."""
+    state = db.inspect(obj)
+    d = {}
+    for attr in state.mapper.column_attrs:
+        if attr.key in state.dict:
+            v = state.dict[attr.key]
+            if hasattr(v, '__clause_element__') or hasattr(v, '_is_clause_element'):
+                raise ValueError(f"books: {attr.key} is a SQL expression, not a value")
+            d[attr.key] = v
+    return state, d
+
+
+@_sa_event.listens_for(db.session, "after_flush")
+def _post_ledger(session, flush_context):
+    """Post the journal lines every financial record change in this flush
+    calls for. A record whose lines cannot be worked out gets a LedgerProblem
+    row instead, and the user's own change still commits: the lines are
+    computed first in plain Python, and only computed values are inserted."""
+    work = []
+    for change, objects in (('new', session.new), ('dirty', session.dirty), ('deleted', session.deleted)):
+        for obj in objects:
+            kind = _LEDGER_MODELS.get(type(obj))
+            if kind is not None:
+                work.append((obj, kind, change))
+    if not work:
+        return
+    try:
+        _post_ledger_work(work)
+    except Exception:
+        # Never let the books break the user's own change.
+        logging.exception("books: posting failed for a flush")
+
+
+def _post_ledger_work(work):
+    session = db.session
+    problems = []
+    todo = []   # (obj, kind, change, tid, oid, values)
+    for obj, kind, change in work:
+        state = db.inspect(obj)
+        tid = state.dict.get('tenant_id')
+        oid = state.dict.get('id')
+        if oid is None and state.identity:
+            oid = state.identity[0]
+        if tid is None or not _books_started(tid):
+            continue
+        if change == 'dirty' and not any(state.attrs[a.key].history.has_changes()
+                                         for a in state.mapper.column_attrs):
+            continue
+        todo.append((obj, kind, change, tid, oid))
+    if not todo:
+        return
+
+    # One "already posted" lookup per kind for the changed and deleted records;
+    # new records have nothing posted yet.
+    wanted = {}
+    for obj, kind, change, tid, oid in todo:
+        if change != 'new' and oid is not None:
+            wanted.setdefault((tid, kind), set()).add(oid)
+    already = {}
+    for (tid, kind), ids in wanted.items():
+        for sid, found in _ledger_already(tid, kind, ids).items():
+            already[(tid, kind, sid)] = found
+
+    groups = {}  # (tid, entry kind) -> [(memo, source, lines)]
+    for obj, kind, change, tid, oid in todo:
+        try:
+            state, values = _ledger_record_values(obj)
+            local_day, today = _ledger_context(tid)
+            if change == 'deleted':
+                desired = []
+            else:
+                desired = _books.desired_lines(kind, obj, local_day)
+            posted, start = already.get((tid, kind, oid), ([], []))
+            start_lines = _date_start_lines(start, desired, _books_started(tid).start_day) if start else []
+            lines = _books.diff_lines(desired, posted + start_lines, today, bool(start))
+            if not lines:
+                continue
+            per_day = {}
+            for l in lines:
+                per_day[l.day] = per_day.get(l.day, 0.0) + l.amount
+            bad = [d for d, v in per_day.items() if abs(v) >= _LEDGER_EPS]
+            if bad:
+                raise ValueError(f"books: lines for {bad[0]} do not balance")
+            for l in lines:
+                _ledger_account_id(tid, l.account_key)  # creates a new expense account; raises if missing
+            entry_kind = 'event' if change == 'new' else 'correction'
+            groups.setdefault((tid, entry_kind), []).append(
+                (_ledger_memo(kind, values, change), (kind, oid), lines))
+        except Exception as e:
+            logging.exception("books: could not post %s %s (%s)", kind, oid, change)
+            problems.append({'tenant_id': tid, 'source_type': kind, 'source_id': oid,
+                             'error': f"{type(e).__name__}: {e}"[:2000], 'created_at': datetime.utcnow()})
+
+    who = _ledger_who() if groups else None
+    for (tid, entry_kind), items in groups.items():
+        try:
+            _post_line_groups(tid, entry_kind, items, who=who)
+        except Exception as e:
+            # Only a validation error can land here (nothing written yet).
+            logging.exception("books: could not post a %s entry", entry_kind)
+            for _, source, _ in items:
+                problems.append({'tenant_id': tid, 'source_type': source[0], 'source_id': source[1],
+                                 'error': f"{type(e).__name__}: {e}"[:2000],
+                                 'created_at': datetime.utcnow()})
+    if problems:
+        session.execute(LedgerProblem.__table__.insert(), problems)
+
+
+@_sa_event.listens_for(db.session, "after_commit")
+@_sa_event.listens_for(db.session, "after_rollback")
+def _drop_ledger_caches(session):
+    for key in _LEDGER_CACHE_KEYS:
+        session.info.pop(key, None)
+
+
+@_sa_event.listens_for(db.session, "after_soft_rollback")
+def _drop_ledger_caches_after_savepoint(session, previous_transaction):
+    """A rolled-back savepoint may have taken accounts or entries this
+    transaction created with it."""
+    if previous_transaction.nested:
+        session.info.pop('ledger_accounts', None)
+        session.info.pop('ledger_entries', None)
+
+
 def _maybe_create_customer_payment_link(payment, customer):
     """If the given (already-`db.session.add`ed, not-yet-committed, paid=False)
     Payment's tenant has TenantWhishSettings.enabled (which already implies

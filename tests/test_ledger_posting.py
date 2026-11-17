@@ -1,0 +1,443 @@
+"""Books (roadmap 1C), task 3: every change to a financial record posts its
+journal lines through the after_flush listener `_post_ledger`.
+
+Spec: docs/superpowers/specs/2026-11-17-ledger-design.md ("The posting rule",
+"Failure handling", "Performance")."""
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import event, func
+
+import ledger
+from tests.conftest import make_tenant
+from tests.test_receive_payment import _customer, _bill, _prepay
+from tests.test_expenses_payroll_supplier import (
+    _make_category, _make_supplier, _make_employee, _pay_supplier, _pay_employee)
+from tests.test_profit_includes_resellers_and_upstream import _reseller, _provider
+from tests.test_cash_entries_transfers import _entry, _transfer, DAY
+from app import (
+    app as flask_app, db, Tenant, Customer, Payment, Supplier, Employee, Reseller,
+    UpstreamProvider, UpstreamProviderPayment, SubscriptionPlan, LedgerAccount,
+    JournalEntry, JournalLine, LedgerState, LedgerProblem, generate_missing_payments,
+    _mark_payment_fully_paid)
+
+
+# --- helpers -------------------------------------------------------------------
+
+def _today():
+    return datetime.now(ZoneInfo("Asia/Beirut")).date()
+
+
+def _tid():
+    with flask_app.app_context():
+        return Tenant.query.order_by(Tenant.id.desc()).first().id
+
+
+def _start_books_for_test(tenant_id):
+    """Stand-in for start_books (task 5): the chart and the started marker,
+    no opening entry and no starting-point lines."""
+    with flask_app.app_context():
+        for key, number, name, type_, party_type in ledger.CHART:
+            db.session.add(LedgerAccount(tenant_id=tenant_id, key=key, number=number,
+                                         name=name, type=type_, party_type=party_type))
+        db.session.add(LedgerState(tenant_id=tenant_id, start_day=_today()))
+        db.session.commit()
+
+
+def _books_party_balance(party_type, party_id):
+    with flask_app.app_context():
+        total = db.session.query(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0)).filter(
+            JournalLine.party_type == party_type, JournalLine.party_id == party_id).scalar()
+        return round(ledger.party_balance_from_books(party_type, float(total or 0)), 4)
+
+
+def _stored_balance(model, pk):
+    with flask_app.app_context():
+        return round(float(db.session.get(model, pk).balance or 0), 4)
+
+
+def _account(tid, key):
+    """Dr - Cr total of one account."""
+    with flask_app.app_context():
+        total = db.session.query(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0)).join(
+            LedgerAccount, LedgerAccount.id == JournalLine.account_id).filter(
+            JournalLine.tenant_id == tid, LedgerAccount.key == key).scalar()
+        return round(float(total or 0), 4)
+
+
+def _account_by_day(tid, key):
+    with flask_app.app_context():
+        rows = db.session.query(JournalLine.entry_date,
+                                func.sum(JournalLine.debit - JournalLine.credit)).join(
+            LedgerAccount, LedgerAccount.id == JournalLine.account_id).filter(
+            JournalLine.tenant_id == tid, LedgerAccount.key == key).group_by(JournalLine.entry_date).all()
+        return {d: round(float(v), 4) for d, v in rows if abs(float(v)) > 1e-9}
+
+
+def _assert_balanced(tid):
+    """Debits equal credits, overall and per entry."""
+    with flask_app.app_context():
+        dr, cr = db.session.query(func.coalesce(func.sum(JournalLine.debit), 0),
+                                  func.coalesce(func.sum(JournalLine.credit), 0)).filter(
+            JournalLine.tenant_id == tid).one()
+        assert round(float(dr), 4) == round(float(cr), 4)
+        per_entry = db.session.query(JournalLine.entry_id,
+                                     func.sum(JournalLine.debit - JournalLine.credit)).filter(
+            JournalLine.tenant_id == tid).group_by(JournalLine.entry_id).all()
+        assert all(abs(float(v)) < 1e-6 for _, v in per_entry)
+        for entry in JournalEntry.query.filter_by(tenant_id=tid).all():
+            dates = {l.entry_date for l in JournalLine.query.filter_by(entry_id=entry.id)}
+            assert dates <= {entry.entry_date}
+
+
+def _assert_customer_matches(tid, cid):
+    _assert_balanced(tid)
+    assert _books_party_balance("customer", cid) == _stored_balance(Customer, cid)
+
+
+def _started_customer(client, username):
+    a = make_tenant(client, "Books", username)
+    cid = _customer(client, a)
+    tid = _tid()
+    _start_books_for_test(tid)
+    return a, tid, cid
+
+
+def _pay(client, hdr, pid, **body):
+    r = client.put(f"/api/payments/{pid}/mark_paid", headers=hdr, json=body)
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+
+# --- customer payments ---------------------------------------------------------
+
+def test_new_bill_posts_receivable_and_income(app, client):
+    a, tid, cid = _started_customer(client, "lp1")
+    _bill(client, a, cid, 25, "2026-09-01")
+    bill_day = datetime(2026, 9, 1).date()
+    assert _account_by_day(tid, "customers") == {bill_day: 25}
+    assert _account_by_day(tid, "income_subscriptions") == {bill_day: -25}
+    with flask_app.app_context():
+        entry = JournalEntry.query.filter_by(tenant_id=tid).one()
+        assert entry.kind == "event" and entry.entry_date == bill_day
+        assert entry.memo.startswith("Bill")
+        lines = JournalLine.query.filter_by(entry_id=entry.id).all()
+        assert {l.source_type for l in lines} == {"payment"}
+    _assert_customer_matches(tid, cid)
+
+
+def test_marking_paid_posts_cash_receipt(app, client):
+    a, tid, cid = _started_customer(client, "lp2")
+    pid = _bill(client, a, cid, 25)
+    _pay(client, a, pid)
+    assert _account_by_day(tid, "cash") == {_today(): 25}
+    assert _account(tid, "customers") == 0
+    _assert_customer_matches(tid, cid)
+
+
+def test_revert_then_repay_nets_to_one_receipt(app, client):
+    a, tid, cid = _started_customer(client, "lp3")
+    pid = _bill(client, a, cid, 25)
+    _pay(client, a, pid)
+    r = client.put(f"/api/payments/{pid}/revert", headers=a, json={"reason": "wrong one"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert _account(tid, "cash") == 0
+    assert _account(tid, "customers") == 25
+    _assert_customer_matches(tid, cid)
+    _pay(client, a, pid)
+    assert _account(tid, "cash") == 25
+    assert _account(tid, "income_subscriptions") == -25
+    _assert_customer_matches(tid, cid)
+    with flask_app.app_context():
+        # bill = event; pay, revert and re-pay change an existing record
+        kinds = sorted(e.kind for e in JournalEntry.query.filter_by(tenant_id=tid))
+        assert kinds == ["correction", "correction", "correction", "event"]
+
+
+def test_method_change_moves_money_between_cash_and_whish(app, client):
+    a, tid, cid = _started_customer(client, "lp4")
+    pid = _bill(client, a, cid, 25)
+    _pay(client, a, pid)
+    r = client.put(f"/api/payments/{pid}/method", headers=a, json={"method": "whish_transfer"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert _account(tid, "cash") == 0
+    assert _account(tid, "whish") == 25
+    _assert_customer_matches(tid, cid)
+
+
+def test_partial_payment_split_balances(app, client):
+    a, tid, cid = _started_customer(client, "lp5")
+    pid = _bill(client, a, cid, 25)
+    _pay(client, a, pid, partial_payment=True, partial_amount=10)
+    assert _account(tid, "cash") == 10
+    assert _account(tid, "customers") == 15
+    assert _account(tid, "income_subscriptions") == -25
+    _assert_customer_matches(tid, cid)
+
+
+def test_bill_settled_from_credit_posts_no_money(app, client):
+    a, tid, cid = _started_customer(client, "lp6")
+    _prepay(client, a, cid, 25)
+    assert _account(tid, "cash") == 25
+    _bill(client, a, cid, 25)
+    with flask_app.app_context():
+        assert Payment.query.filter_by(customer_id=cid, pre_payment=False).one().settled_from_credit
+    assert _account(tid, "cash") == 25            # no second receipt
+    assert _account(tid, "customers") == 0
+    assert _account(tid, "income_subscriptions") == -25
+    _assert_customer_matches(tid, cid)
+
+
+def test_refund_posts_money_out(app, client):
+    a, tid, cid = _started_customer(client, "lp7")
+    pid = _bill(client, a, cid, 25)
+    _pay(client, a, pid)
+    r = client.post(f"/api/payments/{pid}/refund", headers=a, json={"amount": 10, "reason": "outage"})
+    assert r.status_code == 201, r.get_data(as_text=True)
+    assert _account(tid, "cash") == 15
+    assert _account(tid, "customers") == 10
+    _assert_customer_matches(tid, cid)
+
+
+def test_delete_unpaid_bill_reverses_it_dated_today(app, client):
+    a, tid, cid = _started_customer(client, "lp8")
+    pid = _bill(client, a, cid, 25, "2026-09-01")
+    r = client.delete(f"/api/payments/{pid}", headers=a)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    bill_day = datetime(2026, 9, 1).date()
+    today = _today()
+    assert _account_by_day(tid, "customers") == ({bill_day: 25, today: -25} if bill_day != today else {})
+    assert _account(tid, "income_subscriptions") == 0
+    with flask_app.app_context():
+        correction = JournalEntry.query.filter_by(tenant_id=tid, kind="correction").one()
+        assert correction.entry_date == today
+    _assert_customer_matches(tid, cid)
+
+
+# --- other records ------------------------------------------------------------
+
+def test_expense_supplier_credit_and_payment(app, client):
+    a = make_tenant(client, "Books", "lp9")
+    tid = _tid()
+    _start_books_for_test(tid)
+    cat = _make_category(client, a, "Tools")
+    sid = _make_supplier(client, a)
+    r = client.post("/api/expenses", headers=a, json={
+        "category": cat, "amount": 300, "description": "Cable roll", "date": "2026-10-01",
+        "is_credit": True, "supplier_id": sid})
+    assert r.status_code == 201, r.get_data(as_text=True)
+    _pay_supplier(client, a, sid, amount=120, date="2026-10-02")
+    r = client.post("/api/expenses", headers=a, json={
+        "category": cat, "amount": 40, "description": "Fuel", "date": "2026-10-03"})
+    assert r.status_code == 201, r.get_data(as_text=True)
+
+    with flask_app.app_context():
+        acct = LedgerAccount.query.filter(LedgerAccount.tenant_id == tid,
+                                          LedgerAccount.key.like("expense:%")).one()
+        assert acct.name == "Tools" and acct.type == "expense" and 6000 <= acct.number < 7000
+        memos = [e.memo for e in JournalEntry.query.filter_by(tenant_id=tid)]
+        assert "Expense: Fuel" in memos
+    assert _account(tid, acct.key) == 340
+    assert _account(tid, "suppliers") == -180
+    assert _account(tid, "cash") == -160
+    _assert_balanced(tid)
+    assert _books_party_balance("supplier", sid) == _stored_balance(Supplier, sid) == 180
+
+
+def test_payroll_charge_and_payment(app, client):
+    a = make_tenant(client, "Books", "lp10")
+    tid = _tid()
+    _start_books_for_test(tid)
+    eid = _make_employee(client, a, monthly_salary=0)
+    r = client.post(f"/api/employees/{eid}/charges", headers=a,
+                    json={"type": "salary", "amount": 1000, "date": "2026-10-01"})
+    assert r.status_code == 201, r.get_data(as_text=True)
+    r = client.post(f"/api/employees/{eid}/charges", headers=a,
+                    json={"type": "deduction", "amount": 50, "date": "2026-10-02"})
+    assert r.status_code == 201, r.get_data(as_text=True)
+    _pay_employee(client, a, eid, amount=600, date="2026-10-05")
+    assert _account(tid, "cost_payroll") == 950
+    assert _account(tid, "cash") == -600
+    _assert_balanced(tid)
+    assert _books_party_balance("employee", eid) == _stored_balance(Employee, eid) == 350
+
+
+def test_reseller_charge_collection_discount(app, client):
+    a = make_tenant(client, "Books", "lp11")
+    tid = _tid()
+    _start_books_for_test(tid)
+    rid = _reseller(client, a)
+    assert client.post(f"/api/resellers/{rid}/add_credit", headers=a, json={"amount": 500}).status_code == 200
+    assert client.post(f"/api/resellers/{rid}/collect_payment", headers=a,
+                       json={"amount": 200, "paid_via": "whish"}).status_code == 200
+    assert client.post(f"/api/resellers/{rid}/apply_discount", headers=a, json={"amount": 30}).status_code == 200
+    assert _account(tid, "income_resellers") == -500
+    assert _account(tid, "whish") == 200
+    assert _account(tid, "discounts") == 30
+    _assert_balanced(tid)
+    assert _books_party_balance("reseller", rid) == _stored_balance(Reseller, rid) == 270
+
+
+def test_upstream_topup_and_correction(app, client):
+    a = make_tenant(client, "Books", "lp12")
+    tid = _tid()
+    _start_books_for_test(tid)
+    pid = _provider(client, a)
+    assert client.post(f"/api/upstream-providers/{pid}/topup", headers=a, json={"amount": 80}).status_code == 200
+    with flask_app.app_context():
+        eid = UpstreamProviderPayment.query.filter_by(upstream_provider_id=pid).one().id
+    r = client.put(f"/api/upstream-providers/{pid}/entries/{eid}", headers=a, json={"amount": 100})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert _account(tid, "cash") == -100
+    assert _account(tid, "upstream") == 100
+    with flask_app.app_context():
+        assert JournalEntry.query.filter_by(tenant_id=tid, kind="correction").count() == 1
+    _assert_balanced(tid)
+    assert _books_party_balance("upstream", pid) == _stored_balance(UpstreamProvider, pid) == 100
+
+
+def test_cash_entry_transfer_and_day_close(app, client):
+    a = make_tenant(client, "Books", "lp13")
+    tid = _tid()
+    _start_books_for_test(tid)
+    assert _entry(client, a, amount=50).status_code == 201
+    assert _transfer(client, a, amount=40).status_code == 201
+    assert _account(tid, "cash") == 10
+    assert _account(tid, "whish") == 40
+    assert _account(tid, "money_in") == -50
+
+    r = client.put("/api/reports/cash-opening", headers=a, json={"date": DAY, "amount": 0, "whish_amount": 0})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    r = client.post("/api/day-closes", headers=a, json={"day": DAY, "counted_cash": 7, "counted_whish": 40})
+    assert r.status_code == 201, r.get_data(as_text=True)
+    close_id = r.get_json()["id"]
+    assert _account(tid, "over_short") == 3          # 3 short in the cash drawer
+    assert _account(tid, "cash") == 7
+    assert client.delete(f"/api/day-closes/{close_id}", headers=a).status_code == 200
+    assert _account(tid, "over_short") == 0
+    assert _account(tid, "cash") == 10
+    _assert_balanced(tid)
+
+
+# --- system paths, volume, isolation, failure ---------------------------------
+
+def test_whish_callback_payment_posts_with_record_tenant(app, client):
+    a, tid, cid = _started_customer(client, "lp14")
+    pid = _bill(client, a, cid, 25)
+    with flask_app.app_context():  # no request, no JWT, like the Whish callback
+        p = db.session.get(Payment, pid)
+        p.collected_via = "whish"
+        _mark_payment_fully_paid(p, db.session.get(Customer, cid))
+        db.session.commit()
+    assert _account(tid, "whish") == 25
+    with flask_app.app_context():
+        assert JournalLine.query.filter(JournalLine.tenant_id != tid).count() == 0
+    _assert_customer_matches(tid, cid)
+
+
+def test_bulk_billing_posts_one_entry_per_date(app, client):
+    a = make_tenant(client, "Books", "lp15")
+    tid = _tid()
+    start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=75)
+    with flask_app.app_context():
+        plan = SubscriptionPlan(tenant_id=tid, name="Bulk", price=20, billing_cycle="monthly")
+        db.session.add(plan)
+        db.session.flush()
+        for i in range(200):
+            db.session.add(Customer(tenant_id=tid, name=f"C{i}", phone="1", address="x",
+                                    subscription_plan_id=plan.id, subscription_start_date=start,
+                                    subscription_expiry_date=start, is_subscription_active=True,
+                                    balance=0))
+        db.session.commit()
+    _start_books_for_test(tid)
+
+    selects = []
+
+    def count(conn, cursor, statement, params, context, executemany):
+        s = statement.lstrip().upper()
+        if s.startswith("SELECT") and "JOURNAL_LINE" in s:
+            selects.append(statement)
+
+    with flask_app.app_context():
+        engine = db.engine
+        event.listen(engine, "before_cursor_execute", count)
+        try:
+            generate_missing_payments(tid)
+        finally:
+            event.remove(engine, "before_cursor_execute", count)
+
+        bill_days = {p.date.date() for p in Payment.query.filter_by(tenant_id=tid)}
+        assert len(bill_days) >= 2
+        assert Payment.query.filter_by(tenant_id=tid).count() == 200 * len(bill_days)
+        entries = JournalEntry.query.filter_by(tenant_id=tid).all()
+        assert sorted(e.entry_date for e in entries) == sorted(bill_days)
+        assert all(e.kind == "event" for e in entries)
+        some = Customer.query.filter_by(tenant_id=tid).first().id
+    print("journal_line SELECTs during bulk billing:", len(selects))
+    assert len(selects) <= 5, selects
+    assert _account(tid, "customers") == 20 * 200 * len(bill_days)
+    _assert_customer_matches(tid, some)
+
+
+def test_tenant_without_books_gets_no_lines(app, client):
+    a = make_tenant(client, "No books", "lp16")
+    cid = _customer(client, a)
+    pid = _bill(client, a, cid, 25)
+    _pay(client, a, pid)
+    with flask_app.app_context():
+        assert JournalLine.query.count() == 0
+        assert JournalEntry.query.count() == 0
+        assert LedgerProblem.query.count() == 0
+
+
+def test_posting_error_does_not_block_payment(app, client, monkeypatch):
+    a, tid, cid = _started_customer(client, "lp17")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("mapping bug")
+    monkeypatch.setattr(ledger, "desired_lines", boom)
+
+    r = client.post("/api/payments", headers=a, json={
+        "customer_id": cid, "amount": 25, "reason": "Subscription", "date": "2026-09-01"})
+    assert r.status_code == 201, r.get_data(as_text=True)
+    pid = r.get_json()["payment"]["id"]
+    with flask_app.app_context():
+        assert db.session.get(Payment, pid) is not None
+        problem = LedgerProblem.query.filter_by(tenant_id=tid).one()
+        assert problem.source_type == "payment" and problem.source_id == pid
+        assert "mapping bug" in problem.error
+        assert JournalLine.query.filter_by(tenant_id=tid).count() == 0
+    assert _stored_balance(Customer, cid) == -25
+
+
+def test_pre_books_bill_paid_later_posts_only_the_receipt(app, client):
+    """A bill older than the books has starting-point lines (no date); paying
+    it posts the receipt only, not its income a second time."""
+    a = make_tenant(client, "Books", "lp18")
+    cid = _customer(client, a)
+    pid = _bill(client, a, cid, 25, "2026-09-01")
+    tid = _tid()
+    _start_books_for_test(tid)
+    with flask_app.app_context():
+        from app import LedgerStartLine
+        db.session.add_all([
+            LedgerStartLine(tenant_id=tid, source_type="payment", source_id=pid,
+                            account_key="customers", party_type="customer", party_id=cid, amount=25),
+            LedgerStartLine(tenant_id=tid, source_type="payment", source_id=pid,
+                            account_key="income_subscriptions", amount=-25),
+        ])
+        db.session.commit()
+    _pay(client, a, pid)
+    assert _account_by_day(tid, "cash") == {_today(): 25}
+    assert _account_by_day(tid, "customers") == {_today(): -25}
+    assert _account(tid, "income_subscriptions") == 0
+    assert _account(tid, "opening") == 0
+    _assert_balanced(tid)
+
+    # Deleting it later: the income side goes to Opening balances.
+    r = client.put(f"/api/payments/{pid}/revert", headers=a, json={"reason": "x"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert client.delete(f"/api/payments/{pid}", headers=a).status_code == 200
+    assert _account(tid, "income_subscriptions") == 0
+    assert _account(tid, "opening") == 25           # prior-period income reversed
+    assert _account(tid, "customers") == -25
+    _assert_balanced(tid)
