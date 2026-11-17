@@ -148,9 +148,10 @@ def test_revert_then_repay_nets_to_one_receipt(app, client):
     assert _account(tid, "income_subscriptions") == -25
     _assert_customer_matches(tid, cid)
     with flask_app.app_context():
-        # bill = event; pay, revert and re-pay change an existing record
+        # bill and first payment are events (only new keys); the revert and
+        # the re-pay change lines already posted
         kinds = sorted(e.kind for e in JournalEntry.query.filter_by(tenant_id=tid))
-        assert kinds == ["correction", "correction", "correction", "event"]
+        assert kinds == ["correction", "correction", "event", "event"]
 
 
 def test_method_change_moves_money_between_cash_and_whish(app, client):
@@ -441,3 +442,62 @@ def test_pre_books_bill_paid_later_posts_only_the_receipt(app, client):
     assert _account(tid, "opening") == 25           # prior-period income reversed
     assert _account(tid, "customers") == -25
     _assert_balanced(tid)
+
+
+def test_expired_record_is_still_posted(app, client):
+    """A record loaded, committed (attributes expired), then changed or
+    deleted is posted like any other."""
+    a, tid, cid = _started_customer(client, "lp19")
+    pid = _bill(client, a, cid, 25)
+    other = _bill(client, a, cid, 30)
+    with flask_app.app_context():
+        p = db.session.get(Payment, pid)
+        q = db.session.get(Payment, other)
+        c = db.session.get(Customer, cid)
+        db.session.commit()                      # expires p, q, c
+        assert "tenant_id" not in db.inspect(p).dict
+        c.balance = float(c.balance) + 25
+        p.paid = True
+        p.paid_at = datetime.utcnow()
+        db.session.commit()
+        assert "tenant_id" not in db.inspect(q).dict
+        c.balance = float(c.balance) + 30
+        db.session.delete(q)
+        db.session.commit()
+    assert _account(tid, "cash") == 25
+    assert _account(tid, "income_subscriptions") == -25
+    with flask_app.app_context():
+        assert LedgerProblem.query.count() == 0
+    _assert_customer_matches(tid, cid)
+
+
+def test_rolled_back_savepoint_leaves_no_lines_or_party_totals(app, client):
+    a, tid, cid = _started_customer(client, "lp20")
+    with flask_app.app_context():
+        sp = db.session.begin_nested()
+        db.session.add(Payment(tenant_id=tid, customer_id=cid, amount=25, reason="x",
+                               date=datetime(2026, 9, 1)))
+        db.session.flush()
+        assert db.session.info["ledger_party_posted"][(tid, "customer", cid)] == 25
+        sp.rollback()
+        assert not db.session.info.get("ledger_party_posted")
+        db.session.commit()
+        assert JournalLine.query.count() == 0
+        assert JournalEntry.query.count() == 0
+
+
+def test_listener_failure_flags_every_pending_record(app, client, monkeypatch):
+    import app as appmod
+    a, tid, cid = _started_customer(client, "lp21")
+    pid = _bill(client, a, cid, 25)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("lookup down")
+    monkeypatch.setattr(appmod, "_ledger_already", boom)
+    _pay(client, a, pid)
+    with flask_app.app_context():
+        assert db.session.get(Payment, pid).paid
+        problem = LedgerProblem.query.filter_by(tenant_id=tid).one()
+        assert problem.source_type == "payment" and problem.source_id == pid
+        assert "lookup down" in problem.error
+    assert _account(tid, "cash") == 0

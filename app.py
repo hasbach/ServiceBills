@@ -2987,7 +2987,7 @@ _LEDGER_MODELS = {
 }
 # Per-transaction caches in session.info; dropped on commit / rollback.
 _LEDGER_CACHE_KEYS = ('ledger_started', 'ledger_ctx', 'ledger_accounts', 'ledger_entries',
-                      'ledger_party_posted')
+                      'ledger_party_posted', 'ledger_savepoints')
 _LEDGER_EPS = 0.00005
 
 
@@ -3132,7 +3132,7 @@ def _post_lines(tenant_id, lines, kind, memo, source=None):
     _post_line_groups(tenant_id, kind, [(memo, source, list(lines))], who=_ledger_who())
 
 
-def _ledger_memo(kind, d, change):
+def _ledger_memo(kind, d, change, is_event=False):
     """A short description of the record, from its loaded values `d`."""
     def money(v):
         try:
@@ -3174,7 +3174,9 @@ def _ledger_memo(kind, d, change):
     if change == 'deleted':
         return f"Deleted: {text} ({money(d.get('amount'))})" if d.get('amount') is not None else f"Deleted: {text}"
     if change == 'dirty':
-        return f"Changed: {text}"
+        if is_event and kind == 'payment' and not d.get('is_refund') and not d.get('pre_payment'):
+            return f"Bill forgiven (gratis): {text}" if d.get('is_gratis') else f"Payment received: {text}"
+        return text if is_event else f"Changed: {text}"
     return text
 
 
@@ -3254,30 +3256,81 @@ def _post_ledger(session, flush_context):
                 work.append((obj, kind, change))
     if not work:
         return
+    todo = []
     try:
-        _post_ledger_work(work)
-    except Exception:
-        # Never let the books break the user's own change.
+        _post_ledger_work(work, todo)
+    except Exception as e:
+        # Never let the books break the user's own change; flag what was pending.
         logging.exception("books: posting failed for a flush")
+        try:
+            now = datetime.utcnow()
+            rows = [{'tenant_id': tid, 'source_type': kind, 'source_id': oid,
+                     'error': f"{type(e).__name__}: {e}"[:2000], 'created_at': now}
+                    for _, kind, _, tid, oid in todo]
+            if rows:
+                session.execute(LedgerProblem.__table__.insert(), rows)
+        except Exception:
+            logging.exception("books: could not record the failed postings")
 
 
-def _post_ledger_work(work):
+@_sa_event.listens_for(db.session, "before_flush")
+def _ledger_load_expired(session, flush_context, instances):
+    """A record changed or deleted after a commit has expired attributes, and
+    after the flush a deleted row can no longer be read. Load them now, while
+    the row is still there, so _post_ledger knows its tenant and values."""
+    for obj in list(session.dirty) + list(session.deleted):
+        if type(obj) in _LEDGER_MODELS and 'tenant_id' not in db.inspect(obj).dict:
+            try:
+                obj.tenant_id  # loads every expired column; pending changes are kept
+            except Exception:
+                logging.exception("books: could not load a %s before flush", type(obj).__name__)
+
+
+def _ledger_record_tenant(obj, state):
+    """The record's tenant: loaded value, else read through the attribute
+    (a dirty expired row still exists after its UPDATE), else the request's."""
+    tid = state.dict.get('tenant_id')
+    if tid is None and obj not in db.session.deleted:
+        try:
+            with db.session.no_autoflush:
+                tid = obj.tenant_id
+        except Exception:
+            tid = None
+    if tid is None:
+        try:
+            tid = current_tenant_id()
+        except Exception:
+            tid = None
+    return tid
+
+
+def _post_ledger_work(work, todo):
     session = db.session
     problems = []
-    todo = []   # (obj, kind, change, tid, oid, values)
     for obj, kind, change in work:
         state = db.inspect(obj)
-        tid = state.dict.get('tenant_id')
         oid = state.dict.get('id')
         if oid is None and state.identity:
             oid = state.identity[0]
-        if tid is None or not _books_started(tid):
+        tid = _ledger_record_tenant(obj, state)
+        if tid is None:
+            logging.error("books: %s %s has no readable tenant; not posted", kind, oid)
+            continue
+        if not _books_started(tid):
+            continue
+        if state.dict.get('tenant_id') is None:
+            # Its values could not be read: flag it instead of skipping it silently.
+            problems.append({'tenant_id': tid, 'source_type': kind, 'source_id': oid,
+                             'error': 'record values not readable at posting time',
+                             'created_at': datetime.utcnow()})
             continue
         if change == 'dirty' and not any(state.attrs[a.key].history.has_changes()
                                          for a in state.mapper.column_attrs):
             continue
         todo.append((obj, kind, change, tid, oid))
     if not todo:
+        if problems:
+            session.execute(LedgerProblem.__table__.insert(), problems)
         return
 
     # One "already posted" lookup per kind for the changed and deleted records;
@@ -3313,9 +3366,17 @@ def _post_ledger_work(work):
                 raise ValueError(f"books: lines for {bad[0]} do not balance")
             for l in lines:
                 _ledger_account_id(tid, l.account_key)  # creates a new expense account; raises if missing
-            entry_kind = 'event' if change == 'new' else 'correction'
+            # An event when every key is new (a bill, a bill getting paid);
+            # a correction when it changes or removes something already posted.
+            want_net, have_net = {}, {}
+            for src, net in ((desired, want_net), (posted + start_lines, have_net)):
+                for l in src:
+                    k = (l.account_key, l.party_type, l.party_id, l.day)
+                    net[k] = net.get(k, 0.0) + l.amount
+            is_event = all(abs(want_net.get(k, 0.0) - v) < _LEDGER_EPS for k, v in have_net.items())
+            entry_kind = 'event' if is_event else 'correction'
             groups.setdefault((tid, entry_kind), []).append(
-                (_ledger_memo(kind, values, change), (kind, oid), lines))
+                (_ledger_memo(kind, values, change, is_event), (kind, oid), lines))
         except Exception as e:
             logging.exception("books: could not post %s %s (%s)", kind, oid, change)
             problems.append({'tenant_id': tid, 'source_type': kind, 'source_id': oid,
@@ -3345,11 +3406,25 @@ def _drop_ledger_caches(session):
 
 @_sa_event.listens_for(db.session, "after_soft_rollback")
 def _drop_ledger_caches_after_savepoint(session, previous_transaction):
-    """A rolled-back savepoint may have taken accounts or entries this
-    transaction created with it."""
+    """A rolled-back savepoint may have taken accounts, entries or posted
+    lines this transaction created with it."""
     if previous_transaction.nested:
         session.info.pop('ledger_accounts', None)
         session.info.pop('ledger_entries', None)
+        # Its party totals went with its lines (task 4's safety net reads
+        # these): back to what they were when the savepoint began.
+        saved = session.info.get('ledger_savepoints', {}).pop(id(previous_transaction), None)
+        if saved is None:
+            session.info.pop('ledger_party_posted', None)
+        else:
+            session.info['ledger_party_posted'] = saved
+
+
+@_sa_event.listens_for(db.session, "after_transaction_create")
+def _ledger_savepoint_snapshot(session, transaction):
+    if transaction.nested:
+        session.info.setdefault('ledger_savepoints', {})[id(transaction)] = dict(
+            session.info.get('ledger_party_posted', {}))
 
 
 def _maybe_create_customer_payment_link(payment, customer):
