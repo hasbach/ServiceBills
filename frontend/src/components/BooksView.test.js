@@ -78,7 +78,7 @@ describe('BooksView', () => {
             data: {
                 ...STARTED,
                 last_check: {
-                    ...CHECK_OK.last_check, problem_count: 1,
+                    ...CHECK_OK.last_check, problem_count: 0,
                     party_mismatches: [{ party_type: 'customer', party_id: 9, name: 'Rami Khoury', stored: 10, books: 12.5 }],
                 },
             },
@@ -94,5 +94,41 @@ describe('BooksView', () => {
         render(<BooksView />);
         expect(await screen.findByText('Books start automatically tonight')).toBeInTheDocument();
         expect(screen.queryByText('All agree')).not.toBeInTheDocument();
+    });
+
+    it('does not say all agree when problem_count is 0 but a party mismatch exists', async () => {
+        mockApi.fetchBooksCheck.mockResolvedValue({
+            data: { ...STARTED, last_check: { ...CHECK_OK.last_check, problem_count: 0,
+                party_mismatches: [{ party_type: 'customer', party_id: 9, name: 'Rami Khoury', stored: 10, books: 12.5 }] } },
+        });
+        render(<BooksView />);
+        expect(await screen.findByText('1 to look at')).toBeInTheDocument();
+        expect(screen.queryByText('All agree')).not.toBeInTheDocument();
+    });
+
+    it('shows the first-check message when last_check has no checked_at', async () => {
+        mockApi.fetchBooksCheck.mockResolvedValue({ data: { ...STARTED, last_check: { cash_opening_unknown: true } } });
+        render(<BooksView />);
+        expect(await screen.findByText('The first nightly check has not run yet.')).toBeInTheDocument();
+        expect(screen.getByText(/opening is 0/)).toBeInTheDocument();
+        expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
+    });
+
+    it('shows Unknown for a null cash_flow and names a deleted party', async () => {
+        mockApi.fetchBooksCheck.mockResolvedValue({
+            data: { ...STARTED, last_check: { ...CHECK_OK.last_check,
+                party_mismatches: [{ party_type: 'customer', party_id: 4, name: null, stored: 1, books: 2 }] } },
+        });
+        render(<BooksView />);
+        expect(await screen.findByText('(deleted customer #4)')).toBeInTheDocument();
+        expect(screen.getByText('Unknown')).toBeInTheDocument();
+    });
+
+    it('counts a cash difference as something to look at', async () => {
+        mockApi.fetchBooksCheck.mockResolvedValue({
+            data: { ...STARTED, last_check: { ...CHECK_OK.last_check, cash: { books: 100, cash_flow: 90 } } },
+        });
+        render(<BooksView />);
+        expect(await screen.findByText('1 to look at')).toBeInTheDocument();
     });
 });

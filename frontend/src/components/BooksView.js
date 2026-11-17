@@ -167,7 +167,7 @@ function JournalSection({ apiService, accounts }) {
 function CheckSection({ check }) {
     const last = check && check.last_check;
     const when = (v) => (v ? new Date(v.endsWith('Z') ? v : `${v}Z`).toLocaleString() : '');
-    if (!last) {
+    if (!last || !last.checked_at) {
         return (
             <Box sx={{ mb: 4 }}>
                 <Typography variant="h6" sx={{ mb: 1 }}>Check</Typography>
@@ -175,14 +175,20 @@ function CheckSection({ check }) {
             </Box>
         );
     }
-    const agree = last.problem_count === 0;
     const mismatches = last.party_mismatches || [];
     const unbalanced = last.unbalanced_entries || [];
+    const differs = (a, b) => Math.abs(Number(a) - Number(b)) >= 0.005;
+    const cashRows = [['Cash', last.cash], ['Whish', last.whish]];
+    const cashBad = cashRows.filter(([, v]) => v && v.cash_flow != null && differs(v.books, v.cash_flow)).length;
+    const profitBad = (last.profit_by_month || []).filter((m) => differs(m.books_cash_basis, m.reports)).length;
+    const toLookAt = (last.problem_count > 0 ? 1 : 0) + unbalanced.length + mismatches.length
+        + (last.unexplained_count > 0 ? 1 : 0) + cashBad + profitBad;
+    const agree = toLookAt === 0;
     return (
         <Box sx={{ mb: 4 }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap', mb: 1 }}>
                 <Typography variant="h6">Check</Typography>
-                <Chip size="small" color={agree ? 'success' : 'warning'} label={agree ? 'All agree' : `${last.problem_count} to look at`} />
+                <Chip size="small" color={agree ? 'success' : 'warning'} label={agree ? 'All agree' : `${toLookAt} to look at`} />
                 <Typography variant="body2" color="text.secondary">Last checked {when(last.checked_at)}</Typography>
             </Box>
             {unbalanced.length > 0 && (
@@ -205,7 +211,7 @@ function CheckSection({ check }) {
                                 {mismatches.map((m) => (
                                     <TableRow key={`${m.party_type}-${m.party_id}`}>
                                         <TableCell>{PARTY_TYPE_LABELS[m.party_type] || m.party_type}</TableCell>
-                                        <TableCell>{m.name}</TableCell>
+                                        <TableCell>{m.name || `(deleted ${m.party_type} #${m.party_id})`}</TableCell>
                                         <TableCell align="right">{money(m.stored)}</TableCell>
                                         <TableCell align="right">{money(m.books)}</TableCell>
                                     </TableRow>
@@ -220,15 +226,22 @@ function CheckSection({ check }) {
                 <Typography variant="subtitle2" sx={{ p: 1.5 }}>Cash and Whish</Typography>
                 <TableContainer>
                     <Table size="small">
-                        {head(['Account', 'Books', 'Cash Flow'], ['Books', 'Cash Flow'])}
+                        {head(['Account', 'Books', 'Cash Flow', 'Difference'], ['Books', 'Cash Flow', 'Difference'])}
                         <TableBody>
-                            {[['Cash', last.cash], ['Whish', last.whish]].map(([label, v]) => (
-                                <TableRow key={label}>
-                                    <TableCell>{label}</TableCell>
-                                    <TableCell align="right">{v ? money(v.books) : '—'}</TableCell>
-                                    <TableCell align="right">{v && v.cash_flow != null ? money(v.cash_flow) : 'Unknown'}</TableCell>
-                                </TableRow>
-                            ))}
+                            {cashRows.map(([label, v]) => {
+                                const known = v && v.cash_flow != null;
+                                const diff = known ? Number(v.books) - Number(v.cash_flow) : null;
+                                return (
+                                    <TableRow key={label}>
+                                        <TableCell>{label}</TableCell>
+                                        <TableCell align="right">{v ? money(v.books) : '—'}</TableCell>
+                                        <TableCell align="right">{known ? money(v.cash_flow) : 'Unknown'}</TableCell>
+                                        <TableCell align="right" sx={{ color: known && differs(v.books, v.cash_flow) ? 'warning.main' : 'text.secondary' }}>
+                                            {known ? money(diff) : ''}
+                                        </TableCell>
+                                    </TableRow>
+                                );
+                            })}
                         </TableBody>
                     </Table>
                 </TableContainer>
@@ -251,7 +264,7 @@ function CheckSection({ check }) {
                                             </TableCell>
                                             <TableCell align="right">{money(m.books_cash_basis)}</TableCell>
                                             <TableCell align="right">{money(m.reports)}</TableCell>
-                                            <TableCell align="right" sx={{ color: Math.abs(diff) >= 0.005 ? 'warning.main' : 'text.secondary' }}>{money(diff)}</TableCell>
+                                            <TableCell align="right" sx={{ color: differs(m.books_cash_basis, m.reports) ? 'warning.main' : 'text.secondary' }}>{money(diff)}</TableCell>
                                         </TableRow>
                                     );
                                 })}
