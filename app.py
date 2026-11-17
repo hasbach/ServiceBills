@@ -1145,6 +1145,91 @@ class AuditLog(db.Model):
         }
 
 
+class LedgerAccount(db.Model):
+    """One account in a tenant's chart of accounts (books, roadmap 1C).
+    `key` is the stable code name the posting code uses; `number` is for
+    display and ordering."""
+    __table_args__ = (
+        db.Index('ux_ledger_account_tenant_key', 'tenant_id', 'key', unique=True),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    key = db.Column(db.String(60), nullable=False)
+    number = db.Column(db.Integer, nullable=False)
+    name = db.Column(db.String(120), nullable=False)
+    type = db.Column(db.String(10), nullable=False)  # asset | liability | equity | income | expense
+    party_type = db.Column(db.String(20), nullable=True)  # set on per-party control accounts
+
+
+class JournalEntry(db.Model):
+    """One balanced posting: its lines' debits equal their credits."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    entry_date = db.Column(db.Date, nullable=False)
+    kind = db.Column(db.String(12), nullable=False)  # event | opening | correction | unexplained
+    memo = db.Column(db.String(300), nullable=True)
+    created_by = db.Column(db.String(100), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class JournalLine(db.Model):
+    """One debit or credit against an account. entry_date is copied from the
+    entry so range queries need no join. source_* names the record that
+    caused it; party_* the customer / reseller / supplier it concerns."""
+    __table_args__ = (
+        db.Index('ix_journal_line_tenant_account_date', 'tenant_id', 'account_id', 'entry_date'),
+        db.Index('ix_journal_line_source', 'source_type', 'source_id'),
+        db.Index('ix_journal_line_tenant_party', 'tenant_id', 'party_type', 'party_id'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    entry_id = db.Column(db.Integer, db.ForeignKey('journal_entry.id'), nullable=False)
+    account_id = db.Column(db.Integer, db.ForeignKey('ledger_account.id'), nullable=False)
+    party_type = db.Column(db.String(20), nullable=True)
+    party_id = db.Column(db.Integer, nullable=True)
+    debit = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0)
+    credit = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0)
+    source_type = db.Column(db.String(30), nullable=True)
+    source_id = db.Column(db.Integer, nullable=True)
+    entry_date = db.Column(db.Date, nullable=False)
+
+
+class LedgerStartLine(db.Model):
+    """What a source record contributed to the opening balances when the
+    books were started: amount is signed (+debit / -credit)."""
+    __table_args__ = (
+        db.Index('ix_ledger_start_line_source', 'source_type', 'source_id'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    source_type = db.Column(db.String(30), nullable=False)
+    source_id = db.Column(db.Integer, nullable=False)
+    account_key = db.Column(db.String(60), nullable=False)
+    party_type = db.Column(db.String(20), nullable=True)
+    party_id = db.Column(db.Integer, nullable=True)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+
+
+class LedgerState(db.Model):
+    """One row per tenant: when the books started and the last check result."""
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), primary_key=True)
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    start_day = db.Column(db.Date, nullable=False)
+    opening_entry_id = db.Column(db.Integer, nullable=True)
+    last_check_at = db.Column(db.DateTime, nullable=True)
+    last_check = db.Column(db.Text, nullable=True)  # JSON
+
+
+class LedgerProblem(db.Model):
+    """A posting that failed, kept so the books check can report it."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    source_type = db.Column(db.String(30), nullable=False)
+    source_id = db.Column(db.Integer, nullable=True)
+    error = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
 class ExpenseCategory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
@@ -4033,7 +4118,10 @@ _TENANT_DELETE_ORDER = [
     # and only fails against production Postgres.
     NetworkWriteAudit,
     UpgradeRequest, BillingPaymentAttempt, PlatformPayment, PaymentReminder, GeneratedReceipt, ReceiptCounter, AddonPurchase, TicketLog, SupportTicket,
-    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment, BalanceLog, AuditLog,
+    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt,
+    # Books: lines before entries before accounts (FKs), all before Payment.
+    JournalLine, JournalEntry, LedgerStartLine, LedgerProblem, LedgerAccount, LedgerState,
+    Payment, ResellerPayment, SupplierPayment, BalanceLog, AuditLog,
     # WhatsAppMessage holds an FK to whatsapp_conversation, and
     # WhatsAppConversation holds an FK to customer, so both must be deleted
     # before Customer -- message before conversation -- or a tenant delete
