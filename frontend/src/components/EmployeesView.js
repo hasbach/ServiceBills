@@ -15,6 +15,7 @@ import {
     History as HistoryIcon,
     TrendingUp as BonusIcon
 } from '@mui/icons-material';
+import { askDeleteReason } from '../utils/deleteReason.js';
 import { useAppContext } from '../context/AppContext';
 
 const emptyEmployeeForm = { name: '', monthly_salary: '', hire_date: '', active: true, notes: '' };
@@ -38,6 +39,7 @@ function EmployeesView() {
 
     const [historyDialog, setHistoryDialog] = useState({ open: false, employee: null, history: [] });
     const [fixBalanceInput, setFixBalanceInput] = useState('');
+    const [fixBalanceReason, setFixBalanceReason] = useState('');
     const [historyLoading, setHistoryLoading] = useState(false);
     // Correcting a salary/bonus/deduction entry: { charge_id, type, amount, period, reason }
     const [editCharge, setEditCharge] = useState(null);
@@ -137,7 +139,8 @@ function EmployeesView() {
     const handleFixBalance = async () => {
         if (!historyDialog.employee) return;
         try {
-            const res = await apiService.fixEmployeeBalance(historyDialog.employee.id, { balance: fixBalanceInput });
+            const res = await apiService.fixEmployeeBalance(historyDialog.employee.id, { balance: fixBalanceInput, balance_reason: fixBalanceReason });
+            setFixBalanceReason('');
             setSnackbar({ open: true, message: 'Balance updated successfully.', severity: 'success' });
             setHistoryDialog({ ...historyDialog, employee: res.data.employee });
             loadEmployees();
@@ -164,9 +167,10 @@ function EmployeesView() {
 
     const handleDeleteCharge = async (h) => {
         if (!historyDialog.employee) return;
-        if (!window.confirm(`Delete this ${h.title.toLowerCase()} of $${Math.abs(h.amount).toFixed(2)}? The balance owed is adjusted to match.`)) return;
+        const reason = askDeleteReason(`Delete this ${h.title.toLowerCase()} of $${Math.abs(h.amount).toFixed(2)}? The balance owed is adjusted to match.`);
+        if (!reason) return;
         try {
-            await apiService.deleteEmployeeCharge(historyDialog.employee.id, h.charge_id);
+            await apiService.deleteEmployeeCharge(historyDialog.employee.id, h.charge_id, reason);
             setSnackbar({ open: true, message: 'Entry deleted.', severity: 'success' });
             handleOpenHistory(historyDialog.employee);
             loadEmployees();
@@ -366,7 +370,15 @@ function EmployeesView() {
                                     onChange={(e) => setFixBalanceInput(e.target.value)}
                                     sx={{ width: 180 }}
                                 />
-                                <Button variant="contained" size="small" onClick={handleFixBalance}>
+                                <TextField
+                                    size="small"
+                                    label="Reason (required)"
+                                    value={fixBalanceReason}
+                                    onChange={(e) => setFixBalanceReason(e.target.value)}
+                                    inputProps={{ maxLength: 250 }}
+                                    sx={{ minWidth: 240, flex: 1 }}
+                                />
+                                <Button variant="contained" size="small" onClick={handleFixBalance} disabled={!fixBalanceReason.trim()}>
                                     Set Balance
                                 </Button>
                             </Box>

@@ -11,7 +11,7 @@ def _login(client, username, password="pw"):
 def _setup(client, name):
     admin = make_tenant(client, f"Biz {name}", f"{name}_admin")
     sid = client.post("/api/suppliers", headers=admin, json={"name": "Sup"}).get_json()["id"]
-    client.put(f"/api/suppliers/{sid}/fix-balance", headers=admin, json={"balance": 100})
+    client.put(f"/api/suppliers/{sid}/fix-balance", headers=admin, json={"balance": 100, "balance_reason": "test"})
     r = client.post(f"/api/suppliers/{sid}/payments", headers=admin, json={"amount": 30})
     return admin, sid, r.get_json()["payment"]["id"]
 

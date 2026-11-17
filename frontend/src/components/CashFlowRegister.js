@@ -16,6 +16,7 @@ import { localDayRange } from './dailyCashDateRange';
 import DailyCashFlowSection from './DailyCashFlowSection';
 import { apiService, useAppContext } from '../context/AppContext.js';
 import { CloseDayDialog, ClosedDayBanner, ClosesHistory } from './DayClose';
+import { askDeleteReason } from '../utils/deleteReason.js';
 
 const ACCOUNTS = [
   { value: 'cash', label: 'Cash' },
@@ -208,9 +209,10 @@ function CashFlowRegister() {
   const closeDaySaved = () => { setDialog(null); setHistoryKey((k) => k + 1); loadAll(); };
 
   const reopen = async (close) => {
-    if (!window.confirm(`Reopen ${close.day}? The day will be unlocked and its over/short adjustment removed.`)) return;
+    const reason = askDeleteReason(`Reopen ${close.day}? The day will be unlocked and its over/short adjustment removed.`);
+    if (!reason) return;
     try {
-      await apiService.api.delete(`/day-closes/${close.id}`);
+      await apiService.api.delete(`/day-closes/${close.id}`, { data: { reason } });
       setReopenError(null);
       setHistoryKey((k) => k + 1);
       loadAll();
@@ -221,9 +223,10 @@ function CashFlowRegister() {
 
   const remove = async (kind, id) => {
     const label = kind === 'entry' ? 'this cash-in entry' : 'this transfer';
-    if (!window.confirm(`Delete ${label}? This cannot be undone.`)) return;
+    const reason = askDeleteReason(`Delete ${label}? It stays readable in Finance > History.`);
+    if (!reason) return;
     try {
-      await apiService.api.delete(`/${kind === 'entry' ? 'cash-entries' : 'account-transfers'}/${id}`);
+      await apiService.api.delete(`/${kind === 'entry' ? 'cash-entries' : 'account-transfers'}/${id}`, { data: { reason } });
       loadAll();
     } catch (err) {
       setListError(apiError(err, 'Could not delete.'));

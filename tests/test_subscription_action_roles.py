@@ -107,7 +107,7 @@ def test_cashier_can_fully_edit_but_not_the_balance(client):
     assert float(customer.discount) == 5 and customer.upstream_username == "x"
 
     before = float(customer.balance)
-    r = client.put(f"/api/customers/{customer_id}", headers=cashier_hdr, json={"name": "C", "balance": 100})
+    r = client.put(f"/api/customers/{customer_id}", headers=cashier_hdr, json={"name": "C", "balance": 100, "balance_reason": "test"})
     assert r.status_code == 403
     assert float(appmod.Customer.query.get(customer_id).balance) == before
 

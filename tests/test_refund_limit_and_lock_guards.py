@@ -7,7 +7,7 @@ from tests.test_daily_cash_report import _make_plan, _make_customer, _unpaid_pay
 from tests.test_day_close import _today, _set_opening, _close, _blocked
 from tests.test_receive_payment import _customer, _bill, _prepay
 from tests.test_refund_channel import _refund, _balance
-from app import app as flask_app, db, Payment
+from app import app as flask_app, db, Payment, SubmitGuard
 
 
 def _paid_bill(client, hdr, price=40):
@@ -30,6 +30,10 @@ def test_full_refund_cannot_be_issued_twice(app, client):
     cust, pid = _paid_bill(client, a)
     _refund(client, a, pid)
     balance = _balance(cust)
+    with flask_app.app_context():
+        # Past the double-click window: this is about the refund cap.
+        SubmitGuard.query.delete()
+        db.session.commit()
 
     r = _try_refund(client, a, pid)
     assert r.status_code == 400, r.get_data(as_text=True)

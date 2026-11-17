@@ -13,6 +13,7 @@ import {
     AccountBalance as BalanceIcon,
     History as HistoryIcon
 } from '@mui/icons-material';
+import { askDeleteReason } from '../utils/deleteReason.js';
 import { useAppContext } from '../context/AppContext';
 import BalanceLogTable from './BalanceLogTable';
 
@@ -31,6 +32,7 @@ function SuppliersView() {
     const [historyDialog, setHistoryDialog] = useState({ open: false, supplier: null, history: [] });
     const [historyTab, setHistoryTab] = useState(0);
     const [fixBalanceInput, setFixBalanceInput] = useState('');
+    const [fixBalanceReason, setFixBalanceReason] = useState('');
     const [historyLoading, setHistoryLoading] = useState(false);
 
     const loadSuppliers = () => {
@@ -106,7 +108,8 @@ function SuppliersView() {
     const handleFixBalance = async () => {
         if (!historyDialog.supplier) return;
         try {
-            const res = await apiService.fixSupplierBalance(historyDialog.supplier.id, { balance: fixBalanceInput });
+            const res = await apiService.fixSupplierBalance(historyDialog.supplier.id, { balance: fixBalanceInput, balance_reason: fixBalanceReason });
+            setFixBalanceReason('');
             setSnackbar({ open: true, message: 'Balance updated successfully.', severity: 'success' });
             setHistoryDialog({ ...historyDialog, supplier: res.data.supplier });
             loadSuppliers();
@@ -141,9 +144,10 @@ function SuppliersView() {
 
     const handleDeletePayment = async (h) => {
         if (!historyDialog.supplier) return;
-        if (!window.confirm(`Delete this payment of $${Math.abs(h.amount).toFixed(2)}? The amount will be added back to the balance owed.`)) return;
+        const reason = askDeleteReason(`Delete this payment of $${Math.abs(h.amount).toFixed(2)}? The amount will be added back to the balance owed.`);
+        if (!reason) return;
         try {
-            await apiService.deleteSupplierPayment(historyDialog.supplier.id, h.payment_id);
+            await apiService.deleteSupplierPayment(historyDialog.supplier.id, h.payment_id, reason);
             setSnackbar({ open: true, message: 'Payment deleted.', severity: 'success' });
             handleOpenHistory(historyDialog.supplier);
             loadSuppliers();
@@ -229,6 +233,10 @@ function SuppliersView() {
                         <TextField fullWidth margin="dense" name="address" label="Address" defaultValue={supplierDialog.data?.address || ''} />
                         <TextField fullWidth margin="dense" name="notes" label="Notes" multiline rows={3} defaultValue={supplierDialog.data?.notes || ''} />
                         <TextField fullWidth margin="dense" name="balance" label="Fixed Credit Amount / Balance ($)" type="number" inputProps={{ step: "0.01" }} defaultValue={supplierDialog.data?.balance !== undefined ? supplierDialog.data.balance : ''} />
+                        {supplierDialog.data && (
+                            <TextField fullWidth margin="dense" name="balance_reason" label="Reason for balance change" inputProps={{ maxLength: 250 }}
+                                helperText="Required only if you change the balance above. Kept in the balance log and in History." />
+                        )}
                     </DialogContent>
                     <DialogActions>
                         <Button onClick={() => setSupplierDialog({ open: false, data: null })}>Cancel</Button>
@@ -276,7 +284,15 @@ function SuppliersView() {
                                     onChange={(e) => setFixBalanceInput(e.target.value)}
                                     sx={{ width: 180 }}
                                 />
-                                <Button variant="contained" size="small" onClick={handleFixBalance}>
+                                <TextField
+                                    size="small"
+                                    label="Reason (required)"
+                                    value={fixBalanceReason}
+                                    onChange={(e) => setFixBalanceReason(e.target.value)}
+                                    inputProps={{ maxLength: 250 }}
+                                    sx={{ minWidth: 240, flex: 1 }}
+                                />
+                                <Button variant="contained" size="small" onClick={handleFixBalance} disabled={!fixBalanceReason.trim()}>
                                     Set Fixed Credit
                                 </Button>
                             </Box>

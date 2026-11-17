@@ -66,6 +66,7 @@ import {
     Link as LinkIcon,
     Email as EmailIcon
 } from '@mui/icons-material';
+import { askDeleteReason } from '../utils/deleteReason.js';
 import { useAppContext } from '../context/AppContext.js';
 import CreditReviewDialog from './CreditReviewDialog';
 import { escapeHtml } from '../utils/escapeHtml.js';
@@ -1207,9 +1208,10 @@ const PaymentsView = () => {
 
 
     const handleDeletePayment = async (paymentId) => {
-        if (window.confirm('Are you sure you want to delete this payment? This action cannot be undone.')) {
+        const reason = askDeleteReason('Delete this payment? It stays readable in Finance > History.');
+        if (reason) {
             try {
-                await apiService.deletePayment(paymentId);
+                await apiService.deletePayment(paymentId, reason);
                 setSnackbar({ open: true, message: 'Payment deleted successfully!', severity: 'success' });
                 fetchPayments();
                 if (filters.customer_id) {
@@ -1227,10 +1229,11 @@ const PaymentsView = () => {
     // per row) and guards against a double-click re-triggering the batch.
     const handleBulkDelete = async () => {
         if (bulkActionLoading || selected.length === 0) return;
-        if (!window.confirm(`Delete ${selected.length} selected payment(s)? This cannot be undone.`)) return;
+        const reason = askDeleteReason(`Delete ${selected.length} selected payment(s)? They stay readable in Finance > History.`);
+        if (!reason) return;
         setBulkActionLoading(true);
         try {
-            const { data } = await apiService.bulkDeletePayments(selected);
+            const { data } = await apiService.bulkDeletePayments(selected, reason);
             const failCount = (data.failed || []).length;
             setSnackbar({
                 open: true,

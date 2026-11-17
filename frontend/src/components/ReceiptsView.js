@@ -3,14 +3,12 @@ import {
     Box, Typography, Paper, Button, Grid, TextField, MenuItem,
     Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
     Checkbox, Dialog, DialogTitle, DialogContent, DialogActions,
-    alpha, useTheme, InputAdornment, IconButton, Tooltip, Chip, useMediaQuery
+    alpha, useTheme, InputAdornment, Chip, useMediaQuery
 } from '@mui/material';
 import {
     Print as PrintIcon,
     Search as SearchIcon,
     Receipt as ReceiptIcon,
-    Delete as DeleteIcon,
-    DeleteSweep as DeleteSweepIcon,
     FilterList as FilterListIcon,
     Clear as ClearIcon
 } from '@mui/icons-material';
@@ -136,52 +134,6 @@ const ReceiptsView = () => {
         setSelected(newSelected);
     };
 
-    const handleDeleteReceipt = async (receiptId) => {
-        if (window.confirm('Are you sure you want to delete this receipt? This action cannot be undone.')) {
-            try {
-                await apiService.deleteReceipt(receiptId);
-                setSnackbar({ open: true, message: 'Receipt deleted successfully!', severity: 'success' });
-                fetchReceipts(); // Refresh the list
-            } catch (error) {
-                console.error("Error deleting receipt:", error);
-                setSnackbar({
-                    open: true,
-                    message: 'Failed to delete receipt. ' + (error.response?.data?.error || error.message),
-                    severity: 'error'
-                });
-            }
-        }
-    };
-
-    const handleDeleteSelected = async () => {
-        if (selected.length === 0) {
-            setSnackbar({ open: true, message: 'No receipts selected to delete.', severity: 'warning' });
-            return;
-        }
-
-        if (window.confirm(`Are you sure you want to delete ${selected.length} selected receipt(s)? This action cannot be undone.`)) {
-            try {
-                // Delete all selected receipts
-                await Promise.all(selected.map(id => apiService.deleteReceipt(id)));
-                setSnackbar({
-                    open: true,
-                    message: `${selected.length} receipt(s) deleted successfully!`,
-                    severity: 'success'
-                });
-                setSelected([]); // Clear selection
-                fetchReceipts(); // Refresh the list
-            } catch (error) {
-                console.error("Error deleting receipts:", error);
-                setSnackbar({
-                    open: true,
-                    message: 'Failed to delete some receipts. ' + (error.response?.data?.error || error.message),
-                    severity: 'error'
-                });
-            }
-        }
-    };
-
-
     const handleGenerateReceipts = async () => {
         try {
             const response = await apiService.generateReceipts(generationDate);
@@ -282,6 +234,7 @@ const ReceiptsView = () => {
                 <div class="receipt-container">
                     <div class="main-part">
                         <div class="receipt-details">
+                            <span>رقم الإيصال: ${escapeHtml(r.receipt_number ?? '')}</span>
                             <span>الإسم: ${escapeHtml(data.customer_name)}</span>
                             <span>العنوان: ${escapeHtml(data.customer_address)}</span>
                             <span>الهاتف: ${escapeHtml(data.customer_phone)}</span>
@@ -293,6 +246,7 @@ const ReceiptsView = () => {
                     </div>
                     <div class="mini-part">
                         <div class="receipt-details">
+                            <span>رقم الإيصال: ${escapeHtml(r.receipt_number ?? '')}</span>
                             <span>الإسم: ${escapeHtml(data.customer_name)}</span>
                             <span>العنوان: ${escapeHtml(data.customer_address)}</span>
                             <span>الهاتف: ${escapeHtml(data.customer_phone)}</span>
@@ -349,15 +303,6 @@ const ReceiptsView = () => {
                                 sx={{ backgroundColor: 'rgba(255,255,255,0.2)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255,255,255,0.3)', color: 'white', borderRadius: '14px', textTransform: 'none', fontWeight: 600, px: { xs: 2, sm: 2.5 }, py: { xs: 1, sm: 1.2 }, width: { xs: '100%', sm: 'auto' }, '&:hover': { backgroundColor: 'rgba(255,255,255,0.3)' }, '&.Mui-disabled': { color: 'rgba(255,255,255,0.45)', borderColor: 'rgba(255,255,255,0.2)' }, transition: 'all 0.25s ease' }}
                             >
                                 Print Selected ({selected.length})
-                            </Button>
-                            <Button
-                                variant="contained"
-                                startIcon={<DeleteSweepIcon />}
-                                onClick={handleDeleteSelected}
-                                disabled={selected.length === 0}
-                                sx={{ backgroundColor: 'rgba(239,68,68,0.3)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255,255,255,0.25)', color: 'white', borderRadius: '14px', textTransform: 'none', fontWeight: 600, px: { xs: 2, sm: 2.5 }, py: { xs: 1, sm: 1.2 }, width: { xs: '100%', sm: 'auto' }, '&:hover': { backgroundColor: 'rgba(239,68,68,0.5)' }, '&.Mui-disabled': { color: 'rgba(255,255,255,0.45)', borderColor: 'rgba(255,255,255,0.2)' }, transition: 'all 0.25s ease' }}
-                            >
-                                Delete Selected ({selected.length})
                             </Button>
                             <Button
                                 variant="contained"
@@ -468,11 +413,11 @@ const ReceiptsView = () => {
                                     onChange={handleSelectAllClick}
                                 />
                             </TableCell>
+                            <TableCell>No.</TableCell>
                             <TableCell>Customer Name</TableCell>
                             <TableCell>Billing Date</TableCell>
                             <TableCell>Print Count</TableCell>
                             <TableCell>Last Printed</TableCell>
-                            <TableCell align="center">Actions</TableCell>
                         </TableRow>
                     </TableHead>
                     <TableBody>
@@ -493,21 +438,11 @@ const ReceiptsView = () => {
                                         <TableCell padding="checkbox">
                                             <Checkbox checked={isItemSelected} />
                                         </TableCell>
+                                        <TableCell>{row.receipt_number ?? '—'}</TableCell>
                                         <TableCell>{row.customer_name}</TableCell>
                                         <TableCell>{row.billing_date}</TableCell>
                                         <TableCell>{row.print_count}</TableCell>
                                         <TableCell>{row.last_printed_date}</TableCell>
-                                        <TableCell align="center">
-                                            <Tooltip title="Delete Receipt">
-                                                <IconButton
-                                                    color="error"
-                                                    onClick={() => handleDeleteReceipt(row.id)}
-                                                    size="small"
-                                                >
-                                                    <DeleteIcon />
-                                                </IconButton>
-                                            </Tooltip>
-                                        </TableCell>
                                     </TableRow>
                                 );
                             })

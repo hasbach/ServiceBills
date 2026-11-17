@@ -1342,7 +1342,7 @@ const SubscriptionsView = ({
     const openEditCustomerDialog = useCallback((customer) => {
         editingOnuMacSnapshotRef.current = customer.onu_mac_address || '';
         editingCpeMacSnapshotRef.current = customer.cpe_mac_address || '';
-        setEditingCustomer(customer);
+        setEditingCustomer({ ...customer, original_balance: customer.balance, balance_reason: '' });
         setEditDialogOpen(true);
     }, []);
 
@@ -1359,6 +1359,7 @@ const SubscriptionsView = ({
                 discount: editingCustomer.discount,
                 cost_override: editingCustomer.cost_override,
                 balance: editingCustomer.balance !== undefined ? editingCustomer.balance : 0,
+                balance_reason: editingCustomer.balance_reason || '',
                 reseller_id: editingCustomer.reseller_id || "",
                 upstream_provider_id: editingCustomer.upstream_provider_id || "",
                 upstream_username: editingCustomer.upstream_username || "",
@@ -1893,6 +1894,12 @@ const SubscriptionsView = ({
                         <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Cost Override (Optional)" value={editingCustomer?.cost_override ?? ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, cost_override: e.target.value })} helperText="Leave blank to use the plan's default cost" /></Grid>
                         <Grid item xs={12}><TextField fullWidth multiline minRows={2} label="Notes (Optional)" value={editingCustomer?.notes || ''} onChange={(e) => setEditingCustomer({ ...editingCustomer, notes: e.target.value })} inputProps={{ maxLength: 2000 }} helperText="Shown on the subscription card" /></Grid>
                         {!isCashierOnly && <Grid item xs={12} md={6}><TextField fullWidth type="number" label="Account Balance ($)" value={editingCustomer?.balance !== undefined ? editingCustomer.balance : 0} helperText="Negative value = Customer owes money. 0 = Paid." onChange={(e) => setEditingCustomer({ ...editingCustomer, balance: parseFloat(e.target.value) || 0 })} /></Grid>}
+                        {!isCashierOnly && editingCustomer?.id && Math.abs(Number(editingCustomer.balance || 0) - Number(editingCustomer.original_balance || 0)) >= 0.005 && (
+                            <Grid item xs={12} md={6}><TextField fullWidth required label="Reason for balance change" value={editingCustomer.balance_reason || ''}
+                                error={!(editingCustomer.balance_reason || '').trim()} inputProps={{ maxLength: 250 }}
+                                helperText="Required. Kept in the customer's balance log and in History."
+                                onChange={(e) => setEditingCustomer({ ...editingCustomer, balance_reason: e.target.value })} /></Grid>
+                        )}
 
                         {!isCashierOnly && hasModule('network') && businessSettings?.network_mode === 'local_mikrotik' && editingCustomer?.network_device_id && editingCustomer?.pppoe_username && (
                             <Grid item xs={12}>
