@@ -159,6 +159,8 @@ const rawApiService = {
     applyResellerDiscount: (id, data) => api.post(`/resellers/${id}/apply_discount`, data),
     collectResellerPayment: (id, data) => api.post(`/resellers/${id}/collect_payment`, data),
     getResellerHistory: (id) => api.get(`/resellers/${id}/history`),
+    updateResellerEntry: (id, entryId, data) => api.put(`/resellers/${id}/entries/${entryId}`, data),
+    deleteResellerEntry: (id, entryId, reason) => api.delete(`/resellers/${id}/entries/${entryId}`, { data: { reason } }),
     getResellerBalanceLog: (id) => api.get(`/resellers/${id}/balance-log`),
     getAuditLog: (params) => api.get('/audit-log', { params }),
 
@@ -169,6 +171,8 @@ const rawApiService = {
     updateUpstreamProvider: (id, data) => api.put(`/upstream-providers/${id}`, data),
     deleteUpstreamProvider: (id) => api.delete(`/upstream-providers/${id}`),
     getUpstreamProviderHistory: (id) => api.get(`/upstream-providers/${id}/history`),
+    updateUpstreamEntry: (id, entryId, data) => api.put(`/upstream-providers/${id}/entries/${entryId}`, data),
+    deleteUpstreamEntry: (id, entryId, reason) => api.delete(`/upstream-providers/${id}/entries/${entryId}`, { data: { reason } }),
     topupUpstreamProvider: (id, data) => api.post(`/upstream-providers/${id}/topup`, data),
     recordUpstreamRenewalCost: (id, data) => api.post(`/upstream-providers/${id}/renewal-cost`, data),
 

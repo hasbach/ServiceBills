@@ -14,6 +14,7 @@ import {
     History as HistoryIcon
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
+import EntryActions from './EntryActions';
 
 const PRODUCT_LABELS = { proradius: 'PROradius', radiusnew: 'radiusnew', krypton: 'Krypton', manual: 'Manual' };
 
@@ -21,7 +22,9 @@ const PRODUCT_LABELS = { proradius: 'PROradius', radiusnew: 'radiusnew', krypton
 // Data-model + manual tracking only -- no portal automation exists yet, see
 // docs/superpowers/specs/2026-08-12-network-enforcement-design.md, Concept A.
 const UpstreamProviderManagementView = () => {
-    const { setSnackbar } = useAppContext();
+    const { setSnackbar, user } = useAppContext();
+    const isAdmin = (user?.role || '').split(',').map((r) => r.trim()).includes('admin');
+    const [historyProviderId, setHistoryProviderId] = useState(null);
     const [providers, setProviders] = useState([]);
     // Every customer for the renewal-cost picker -- this used to reuse the
     // Subscriptions page's current (paginated, status-filtered) list.
@@ -124,7 +127,22 @@ const UpstreamProviderManagementView = () => {
         }
     };
 
+    // Correct a recorded entry (admin): reload the entry list and the balances.
+    const correctEntry = async (call, done) => {
+        try {
+            await call();
+            setSnackbar({ open: true, message: done, severity: 'success' });
+            const response = await apiService.getUpstreamProviderHistory(historyProviderId);
+            setHistoryData(response.data || []);
+            loadProviders();
+        } catch (error) {
+            setSnackbar({ open: true, message: error.response?.data?.error || error.response?.data?.message || 'Could not change the entry.', severity: 'error' });
+            throw error;
+        }
+    };
+
     const openHistoryDialog = async (id) => {
+        setHistoryProviderId(id);
         setHistoryDialogOpen(true);
         setHistoryLoading(true);
         try {
@@ -312,6 +330,7 @@ const UpstreamProviderManagementView = () => {
                                         <TableCell sx={{ fontWeight: 'bold' }}>Type</TableCell>
                                         <TableCell sx={{ fontWeight: 'bold' }}>Amount</TableCell>
                                         <TableCell sx={{ fontWeight: 'bold' }}>Description</TableCell>
+                                        {isAdmin && <TableCell sx={{ fontWeight: 'bold' }} align="right">Actions</TableCell>}
                                     </TableRow>
                                 </TableHead>
                                 <TableBody>
@@ -324,6 +343,15 @@ const UpstreamProviderManagementView = () => {
                                             </TableCell>
                                             <TableCell sx={{ fontWeight: 600 }}>${parseFloat(row.amount).toFixed(2)}</TableCell>
                                             <TableCell>{row.description}</TableCell>
+                                            {isAdmin && (
+                                                <TableCell align="right">
+                                                    {(row.type === 'balance_topup' || row.type === 'renewal_cost') && (
+                                                        <EntryActions row={row} showChannel={row.type === 'balance_topup'}
+                                                            onUpdate={(payload) => correctEntry(() => apiService.updateUpstreamEntry(historyProviderId, row.id, payload), 'Entry updated.')}
+                                                            onDelete={(reason) => correctEntry(() => apiService.deleteUpstreamEntry(historyProviderId, row.id, reason), 'Entry deleted.').catch(() => {})} />
+                                                    )}
+                                                </TableCell>
+                                            )}
                                         </TableRow>
                                     ))}
                                 </TableBody>

@@ -16,9 +16,11 @@ import {
 } from '@mui/icons-material';
 import { apiService, useAppContext } from '../context/AppContext';
 import BalanceLogTable from './BalanceLogTable';
+import EntryActions from './EntryActions';
 
 const ResellerManagementView = () => {
-    const { setSnackbar } = useAppContext();
+    const { setSnackbar, user } = useAppContext();
+    const isAdmin = (user?.role || '').split(',').map((r) => r.trim()).includes('admin');
     const [resellers, setResellers] = useState([]);
     const [loading, setLoading] = useState(true);
 
@@ -53,6 +55,20 @@ const ResellerManagementView = () => {
         }
     };
 
+
+    // Correct a recorded entry (admin): reload the entry list and the balances.
+    const correctEntry = async (call, done) => {
+        try {
+            await call();
+            setSnackbar({ open: true, message: done, severity: 'success' });
+            const response = await apiService.getResellerHistory(historyResellerId);
+            setHistoryData(response.data || []);
+            loadResellers();
+        } catch (error) {
+            setSnackbar({ open: true, message: error.response?.data?.error || error.response?.data?.message || 'Could not change the entry.', severity: 'error' });
+            throw error;
+        }
+    };
 
     useEffect(() => {
         loadResellers();
@@ -293,6 +309,7 @@ const ResellerManagementView = () => {
                                         <TableCell sx={{ fontWeight: 'bold' }}>Type</TableCell>
                                         <TableCell sx={{ fontWeight: 'bold' }}>Amount</TableCell>
                                         <TableCell sx={{ fontWeight: 'bold' }}>Description</TableCell>
+                                        {isAdmin && <TableCell sx={{ fontWeight: 'bold' }} align="right">Actions</TableCell>}
                                     </TableRow>
                                 </TableHead>
                                 <TableBody>
@@ -308,6 +325,15 @@ const ResellerManagementView = () => {
                                             </TableCell>
                                             <TableCell sx={{ fontWeight: 600 }}>${parseFloat(row.amount).toFixed(2)}</TableCell>
                                             <TableCell>{row.description}</TableCell>
+                                            {isAdmin && (
+                                                <TableCell align="right">
+                                                    {row.customer_id == null && (
+                                                        <EntryActions row={row} showChannel={row.type === 'payment_received' || row.type === 'payment_collected'}
+                                                            onUpdate={(payload) => correctEntry(() => apiService.updateResellerEntry(historyResellerId, row.id, payload), 'Entry updated.')}
+                                                            onDelete={(reason) => correctEntry(() => apiService.deleteResellerEntry(historyResellerId, row.id, reason), 'Entry deleted.').catch(() => {})} />
+                                                    )}
+                                                </TableCell>
+                                            )}
                                         </TableRow>
                                     ))}
                                 </TableBody>

@@ -13251,6 +13251,87 @@ def record_upstream_renewal_cost(provider_id):
         return jsonify({'error': str(e)}), 400
 
 
+# --- Correcting reseller entries and upstream entries -------------------------
+# Same rules as supplier payments (update_supplier_payment): admin only, the
+# day lock applies to entries that moved money, and the party's balance moves
+# by the difference so it ends where it would have been had the entry been
+# typed correctly the first time. Every change lands in the audit log.
+
+# How each entry type moved its party's balance when it was recorded.
+_RESELLER_ENTRY_SIGN = {'credit_added': 1, 'payment_received': -1, 'discount_applied': -1, 'payment_collected': -1}
+_UPSTREAM_ENTRY_SIGN = {'balance_topup': 1, 'renewal_cost': -1}
+# Entry types where cash or Whish actually moved (so the day lock applies).
+_MONEY_ENTRY_TYPES = {'payment_received', 'payment_collected', 'balance_topup'}
+
+
+def _correct_ledger_entry(party, entry, sign_by_type, label):
+    """Edit (PUT) or remove (DELETE) one reseller / upstream entry and move the
+    party's balance to match. Returns a Flask response."""
+    if 'admin' not in _jwt_roles():
+        return jsonify({'error': f'Only an administrator can change a recorded {label} entry.'}), 403
+    sign = sign_by_type.get(entry.type)
+    if sign is None:
+        return jsonify({'error': f'A "{entry.type}" entry cannot be changed.'}), 400
+    if entry.type in _MONEY_ENTRY_TYPES:
+        closed = _assert_day_open(_inst_day(entry.date))
+        if closed:
+            return closed
+    old_amount = float(entry.amount)
+    try:
+        if request.method == 'DELETE':
+            _note_balance_reason(party, f"{entry.type.replace('_', ' ').capitalize()} deleted ({old_amount:.2f})")
+            party.balance = float(party.balance or 0) - sign * old_amount
+            db.session.delete(entry)
+            db.session.commit()
+            return jsonify({'message': 'Entry deleted.', label: party.to_dict()}), 200
+        data = request.json or {}
+        if 'amount' in data:
+            try:
+                new_amount = _parse_positive_amount(data['amount'])
+            except ValueError as ve:
+                return jsonify({'error': str(ve)}), 400
+            if abs(new_amount - old_amount) >= 0.00005:
+                _note_balance_reason(party, f"{entry.type.replace('_', ' ').capitalize()} edited: {old_amount:.2f} -> {new_amount:.2f}")
+                party.balance = float(party.balance or 0) + sign * (new_amount - old_amount)
+                entry.amount = new_amount
+        if 'description' in data:
+            entry.description = (data['description'] or '')[:200]
+        if entry.type in _MONEY_ENTRY_TYPES:
+            entry.paid_via = _paid_via(data, entry.paid_via)
+        db.session.commit()
+        return jsonify({'message': 'Entry updated.', label: party.to_dict(), 'entry': entry.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/resellers/<int:reseller_id>/entries/<int:entry_id>', methods=['PUT', 'DELETE'])
+@jwt_required()
+def correct_reseller_entry(reseller_id, entry_id):
+    """Admin-only correction of a reseller-level entry (credit added, payment
+    received, discount). Per-customer billing entries come from the billing
+    cycle and are not edited here."""
+    reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
+    entry = tenant_query(ResellerPayment).filter_by(id=entry_id, reseller_id=reseller_id).first()
+    if not reseller or not entry:
+        return jsonify({'message': 'Entry not found!'}), 404
+    if entry.customer_id is not None:
+        return jsonify({'error': "This entry was created by a customer's billing and cannot be changed here."}), 400
+    return _correct_ledger_entry(reseller, entry, _RESELLER_ENTRY_SIGN, 'reseller')
+
+
+@app.route('/api/upstream-providers/<int:provider_id>/entries/<int:entry_id>', methods=['PUT', 'DELETE'])
+@jwt_required()
+@require_module('upstream_sync')
+def correct_upstream_entry(provider_id, entry_id):
+    """Admin-only correction of an upstream top-up or renewal cost."""
+    provider = tenant_query(UpstreamProvider).filter_by(id=provider_id).first()
+    entry = tenant_query(UpstreamProviderPayment).filter_by(id=entry_id, upstream_provider_id=provider_id).first()
+    if not provider or not entry:
+        return jsonify({'message': 'Entry not found!'}), 404
+    return _correct_ledger_entry(provider, entry, _UPSTREAM_ENTRY_SIGN, 'provider')
+
+
 # --- Read-only status sync against a customer's upstream portal account.
 # Dispatches by UpstreamProvider.product: PROradius (Terra, Northern -- see
 # docs/superpowers/specs/2026-08-22-upstream-status-sync-design.md) or
