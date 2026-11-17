@@ -118,8 +118,8 @@ def test_filters_party_user_and_paging(app, client):
     a = make_tenant(client, "B", "al8")
     c1 = _customer(client, a, name="One")
     c2 = _customer(client, a, name="Two")
-    for _ in range(3):
-        _bill(client, a, c1, 25)
+    for day in ("2026-09-01", "2026-09-02", "2026-09-03"):
+        _bill(client, a, c1, 25, day)
     _prepay(client, a, c2, 40)
 
     one = _log(client, a, party_type="customer", party_id=c1)

@@ -33,7 +33,7 @@ import secrets
 import requests
 import traceback
 from types import SimpleNamespace
-from flask import Flask, jsonify, request, redirect, g, has_request_context
+from flask import Flask, jsonify, request, redirect, g, has_request_context, make_response
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
@@ -1082,6 +1082,20 @@ class BalanceLog(db.Model):
             # UTC, marked as such so the browser shows local time.
             'date': self.created_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
         }
+
+
+class SubmitGuard(db.Model):
+    """One row per money request just accepted, so the same request sent twice
+    in a few seconds (a double click, a retry after a slow network) is refused
+    instead of recorded twice. `key` is a hash of tenant, user, method, path
+    and body; the unique index is what makes two simultaneous copies collide,
+    across every server worker. Rows are short-lived: see no_double_submit()."""
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(64), nullable=False, unique=True)
+    # Hash of tenant + user: any other write by the same user clears their
+    # rows, so "pay, revert, pay again" is not mistaken for a double click.
+    who = db.Column(db.String(64), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 
 class AuditLog(db.Model):
@@ -2681,6 +2695,34 @@ def _log_balance_changes(session, flush_context, instances):
         session.add(log)
 
 
+_BALANCE_HOLDERS = (Customer, Reseller, Supplier, Employee, UpstreamProvider)
+
+
+@_sa_event.listens_for(db.session, "before_flush")
+def _balance_changes_as_increments(session, flush_context, instances):
+    """Write every balance change as `balance = balance + delta` instead of
+    the value this request computed. Two requests moving the same balance at
+    once (two cashiers, a payment during the nightly billing run) then both
+    count; with a plain SET the later one would overwrite the earlier one's
+    change. Registered after _log_balance_changes, which still reads the
+    plain numbers. SQLAlchemy expires the attribute after the flush, so the
+    next read in this request returns the database's real value."""
+    for obj in list(session.dirty):
+        if not isinstance(obj, _BALANCE_HOLDERS):
+            continue
+        hist = db.inspect(obj).attrs.balance.history
+        if not hist.has_changes() or not hist.deleted or not hist.added:
+            continue  # never loaded (old value unknown) -> keep the plain write
+        old, new = hist.deleted[0], hist.added[0]
+        if old is None or new is None or hasattr(new, '__clause_element__'):
+            continue
+        delta = float(new) - float(old)
+        if abs(delta) < 1e-9:
+            continue
+        model = type(obj)
+        obj.balance = model.balance + delta
+
+
 @_sa_event.listens_for(db.session, "after_commit")
 @_sa_event.listens_for(db.session, "after_rollback")
 def _drop_pending_ledger(session):
@@ -2970,6 +3012,99 @@ def admin_or_finance_required():
             else:
                 return jsonify(msg="Admins or finance only!"), 403
         return decorator
+    return wrapper
+
+
+DOUBLE_SUBMIT_WINDOW = timedelta(seconds=10)
+
+
+def _submit_guard_who():
+    """Hash of (tenant, user) for the current request, or None without a JWT."""
+    try:
+        who = get_jwt_identity()
+    except Exception:
+        who = None
+    if not who:
+        return None
+    try:
+        tid = current_tenant_id()
+    except Exception:
+        tid = None
+    return hashlib.sha256(json.dumps([tid, str(who)]).encode('utf-8')).hexdigest()
+
+
+def _submit_guard_key(who):
+    body = request.get_json(silent=True)
+    if body is None:
+        body = request.get_data(as_text=True) or ''
+    canonical = json.dumps([who, request.method, request.path, body], sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+@app.after_request
+def _clear_submit_guards_on_other_writes(response):
+    """A duplicate is the same money request twice in a row. Any other
+    successful write by the same user in between (a revert, a delete, an
+    edit) means the repeat is deliberate, so their claims are dropped."""
+    try:
+        if (request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and response.status_code < 400
+                and not request.environ.get('servicebills.submit_guard')):
+            who = _submit_guard_who()
+            if who:
+                SubmitGuard.query.filter_by(who=who).delete(synchronize_session=False)
+                db.session.commit()
+    except Exception:
+        db.session.rollback()
+    return response
+
+
+def no_double_submit(fn):
+    """Refuse the same money request (same user, route and body) a second
+    time within DOUBLE_SUBMIT_WINDOW. The first copy claims a SubmitGuard row
+    and commits it before running, so a copy arriving at the same moment on
+    another worker hits the unique key and gets 409. A request that fails
+    (any 4xx/5xx) gives its claim back, so correcting and resending works.
+    Place it below @jwt_required and the role checks."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        request.environ['servicebills.submit_guard'] = True
+        who = _submit_guard_who()
+        if not who:
+            return fn(*args, **kwargs)
+        key = _submit_guard_key(who)
+        now = datetime.utcnow()
+        try:
+            SubmitGuard.query.filter(SubmitGuard.created_at < now - DOUBLE_SUBMIT_WINDOW).delete(
+                synchronize_session=False)
+            # A different money request by the same user also ends the window.
+            SubmitGuard.query.filter(SubmitGuard.who == who, SubmitGuard.key != key).delete(
+                synchronize_session=False)
+            db.session.add(SubmitGuard(key=key, who=who, created_at=now))
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify(
+                error='This was already submitted a moment ago and has been recorded. '
+                      'Check the list before sending it again.',
+                duplicate=True), 409
+
+        def release():
+            try:
+                db.session.rollback()
+                SubmitGuard.query.filter_by(key=key).delete(synchronize_session=False)
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logging.exception("could not release a submit guard")
+
+        try:
+            rv = fn(*args, **kwargs)
+        except Exception:
+            release()
+            raise
+        if make_response(rv).status_code >= 400:
+            release()
+        return rv
     return wrapper
 
 
@@ -6014,6 +6149,7 @@ def _parse_positive_amount(raw, field_name='amount'):
 @app.route('/api/payments', methods=['POST'])
 @jwt_required()
 @subscription_desk_required()
+@no_double_submit
 def add_payment():
     data = request.json
 
@@ -6408,12 +6544,14 @@ def _customer_income_by_month(start_day=None, end_day=None):
 # New Report Routes
 @app.route('/api/reports/total-sales', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_total_sales():
     total_sales = _customer_income_by_month()
     return jsonify([{'month': month, 'value': total_sales[month]} for month in sorted(total_sales)])
 
 @app.route('/api/reports/unpaid-payments', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_unpaid_payments():
     unpaid_payments = db.session.query(
         month_key(Payment.date).label('month'),
@@ -6430,6 +6568,7 @@ def get_unpaid_payments():
 
 @app.route('/api/reports/customer-whish-payments', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def customer_whish_payments_report():
     has_links = modules.is_enabled(db.session.get(Tenant, current_tenant_id()), 'whish_payments')
     query = tenant_query(CustomerPaymentLink).join(Customer)
@@ -6496,6 +6635,7 @@ def customer_whish_payments_report():
 
 @app.route('/api/reports/customer-numbers', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_customer_numbers():
     customer_numbers = db.session.query(
         month_key(Customer.subscription_start_date).label('month'),
@@ -6917,6 +7057,7 @@ def _customer_money_request(customer_id):
 
 @app.route('/api/customers/<int:customer_id>/receive-payment', methods=['POST'])
 @jwt_required()
+@no_double_submit
 def receive_customer_payment(customer_id):
     """One amount for the whole customer instead of card by card.
     action 'pay' (admin/finance) confirms it straight away; 'collect'
@@ -7318,6 +7459,7 @@ def _refunded_total(payment):
 @app.route('/api/payments/<int:payment_id>/refund', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@no_double_submit
 def refund_payment(payment_id):
     """The ONLY sanctioned path for a negative/refund-style balance
     adjustment. General payment endpoints (add_payment, mark_paid, etc.)
@@ -7433,6 +7575,7 @@ def refund_payment(payment_id):
 
 @app.route('/api/payments/bulk_mark_paid', methods=['POST'])
 @jwt_required()
+@no_double_submit
 def bulk_mark_payments_paid():
     """Mark a batch of payments as fully paid in a single request instead of
     one HTTP round trip per row (what the 'select multiple payments' bulk
@@ -7948,6 +8091,7 @@ def _upstream_cost_by_month(start=None, end=None):
 
 @app.route('/api/reports/expenses-total', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_expenses_total():
     # Direct cash expenses (exclude credit purchases). A payroll payment is
     # identified by employee_id being set -- not by category name -- so this
@@ -7998,6 +8142,7 @@ def get_expenses_total():
 
 @app.route('/api/reports/monthly-revenue', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_monthly_revenue():
     # Customer income -- the one shared definition (see _customer_income_by_month).
     sales_data = _customer_income_by_month()
@@ -9652,6 +9797,7 @@ def send_whatsapp_message(customer, event_type, context=None):
 
 @app.route('/api/dashboard', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_dashboard_metrics():
     # start_date/end_date are optional -- when given, they scope the money-flow
     # figures (revenue, expenses) to that period. Customer counts and
@@ -10903,6 +11049,7 @@ release_routes.register(app, sys.modules[__name__])
 
 @app.route('/api/reports/revenue', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_revenue_report():
     try:
         start_date_str = request.args.get('start_date')
@@ -10942,6 +11089,7 @@ def get_revenue_report():
 
 @app.route('/api/reports/overdue', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_overdue_payments():
     days_overdue = request.args.get('days', 30, type=int)
     cutoff_date = datetime.utcnow() - timedelta(days=days_overdue)
@@ -11090,6 +11238,7 @@ def _renew_subscription_core(customer, notify_later=None):
 @app.route('/api/customers/<int:customer_id>/renew_subscription', methods=['POST'])
 @jwt_required()
 @subscription_desk_required()
+@no_double_submit
 def renew_subscription(customer_id):
     try:
         customer = tenant_query(Customer).filter_by(id=customer_id).first()
@@ -11110,6 +11259,7 @@ def renew_subscription(customer_id):
 @app.route('/api/customers/bulk_renew_subscription', methods=['POST'])
 @jwt_required()
 @subscription_desk_required()
+@no_double_submit
 def bulk_renew_subscriptions():
     """Renew a batch of customer subscriptions in a single request instead of
     one HTTP round trip per row."""
@@ -11207,12 +11357,14 @@ def delete_sector(id):
 
 @app.route('/api/expense_categories', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_expense_categories():
     categories = tenant_query(ExpenseCategory).order_by(ExpenseCategory.name).all()
     return jsonify([c.to_dict() for c in categories])
 
 @app.route('/api/expense_categories', methods=['POST'])
 @jwt_required()
+@admin_or_finance_required()
 def add_expense_category():
     data = request.json
     if not data or 'name' not in data or not data['name'].strip():
@@ -11231,6 +11383,7 @@ def add_expense_category():
 
 @app.route('/api/expense_categories/<int:category_id>', methods=['PUT'])
 @jwt_required()
+@admin_or_finance_required()
 def update_expense_category(category_id):
     data = request.json
     category = tenant_query(ExpenseCategory).filter_by(id=category_id).first()
@@ -11251,6 +11404,7 @@ def update_expense_category(category_id):
 
 @app.route('/api/expense_categories/<int:category_id>', methods=['DELETE'])
 @jwt_required()
+@admin_or_finance_required()
 def delete_expense_category(category_id):
     category = tenant_query(ExpenseCategory).filter_by(id=category_id).first()
     if not category:
@@ -11342,6 +11496,7 @@ def get_expenses():
 @app.route('/api/expenses', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@no_double_submit
 def add_expense():
     try:
         data = request.json
@@ -11613,6 +11768,7 @@ def log_receipt_print():
 
 @app.route('/api/reports/active-subscriptions-by-plan', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_active_subscriptions_by_plan():
     """
     Get count of active subscriptions grouped by subscription plan
@@ -11660,6 +11816,7 @@ def get_active_subscriptions_by_plan():
 
 @app.route('/api/reports/collector-progress', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_collector_progress():
     try:
         start_date_str = request.args.get('start_date')
@@ -12098,6 +12255,7 @@ def get_cash_entries():
 @app.route('/api/cash-entries', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@no_double_submit
 def add_cash_entry():
     data = request.get_json(silent=True) or {}
     account = data.get('account')
@@ -12146,6 +12304,7 @@ def get_account_transfers():
 @app.route('/api/account-transfers', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@no_double_submit
 def add_account_transfer():
     data = request.get_json(silent=True) or {}
     from_account, to_account = data.get('from_account'), data.get('to_account')
@@ -12305,6 +12464,7 @@ def reopen_day_close(close_id):
 
 @app.route('/api/reports/daily-cash', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_daily_cash_report():
     """Cash reconciliation for one calendar day: how much cash each field
     collector collected, plus an 'Office / Direct' bucket for payments with
@@ -12563,6 +12723,7 @@ def get_reconciliation_report():
 
 @app.route('/api/reports/financial', methods=['GET'])
 @jwt_required()
+@admin_or_finance_required()
 def get_financial_report():
     """
     Get Income, Expenses, and Profit aggregated by month for a given date range.
@@ -12963,6 +13124,7 @@ def update_reseller(reseller_id):
 @app.route('/api/resellers/<int:reseller_id>/add_credit', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@no_double_submit
 def add_reseller_credit(reseller_id):
     data = request.json
     reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
@@ -12997,6 +13159,7 @@ def add_reseller_credit(reseller_id):
 @app.route('/api/resellers/<int:reseller_id>/apply_discount', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@no_double_submit
 def apply_reseller_discount(reseller_id):
     data = request.json
     reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
@@ -13031,6 +13194,7 @@ def apply_reseller_discount(reseller_id):
 @app.route('/api/resellers/<int:reseller_id>/collect_payment', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@no_double_submit
 def collect_reseller_payment(reseller_id):
     data = request.json
     reseller = tenant_query(Reseller).filter_by(id=reseller_id).first()
@@ -13179,6 +13343,7 @@ def get_upstream_provider_history(provider_id):
 @jwt_required()
 @admin_or_finance_required()
 @require_module('upstream_sync')
+@no_double_submit
 def topup_upstream_provider(provider_id):
     """Manual prepaid-credit top-up -- decreases balance, the same direction the
     real portal's own balance figure moves when the tenant pays the upstream."""
@@ -13215,6 +13380,7 @@ def topup_upstream_provider(provider_id):
 @jwt_required()
 @admin_or_finance_required()
 @require_module('upstream_sync')
+@no_double_submit
 def record_upstream_renewal_cost(provider_id):
     """Manual record of what a customer's renewal cost upstream -- how the
     tenant tracks real per-customer cost until portal automation exists."""
@@ -16253,6 +16419,7 @@ def get_supplier_payments(supplier_id):
 @app.route('/api/suppliers/<int:supplier_id>/payments', methods=['POST'])
 @jwt_required()
 @admin_or_finance_required()
+@no_double_submit
 def record_supplier_payment(supplier_id):
     data = request.json
     supplier = tenant_query(Supplier).filter_by(id=supplier_id).first()
@@ -16558,6 +16725,7 @@ def get_employee_charges(employee_id):
 
 @app.route('/api/employees/<int:employee_id>/charges', methods=['POST'])
 @admin_required()
+@no_double_submit
 def add_employee_charge(employee_id):
     data = request.json
     employee = tenant_query(Employee).filter_by(id=employee_id).first()
@@ -16696,6 +16864,7 @@ def get_employee_payments(employee_id):
 
 @app.route('/api/employees/<int:employee_id>/payments', methods=['POST'])
 @admin_required()
+@no_double_submit
 def record_employee_payment(employee_id):
     data = request.json
     employee = tenant_query(Employee).filter_by(id=employee_id).first()

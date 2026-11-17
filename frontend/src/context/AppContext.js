@@ -35,6 +35,14 @@ api.interceptors.response.use(
             window.location.reload();
         }
 
+        // Same money request sent twice in a few seconds (no_double_submit):
+        // pages read either `error` or `message`, so carry the text in both.
+        if (status === 409 && error.response?.data?.duplicate) {
+            const d = error.response.data;
+            d.message = d.message || d.error;
+            d.error = d.error || d.message;
+        }
+
         // Plan limit hit -> prompt to upgrade (skip billing calls themselves).
         if (status === 402 && !url.includes('/billing')) {
             window.dispatchEvent(new CustomEvent('sb:upgrade-required', {
