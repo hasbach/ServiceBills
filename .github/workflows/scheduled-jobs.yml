@@ -22,6 +22,7 @@ on:
     - cron: "*/15 * * * *"  # refresh_agent_mode_network_status
     - cron: "5 * * * *"     # whatsapp_connection_health
     - cron: "0 3 * * *"     # ledger_nightly
+    - cron: "*/10 * * * *"  # resume_whatsapp_campaigns
   workflow_dispatch:
     inputs:
       job_name:
@@ -45,6 +46,7 @@ jobs:
             "*/15 * * * *") echo "name=refresh_agent_mode_network_status" >> "$GITHUB_OUTPUT" ;;
             "5 * * * *")    echo "name=whatsapp_connection_health" >> "$GITHUB_OUTPUT" ;;
             "0 3 * * *")    echo "name=ledger_nightly" >> "$GITHUB_OUTPUT" ;;
+            "*/10 * * * *") echo "name=resume_whatsapp_campaigns" >> "$GITHUB_OUTPUT" ;;
             *)              echo "name=${{ github.event.inputs.job_name }}" >> "$GITHUB_OUTPUT" ;;
           esac
 

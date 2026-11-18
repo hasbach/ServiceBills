@@ -34,7 +34,7 @@ import secrets
 import requests
 import traceback
 from types import SimpleNamespace
-from flask import Flask, jsonify, request, redirect, g, has_request_context, make_response
+from flask import Flask, jsonify, request, redirect, g, has_request_context, make_response, Response
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
@@ -50,10 +50,13 @@ from sqlalchemy.exc import IntegrityError
 from dateutil.relativedelta import relativedelta # REQUIRED: pip install python-dateutil
 import signal
 import sys
+import csv
+import io
 import json
 import cs_agent_tools
 import functools
 import whatsapp_inbox
+import wa_campaigns
 import wa_connect
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager, verify_jwt_in_request
@@ -2277,6 +2280,46 @@ class CSAgentMessageLog(db.Model):
             'transcript': self.transcript,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S') if self.created_at else None,
         }
+
+
+class WhatsAppCampaign(db.Model):
+    """One bulk send from Messaging (customer notification or custom-number
+    marketing template). Sent in the background, one recipient row at a time,
+    so the page can close and one failed number never stops the rest."""
+    __tablename__ = "whatsapp_campaign"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    kind = db.Column(db.String(20), nullable=False)  # 'customers' | 'custom_list'
+    title = db.Column(db.String(200), nullable=False)
+    params = db.Column(db.JSON, nullable=True)  # what to send: template, variables, audience...
+    # queued -> running -> completed | cancelled
+    status = db.Column(db.String(20), nullable=False, default='queued', index=True)
+    total = db.Column(db.Integer, nullable=False, default=0)
+    created_by = db.Column(db.String(80), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    started_at = db.Column(db.DateTime, nullable=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+    # Touched by the sender after every recipient; a 'running' campaign whose
+    # heartbeat is old lost its worker (restart/deploy) and gets resumed.
+    heartbeat_at = db.Column(db.DateTime, nullable=True)
+
+
+class WhatsAppCampaignRecipient(db.Model):
+    __tablename__ = "whatsapp_campaign_recipient"
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('whatsapp_campaign.id'), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, nullable=True)  # set for customer campaigns
+    name = db.Column(db.String(200), nullable=True)
+    phone = db.Column(db.String(40), nullable=True)
+    # pending -> sending -> sent | failed | skipped | cancelled
+    status = db.Column(db.String(20), nullable=False, default='pending', index=True)
+    # Meta's later receipt for an accepted message: sent | delivered | read | failed
+    delivery_status = db.Column(db.String(20), nullable=True)
+    wa_message_id = db.Column(db.String(128), nullable=True, index=True)
+    error = db.Column(db.Text, nullable=True)
+    sent_at = db.Column(db.DateTime, nullable=True)
+    updated_at = db.Column(db.DateTime, nullable=True)
 
 
 class CSAgentKnowledgeEntry(db.Model):
@@ -6328,6 +6371,11 @@ def ledger_nightly():
                 logging.exception("books: nightly run failed for tenant %s", tid)
 
 
+def resume_whatsapp_campaigns_with_context():
+    with app.app_context():
+        wa_campaigns.resume_stale(sys.modules[__name__])
+
+
 _SCHEDULED_JOBS = {
     "generate_missing_payments": generate_missing_payments_with_context,
     "generate_missing_salary_charges": generate_missing_salary_charges_with_context,
@@ -6345,6 +6393,8 @@ _SCHEDULED_JOBS = {
     "whatsapp_connection_health": whatsapp_connection_health_with_context,
     # The books (roadmap 1C): starts unstarted businesses, else checks them.
     "ledger_nightly": ledger_nightly,
+    # Restarts background WhatsApp campaigns whose sender died (deploy/restart).
+    "resume_whatsapp_campaigns": resume_whatsapp_campaigns_with_context,
 }
 
 
@@ -6369,6 +6419,7 @@ SCHEDULE = {
     "refresh_agent_mode_network_status": "*/15 * * * *",
     "whatsapp_connection_health": "5 * * * *",
     "ledger_nightly": "0 3 * * *",
+    "resume_whatsapp_campaigns": "*/10 * * * *",
 }
 ONPREM_EXTRA_SCHEDULE = {"refresh_license": "0 3 * * *"}
 
@@ -11163,7 +11214,8 @@ def send_whatsapp_message(customer, event_type, context=None):
             res_data = response.json()
             msg_id = res_data.get('messages', [{}])[0].get('id', 'Accepted')
             logging.info(f'WhatsApp [{event_type}] sent to customer {customer.id} ({phone}): {res_data}')
-            return {'success': True, 'status': 'Sent (Accepted by Meta)', 'details': f'Dispatched to Meta API queue (ID: {msg_id})'}
+            return {'success': True, 'status': 'Sent (Accepted by Meta)', 'details': f'Dispatched to Meta API queue (ID: {msg_id})',
+                    'message_id': msg_id if msg_id != 'Accepted' else None}
         else:
             err_json = {}
             try:
@@ -11743,201 +11795,258 @@ def trigger_whatsapp_reminder(customer_id):
     except Exception as e:
         return jsonify({'message': f'Failed to trigger WhatsApp message: {str(e)}'}), 500
 
+def send_custom_wa_template(tenant_id, phone_raw, template_name, language=None,
+                            body_params=None, header_url=None):
+    """Send one Meta template to a raw phone number (marketing campaign to
+    non-customers). Same result shape as send_whatsapp_message, plus
+    message_id. Never raises."""
+    try:
+        phone = normalize_whatsapp_phone(phone_raw)
+        if not phone:
+            return {'success': False, 'status': 'Failed',
+                    'error': 'Invalid phone number format (must contain digits)'}
+        if not modules.is_enabled(db.session.get(Tenant, tenant_id), 'whatsapp'):
+            return {'success': False, 'status': 'Skipped', 'error': 'whatsapp module disabled'}
+        settings = WhatsAppSettings.query.filter_by(tenant_id=tenant_id).first()
+        if not (settings and settings.mode == 'api' and settings.access_token and settings.phone_number_id):
+            logging.info(f'Simulated sending custom template [{template_name}] to {phone}')
+            return {'success': True, 'status': 'Simulated / Sent',
+                    'details': 'Sent in simulated/manual mode (no API credentials configured)'}
+        if wa_connect.blocks_sends(settings):
+            return {'success': False, 'status': 'Failed', 'error': wa_connect.NEEDS_ATTENTION_SEND_ERROR}
+
+        api_version = settings.api_version or 'v19.0'
+        url = f'https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages'
+        headers = {'Authorization': f'Bearer {settings.access_token}', 'Content-Type': 'application/json'}
+        template_dict = build_meta_template_payload(
+            settings=settings,
+            template_name=template_name,
+            default_language=language or settings.template_language or 'en',
+            user_body_params=[str(v) for v in (body_params or []) if str(v).strip()],
+            user_header_params=(header_url or '').strip() or None,
+        )
+        payload = {'messaging_product': 'whatsapp', 'to': phone, 'type': 'template', 'template': template_dict}
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        if response.ok:
+            res_data = response.json()
+            msg_id = res_data.get('messages', [{}])[0].get('id')
+            logging.info(f'Custom Meta template [{template_name}] sent to {phone}: {res_data}')
+            return {'success': True, 'status': 'Sent (Accepted by Meta)',
+                    'details': f'Dispatched to Meta API queue (ID: {msg_id})', 'message_id': msg_id}
+        err_json = {}
+        try:
+            err_json = response.json().get('error', {})
+        except Exception:
+            pass
+        err_msg = err_json.get('message') or err_json.get('error_data', {}).get('details') or response.text
+        logging.error(f'Meta API error sending to {phone}: {response.status_code} {response.text}')
+        wa_connect.note_send_error(sys.modules[__name__], settings, err_json.get('code'), err_msg)
+        return {'success': False, 'status': 'Failed', 'error': f'Meta API Error ({response.status_code}): {err_msg}'}
+    except Exception as exc:
+        logging.error(f"Error sending custom template to {phone_raw}: {exc}")
+        return {'success': False, 'status': 'Failed', 'error': f'Network / Execution Error: {exc}'}
+
+
+_BULK_EVENT_LABELS = {'outage': 'Outage', 'maintenance': 'Maintenance', 'feature': 'New feature', 'offer': 'Offer'}
+_BULK_AUDIENCE_LABELS = {'all': 'all customers', 'active': 'active customers', 'expired': 'expired customers'}
+
+
+def _messaging_admin():
+    user = User.query.filter_by(username=get_jwt_identity()).first()
+    return user if user and user.role == 'admin' else None
+
+
 @app.route('/api/messages/bulk_send', methods=['POST'])
 @jwt_required()
 @require_module('whatsapp')
 def send_bulk_messages():
-    # Only allow admin
-    current_username = get_jwt_identity()
-    user = User.query.filter_by(username=current_username).first()
-    if not user or user.role != 'admin':
+    """Save a WhatsApp campaign and send it in the background. Returns at
+    once (202) with the campaign id; progress and the per-number report live
+    under /api/messages/campaigns."""
+    user = _messaging_admin()
+    if not user:
         return jsonify({'message': 'Access Denied'}), 403
 
-    data = request.json
+    data = request.json or {}
     audience = data.get('audience', 'all')
+    tenant_id = current_tenant_id()
 
     if audience == 'custom_list':
-        custom_phones = data.get('custom_phones', [])
+        custom_phones = data.get('custom_phones') or []
         custom_template = data.get('custom_template')
-        template_language = data.get('template_language', 'en')
-        custom_variables = data.get('custom_variables', [])
-
         if not custom_template:
             return jsonify({'message': 'Please select a Meta message template.'}), 400
         if not custom_phones:
             return jsonify({'message': 'No valid mobile numbers provided.'}), 400
 
-        settings = tenant_query(WhatsAppSettings).first()
-        success_count = 0
-        failed_count = 0
-        report_details = []
-
-        for phone_raw in custom_phones:
-            phone = normalize_whatsapp_phone(phone_raw)
-            if not phone:
-                failed_count += 1
-                report_details.append({
-                    'recipient': str(phone_raw),
-                    'name': 'Unknown / File Upload',
-                    'status': 'Failed',
-                    'details': 'Invalid phone number format (must contain digits)'
-                })
-                continue
-            if settings and settings.mode == 'api' and settings.access_token and settings.phone_number_id:
-                try:
-                    api_version = settings.api_version or 'v19.0'
-                    url = f'https://graph.facebook.com/{api_version}/{settings.phone_number_id}/messages'
-                    headers = {
-                        'Authorization': f'Bearer {settings.access_token}',
-                        'Content-Type': 'application/json',
-                    }
-                    user_body_params = []
-                    if custom_variables and isinstance(custom_variables, list):
-                        user_body_params = [str(var) for var in custom_variables if str(var).strip()]
-                    elif data.get('variables', {}).get('message'):
-                        user_body_params = [str(data['variables']['message'])]
-
-                    user_header_params = data.get('header_url', '').strip() or None
-
-                    template_dict = build_meta_template_payload(
-                        settings=settings,
-                        template_name=custom_template,
-                        default_language=template_language or settings.template_language or 'en',
-                        user_body_params=user_body_params,
-                        user_header_params=user_header_params
-                    )
-
-                    payload = {
-                        'messaging_product': 'whatsapp',
-                        'to': phone,
-                        'type': 'template',
-                        'template': template_dict,
-                    }
-                    response = requests.post(url, json=payload, headers=headers, timeout=10)
-                    if response.ok:
-                        success_count += 1
-                        res_data = response.json()
-                        msg_id = res_data.get('messages', [{}])[0].get('id', 'Accepted')
-                        logging.info(f'Custom Meta template [{custom_template}] sent to {phone}: {res_data}')
-                        report_details.append({
-                            'recipient': f'+{phone}',
-                            'name': 'Custom Contact',
-                            'status': 'Sent (Accepted by Meta)',
-                            'details': f'Dispatched to Meta API queue (ID: {msg_id})'
-                        })
-                    else:
-                        failed_count += 1
-                        err_json = {}
-                        try:
-                            err_json = response.json().get('error', {})
-                        except:
-                            pass
-                        err_msg = err_json.get('message') or err_json.get('error_data', {}).get('details') or response.text
-                        logging.error(f'Meta API error sending to {phone}: {response.status_code} {response.text}')
-                        report_details.append({
-                            'recipient': f'+{phone}',
-                            'name': 'Custom Contact',
-                            'status': 'Failed',
-                            'details': f'Meta API Error ({response.status_code}): {err_msg}'
-                        })
-                except Exception as e:
-                    failed_count += 1
-                    logging.error(f"Error sending custom template to {phone}: {e}")
-                    report_details.append({
-                        'recipient': f'+{phone}',
-                        'name': 'Custom Contact',
-                        'status': 'Failed',
-                        'details': f'Network / Execution Error: {str(e)}'
-                    })
-            else:
-                success_count += 1
-                logging.info(f'Simulated sending custom template [{custom_template}] to {phone}')
-                report_details.append({
-                    'recipient': f'+{phone}',
-                    'name': 'Custom Contact',
-                    'status': 'Simulated / Sent',
-                    'details': 'Sent in simulated/manual mode (no API credentials configured)'
-                })
-
-        total_targeted = success_count + failed_count
-        return jsonify({
-            'message': f'Dispatched marketing template [{custom_template}] to {total_targeted} contacts ({success_count} sent, {failed_count} failed).',
-            'report': {
-                'total_targeted': total_targeted,
-                'sent_count': success_count,
-                'failed_count': failed_count,
-                'details': report_details
-            }
-        }), 200
-
-    event_type = data.get('event_type')
-    variables = data.get('variables', {})
-    exclude_resellers = data.get('exclude_reseller_customers', False)
-    target_sector = data.get('sector', '').strip()
-
-    query = tenant_query(Customer).filter_by(whatsapp_notifications_enabled=True)
-    if exclude_resellers:
-        query = query.filter(Customer.reseller_id == None)
-    if target_sector and event_type in ['outage', 'maintenance']:
-        query = query.filter(Customer.sector == target_sector)
-    
-    if audience == 'active':
-        query = query.filter_by(is_subscription_active=True)
-    elif audience == 'expired':
-        query = query.filter_by(is_subscription_active=False)
-    
-    customers = query.all()
-    
-    success_count = 0
-    failed_count = 0
-    report_details = []
-
-    for customer in customers:
-        try:
-            # We pass variables in the context
-            context = {
-                **variables
-            }
-            res = send_whatsapp_message(customer, f'bulk_{event_type}', context)
-            if isinstance(res, dict):
-                if res.get('success'):
-                    success_count += 1
-                else:
-                    failed_count += 1
-                report_details.append({
-                    'recipient': f"+{customer.phone}" if customer.phone else "N/A",
-                    'name': customer.name or f"Customer #{customer.id}",
-                    'status': res.get('status', 'Sent (Accepted by Meta)' if res.get('success') else 'Failed'),
-                    'details': res.get('details') or res.get('error') or 'Processed notification'
-                })
-            else:
-                success_count += 1
-                report_details.append({
-                    'recipient': f"+{customer.phone}" if customer.phone else "N/A",
-                    'name': customer.name or f"Customer #{customer.id}",
-                    'status': 'Sent (Accepted by Meta)',
-                    'details': 'Processed notification'
-                })
-        except Exception as e:
-            failed_count += 1
-            logging.error(f"Failed to send bulk message to {customer.id}: {e}")
-            report_details.append({
-                'recipient': f"+{customer.phone}" if customer.phone else "N/A",
-                'name': customer.name or f"Customer #{customer.id}",
-                'status': 'Failed',
-                'details': f"Error: {str(e)}"
-            })
-
-    total_targeted = len(customers)
-    return jsonify({
-        'message': f'Dispatched notifications to {total_targeted} customers ({success_count} sent, {failed_count} failed).',
-        'report': {
-            'total_targeted': total_targeted,
-            'sent_count': success_count,
-            'failed_count': failed_count,
-            'details': report_details
+        custom_variables = data.get('custom_variables') or []
+        if not isinstance(custom_variables, list):
+            custom_variables = []
+        if not custom_variables and (data.get('variables') or {}).get('message'):
+            custom_variables = [str(data['variables']['message'])]
+        params = {
+            'template': custom_template,
+            'language': data.get('template_language') or 'en',
+            'variables': [str(v) for v in custom_variables if str(v).strip()],
+            'header_url': (data.get('header_url') or '').strip() or None,
         }
-    }), 200
+        recipients, seen = [], set()
+        for raw in custom_phones:
+            norm = normalize_whatsapp_phone(raw)
+            key = norm or str(raw)
+            if key in seen:
+                continue  # never message the same number twice in one campaign
+            seen.add(key)
+            if norm:
+                recipients.append({'phone': f'+{norm}', 'name': None})
+            else:
+                recipients.append({'phone': str(raw)[:40], 'name': None, 'status': 'failed',
+                                   'error': 'Invalid phone number format (must contain digits)'})
+        title = f'Template "{custom_template}" to {len(recipients)} numbers'
+        kind = 'custom_list'
+    else:
+        event_type = data.get('event_type')
+        if event_type not in _BULK_EVENT_LABELS:
+            return jsonify({'message': 'Unknown notification type.'}), 400
+        variables = data.get('variables') or {}
+        exclude_resellers = bool(data.get('exclude_reseller_customers', False))
+        target_sector = (data.get('sector') or '').strip()
+
+        query = tenant_query(Customer).filter_by(whatsapp_notifications_enabled=True)
+        if exclude_resellers:
+            query = query.filter(Customer.reseller_id == None)
+        if target_sector and event_type in ['outage', 'maintenance']:
+            query = query.filter(Customer.sector == target_sector)
+        if audience == 'active':
+            query = query.filter_by(is_subscription_active=True)
+        elif audience == 'expired':
+            query = query.filter_by(is_subscription_active=False)
+        customers = query.order_by(Customer.id).all()
+        if not customers:
+            return jsonify({'message': 'No customers match this audience.'}), 400
+
+        params = {'event_type': event_type, 'variables': variables, 'audience': audience,
+                  'sector': target_sector or None, 'exclude_reseller_customers': exclude_resellers}
+        recipients = [{'customer_id': c.id, 'name': c.name or f'Customer #{c.id}',
+                       'phone': f'+{c.phone}' if c.phone else None} for c in customers]
+        where = f' in {target_sector}' if target_sector and event_type in ['outage', 'maintenance'] else ''
+        title = f"{_BULK_EVENT_LABELS[event_type]} notice to {_BULK_AUDIENCE_LABELS.get(audience, audience)}{where}"
+        kind = 'customers'
+
+    appmod = sys.modules[__name__]
+    campaign = wa_campaigns.create_campaign(appmod, tenant_id, kind, title, params,
+                                            recipients, created_by=user.username)
+    campaign_id, total = campaign.id, campaign.total
+    wa_campaigns.start(appmod, campaign_id)
+    return jsonify({
+        'message': f'Campaign started: sending to {total} recipients in the background. '
+                   f'You can close this page; the report is under Campaigns.',
+        'campaign_id': campaign_id,
+        'total': total,
+    }), 202
+
+
+def _tenant_campaign(campaign_id):
+    return tenant_query(WhatsAppCampaign).filter_by(id=campaign_id).first()
+
+
+@app.route('/api/messages/campaigns', methods=['GET'])
+@jwt_required()
+@require_module('whatsapp')
+def list_whatsapp_campaigns():
+    if not _messaging_admin():
+        return jsonify({'message': 'Access Denied'}), 403
+    appmod = sys.modules[__name__]
+    # Opening the list also restarts any campaign whose sender died, so a
+    # deploy mid-send recovers without waiting for the scheduled job.
+    wa_campaigns.resume_stale(appmod, tenant_id=current_tenant_id())
+    limit = min(max(request.args.get('limit', 50, type=int), 1), 200)
+    offset = max(request.args.get('offset', 0, type=int), 0)
+    q = tenant_query(WhatsAppCampaign).order_by(WhatsAppCampaign.id.desc())
+    total = q.count()
+    rows = q.offset(offset).limit(limit).all()
+    c = wa_campaigns.counts(appmod, [r.id for r in rows])
+    return jsonify({'total': total,
+                    'campaigns': [wa_campaigns.campaign_dict(r, c[r.id]) for r in rows]}), 200
+
+
+@app.route('/api/messages/campaigns/<int:campaign_id>', methods=['GET'])
+@jwt_required()
+@require_module('whatsapp')
+def get_whatsapp_campaign(campaign_id):
+    if not _messaging_admin():
+        return jsonify({'message': 'Access Denied'}), 403
+    campaign = _tenant_campaign(campaign_id)
+    if not campaign:
+        return jsonify({'message': 'Campaign not found'}), 404
+    appmod = sys.modules[__name__]
+    R = WhatsAppCampaignRecipient
+    rq = R.query.filter_by(campaign_id=campaign.id)
+    status_filter = request.args.get('status')
+    if status_filter == 'pending':
+        rq = rq.filter(R.status.in_(['pending', 'sending']))
+    elif status_filter in ('sent', 'failed', 'skipped', 'cancelled'):
+        rq = rq.filter(R.status == status_filter)
+    elif status_filter == 'delivered':
+        rq = rq.filter(R.delivery_status.in_(['delivered', 'read']))
+    elif status_filter == 'read':
+        rq = rq.filter(R.delivery_status == 'read')
+    recipients = rq.order_by(R.id).all()
+    out = wa_campaigns.campaign_dict(campaign, wa_campaigns.counts(appmod, [campaign.id])[campaign.id])
+    out['recipients'] = [wa_campaigns.recipient_dict(r) for r in recipients]
+    return jsonify(out), 200
+
+
+@app.route('/api/messages/campaigns/<int:campaign_id>/retry_failed', methods=['POST'])
+@jwt_required()
+@require_module('whatsapp')
+def retry_whatsapp_campaign_failed(campaign_id):
+    if not _messaging_admin():
+        return jsonify({'message': 'Access Denied'}), 403
+    campaign = _tenant_campaign(campaign_id)
+    if not campaign:
+        return jsonify({'message': 'Campaign not found'}), 404
+    if campaign.status in ('queued', 'running'):
+        return jsonify({'message': 'This campaign is still sending. Retry once it finishes.'}), 409
+    n = wa_campaigns.retry_failed(sys.modules[__name__], campaign)
+    if not n:
+        return jsonify({'message': 'No failed numbers to retry.'}), 400
+    return jsonify({'message': f'Retrying {n} failed numbers in the background.', 'retried': n}), 202
+
+
+@app.route('/api/messages/campaigns/<int:campaign_id>/cancel', methods=['POST'])
+@jwt_required()
+@require_module('whatsapp')
+def cancel_whatsapp_campaign(campaign_id):
+    if not _messaging_admin():
+        return jsonify({'message': 'Access Denied'}), 403
+    campaign = _tenant_campaign(campaign_id)
+    if not campaign:
+        return jsonify({'message': 'Campaign not found'}), 404
+    if not wa_campaigns.cancel(sys.modules[__name__], campaign):
+        return jsonify({'message': 'This campaign has already finished.'}), 409
+    return jsonify({'message': 'Campaign stopped. Numbers already sent stay sent.'}), 200
+
+
+@app.route('/api/messages/campaigns/<int:campaign_id>/export', methods=['GET'])
+@jwt_required()
+@require_module('whatsapp')
+def export_whatsapp_campaign(campaign_id):
+    if not _messaging_admin():
+        return jsonify({'message': 'Access Denied'}), 403
+    campaign = _tenant_campaign(campaign_id)
+    if not campaign:
+        return jsonify({'message': 'Campaign not found'}), 404
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(['Name', 'Phone', 'Status', 'Delivery', 'Sent at (UTC)', 'Details'])
+    for r in (WhatsAppCampaignRecipient.query.filter_by(campaign_id=campaign.id)
+              .order_by(WhatsAppCampaignRecipient.id)):
+        w.writerow([r.name or '', r.phone or '', r.status, r.delivery_status or '',
+                    r.sent_at.strftime('%Y-%m-%d %H:%M:%S') if r.sent_at else '', r.error or ''])
+    return Response(buf.getvalue(), mimetype='text/csv',
+                    headers={'Content-Disposition': f'attachment; filename=campaign-{campaign.id}.csv'})
+
 
 @app.route('/api/whatsapp/webhook', methods=['GET', 'POST'])
 def whatsapp_webhook():
@@ -12115,6 +12224,13 @@ def whatsapp_webhook():
                             logging.warning(f"WhatsApp message to {st_recipient} FAILED: {st.get('errors', [])}")
                         else:
                             logging.info(f"WhatsApp message status update: to={st_recipient} status={st_status}")
+                        try:
+                            # Campaign report: delivered / read / not delivered.
+                            if wa_campaigns.apply_status(_appmod, resolved_tenant_id, st):
+                                db.session.commit()
+                        except Exception as ex_cs:
+                            db.session.rollback()
+                            logging.warning(f"WhatsApp campaign: could not apply status {st.get('id')}: {ex_cs}")
                         try:
                             _st_msg, _st_flagged = whatsapp_inbox.apply_status(_appmod, resolved_tenant_id, st)
                             db.session.commit()
