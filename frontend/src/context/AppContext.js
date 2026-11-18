@@ -387,6 +387,11 @@ const rawApiService = {
     
     // Bulk Messaging
     sendBulkMessage: (payload) => api.post('/messages/bulk_send', payload),
+    fetchWhatsAppCampaigns: (params = {}) => api.get('/messages/campaigns', { params }),
+    fetchWhatsAppCampaign: (id, status) => api.get(`/messages/campaigns/${id}`, { params: status ? { status } : {} }),
+    retryWhatsAppCampaignFailed: (id) => api.post(`/messages/campaigns/${id}/retry_failed`),
+    cancelWhatsAppCampaign: (id) => api.post(`/messages/campaigns/${id}/cancel`),
+    exportWhatsAppCampaign: (id) => api.get(`/messages/campaigns/${id}/export`, { responseType: 'blob' }),
     fetchMetaTemplates: () => api.get('/whatsapp/templates'),
     fetchWhatsAppTemplates: () => api.get('/whatsapp/templates'),
     syncWhatsAppTemplates: () => api.post('/whatsapp/templates/sync'),
