@@ -21,6 +21,7 @@ except ImportError:
     AI_REPLY_GREENLET_POOL = None
 
 import re
+import contextlib
 import difflib
 import modules
 import hmac
@@ -1143,6 +1144,94 @@ class AuditLog(db.Model):
             # UTC, marked as such so the browser shows local time.
             'date': self.created_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
         }
+
+
+class LedgerAccount(db.Model):
+    """One account in a tenant's chart of accounts (books, roadmap 1C).
+    `key` is the stable code name the posting code uses; `number` is for
+    display and ordering."""
+    __table_args__ = (
+        db.Index('ux_ledger_account_tenant_key', 'tenant_id', 'key', unique=True),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    key = db.Column(db.String(60), nullable=False)
+    number = db.Column(db.Integer, nullable=False)
+    name = db.Column(db.String(120), nullable=False)
+    type = db.Column(db.String(10), nullable=False)  # asset | liability | equity | income | expense
+    party_type = db.Column(db.String(20), nullable=True)  # set on per-party control accounts
+
+
+class JournalEntry(db.Model):
+    """One balanced posting: its lines' debits equal their credits."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    entry_date = db.Column(db.Date, nullable=False)
+    kind = db.Column(db.String(12), nullable=False)  # event | opening | correction | unexplained
+    memo = db.Column(db.String(300), nullable=True)
+    created_by = db.Column(db.String(100), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class JournalLine(db.Model):
+    """One debit or credit against an account. entry_date is copied from the
+    entry so range queries need no join. source_* names the record that
+    caused it; party_* the customer / reseller / supplier it concerns."""
+    __table_args__ = (
+        db.Index('ix_journal_line_tenant_account_date', 'tenant_id', 'account_id', 'entry_date'),
+        db.Index('ix_journal_line_source', 'source_type', 'source_id'),
+        db.Index('ix_journal_line_tenant_party', 'tenant_id', 'party_type', 'party_id'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    entry_id = db.Column(db.Integer, db.ForeignKey('journal_entry.id'), nullable=False)
+    account_id = db.Column(db.Integer, db.ForeignKey('ledger_account.id'), nullable=False)
+    party_type = db.Column(db.String(20), nullable=True)
+    party_id = db.Column(db.Integer, nullable=True)
+    debit = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0)
+    credit = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False, default=0)
+    source_type = db.Column(db.String(30), nullable=True)
+    source_id = db.Column(db.Integer, nullable=True)
+    entry_date = db.Column(db.Date, nullable=False)
+
+
+class LedgerStartLine(db.Model):
+    """What a source record contributed to the opening balances when the
+    books were started, one row per desired line (unnetted): amount is signed
+    (+debit / -credit), day is that line's own day. day is NULL only on rows
+    written without one; those are dated by matching (_date_start_lines)."""
+    __table_args__ = (
+        db.Index('ix_ledger_start_line_source', 'source_type', 'source_id'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    source_type = db.Column(db.String(30), nullable=False)
+    source_id = db.Column(db.Integer, nullable=False)
+    account_key = db.Column(db.String(60), nullable=False)
+    party_type = db.Column(db.String(20), nullable=True)
+    party_id = db.Column(db.Integer, nullable=True)
+    amount = db.Column(db.Numeric(18, 4, asdecimal=False), nullable=False)
+    day = db.Column(db.Date, nullable=True)
+
+
+class LedgerState(db.Model):
+    """One row per tenant: when the books started and the last check result."""
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), primary_key=True)
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    start_day = db.Column(db.Date, nullable=False)
+    opening_entry_id = db.Column(db.Integer, nullable=True)
+    last_check_at = db.Column(db.DateTime, nullable=True)
+    last_check = db.Column(db.Text, nullable=True)  # JSON
+
+
+class LedgerProblem(db.Model):
+    """A posting that failed, kept so the books check can report it."""
+    id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey('tenant.id'), nullable=False, index=True)
+    source_type = db.Column(db.String(30), nullable=False)
+    source_id = db.Column(db.Integer, nullable=True)
+    error = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
 class ExpenseCategory(db.Model):
@@ -2714,6 +2803,54 @@ def _log_balance_changes(session, flush_context, instances):
 
 
 _BALANCE_HOLDERS = (Customer, Reseller, Supplier, Employee, UpstreamProvider)
+# balance holder -> its party type in the books (ledger.PARTY_ACCOUNT)
+_LEDGER_PARTY_TYPES = {Customer: 'customer', Reseller: 'reseller', Supplier: 'supplier',
+                       Employee: 'employee', UpstreamProvider: 'upstream'}
+
+
+def _is_sql_expression(v):
+    return hasattr(v, '__clause_element__') or hasattr(v, '_is_clause_element')
+
+
+@_sa_event.listens_for(db.session, "before_flush")
+def _capture_balance_deltas(session, flush_context, instances):
+    """Books safety net, part 1: add up each party's stored-balance change in
+    this transaction (session.info['ledger_party_delta'], stored-balance
+    units), for tenants whose books have started. Registered before
+    _balance_changes_as_increments, which turns the plain values this reads
+    into SQL expressions. New parties are counted after their flush
+    (_capture_new_party_balances), once they have an id."""
+    for obj in list(session.dirty):
+        party_type = _LEDGER_PARTY_TYPES.get(type(obj))
+        if party_type is None:
+            continue
+        try:
+            state = db.inspect(obj)
+            hist = state.attrs.balance.history
+            if not hist.has_changes() or not hist.added:
+                continue
+            new = hist.added[0]
+            if new is None or _is_sql_expression(new):
+                continue
+            pk = state.identity[0] if state.identity else None
+            if pk is None:
+                continue
+            with session.no_autoflush:
+                tid = obj.tenant_id
+                if tid is None or not _books_started(tid):
+                    continue
+                if hist.deleted:
+                    old = hist.deleted[0]
+                else:  # overwritten without being read: the row still has the old value
+                    old = session.execute(db.select(type(obj).balance).where(type(obj).id == pk)).scalar()
+            delta = float(new) - float(old or 0)
+            if abs(delta) < 1e-9:
+                continue
+            deltas = session.info.setdefault('ledger_party_delta', {})
+            key = (tid, party_type, pk)
+            deltas[key] = round(deltas.get(key, 0.0) + delta, 4)
+        except Exception:
+            logging.exception("books: could not read a %s balance change", type(obj).__name__)
 
 
 @_sa_event.listens_for(db.session, "before_flush")
@@ -2881,6 +3018,650 @@ def _write_audit_log(session, flush_context):
     session.execute(AuditLog.__table__.insert(), rows)
 
 
+# --- Books (double-entry ledger, roadmap 1C) ---------------------------------
+# Spec: docs/superpowers/specs/2026-11-17-ledger-design.md. The pure mapping
+# lives in ledger.py; _post_ledger (after_flush) compares what each financial
+# record should have contributed with what is already in the books for it and
+# posts the difference. Only for tenants whose books have started.
+import ledger as _books
+
+_LEDGER_MODELS = {
+    Payment: 'payment',
+    ResellerPayment: 'reseller_payment',
+    UpstreamProviderPayment: 'upstream_payment',
+    SupplierPayment: 'supplier_payment',
+    Expense: 'expense',
+    SalaryCharge: 'salary_charge',
+    SalaryPayment: 'salary_payment',
+    CashEntry: 'cash_entry',
+    AccountTransfer: 'account_transfer',
+    DayClose: 'day_close',
+}
+# Per-transaction caches in session.info; dropped on commit / rollback.
+_LEDGER_CACHE_KEYS = ('ledger_started', 'ledger_ctx', 'ledger_accounts', 'ledger_entries',
+                      'ledger_party_posted', 'ledger_savepoints', 'ledger_party_delta',
+                      'ledger_party_explained', 'ledger_deleting_customers')
+# Per-transaction state a rolled-back savepoint must put back as it was.
+_LEDGER_SAVEPOINT_KEYS = ('ledger_party_posted', 'ledger_party_delta',
+                          'ledger_party_explained', 'ledger_deleting_customers')
+_LEDGER_EPS = 0.00005
+
+
+def _books_started(tenant_id):
+    """The tenant's LedgerState, or None when its books have not started.
+    One lookup per tenant per transaction."""
+    cache = db.session.info.setdefault('ledger_started', {})
+    if tenant_id not in cache:
+        with db.session.no_autoflush:
+            cache[tenant_id] = db.session.get(LedgerState, tenant_id)
+    return cache[tenant_id]
+
+
+def _ledger_context(tenant_id):
+    """(local_day(dt, calendar), today) on the record tenant's own calendar --
+    never the request's tenant: the Whish callback and the scheduler have none."""
+    cache = db.session.info.setdefault('ledger_ctx', {})
+    ctx = cache.get(tenant_id)
+    if ctx is None:
+        with db.session.no_autoflush:
+            tz = db.session.execute(
+                db.select(BusinessSettings.timezone).where(BusinessSettings.tenant_id == tenant_id)
+                .order_by(BusinessSettings.id)).scalars().first()
+        settings = SimpleNamespace(timezone=tz)
+
+        def local_day(dt, calendar=False):
+            return _local_day(settings, dt, calendar)
+
+        ctx = cache[tenant_id] = (local_day, datetime.now(_zone_for(settings)).date())
+    return ctx
+
+
+def _ledger_account_id(tenant_id, key, name_hint=None):
+    """Id of the tenant's account `key`. An `expense:<category id>` account is
+    created on first use, named after its category."""
+    accounts = db.session.info.setdefault('ledger_accounts', {})
+    by_key = accounts.get(tenant_id)
+    if by_key is None:
+        with db.session.no_autoflush:
+            by_key = dict(db.session.execute(
+                db.select(LedgerAccount.key, LedgerAccount.id).where(LedgerAccount.tenant_id == tenant_id)).all())
+        accounts[tenant_id] = by_key
+    if key in by_key:
+        return by_key[key]
+    if not key.startswith('expense:'):
+        raise LookupError(f"books: tenant {tenant_id} has no '{key}' account")
+    with db.session.no_autoflush:
+        if name_hint is None:
+            cat_id = key.split(':', 1)[1]
+            if cat_id.isdigit():
+                name_hint = db.session.execute(db.select(ExpenseCategory.name).where(
+                    ExpenseCategory.id == int(cat_id), ExpenseCategory.tenant_id == tenant_id)).scalar()
+            name_hint = name_hint or 'Uncategorised expenses'
+        top = db.session.execute(db.select(func.max(LedgerAccount.number)).where(
+            LedgerAccount.tenant_id == tenant_id, LedgerAccount.number >= 6000,
+            LedgerAccount.number < 7000)).scalar()
+        values = dict(tenant_id=tenant_id, key=key, number=(top + 1) if top else 6000,
+                      name=str(name_hint)[:120], type='expense', party_type=None)
+        if db.engine.dialect.name == 'postgresql':
+            from sqlalchemy.dialects.postgresql import insert as _dialect_insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as _dialect_insert
+        # Two requests may create the same category account at once.
+        db.session.execute(_dialect_insert(LedgerAccount.__table__).values(**values)
+                           .on_conflict_do_nothing(index_elements=['tenant_id', 'key']))
+        by_key[key] = db.session.execute(db.select(LedgerAccount.id).where(
+            LedgerAccount.tenant_id == tenant_id, LedgerAccount.key == key)).scalar()
+    return by_key[key]
+
+
+def _ledger_who():
+    try:
+        who = get_jwt_identity()
+    except Exception:
+        who = None  # scheduler / webhook / no JWT in context
+    return str(who)[:100] if who else None
+
+
+def _post_line_groups(tenant_id, kind, items, who=None):
+    """Write `items` -- [(memo, (source_type, source_id) | None, [Line])] --
+    as one JournalEntry per day plus its lines. Within a transaction an entry
+    of the same tenant, kind and day is reused, so a bulk run (the nightly
+    billing autoflushes once per customer) still books one entry per date.
+    Raises ValueError, before writing anything, if a day does not balance."""
+    by_day = {}
+    for memo, source, lines in items:
+        for l in lines:
+            by_day.setdefault(l.day, []).append((memo, source, l))
+    for day, rows in by_day.items():
+        total = sum(l.amount for _, _, l in rows)
+        if abs(total) >= _LEDGER_EPS:
+            raise ValueError(f"books: {kind} entry for {day} does not balance ({total:+.4f})")
+    account_ids = {l.account_key: _ledger_account_id(tenant_id, l.account_key)
+                   for rows in by_day.values() for _, _, l in rows}
+    session = db.session
+    entries = session.info.setdefault('ledger_entries', {})
+    posted = session.info.setdefault('ledger_party_posted', {})
+    line_rows = []
+    now = datetime.utcnow()
+    for day in sorted(by_day):
+        rows = by_day[day]
+        sources = {s for _, s, _ in rows}
+        entry = entries.get((tenant_id, kind, day))
+        if entry is None:
+            base = rows[0][0] or ''
+            memo = base if len(sources) == 1 else f"{base} (+{len(sources) - 1} more)"
+            result = session.execute(JournalEntry.__table__.insert().values(
+                tenant_id=tenant_id, entry_date=day, kind=kind, memo=memo[:300],
+                created_by=who, created_at=now))
+            entry = entries[(tenant_id, kind, day)] = {
+                'id': result.inserted_primary_key[0], 'memo': base, 'sources': set(sources),
+                'multi': len(sources) > 1}
+        else:
+            entry['sources'] |= sources
+            if not entry['multi'] and len(entry['sources']) > 1:
+                # Inserted earlier in this same transaction: say it now covers more.
+                entry['multi'] = True
+                session.execute(JournalEntry.__table__.update().where(
+                    JournalEntry.__table__.c.id == entry['id']).values(
+                    memo=f"{entry['memo']} (+ more)"[:300]))
+        for _, source, l in rows:
+            amount = round(float(l.amount), 4)
+            line_rows.append({
+                'tenant_id': tenant_id, 'entry_id': entry['id'],
+                'account_id': account_ids[l.account_key],
+                'party_type': l.party_type, 'party_id': l.party_id,
+                'debit': amount if amount > 0 else 0.0,
+                'credit': -amount if amount < 0 else 0.0,
+                'source_type': source[0] if source else None,
+                'source_id': source[1] if source else None,
+                'entry_date': day,
+            })
+            if l.party_type:
+                key = (tenant_id, l.party_type, l.party_id)
+                posted[key] = round(posted.get(key, 0.0) + amount, 4)
+    if line_rows:
+        session.execute(JournalLine.__table__.insert(), line_rows)
+
+
+def _post_lines(tenant_id, lines, kind, memo, source=None):
+    """Post `lines` (ledger.Line) as one entry per day. See _post_line_groups."""
+    _post_line_groups(tenant_id, kind, [(memo, source, list(lines))], who=_ledger_who())
+
+
+def _ledger_memo(kind, d, change, is_event=False):
+    """A short description of the record, from its loaded values `d`."""
+    def money(v):
+        try:
+            return f"{float(v):.2f}"
+        except (TypeError, ValueError):
+            return ''
+    if kind == 'payment':
+        if d.get('is_refund'):
+            text = 'Refund'
+        elif d.get('pre_payment'):
+            text = 'Payment received'
+        elif d.get('reason'):
+            text = f"Bill: {d.get('reason')}"
+        else:
+            text = 'Subscription bill'
+    elif kind == 'reseller_payment':
+        label = _RESELLER_ENTRY_LABELS.get(d.get('type'), d.get('type') or 'Reseller entry')
+        desc = (d.get('description') or '').strip()
+        text = label if not desc or desc.lower() == label.lower() else f"{label}: {desc}"
+    elif kind == 'upstream_payment':
+        text = {'balance_topup': 'Upstream top-up', 'renewal_cost': 'Upstream renewal cost'}.get(
+            d.get('type'), 'Upstream entry')
+    elif kind == 'supplier_payment':
+        text = 'Supplier payment'
+    elif kind == 'expense':
+        text = f"Expense: {d.get('description') or ''}".strip()
+    elif kind == 'salary_charge':
+        text = f"Payroll {d.get('type') or 'charge'}"
+    elif kind == 'salary_payment':
+        text = 'Salary payment'
+    elif kind == 'cash_entry':
+        text = f"Money put in: {d.get('reason') or ''}".strip()
+    elif kind == 'account_transfer':
+        text = f"Transfer {d.get('from_account')} -> {d.get('to_account')}"
+    elif kind == 'day_close':
+        text = f"Day close {d.get('day')}"
+    else:
+        text = kind
+    if change == 'deleted':
+        return f"Deleted: {text} ({money(d.get('amount'))})" if d.get('amount') is not None else f"Deleted: {text}"
+    if change == 'dirty':
+        if is_event and kind == 'payment' and not d.get('is_refund') and not d.get('pre_payment'):
+            return f"Bill forgiven (gratis): {text}" if d.get('is_gratis') else f"Payment received: {text}"
+        return text if is_event else f"Changed: {text}"
+    return text
+
+
+def _ledger_already(tenant_id, kind, ids):
+    """{source_id: ([posted Line], [(account_key, party_type, party_id, amount, day)] start lines)}
+    for the non-new records of one kind. Two queries per kind per flush."""
+    out = {i: ([], []) for i in ids}
+    ids = list(ids)
+    with db.session.no_autoflush:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            rows = db.session.execute(
+                db.select(JournalLine.source_id, LedgerAccount.key, JournalLine.party_type,
+                          JournalLine.party_id, JournalLine.debit, JournalLine.credit,
+                          JournalLine.entry_date)
+                .join(LedgerAccount, LedgerAccount.id == JournalLine.account_id)
+                .where(JournalLine.tenant_id == tenant_id, JournalLine.source_type == kind,
+                       JournalLine.source_id.in_(chunk))).all()
+            for sid, key, ptype, pid, dr, cr, day in rows:
+                out[sid][0].append(_books.Line(key, ptype, pid,
+                                               round(float(dr or 0) - float(cr or 0), 4), day))
+            rows = db.session.execute(
+                db.select(LedgerStartLine.source_id, LedgerStartLine.account_key,
+                          LedgerStartLine.party_type, LedgerStartLine.party_id, LedgerStartLine.amount,
+                          LedgerStartLine.day)
+                .where(LedgerStartLine.tenant_id == tenant_id, LedgerStartLine.source_type == kind,
+                       LedgerStartLine.source_id.in_(chunk))).all()
+            for sid, key, ptype, pid, amount, day in rows:
+                out[sid][1].append((key, ptype, pid, round(float(amount or 0), 4), day))
+    return out
+
+
+def _date_start_lines(start, desired, fallback_day):
+    """Starting-point lines as Lines. start_books stores each with the day of
+    the line it stands for, which is used as is. A row without a day is given
+    the day of the desired line it stands for: the same account/party and
+    amount first, else the same account/party, else `fallback_day` -- so an
+    unchanged record that predates the books diffs to nothing."""
+    free = list(desired)
+    out = []
+    for key, ptype, pid, amount, day in start:
+        if day is not None:
+            out.append(_books.Line(key, ptype, pid, amount, day))
+            continue
+        match = next((l for l in free if (l.account_key, l.party_type, l.party_id) == (key, ptype, pid)
+                      and abs(l.amount - amount) < _LEDGER_EPS), None)
+        if match is not None:
+            free.remove(match)
+            day = match.day
+        else:
+            same = next((l for l in desired if (l.account_key, l.party_type, l.party_id) == (key, ptype, pid)), None)
+            day = same.day if same is not None else fallback_day
+        out.append(_books.Line(key, ptype, pid, amount, day))
+    return out
+
+
+def _ledger_all_still_desired(already, desired):
+    """True when every line already in the books for a record is matched
+    one-to-one by a desired line (same account, party, day and amount): the
+    change only adds lines (a bill getting paid, even on its own bill day),
+    so it is an event; otherwise it changes history and is a correction."""
+    free = list(desired)
+    for l in already:
+        if l.account_key == _books.START_MARKER:
+            continue
+        match = next((d for d in free if (d.account_key, d.party_type, d.party_id, d.day)
+                      == (l.account_key, l.party_type, l.party_id, l.day)
+                      and abs(d.amount - l.amount) < _LEDGER_EPS), None)
+        if match is None:
+            return False
+        free.remove(match)
+    return True
+
+
+def _ledger_record_values(obj):
+    """The record's loaded column values; a SQL expression among them (e.g. a
+    balance rewritten as `balance + delta`) cannot be read as a number here."""
+    state = db.inspect(obj)
+    d = {}
+    for attr in state.mapper.column_attrs:
+        if attr.key in state.dict:
+            v = state.dict[attr.key]
+            if hasattr(v, '__clause_element__') or hasattr(v, '_is_clause_element'):
+                raise ValueError(f"books: {attr.key} is a SQL expression, not a value")
+            d[attr.key] = v
+    return state, d
+
+
+@_sa_event.listens_for(db.session, "after_flush")
+def _post_ledger(session, flush_context):
+    """Post the journal lines every financial record change in this flush
+    calls for. A record whose lines cannot be worked out gets a LedgerProblem
+    row instead, and the user's own change still commits: the lines are
+    computed first in plain Python, and only computed values are inserted."""
+    work = []
+    for change, objects in (('new', session.new), ('dirty', session.dirty), ('deleted', session.deleted)):
+        for obj in objects:
+            kind = _LEDGER_MODELS.get(type(obj))
+            if kind is not None:
+                work.append((obj, kind, change))
+    if not work:
+        return
+    todo, problems = [], []
+    try:
+        _post_ledger_work(work, todo, problems)
+    except Exception as e:
+        # Never let the books break the user's own change; flag what was
+        # pending, keeping the specific errors already collected per record.
+        logging.exception("books: posting failed for a flush")
+        try:
+            now = datetime.utcnow()
+            rows = list(problems)
+            flagged = {(r['source_type'], r['source_id']) for r in rows}
+            rows += [{'tenant_id': tid, 'source_type': kind, 'source_id': oid,
+                      'error': f"{type(e).__name__}: {e}"[:2000], 'created_at': now}
+                     for _, kind, _, tid, oid in todo if (kind, oid) not in flagged]
+            if rows:
+                session.execute(LedgerProblem.__table__.insert(), rows)
+        except Exception:
+            logging.exception("books: could not record the failed postings")
+
+
+@_sa_event.listens_for(db.session, "before_flush")
+def _ledger_load_expired(session, flush_context, instances):
+    """A record changed or deleted after a commit has expired attributes, and
+    after the flush a deleted row can no longer be read. Load them now, while
+    the row is still there, so _post_ledger knows its tenant and values."""
+    for obj in list(session.dirty) + list(session.deleted):
+        if type(obj) in _LEDGER_MODELS and 'tenant_id' not in db.inspect(obj).dict:
+            try:
+                obj.tenant_id  # loads every expired column; pending changes are kept
+            except Exception:
+                logging.exception("books: could not load a %s before flush", type(obj).__name__)
+
+
+def _ledger_record_tenant(obj, state):
+    """The record's tenant: loaded value, else read through the attribute
+    (a dirty expired row still exists after its UPDATE), else the request's."""
+    tid = state.dict.get('tenant_id')
+    if tid is None and obj not in db.session.deleted:
+        try:
+            with db.session.no_autoflush:
+                tid = obj.tenant_id
+        except Exception:
+            tid = None
+    if tid is None:
+        try:
+            tid = current_tenant_id()
+        except Exception:
+            tid = None
+    return tid
+
+
+def _post_ledger_work(work, todo, problems):
+    session = db.session
+    for obj, kind, change in work:
+        state = db.inspect(obj)
+        oid = state.dict.get('id')
+        if oid is None and state.identity:
+            oid = state.identity[0]
+        tid = _ledger_record_tenant(obj, state)
+        if tid is None:
+            logging.error("books: %s %s has no readable tenant; not posted", kind, oid)
+            continue
+        if not _books_started(tid):
+            continue
+        if state.dict.get('tenant_id') is None:
+            # Its values could not be read: flag it instead of skipping it silently.
+            problems.append({'tenant_id': tid, 'source_type': kind, 'source_id': oid,
+                             'error': 'record values not readable at posting time',
+                             'created_at': datetime.utcnow()})
+            continue
+        if change == 'dirty' and not any(state.attrs[a.key].history.has_changes()
+                                         for a in state.mapper.column_attrs):
+            continue
+        if (change == 'deleted' and kind == 'payment' and state.dict.get('customer_id')
+                in session.info.get('ledger_deleting_customers', ())):
+            # Cascade of a customer delete: the money stays in the books;
+            # _ledger_write_off_customer moves the leftover balance instead.
+            continue
+        todo.append((obj, kind, change, tid, oid))
+    if not todo:
+        if problems:
+            session.execute(LedgerProblem.__table__.insert(), problems)
+            problems.clear()
+        return
+
+    # One "already posted" lookup per kind for the changed and deleted records;
+    # new records have nothing posted yet.
+    wanted = {}
+    for obj, kind, change, tid, oid in todo:
+        if change != 'new' and oid is not None:
+            wanted.setdefault((tid, kind), set()).add(oid)
+    already = {}
+    for (tid, kind), ids in wanted.items():
+        for sid, found in _ledger_already(tid, kind, ids).items():
+            already[(tid, kind, sid)] = found
+
+    groups = {}  # (tid, entry kind) -> [(memo, source, lines)]
+    for obj, kind, change, tid, oid in todo:
+        try:
+            state, values = _ledger_record_values(obj)
+            local_day, today = _ledger_context(tid)
+            if change == 'deleted':
+                desired = []
+            else:
+                desired = _books.desired_lines(kind, obj, local_day)
+            posted, start = already.get((tid, kind, oid), ([], []))
+            start_lines = _date_start_lines(start, desired, _books_started(tid).start_day) if start else []
+            lines = _books.diff_lines(desired, posted + start_lines, today, bool(start))
+            if not lines:
+                continue
+            per_day = {}
+            for l in lines:
+                per_day[l.day] = per_day.get(l.day, 0.0) + l.amount
+            bad = [d for d, v in per_day.items() if abs(v) >= _LEDGER_EPS]
+            if bad:
+                raise ValueError(f"books: lines for {bad[0]} do not balance")
+            for l in lines:
+                _ledger_account_id(tid, l.account_key)  # creates a new expense account; raises if missing
+            # An event when every key is new (a bill, a bill getting paid);
+            # a correction when it changes or removes something already posted.
+            is_event = _ledger_all_still_desired(posted + start_lines, desired)
+            entry_kind = 'event' if is_event else 'correction'
+            groups.setdefault((tid, entry_kind), []).append(
+                (_ledger_memo(kind, values, change, is_event), (kind, oid), lines))
+        except Exception as e:
+            logging.exception("books: could not post %s %s (%s)", kind, oid, change)
+            problems.append({'tenant_id': tid, 'source_type': kind, 'source_id': oid,
+                             'error': f"{type(e).__name__}: {e}"[:2000], 'created_at': datetime.utcnow()})
+
+    who = _ledger_who() if groups else None
+    for (tid, entry_kind), items in groups.items():
+        try:
+            _post_line_groups(tid, entry_kind, items, who=who)
+        except Exception as e:
+            # Only a validation error can land here (nothing written yet).
+            logging.exception("books: could not post a %s entry", entry_kind)
+            for _, source, _ in items:
+                problems.append({'tenant_id': tid, 'source_type': source[0], 'source_id': source[1],
+                                 'error': f"{type(e).__name__}: {e}"[:2000],
+                                 'created_at': datetime.utcnow()})
+    if problems:
+        session.execute(LedgerProblem.__table__.insert(), problems)
+        problems.clear()
+
+
+@_sa_event.listens_for(db.session, "after_commit")
+@_sa_event.listens_for(db.session, "after_rollback")
+def _drop_ledger_caches(session):
+    if session.in_nested_transaction():
+        # These events fire for savepoints too. A released savepoint keeps its
+        # rows, so every cache is still right; a rolled-back one is handled
+        # by _drop_ledger_caches_after_savepoint.
+        return
+    for key in _LEDGER_CACHE_KEYS:
+        session.info.pop(key, None)
+
+
+@_sa_event.listens_for(db.session, "after_soft_rollback")
+def _drop_ledger_caches_after_savepoint(session, previous_transaction):
+    """A rolled-back savepoint may have taken accounts, entries or posted
+    lines this transaction created with it."""
+    if previous_transaction.nested:
+        session.info.pop('ledger_accounts', None)
+        session.info.pop('ledger_entries', None)
+        # Its party totals and balance changes went with it: back to what
+        # they were when the savepoint began.
+        saved = session.info.get('ledger_savepoints', {}).pop(id(previous_transaction), None) or {}
+        for key in _LEDGER_SAVEPOINT_KEYS:
+            if saved.get(key):
+                session.info[key] = saved[key]
+            else:
+                session.info.pop(key, None)
+
+
+@_sa_event.listens_for(db.session, "after_transaction_create")
+def _ledger_savepoint_snapshot(session, transaction):
+    if transaction.nested:
+        session.info.setdefault('ledger_savepoints', {})[id(transaction)] = {
+            key: type(session.info[key])(session.info[key])
+            for key in _LEDGER_SAVEPOINT_KEYS if session.info.get(key)}
+
+
+@_sa_event.listens_for(db.session, "after_flush")
+def _capture_new_party_balances(session, flush_context):
+    """Safety net, part 1 for parties created in this flush: their whole
+    starting balance is a change (now that they have an id)."""
+    for obj in session.new:
+        party_type = _LEDGER_PARTY_TYPES.get(type(obj))
+        if party_type is None:
+            continue
+        try:
+            state = db.inspect(obj)
+            value = state.dict.get('balance')
+            tid = state.dict.get('tenant_id')
+            pk = state.identity[0] if state.identity else state.dict.get('id')
+            if value is None or _is_sql_expression(value) or tid is None or pk is None:
+                continue
+            if abs(float(value)) < 1e-9 or not _books_started(tid):
+                continue
+            deltas = session.info.setdefault('ledger_party_delta', {})
+            key = (tid, party_type, pk)
+            deltas[key] = round(deltas.get(key, 0.0) + float(value), 4)
+        except Exception:
+            logging.exception("books: could not read a new %s balance", type(obj).__name__)
+
+
+def _ledger_problem(tenant_id, source_type, source_id, error):
+    """Best effort: record a books failure without breaking the caller."""
+    try:
+        db.session.execute(LedgerProblem.__table__.insert(), [{
+            'tenant_id': tenant_id, 'source_type': source_type[:30], 'source_id': source_id,
+            'error': str(error)[:2000], 'created_at': datetime.utcnow()}])
+    except Exception:
+        logging.exception("books: could not record a problem")
+
+
+def _ledger_note_manual(obj, party_type, delta_balance, memo):
+    """Post a stored-balance change that has no record behind it (a hand-typed
+    balance, an opening balance, restored credit) as a `correction` against
+    Balance corrections, dated today. Its party total lands in
+    ledger_party_posted, so the safety net sees the change as explained.
+    Never raises: a failure is logged and kept as a LedgerProblem (and the
+    safety net then posts the change as unexplained)."""
+    tid = None
+    try:
+        tid = getattr(obj, 'tenant_id', None)
+        if tid is None:
+            tid = current_tenant_id()
+        # Decide before any flush: a tenant without books must not pay for
+        # (or be broken by) an extra flush here.
+        if tid is None or not _books_started(tid):
+            return
+        if getattr(obj, 'id', None) is None:
+            db.session.flush()  # a new party: needs its id
+        _, today = _ledger_context(tid)
+        lines = _books.balance_delta_to_lines(party_type, obj.id, delta_balance, today)
+        if lines:
+            _post_lines(tid, lines, 'correction', memo)
+    except Exception as e:
+        logging.exception("books: could not post a %s balance change", party_type)
+        if tid is not None:
+            _ledger_problem(tid, f'balance_{party_type}', getattr(obj, 'id', None),
+                            f"{type(e).__name__}: {e}")
+
+
+def _ledger_write_off_customer(customer):
+    """Customer delete: move the customer's books balance (what they still
+    owed, or their credit) to Balance corrections in one entry. Their bills,
+    receipts and refunds stay posted (_post_ledger skips the cascade)."""
+    tid = customer.tenant_id
+    try:
+        if tid is None or not _books_started(tid):
+            return
+        db.session.flush()  # anything still pending for this customer posts first
+        key = (tid, 'customer', customer.id)
+        with db.session.no_autoflush:
+            total = db.session.execute(
+                db.select(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0))
+                .where(JournalLine.tenant_id == tid, JournalLine.party_type == 'customer',
+                       JournalLine.party_id == customer.id)).scalar()
+        balance = _books.party_balance_from_books('customer', float(total or 0))
+        _, today = _ledger_context(tid)
+        lines = _books.balance_delta_to_lines('customer', customer.id, -balance, today)
+        if lines:
+            _post_lines(tid, lines, 'correction', f"Customer deleted: {customer.name}")
+        # The stored balance leaves with the row; nothing left to explain.
+        db.session.info.setdefault('ledger_party_explained', set()).add(key)
+    except Exception as e:
+        logging.exception("books: could not write off deleted customer %s", customer.id)
+        if tid is not None:
+            _ledger_problem(tid, 'customer_delete', customer.id, f"{type(e).__name__}: {e}")
+
+
+@_sa_event.listens_for(db.session, "before_commit")
+def _ledger_safety_net(session):
+    """Safety net, part 2: within the transaction now committing, any stored
+    balance change the posted party lines do not account for is posted to
+    Balance corrections as an `unexplained` entry, so the books always agree
+    with the stored balances and an unmapped path shows on the Books check.
+    Never raises into the commit (the flush below is the commit's own)."""
+    if session.in_nested_transaction():
+        return  # a savepoint release; the outer commit checks the whole transaction
+    if (not session.info.get('ledger_party_delta') and not session.info.get('ledger_party_posted')
+            and not (session.new or session.dirty or session.deleted)):
+        return
+    # before_commit runs before the commit's final flush: flush now so every
+    # change and its lines are counted.
+    session.flush()
+    deltas = session.info.pop('ledger_party_delta', None) or {}
+    posted = session.info.pop('ledger_party_posted', None) or {}
+    explained = session.info.pop('ledger_party_explained', None) or set()
+    try:
+        by_tenant = {}
+        for key in set(deltas) | set(posted):
+            if key in explained:
+                continue
+            tid, party_type, party_id = key
+            unexplained = round(deltas.get(key, 0.0)
+                                - _books.party_balance_from_books(party_type, posted.get(key, 0.0)), 4)
+            if abs(unexplained) >= 0.005:
+                by_tenant.setdefault(tid, []).append((party_type, party_id, unexplained))
+        if not by_tenant:
+            return
+        where = (request.endpoint if has_request_context() else None) or 'background'
+        memo = f"Unexplained balance change ({where})"
+        who = _ledger_who()
+        for tid, found in by_tenant.items():
+            try:
+                _, today = _ledger_context(tid)
+                items = [(memo, None, _books.balance_delta_to_lines(pt, pid, amount, today))
+                         for pt, pid, amount in sorted(found)]
+                _post_line_groups(tid, 'unexplained', items, who=who)
+                logging.warning("books: tenant %s, unexplained balance change(s) %s at %s",
+                                tid, found, where)
+            except Exception as e:
+                logging.exception("books: could not post unexplained balance changes for tenant %s", tid)
+                for pt, pid, amount in found:
+                    _ledger_problem(tid, f'balance_{pt}', pid,
+                                    f"unexplained {amount:+.4f} not posted: {type(e).__name__}: {e}")
+    except Exception:
+        logging.exception("books: safety net failed")
+    finally:
+        # Posting above refills these; this transaction is done with them.
+        session.info.pop('ledger_party_posted', None)
+        session.info.pop('ledger_party_delta', None)
+
+
 def _maybe_create_customer_payment_link(payment, customer):
     """If the given (already-`db.session.add`ed, not-yet-committed, paid=False)
     Payment's tenant has TenantWhishSettings.enabled (which already implies
@@ -2968,6 +3749,7 @@ def _adjust_balance(obj, party_type, raw_new, data):
         raise BalanceReasonRequired()
     _note_balance_reason(obj, f'Adjustment: {reason}')
     obj.balance = new
+    _ledger_note_manual(obj, party_type, new - old, f'Adjustment: {reason}')
     try:
         who = get_jwt_identity()
     except Exception:
@@ -4033,7 +4815,10 @@ _TENANT_DELETE_ORDER = [
     # and only fails against production Postgres.
     NetworkWriteAudit,
     UpgradeRequest, BillingPaymentAttempt, PlatformPayment, PaymentReminder, GeneratedReceipt, ReceiptCounter, AddonPurchase, TicketLog, SupportTicket,
-    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt, Payment, ResellerPayment, SupplierPayment, BalanceLog, AuditLog,
+    CustomerFeedback, ServiceStatus, CustomerPaymentLink, CustomerWhishPaymentAttempt,
+    # Books: lines before entries before accounts (FKs), all before Payment.
+    JournalLine, JournalEntry, LedgerStartLine, LedgerProblem, LedgerAccount, LedgerState,
+    Payment, ResellerPayment, SupplierPayment, BalanceLog, AuditLog,
     # WhatsAppMessage holds an FK to whatsapp_conversation, and
     # WhatsAppConversation holds an FK to customer, so both must be deleted
     # before Customer -- message before conversation -- or a tenant delete
@@ -4969,6 +5754,580 @@ def whatsapp_connection_health_with_context():
         wa_connect.run_health_checks(sys.modules[__name__])
 
 
+@contextlib.contextmanager
+def _acting_as_tenant(tenant_id):
+    """Run tenant_query()-based code (the Cash Flow report) for `tenant_id`
+    outside that tenant's own request -- the nightly job has no JWT. Inside a
+    request already carrying that tenant's token nothing changes; otherwise a
+    short-lived token for it is attached to a throwaway request context that
+    reuses the current app context, so the DB session is shared (the same
+    pattern as mcp_tools.call_api)."""
+    try:
+        same = has_request_context() and get_jwt().get('tenant_id') == tenant_id
+    except Exception:
+        same = False
+    if same:
+        yield
+        return
+    token = create_access_token(identity='books', additional_claims={'role': 'system', 'tenant_id': tenant_id},
+                                expires_delta=timedelta(minutes=5))
+    with app.test_request_context('/', headers={'Authorization': f'Bearer {token}'}):
+        verify_jwt_in_request()
+        yield
+
+
+def _ledger_start_day(settings, now=None):
+    """The tenant's own local date of `now` (naive = UTC), never the request's."""
+    zone = _zone_for(settings)
+    if now is None:
+        return datetime.now(zone).date()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(zone).date()
+
+
+def _ledger_write_starting_point(tenant_id, start_day):
+    """The starting point: every existing record's desired lines in its
+    current state, one LedgerStartLine per line (unnetted, with its day). A
+    record with no lines at all (an unpaid prepayment, a zero amount, a day
+    close with no difference) gets one zero-amount marker row
+    (ledger.START_MARKER), so a later edit still counts as fixing a record
+    from before the books. Loaded in id-ordered chunks so a large tenant does
+    not hold every record at once.
+
+    Returns {'cash': x, 'whish': y}: the Cash / Whish lines dated after
+    start_day (records that exist now but move money on a later day)."""
+    future = {'cash': 0.0, 'whish': 0.0}
+    local_day, _ = _ledger_context(tenant_id)
+    session = db.session
+    table = LedgerStartLine.__table__
+    known = set(session.identity_map.keys())  # the caller's own objects stay attached
+    for model, kind in _LEDGER_MODELS.items():
+        last = 0
+        while True:
+            with session.no_autoflush:
+                chunk = (model.query.filter(model.tenant_id == tenant_id, model.id > last)
+                         .order_by(model.id).limit(1000).all())
+            if not chunk:
+                break
+            rows = []
+            for rec in chunk:
+                lines = _books.desired_lines(kind, rec, local_day)
+                if not lines:
+                    rows.append({'tenant_id': tenant_id, 'source_type': kind, 'source_id': rec.id,
+                                 'account_key': _books.START_MARKER, 'party_type': None,
+                                 'party_id': None, 'amount': 0.0, 'day': start_day})
+                for l in lines:
+                    rows.append({'tenant_id': tenant_id, 'source_type': kind, 'source_id': rec.id,
+                                 'account_key': l.account_key, 'party_type': l.party_type,
+                                 'party_id': l.party_id, 'amount': round(float(l.amount), 4),
+                                 'day': l.day})
+                    if l.account_key in future and l.day is not None and l.day > start_day:
+                        future[l.account_key] += float(l.amount)
+            last = chunk[-1].id
+            if rows:
+                session.execute(table.insert(), rows)
+            for rec in chunk:
+                if db.inspect(rec).identity_key not in known:
+                    session.expunge(rec)
+    return {k: round(v, 4) for k, v in future.items()}
+
+
+def _start_books_isolation(dialect_name):
+    """Execution options for start_books' transaction: one REPEATABLE READ
+    snapshot on Postgres, so the party balances, the Cash Flow figures and
+    the starting-point records are all read as of the same moment (under
+    READ COMMITTED a write committed between those reads would land in one
+    and not the other -- a silent, permanent drift). SQLite runs one writer
+    at a time anyway: nothing to set."""
+    if dialect_name == 'postgresql':
+        return {'isolation_level': 'REPEATABLE READ'}
+    return None
+
+
+def start_books(tenant_id, now=None):
+    """Start the tenant's books (spec "Starting the books (cut-over)"), in the
+    caller's transaction -- the caller commits. Idempotent: an already started
+    tenant's LedgerState is returned untouched.
+
+    1. the chart of accounts;
+    2. the opening entry, dated start_day (the tenant's own local date of
+       `now`): every party's non-zero stored balance and Cash / Whish at the
+       Cash Flow running balance, each against Opening balances. Cash / Whish
+       are the Cash Flow page's closing figures for start_day itself, i.e.
+       the day before's close plus what already moved today: every record
+       existing now is in the starting point, so a movement earlier on the
+       start day must already be inside the opening (else the books' Cash
+       would trail the Cash Flow page by it for good). No opening balance on
+       that page: 0, and last_check['cash_opening_unknown'] = True;
+    3. the starting point (LedgerStartLine rows) for every existing record;
+    4. the LedgerState row.
+
+    The opening entry's party lines are not counted by the safety net: they
+    restate balances, they do not change them.
+
+    Consistency: on Postgres the whole start is one REPEATABLE READ snapshot
+    (_start_books_isolation), so it must begin a fresh transaction -- the
+    caller commits or rolls back first (the route and ledger_nightly do);
+    with a transaction already open it raises RuntimeError. The isolation
+    level is the connection's for this transaction only: SQLAlchemy resets
+    it when the connection goes back to the pool at commit / rollback. A
+    snapshot still cannot see another transaction that is in flight across
+    the start and commits after it: its balance change is in neither the
+    opening nor the starting point, and its records post nothing (they were
+    new before the books started). The nightly check (task 6) is what
+    reports such a gap."""
+    session = db.session
+    options = _start_books_isolation(db.engine.dialect.name)
+    if options:
+        if session().in_transaction():  # the real Session: db.session raised AttributeError here
+            raise RuntimeError("start_books needs a fresh transaction: commit or roll back first")
+        session.connection(execution_options=options)
+    state = session.get(LedgerState, tenant_id)
+    if state is not None:
+        return state
+    with session.no_autoflush:
+        settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).order_by(BusinessSettings.id).first()
+    start_day = _ledger_start_day(settings, now)
+
+    # 4 first: a second start racing this one blocks on the primary key.
+    state = LedgerState(tenant_id=tenant_id, start_day=start_day, started_at=datetime.utcnow())
+    session.add(state)
+    session.flush()
+
+    # 1. Chart of accounts (only what is missing).
+    with session.no_autoflush:
+        have = set(session.execute(db.select(LedgerAccount.key)
+                                   .where(LedgerAccount.tenant_id == tenant_id)).scalars())
+    rows = [{'tenant_id': tenant_id, 'key': key, 'number': number, 'name': name, 'type': type_,
+             'party_type': party_type}
+            for key, number, name, type_, party_type in _books.CHART if key not in have]
+    if rows:
+        session.execute(LedgerAccount.__table__.insert(), rows)
+    # Caches that saw this tenant as not started / without accounts are stale now.
+    session.info.setdefault('ledger_started', {})[tenant_id] = state
+    session.info.get('ledger_accounts', {}).pop(tenant_id, None)
+
+    # 3. Starting point (before the opening: Cash / Whish need its future-dated lines).
+    future = _ledger_write_starting_point(tenant_id, start_day)
+
+    # 2. Opening entry.
+    items = []
+    for model, party_type in _LEDGER_PARTY_TYPES.items():
+        with session.no_autoflush:
+            parties = session.execute(
+                db.select(model.id, model.balance).where(model.tenant_id == tenant_id)
+                .order_by(model.id)).all()
+        for pid, balance in parties:
+            balance = round(float(balance or 0), 4)
+            if abs(balance) >= 0.005:
+                items.append(('Opening balances', None,
+                              _books.balance_delta_to_lines(party_type, pid, balance, start_day,
+                                                            against='opening')))
+    with _acting_as_tenant(tenant_id):
+        flow = _cash_flow_for_day(start_day, settings)
+    unknown = flow.get('cash_end') is None or flow.get('whish_end') is None
+    for key, value in (('cash', flow.get('cash_end')), ('whish', flow.get('whish_end'))):
+        # Money a record moves after start_day is in the starting point (never
+        # posted) but reaches the Cash Flow page only on its own day: include
+        # it now, or the books would trail that page from then on.
+        amount = round(float(value or 0) + future[key], 4)
+        if abs(amount) >= _LEDGER_EPS:
+            items.append(('Opening balances', None, [
+                _books.Line(key, None, None, amount, start_day),
+                _books.Line('opening', None, None, -amount, start_day)]))
+    if items:
+        posted = session.info.get('ledger_party_posted')
+        before = dict(posted) if posted else None
+        _post_line_groups(tenant_id, 'opening', items, who=_ledger_who())
+        # Restating a balance is not a change of it: keep these lines out of
+        # what the safety net compares with this transaction's balance changes.
+        if before:
+            session.info['ledger_party_posted'] = before
+        else:
+            session.info.pop('ledger_party_posted', None)
+        state.opening_entry_id = session.info['ledger_entries'][(tenant_id, 'opening', start_day)]['id']
+    if unknown:
+        state.last_check = json.dumps({'cash_opening_unknown': True})
+    session.flush()
+    return state
+
+
+def _ledger_state_json(state):
+    check = None
+    if state.last_check:
+        try:
+            check = json.loads(state.last_check)
+        except ValueError:
+            check = None
+    return {
+        'tenant_id': state.tenant_id,
+        'started_at': state.started_at.strftime('%Y-%m-%dT%H:%M:%SZ') if state.started_at else None,
+        'start_day': state.start_day.isoformat() if state.start_day else None,
+        'opening_entry_id': state.opening_entry_id,
+        'last_check_at': state.last_check_at.strftime('%Y-%m-%dT%H:%M:%SZ') if state.last_check_at else None,
+        'last_check': check,
+    }
+
+
+@app.route('/api/books/start', methods=['POST'])
+@jwt_required()
+@admin_required()
+def start_books_route():
+    """Start this business's books now (admin). Idempotent; a start racing
+    another (the nightly job) returns the state the winner created."""
+    tenant_id = current_tenant_id()
+    db.session.commit()  # start_books needs a fresh transaction (its snapshot)
+    try:
+        state = start_books(tenant_id)
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        state = db.session.get(LedgerState, tenant_id)
+        if state is None:
+            raise
+    return jsonify(_ledger_state_json(state)), 200
+
+
+# Cash-basis profit (spec "What 'the books and the reports agree' means"):
+# which side of a money line's entry an account is on. Income side: the
+# customer / reseller control accounts plus the accounts a bill or discount
+# pairs them with, so a bill booked in the same entry as its receipt nets to
+# nothing inside the side (the posting rule nets per account, so the receipt's
+# counter-line may already have been merged into the bill's). Cost side
+# likewise: a payable and the expense it pays for. Everything else (Cash /
+# Whish transfers, money_in, opening, over_short, corrections) is neither.
+_BOOKS_INCOME_SIDE = frozenset(('customers', 'resellers', 'income_subscriptions', 'income_resellers',
+                                'discounts'))
+_BOOKS_COST_SIDE = frozenset(('upstream', 'suppliers', 'salaries'))
+
+
+def _books_profit_side(key):
+    if key in _BOOKS_INCOME_SIDE:
+        return 'income'
+    if key in _BOOKS_COST_SIDE or key.startswith('expense:') or key.startswith('cost_'):
+        return 'cost'
+    return None
+
+
+def _month_bounds(month):
+    """('YYYY-MM') -> (first day, last day)."""
+    first = datetime.strptime(month, '%Y-%m').date()
+    nxt = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return first, nxt - timedelta(days=1)
+
+
+def _books_cash_basis_profit(tenant_id, month, from_day=None):
+    """Cash-basis profit of `month` ('YYYY-MM') worked out from the books:
+    for every Cash / Whish line in the month (from `from_day` on, when given)
+    follow its entry's other lines -- per record, i.e. per (entry, source) --
+    and count money against the income side as income, against the cost side
+    as cost; transfers, money_in, opening and over_short are neither. Opening
+    entries are skipped. Returns income - cost. Reads only."""
+    first, last = _month_bounds(month)
+    if from_day is not None and from_day > first:
+        first = from_day
+    if first > last:
+        return 0.0
+    keys = dict(db.session.execute(db.select(LedgerAccount.id, LedgerAccount.key)
+                                   .where(LedgerAccount.tenant_id == tenant_id)).all())
+    money_ids = [aid for aid, key in keys.items() if key in ('cash', 'whish')]
+    if not money_ids:
+        return 0.0
+    with_money = (db.select(JournalLine.entry_id).distinct()
+                  .where(JournalLine.tenant_id == tenant_id, JournalLine.account_id.in_(money_ids),
+                         JournalLine.entry_date >= first, JournalLine.entry_date <= last))
+    rows = db.session.execute(
+        db.select(JournalLine.entry_id, JournalLine.source_type, JournalLine.source_id, JournalLine.account_id,
+                  func.sum(JournalLine.debit - JournalLine.credit))
+        .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
+        .where(JournalLine.tenant_id == tenant_id, JournalEntry.kind != 'opening',
+               JournalLine.entry_id.in_(with_money))
+        .group_by(JournalLine.entry_id, JournalLine.source_type, JournalLine.source_id,
+                  JournalLine.account_id)).all()
+    groups = {}
+    for entry_id, stype, sid, account_id, net in rows:
+        g = groups.setdefault((entry_id, stype, sid), {'money': 0.0, 'income': 0.0, 'cost': 0.0})
+        key = keys.get(account_id, '')
+        side = 'money' if key in ('cash', 'whish') else _books_profit_side(key)
+        if side:
+            g[side] += float(net or 0)
+    profit = 0.0
+    for g in groups.values():
+        if abs(g['money']) >= _LEDGER_EPS:
+            # Money in against the income side credits it (-), money out to
+            # the cost side debits it (+): profit = -(income + cost).
+            profit -= g['income'] + g['cost']
+    return round(profit, 4)
+
+
+def _books_utc_stamp(dt):
+    return dt.strftime('%Y-%m-%dT%H:%M:%SZ') if dt else None
+
+
+def run_books_check(tenant_id):
+    """The nightly books check (spec "Nightly check" and "What 'the books
+    and the reports agree' means"). Compares the books with the stored party
+    balances, the Cash Flow page's closing Cash / Whish for today and the
+    Finance page's monthly profit; stores the result as JSON in
+    LedgerState.last_check (keeping start_books' cash_opening_unknown flag)
+    and returns it. Writes nothing else: no journal line, no balance, no
+    estimate. A tenant whose books have not started gets {}.
+
+    Profit months run from start_day's month to the current month. The first
+    month is compared from the day AFTER start_day on both sides: records
+    from earlier on start_day are inside the opening entry (not posted), so
+    the books cannot cover start_day the way the report does."""
+    session = db.session
+    with session.no_autoflush:
+        state = session.get(LedgerState, tenant_id)
+        if state is None:
+            return {}
+        settings = BusinessSettings.query.filter_by(tenant_id=tenant_id).order_by(BusinessSettings.id).first()
+        today = _ledger_start_day(settings)
+        accounts = dict(session.execute(db.select(LedgerAccount.key, LedgerAccount.id)
+                                        .where(LedgerAccount.tenant_id == tenant_id)).all())
+
+        unbalanced = [eid for (eid,) in session.execute(
+            db.select(JournalLine.entry_id).where(JournalLine.tenant_id == tenant_id)
+            .group_by(JournalLine.entry_id)
+            .having(func.abs(func.sum(JournalLine.debit - JournalLine.credit)) >= 0.005)
+            .order_by(JournalLine.entry_id)).all()]
+
+        books_party = {(pt, pid): float(total or 0) for pt, pid, total in session.execute(
+            db.select(JournalLine.party_type, JournalLine.party_id,
+                      func.sum(JournalLine.debit - JournalLine.credit))
+            .where(JournalLine.tenant_id == tenant_id, JournalLine.party_type.isnot(None))
+            .group_by(JournalLine.party_type, JournalLine.party_id)).all()}
+        mismatches = []
+        for model, party_type in _LEDGER_PARTY_TYPES.items():
+            seen = set()
+            for pid, name, balance in session.execute(
+                    db.select(model.id, model.name, model.balance)
+                    .where(model.tenant_id == tenant_id).order_by(model.id)).all():
+                seen.add(pid)
+                stored = round(float(balance or 0), 2)
+                books = round(_books.party_balance_from_books(party_type, books_party.get((party_type, pid), 0.0)), 2)
+                if abs(stored - books) >= 0.005:
+                    mismatches.append({'party_type': party_type, 'party_id': pid, 'name': name,
+                                       'stored': stored, 'books': books})
+            # Lines for a party whose row is gone (a deleted customer's are
+            # moved to Balance corrections, so these should net to 0).
+            for (pt, pid), total in sorted(books_party.items(), key=lambda kv: kv[0][1] or 0):
+                if pt != party_type or pid in seen:
+                    continue
+                books = round(_books.party_balance_from_books(party_type, total), 2)
+                if abs(books) >= 0.005:
+                    mismatches.append({'party_type': party_type, 'party_id': pid, 'name': None,
+                                       'stored': 0.0, 'books': books})
+
+        def books_money(key):
+            if key not in accounts:
+                return 0.0
+            total = session.execute(db.select(func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0))
+                                    .where(JournalLine.tenant_id == tenant_id,
+                                           JournalLine.account_id == accounts[key],
+                                           JournalLine.entry_date <= today)).scalar()
+            return round(float(total or 0), 2)
+
+        with _acting_as_tenant(tenant_id):
+            flow = _cash_flow_for_day(today, settings)
+            first_day = state.start_day + timedelta(days=1)
+            _, last_day = _month_bounds(today.strftime('%Y-%m'))
+            reports = _financial_report_months(first_day, last_day) if first_day <= last_day else {}
+
+        def flow_end(key):
+            value = flow.get(key)
+            return None if value is None else round(float(value), 2)
+
+        months = []
+        month = state.start_day.strftime('%Y-%m')
+        while month <= today.strftime('%Y-%m'):
+            m_first, m_last = _month_bounds(month)
+            if first_day <= m_last:
+                frm = max(m_first, first_day)
+                months.append({
+                    'month': month,
+                    'from': frm.isoformat(),
+                    'partial': frm > m_first,
+                    'books_cash_basis': round(_books_cash_basis_profit(tenant_id, month, frm), 2),
+                    'reports': round(float((reports.get(month) or {}).get('profit') or 0), 2),
+                })
+            month = (m_last + timedelta(days=1)).strftime('%Y-%m')
+
+        result = {
+            'checked_at': _books_utc_stamp(datetime.utcnow()),
+            'unbalanced_entries': unbalanced,
+            'party_mismatches': mismatches,
+            'cash': {'books': books_money('cash'), 'cash_flow': flow_end('cash_end')},
+            'whish': {'books': books_money('whish'), 'cash_flow': flow_end('whish_end')},
+            'unexplained_count': session.execute(db.select(func.count(JournalEntry.id)).where(
+                JournalEntry.tenant_id == tenant_id, JournalEntry.kind == 'unexplained')).scalar() or 0,
+            'problem_count': session.execute(db.select(func.count(LedgerProblem.id)).where(
+                LedgerProblem.tenant_id == tenant_id)).scalar() or 0,
+            'profit_by_month': months,
+        }
+    try:
+        previous = json.loads(state.last_check) if state.last_check else {}
+    except ValueError:
+        previous = {}
+    stored = dict(result)
+    if isinstance(previous, dict) and 'cash_opening_unknown' in previous:
+        stored['cash_opening_unknown'] = previous['cash_opening_unknown']
+    state.last_check = json.dumps(stored)
+    state.last_check_at = datetime.utcnow()
+    session.flush()
+    return result
+
+
+def _books_day_arg(name):
+    raw = request.args.get(name)
+    if not raw:
+        return None
+    return datetime.strptime(raw, '%Y-%m-%d').date()  # ValueError -> 400 by the caller
+
+
+@app.route('/api/books/accounts', methods=['GET'])
+@jwt_required()
+@admin_required()
+def books_accounts():
+    """Trial balance as of a day (default today): every account with its
+    debit and credit totals over lines dated on or before it, and balance on
+    its natural side (asset / expense: debit - credit; else credit - debit)."""
+    tenant_id = current_tenant_id()
+    try:
+        as_of = _books_day_arg('as_of') or _tenant_today()
+    except ValueError:
+        return jsonify({'error': 'Use as_of as YYYY-MM-DD.'}), 400
+    sums = {aid: (float(dr or 0), float(cr or 0)) for aid, dr, cr in db.session.execute(
+        db.select(JournalLine.account_id, func.sum(JournalLine.debit), func.sum(JournalLine.credit))
+        .where(JournalLine.tenant_id == tenant_id, JournalLine.entry_date <= as_of)
+        .group_by(JournalLine.account_id)).all()}
+    out, total_dr, total_cr = [], 0.0, 0.0
+    for acc in LedgerAccount.query.filter_by(tenant_id=tenant_id).order_by(LedgerAccount.number, LedgerAccount.id):
+        dr, cr = sums.get(acc.id, (0.0, 0.0))
+        dr, cr = round(dr, 4), round(cr, 4)
+        total_dr += dr
+        total_cr += cr
+        balance = dr - cr if acc.type in ('asset', 'expense') else cr - dr
+        out.append({'key': acc.key, 'number': acc.number, 'name': acc.name, 'type': acc.type,
+                    'debit': dr, 'credit': cr, 'balance': round(balance, 4)})
+    return jsonify({'as_of': as_of.isoformat(), 'accounts': out,
+                    'totals': {'debit': round(total_dr, 4), 'credit': round(total_cr, 4)}}), 200
+
+
+@app.route('/api/books/journal', methods=['GET'])
+@jwt_required()
+@admin_required()
+def books_journal():
+    """Journal entries, newest first, each with all its lines. Filters:
+    start_date / end_date (entry date, inclusive), account (key), party_type
+    + party_id (entries with at least one matching line). Paged."""
+    tenant_id = current_tenant_id()
+    try:
+        start = _books_day_arg('start_date')
+        end = _books_day_arg('end_date')
+        page = max(int(request.args.get('page') or 1), 1)
+        per_page = min(max(int(request.args.get('per_page') or 50), 1), 200)
+        party_id = request.args.get('party_id')
+        party_id = int(party_id) if party_id not in (None, '') else None
+    except ValueError:
+        return jsonify({'error': 'Bad filter: dates are YYYY-MM-DD, page / per_page / party_id are numbers.'}), 400
+    account = request.args.get('account')
+    party_type = request.args.get('party_type')
+
+    q = db.select(JournalEntry).where(JournalEntry.tenant_id == tenant_id)
+    if start:
+        q = q.where(JournalEntry.entry_date >= start)
+    if end:
+        q = q.where(JournalEntry.entry_date <= end)
+    if account or party_type or party_id is not None:
+        lines = db.select(JournalLine.entry_id).where(JournalLine.tenant_id == tenant_id)
+        if account:
+            account_id = db.session.execute(db.select(LedgerAccount.id).where(
+                LedgerAccount.tenant_id == tenant_id, LedgerAccount.key == account)).scalar()
+            if account_id is None:
+                return jsonify({'items': [], 'total': 0}), 200
+            lines = lines.where(JournalLine.account_id == account_id)
+        if party_type:
+            lines = lines.where(JournalLine.party_type == party_type)
+        if party_id is not None:
+            lines = lines.where(JournalLine.party_id == party_id)
+        q = q.where(JournalEntry.id.in_(lines))
+    total = db.session.execute(db.select(func.count()).select_from(q.subquery())).scalar() or 0
+    entries = db.session.execute(q.order_by(JournalEntry.entry_date.desc(), JournalEntry.id.desc())
+                                 .offset((page - 1) * per_page).limit(per_page)).scalars().all()
+
+    ids = [e.id for e in entries]
+    by_entry = {eid: [] for eid in ids}
+    party_ids = {}
+    if ids:
+        for line, key in db.session.execute(
+                db.select(JournalLine, LedgerAccount.key)
+                .join(LedgerAccount, LedgerAccount.id == JournalLine.account_id)
+                .where(JournalLine.tenant_id == tenant_id, JournalLine.entry_id.in_(ids))
+                .order_by(JournalLine.id)).all():
+            by_entry[line.entry_id].append((line, key))
+            if line.party_type and line.party_id is not None:
+                party_ids.setdefault(line.party_type, set()).add(line.party_id)
+    # One query per party type for the whole page.
+    models = {pt: model for model, pt in _LEDGER_PARTY_TYPES.items()}
+    names = {}
+    for pt, pids in party_ids.items():
+        model = models.get(pt)
+        if model is None:
+            continue
+        for pid, name in db.session.execute(db.select(model.id, model.name).where(
+                model.tenant_id == tenant_id, model.id.in_(pids))).all():
+            names[(pt, pid)] = name
+
+    items = [{
+        'id': e.id, 'date': e.entry_date.isoformat(), 'kind': e.kind, 'memo': e.memo,
+        'created_by': e.created_by,
+        'lines': [{'account': key, 'party_type': l.party_type, 'party_id': l.party_id,
+                   'party_name': names.get((l.party_type, l.party_id)),
+                   'debit': round(float(l.debit or 0), 4), 'credit': round(float(l.credit or 0), 4),
+                   'source_type': l.source_type, 'source_id': l.source_id}
+                  for l, key in by_entry[e.id]],
+    } for e in entries]
+    return jsonify({'items': items, 'total': total}), 200
+
+
+@app.route('/api/books/check', methods=['GET'])
+@jwt_required()
+@admin_required()
+def books_check():
+    """When the books started and the last nightly check's result."""
+    state = db.session.get(LedgerState, current_tenant_id())
+    if state is None:
+        return jsonify({'started_at': None, 'start_day': None, 'last_check': None}), 200
+    full = _ledger_state_json(state)
+    return jsonify({'started_at': full['started_at'], 'start_day': full['start_day'],
+                    'last_check': full['last_check']}), 200
+
+
+def ledger_nightly():
+    """Nightly (after the other nightly jobs): start the books of every
+    business that has not started them, else run its books check. Each
+    tenant in its own try + commit, so one failing does not stop the rest."""
+    with app.app_context():
+        tenant_ids = [t for (t,) in db.session.execute(db.select(Tenant.id).order_by(Tenant.id)).all()]
+        db.session.commit()  # each start_books begins its own transaction
+        for tid in tenant_ids:
+            try:
+                if db.session.get(LedgerState, tid) is None:
+                    # That read opened a transaction; start_books must begin
+                    # its own (its snapshot), so end this one first.
+                    db.session.rollback()
+                    start_books(tid)
+                else:
+                    run_books_check(tid)
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logging.exception("books: nightly run failed for tenant %s", tid)
+
+
 _SCHEDULED_JOBS = {
     "generate_missing_payments": generate_missing_payments_with_context,
     "generate_missing_salary_charges": generate_missing_salary_charges_with_context,
@@ -4984,6 +6343,8 @@ _SCHEDULED_JOBS = {
     "check_pro_plan_expirations": check_pro_plan_expirations_with_context,
     "refresh_agent_mode_network_status": refresh_agent_mode_network_status_with_context,
     "whatsapp_connection_health": whatsapp_connection_health_with_context,
+    # The books (roadmap 1C): starts unstarted businesses, else checks them.
+    "ledger_nightly": ledger_nightly,
 }
 
 
@@ -5007,6 +6368,7 @@ SCHEDULE = {
     "check_pro_plan_expirations": "50 2 * * *",
     "refresh_agent_mode_network_status": "*/15 * * * *",
     "whatsapp_connection_health": "5 * * * *",
+    "ledger_nightly": "0 3 * * *",
 }
 ONPREM_EXTRA_SCHEDULE = {"refresh_license": "0 3 * * *"}
 
@@ -5800,6 +7162,11 @@ def _delete_customer_core(customer):
     # DELETE that the constraint would reject).
     WhatsAppConversation.query.filter_by(customer_id=customer.id).update(
         {'customer_id': None}, synchronize_session=False)
+    # Books: the customer's bills and receipts stay posted (money really
+    # received must not leave the books); their leftover balance is written
+    # off to Balance corrections, and the cascade below is not reversed.
+    _ledger_write_off_customer(customer)
+    db.session.info.setdefault('ledger_deleting_customers', set()).add(customer.id)
     db.session.delete(customer)
 
 
@@ -7262,6 +8629,8 @@ def resolve_credit_review(customer_id):
         if action == 'restore':
             _note_balance_reason(customer, f"Correction: credit lost to auto-settlement restored (${total:.2f})")
             customer.balance = float(customer.balance or 0) + total
+            _ledger_note_manual(customer, 'customer', total,
+                                f"Credit lost to auto-settlement restored (${total:.2f})")
             db.session.flush()
             apply_customer_balance_to_unpaid_payments(customer)
         db.session.commit()
@@ -12765,6 +14134,120 @@ def get_reconciliation_report():
     }), 200
 
 
+def _financial_report_months(start_day, end_day):
+    """{'YYYY-MM': {...}} -- the Finance page's cash-basis monthly income,
+    expenses and profit (with the per-source split) for the current tenant,
+    between two business-local days inclusive. Shared by the
+    /api/reports/financial route and the books check (run_books_check), so
+    the check compares against exactly the figure the page shows. Reads only.
+    """
+    start_date = datetime.combine(start_day, datetime.min.time())
+    end_date = datetime.combine(end_day, datetime.min.time()).replace(hour=23, minute=59, second=59)
+
+    # 1. Income: the one shared definition (see _customer_income_by_month).
+    income_query = [SimpleNamespace(month=month, total=total)
+                    for month, total in _customer_income_by_month(start_day, end_day).items()]
+
+    # 2. Expenses (direct non-credit, not a payroll payment). employee_id
+    # being set is what identifies a payroll expense -- not the category
+    # name -- so this keeps working even if "Payroll" gets renamed.
+    expense_query = db.session.query(
+        month_key(Expense.date).label('month'),
+        func.sum(Expense.amount).label('total')
+    ).filter(
+        Expense.tenant_id == current_tenant_id(),
+        Expense.is_credit == False,
+        Expense.employee_id.is_(None),
+        Expense.date >= start_date,
+        Expense.date <= end_date
+    ).group_by('month').all()
+
+    # 2b. Payroll payments recorded as Expense rows (see record_employee_payment)
+    payroll_expense_query = db.session.query(
+        month_key(Expense.date).label('month'),
+        func.sum(Expense.amount).label('total')
+    ).filter(
+        Expense.tenant_id == current_tenant_id(),
+        Expense.is_credit == False,
+        Expense.employee_id.isnot(None),
+        Expense.date >= start_date,
+        Expense.date <= end_date
+    ).group_by('month').all()
+
+    # 3. Supplier cash payments
+    sp_query = db.session.query(
+        month_key(SupplierPayment.payment_date).label('month'),
+        func.sum(SupplierPayment.amount).label('total')
+    ).filter(
+        SupplierPayment.tenant_id == current_tenant_id(),
+        SupplierPayment.payment_date >= start_date,
+        SupplierPayment.payment_date <= end_date
+    ).group_by('month').all()
+
+    # 4. Legacy salary payments predating Expense-based payroll -- still
+    # counted so historical months don't lose their payroll expense.
+    sal_query = db.session.query(
+        month_key(SalaryPayment.payment_date).label('month'),
+        func.sum(SalaryPayment.amount).label('total')
+    ).filter(
+        SalaryPayment.tenant_id == current_tenant_id(),
+        SalaryPayment.payment_date >= start_date,
+        SalaryPayment.payment_date <= end_date
+    ).group_by('month').all()
+
+    # 4b. Reseller collections (income) and upstream top-ups (cost).
+    reseller_income = _reseller_income_by_month(start_day, end_day)
+    upstream_cost = _upstream_cost_by_month(start_day, end_day)
+
+    # Combine results
+    months_set = set(
+        [row.month for row in income_query] + [row.month for row in expense_query]
+        + [row.month for row in payroll_expense_query]
+        + [row.month for row in sp_query] + [row.month for row in sal_query]
+        + list(reseller_income.keys()) + list(upstream_cost.keys())
+    )
+
+    monthly_data_dict = {m: {
+        'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0,
+        # Same total as `expenses`, split by source -- previously computed
+        # here and immediately discarded once summed together.
+        'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0,
+        'expenses_upstream': 0.0, 'income_customers': 0.0, 'income_resellers': 0.0
+    } for m in months_set}
+
+    for m, total in reseller_income.items():
+        monthly_data_dict[m]['income'] += total
+        monthly_data_dict[m]['income_resellers'] += total
+
+    for m, total in upstream_cost.items():
+        monthly_data_dict[m]['expenses'] += total
+        monthly_data_dict[m]['expenses_upstream'] += total
+
+    for row in income_query:
+        monthly_data_dict[row.month]['income'] += float(row.total or 0)
+        monthly_data_dict[row.month]['income_customers'] += float(row.total or 0)
+
+    for row in expense_query:
+        monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+        monthly_data_dict[row.month]['expenses_manual'] += float(row.total or 0)
+
+    for row in sp_query:
+        monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+        monthly_data_dict[row.month]['expenses_supplier'] += float(row.total or 0)
+
+    for row in payroll_expense_query:
+        monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+        monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
+
+    for row in sal_query:
+        monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
+        monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
+
+    for data in monthly_data_dict.values():
+        data['profit'] = data['income'] - data['expenses']
+    return monthly_data_dict
+
+
 @app.route('/api/reports/financial', methods=['GET'])
 @jwt_required()
 @admin_or_finance_required()
@@ -12786,56 +14269,8 @@ def get_financial_report():
         start_date = datetime.combine(start_day, datetime.min.time())
         end_date = datetime.combine(end_day, datetime.min.time()).replace(hour=23, minute=59, second=59)
 
-        # 1. Income: the one shared definition (see _customer_income_by_month).
-        income_query = [SimpleNamespace(month=month, total=total)
-                        for month, total in _customer_income_by_month(start_day, end_day).items()]
-
-        # 2. Expenses (direct non-credit, not a payroll payment). employee_id
-        # being set is what identifies a payroll expense -- not the category
-        # name -- so this keeps working even if "Payroll" gets renamed.
-        expense_query = db.session.query(
-            month_key(Expense.date).label('month'),
-            func.sum(Expense.amount).label('total')
-        ).filter(
-            Expense.tenant_id == current_tenant_id(),
-            Expense.is_credit == False,
-            Expense.employee_id.is_(None),
-            Expense.date >= start_date,
-            Expense.date <= end_date
-        ).group_by('month').all()
-
-        # 2b. Payroll payments recorded as Expense rows (see record_employee_payment)
-        payroll_expense_query = db.session.query(
-            month_key(Expense.date).label('month'),
-            func.sum(Expense.amount).label('total')
-        ).filter(
-            Expense.tenant_id == current_tenant_id(),
-            Expense.is_credit == False,
-            Expense.employee_id.isnot(None),
-            Expense.date >= start_date,
-            Expense.date <= end_date
-        ).group_by('month').all()
-
-        # 3. Supplier cash payments
-        sp_query = db.session.query(
-            month_key(SupplierPayment.payment_date).label('month'),
-            func.sum(SupplierPayment.amount).label('total')
-        ).filter(
-            SupplierPayment.tenant_id == current_tenant_id(),
-            SupplierPayment.payment_date >= start_date,
-            SupplierPayment.payment_date <= end_date
-        ).group_by('month').all()
-
-        # 4. Legacy salary payments predating Expense-based payroll -- still
-        # counted so historical months don't lose their payroll expense.
-        sal_query = db.session.query(
-            month_key(SalaryPayment.payment_date).label('month'),
-            func.sum(SalaryPayment.amount).label('total')
-        ).filter(
-            SalaryPayment.tenant_id == current_tenant_id(),
-            SalaryPayment.payment_date >= start_date,
-            SalaryPayment.payment_date <= end_date
-        ).group_by('month').all()
+        # 1-4b. Income, expenses and profit per month: the one shared definition.
+        monthly_data_dict = _financial_report_months(start_day, end_day)
 
         # 5. Logged estimated profit -- lazily backfill the current month if it's
         # in range and hasn't been computed yet (no event/daily-job tick reached
@@ -12849,10 +14284,6 @@ def get_financial_report():
             ).first():
                 recalculate_estimated_profit(current_tenant_id())
 
-        # 4b. Reseller collections (income) and upstream top-ups (cost).
-        reseller_income = _reseller_income_by_month(start_day, end_day)
-        upstream_cost = _upstream_cost_by_month(start_day, end_day)
-
         estimate_query = MonthlyProfitEstimate.query.filter(
             MonthlyProfitEstimate.tenant_id == current_tenant_id(),
             MonthlyProfitEstimate.month >= start_month,
@@ -12861,50 +14292,12 @@ def get_financial_report():
         estimate_data = {e.month: e.estimated_profit for e in estimate_query}
         estimate_payroll_data = {e.month: float(e.estimated_payroll or 0) for e in estimate_query}
 
-        # Combine results
-        months_set = set(
-            [row.month for row in income_query] + [row.month for row in expense_query]
-            + [row.month for row in payroll_expense_query]
-            + [row.month for row in sp_query] + [row.month for row in sal_query]
-            + list(reseller_income.keys()) + list(upstream_cost.keys())
-            + list(estimate_data.keys())
-        )
-
-        monthly_data_dict = {m: {
-            'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0,
-            # Same total as `expenses`, split by source -- previously computed
-            # here and immediately discarded once summed together.
-            'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0,
-            'expenses_upstream': 0.0, 'income_customers': 0.0, 'income_resellers': 0.0
-        } for m in months_set}
-
-        for m, total in reseller_income.items():
-            monthly_data_dict[m]['income'] += total
-            monthly_data_dict[m]['income_resellers'] += total
-
-        for m, total in upstream_cost.items():
-            monthly_data_dict[m]['expenses'] += total
-            monthly_data_dict[m]['expenses_upstream'] += total
-
-        for row in income_query:
-            monthly_data_dict[row.month]['income'] += float(row.total or 0)
-            monthly_data_dict[row.month]['income_customers'] += float(row.total or 0)
-
-        for row in expense_query:
-            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
-            monthly_data_dict[row.month]['expenses_manual'] += float(row.total or 0)
-
-        for row in sp_query:
-            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
-            monthly_data_dict[row.month]['expenses_supplier'] += float(row.total or 0)
-
-        for row in payroll_expense_query:
-            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
-            monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
-
-        for row in sal_query:
-            monthly_data_dict[row.month]['expenses'] += float(row.total or 0)
-            monthly_data_dict[row.month]['expenses_payroll'] += float(row.total or 0)
+        for m in estimate_data:
+            monthly_data_dict.setdefault(m, {
+                'month': m, 'income': 0.0, 'expenses': 0.0, 'profit': 0.0,
+                'expenses_manual': 0.0, 'expenses_supplier': 0.0, 'expenses_payroll': 0.0,
+                'expenses_upstream': 0.0, 'income_customers': 0.0, 'income_resellers': 0.0})
+        months_set = set(monthly_data_dict)
 
         monthly_data = []
         total_income = 0.0
@@ -13139,6 +14532,9 @@ def create_reseller():
             balance=float(data.get('balance', 0.0))
         )
         db.session.add(new_reseller)
+        if new_reseller.balance:
+            _ledger_note_manual(new_reseller, 'reseller', new_reseller.balance,
+                                f"Opening balance: reseller {new_reseller.name}")
         db.session.commit()
         return jsonify({'message': 'Reseller created successfully!', 'reseller': new_reseller.to_dict()}), 201
     except Exception as e:
@@ -13313,6 +14709,9 @@ def create_upstream_provider():
             status=data.get('status', 'active'),
         )
         db.session.add(provider)
+        if provider.balance:
+            _ledger_note_manual(provider, 'upstream', provider.balance,
+                                f"Opening balance: upstream provider {provider.name}")
         db.session.commit()
         return jsonify({'message': 'Upstream provider created successfully!', 'provider': provider.to_dict()}), 201
     except Exception as e:
